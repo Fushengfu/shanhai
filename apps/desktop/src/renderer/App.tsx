@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
 interface ToolTrace {
   kind: 'tool-call' | 'tool-result'
@@ -193,7 +195,7 @@ export function App() {
       </aside>
 
       {/* 主区 */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative' }}>
         {/* 顶栏（可拖拽窗口） */}
         <header
           style={
@@ -223,18 +225,25 @@ export function App() {
             if (it.kind === 'assistant') {
               return (
                 <div key={i} style={{ marginBottom: 12 }}>
-                  <span style={bubble('#fff', '#333')}>{it.content}</span>
+                  <div style={{ display: 'inline-block', maxWidth: '85%', padding: '10px 14px', borderRadius: 12, background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,0.08)', fontSize: 14, lineHeight: 1.6, color: '#333' }}>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                      {it.content}
+                    </ReactMarkdown>
+                  </div>
                 </div>
               )
             }
-            // 工具过程
+            // 工具过程（按类型显示：调用 / 结果）
             const t = it.trace
             return (
               <div key={i} style={{ marginBottom: 8, fontSize: 12 }}>
-                <div style={{ display: 'inline-block', padding: '6px 10px', borderRadius: 8, background: '#f0f0f0', color: '#555', maxWidth: '90%', whiteSpace: 'pre-wrap' }}>
-                  {t.kind === 'tool-call'
-                    ? `🔧 调用工具 ${t.name}(${JSON.stringify(t.args ?? {})})`
-                    : `✅ ${t.name} → ${t.error ? '出错: ' + t.error : JSON.stringify(t.result)}`}
+                <div style={{ display: 'inline-flex', alignItems: 'flex-start', gap: 4, padding: '6px 10px', borderRadius: 8, background: t.error ? '#fff2f0' : '#f0f0f0', color: t.error ? '#cf1322' : '#555', maxWidth: '90%' }}>
+                  {t.kind === 'tool-call' ? <IconWrench /> : <IconCheck />}
+                  <span style={{ whiteSpace: 'pre-wrap' }}>
+                    {t.kind === 'tool-call'
+                      ? `调用工具 ${t.name}(${JSON.stringify(t.args ?? {})})`
+                      : `${t.name}${t.error ? ' 出错: ' + t.error : ' → ' + JSON.stringify(t.result)}`}
+                  </span>
                 </div>
               </div>
             )
@@ -247,24 +256,42 @@ export function App() {
               </span>
             </div>
           )}
-          {pendingApproval && (
-            <div style={{ marginBottom: 12, padding: 12, borderRadius: 10, border: '1px solid #ffccc7', background: '#fff2f0', fontSize: 13 }}>
-              <div style={{ fontWeight: 600, marginBottom: 6 }}>⚠️ 需要确认危险操作</div>
-              <div style={{ color: '#555', marginBottom: 4 }}>工具：{pendingApproval.toolName}（风险 {pendingApproval.riskLevel}）</div>
-              <div style={{ color: '#888', marginBottom: 10, whiteSpace: 'pre-wrap', fontSize: 12 }}>
-                {JSON.stringify(pendingApproval.args, null, 2)}
-              </div>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <button onClick={() => void respondApproval('allowed-once')} style={btn('#1677ff', '#fff')}>
-                  允许一次
-                </button>
-                <button onClick={() => void respondApproval('rejected')} style={btn('#fff', '#333', '1px solid #ddd')}>
-                  拒绝
-                </button>
-              </div>
-            </div>
-          )}
         </div>
+
+        {/* 审批弹窗（输入框上方浮动） */}
+        {pendingApproval && (
+          <div
+            style={{
+              position: 'absolute',
+              bottom: 158,
+              left: 16,
+              right: 16,
+              padding: 14,
+              borderRadius: 12,
+              border: '1px solid #ffccc7',
+              background: '#fff2f0',
+              fontSize: 13,
+              boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+            }}
+          >
+            <div style={{ fontWeight: 600, marginBottom: 6, color: '#333' }}>
+              <IconWarn />
+              需要确认危险操作
+            </div>
+            <div style={{ color: '#555', marginBottom: 4 }}>工具：{pendingApproval.toolName}（风险 {pendingApproval.riskLevel}）</div>
+            <div style={{ color: '#888', marginBottom: 10, whiteSpace: 'pre-wrap', fontSize: 12 }}>
+              {JSON.stringify(pendingApproval.args, null, 2)}
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={() => void respondApproval('allowed-once')} style={btn('#1677ff', '#fff')}>
+                允许一次
+              </button>
+              <button onClick={() => void respondApproval('rejected')} style={btn('#fff', '#333', '1px solid #ddd')}>
+                拒绝
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* 输入区（单卡片：textarea + 底部功能行 + 发送按钮） */}
         <div style={{ padding: '12px 16px 16px', borderTop: '1px solid #eee', background: '#fff' }}>
@@ -443,6 +470,32 @@ function IconLogout() {
       <path d="M21 12H9" />
     </svg>
   )
+}
+
+// Markdown 渲染组件（代码块高亮 / 行内代码 / 链接等）
+const markdownComponents = {
+  code(props: { className?: string; children?: React.ReactNode }) {
+    const hasLang = /language-[\w-]+/.test(props.className ?? '')
+    if (!props.className || !hasLang) {
+      return (
+        <code style={{ background: '#f0f0f0', padding: '2px 5px', borderRadius: 4, fontSize: '0.9em', fontFamily: 'ui-monospace, monospace' }}>
+          {props.children}
+        </code>
+      )
+    }
+    return (
+      <pre style={{ background: '#282c34', color: '#abb2bf', padding: 12, borderRadius: 8, overflowX: 'auto', fontSize: 13, lineHeight: 1.55, margin: '8px 0' }}>
+        <code style={{ fontFamily: 'ui-monospace, monospace' }}>{props.children}</code>
+      </pre>
+    )
+  },
+  a(props: { href?: string; children?: React.ReactNode }) {
+    return (
+      <a href={props.href} target="_blank" rel="noreferrer" style={{ color: '#1677ff' }}>
+        {props.children}
+      </a>
+    )
+  },
 }
 
 function LoginView({ onLogin }: { onLogin: (u: string, p: string) => Promise<void> }) {
