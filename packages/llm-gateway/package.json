@@ -1,0 +1,33 @@
+{
+  "name": "@shanhai/llm-gateway",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "山海模型网关：路由（旗舰/性价比/视觉）+ 降级重试 + SSE 流式",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@shanhai/auth": "workspace:*",
+    "@shanhai/llm": "workspace:*",
+    "@shanhai/tools": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsup": "^8.3.5",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}

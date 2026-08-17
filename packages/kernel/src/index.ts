@@ -1,0 +1,25 @@
+export * from './types'
+// K1 组合运行时
+export { DisposerStack, collectEffect } from './runtime/dispose'
+export { Fiber } from './runtime/fiber'
+export type { FiberApply, FiberMeta } from './runtime/fiber'
+export { Events } from './runtime/event'
+export type { EventListener } from './runtime/event'
+export { Service } from './runtime/service'
+export type { ServiceContext } from './runtime/service'
+export { Context, createContext } from './runtime/context'
+export type { Plugin, PluginFunction, PluginConstructor, PluginObject, ContextMeta } from './runtime/context'
+export { Kernel } from './runtime/kernel'
+// K2 版本生命周期
+export { PluginRegistry } from './lifecycle/registry'
+export type { PluginRegistryOptions } from './lifecycle/registry'
+export type { PluginVersion, PluginRecord, Approver } from './lifecycle/types'
+// K4 安全
+export { guardContext } from './security/capability'
+export { stableStringify, signPayload, verifyPayload, FileSnapshotStore } from './security/signing'
+export type { SnapshotId, SnapshotStore } from './security/signing'
+// K5 自修改
+export { PluginInventory } from './selfmod/inventory'
+export type { DynamicPackage, DynamicPackageStatus, InspectReport } from './selfmod/inventory'
+export { Updater } from './selfmod/marketplace'
+export type { PluginSource, UpdateCheck } from './selfmod/marketplace'

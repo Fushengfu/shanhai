@@ -1,0 +1,44 @@
+{
+  "name": "@shanhai/runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "山海运行时（host 装配）：用内核装配底座服务 + 能力插件，跑通宿主",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "shanhai": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@shanhai/agent": "workspace:*",
+    "@shanhai/approval": "workspace:*",
+    "@shanhai/auth": "workspace:*",
+    "@shanhai/compaction": "workspace:*",
+    "@shanhai/computer-use": "workspace:*",
+    "@shanhai/kernel": "workspace:*",
+    "@shanhai/llm": "workspace:*",
+    "@shanhai/llm-gateway": "workspace:*",
+    "@shanhai/memory": "workspace:*",
+    "@shanhai/session": "workspace:*",
+    "@shanhai/tools": "workspace:*",
+    "@shanhai/voice": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsup": "^8.3.5",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}

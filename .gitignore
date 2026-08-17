@@ -1,0 +1,47 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# 日志
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# 环境变量（含密钥，严禁提交）
+.env
+.env.*
+!.env.example
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# 测试覆盖
+coverage/
+
+# 本地数据（记忆库/向量库/沙箱工作区）
+.local/
+data/
+*.sqlite
+*.sqlite3
+
+# 密钥与凭证
+*.pem
+*.key
+secrets/
+poc/sandbox/workspace/*
+!poc/sandbox/workspace/.gitkeep
+
+# POC 测试临时输出（测试运行时生成，不提交）
+poc/**/.tmp/
