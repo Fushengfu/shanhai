@@ -329,27 +329,29 @@ export function App() {
                   )}
                 </select>
                 <button title="操作电脑" style={iconBtn}><IconMonitor /></button>
-                <button title="语音输入" style={iconBtn}><IconMic /></button>
               </div>
-              <button
-                onClick={() => void send()}
-                disabled={busy || !input.trim()}
-                title="发送"
-                style={{
-                  width: 36,
-                  height: 36,
-                  borderRadius: 18,
-                  border: 'none',
-                  background: busy || !input.trim() ? '#d9d9d9' : '#1677ff',
-                  color: '#fff',
-                  fontSize: 18,
-                  lineHeight: '36px',
-                  cursor: busy || !input.trim() ? 'not-allowed' : 'pointer',
-                  flexShrink: 0,
-                }}
-              >
-                <IconSend />
-              </button>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <button title="语音输入" style={iconBtn}><IconMic /></button>
+                <button
+                  onClick={() => void send()}
+                  disabled={busy || !input.trim()}
+                  title="发送"
+                  style={{
+                    width: 36,
+                    height: 36,
+                    borderRadius: 18,
+                    border: 'none',
+                    background: busy || !input.trim() ? '#d9d9d9' : '#1677ff',
+                    color: '#fff',
+                    fontSize: 18,
+                    lineHeight: '36px',
+                    cursor: busy || !input.trim() ? 'not-allowed' : 'pointer',
+                    flexShrink: 0,
+                  }}
+                >
+                  <IconSend />
+                </button>
+              </div>
             </div>
           </div>
         </div>

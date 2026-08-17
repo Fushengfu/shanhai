@@ -146,18 +146,25 @@ export async function bootstrap(): Promise<Runtime> {
   // 启动时恢复本地凭证（有 gateway apiKey 则视为已登录，模型调用走 apiKey）
   let loggedIn = false
   let username: string | null = null
+  let gatewayModels: GatewayModel[] = []
+  let selectedTier: ModelTier = 'flagship'
   try {
     const raw = await fs.readFile(join(homedir(), '.shanhai', 'config.json'), 'utf8')
-    const cfg = JSON.parse(raw) as { gateway?: { apiKey?: string; account?: { username?: string } } }
-    if (cfg.gateway?.apiKey) {
+    const cfg = JSON.parse(raw) as {
+      gateway?: { apiKey?: string; baseUrl?: string; selectedModelId?: string; account?: { username?: string } }
+    }
+    const g = cfg.gateway
+    if (g?.apiKey) {
       loggedIn = true
-      username = cfg.gateway.account?.username ?? null
+      username = g.account?.username ?? null
+      // 构造当前模型（网关模型列表拉不到时兜底，保证模型下拉有内容）
+      if (g.selectedModelId) {
+        gatewayModels = [{ id: g.selectedModelId, name: g.selectedModelId, tier: selectedTier, apiKey: g.apiKey, baseUrl: g.baseUrl ?? '' }]
+      }
     }
   } catch {
     // 无凭证，未登录
   }
-  let gatewayModels: GatewayModel[] = []
-  let selectedTier: ModelTier = 'flagship'
 
   // —— 其余能力 ——
   const memory = new MemoryStore()
@@ -207,12 +214,7 @@ export async function bootstrap(): Promise<Runtime> {
       await credentials.clear()
     },
     async listModels() {
-      if (gatewayModels.length === 0) {
-        const cred = await credentials.load()
-        if (cred?.token) {
-          gatewayModels = await authService.fetchModels(cred.token)
-        }
-      }
+      // 启动时已从 config.json 构造当前模型，这里直接返回（网关列表拉不到时兜底）
       return gatewayModels
     },
     selectedTier,
