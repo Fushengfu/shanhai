@@ -35,6 +35,7 @@ function registerIpc(): void {
     runtime!.run(message, { attachments: attachments as never }),
   )
   ipcMain.handle('model:switch', async (_e, id: string) => runtime!.switchModel(id))
+  ipcMain.handle('model:current', async () => runtime!.getCurrentModelId())
   ipcMain.handle('chat:stop', async () => runtime!.stop())
   ipcMain.handle('voice:speak', async (_e, text: string) => {
     await runtime!.voice.synthesize(text)

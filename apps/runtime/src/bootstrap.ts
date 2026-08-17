@@ -67,8 +67,10 @@ export interface Runtime {
   /** 流式增量回调 */
   onDelta(cb: (text: string) => void): () => void
 
-  /** 切换模型（动态更新 provider，后续对话用新模型） */
+  /** 切换模型（动态更新 provider，后续对话用新模型，并持久化到本地） */
   switchModel(modelId: string): void
+  /** 当前选中的模型 id（从本地缓存恢复，重启后仍记住） */
+  getCurrentModelId(): string
   /** 中断当前任务 */
   stop(): void
 
@@ -98,6 +100,14 @@ function inferTier(id: string): ModelTier {
   return 'flagship'
 }
 
+/** 视觉模型匹配提示词（这些厂商的模型通常支持多模态视觉） */
+const VISION_HINTS = ['qwen', 'kimi', 'mimo', 'minimax', 'longcat', 'glm', 'vision', 'vl', 'omni', 'step']
+
+function isVisionModel(id: string): boolean {
+  const lower = id.toLowerCase()
+  return VISION_HINTS.some((h) => lower.includes(h))
+}
+
 /** 用 apiKey 拉取网关完整模型列表（/api/v1/models，13 个模型，各自 baseUrl） */
 async function fetchGatewayModels(apiKey: string, baseUrl: string): Promise<GatewayModel[]> {
   try {
@@ -119,6 +129,19 @@ async function fetchGatewayModels(apiKey: string, baseUrl: string): Promise<Gate
     }))
   } catch {
     return []
+  }
+}
+
+/** 持久化选中模型到 config.json（下次打开不再重复选择） */
+async function persistSelectedModel(modelId: string): Promise<void> {
+  try {
+    const path = join(homedir(), '.shanhai', 'config.json')
+    const raw = await fs.readFile(path, 'utf8')
+    const cfg = JSON.parse(raw) as { gateway?: { selectedModelId?: string } }
+    if (cfg.gateway) cfg.gateway.selectedModelId = modelId
+    await fs.writeFile(path, JSON.stringify(cfg, null, 2), { mode: 0o600 })
+  } catch {
+    // 忽略持久化失败
   }
 }
 
@@ -167,6 +190,12 @@ function keyCode(key: string): number {
 export async function bootstrap(): Promise<Runtime> {
   const kernel = new Kernel()
 
+  // 网关凭证 + 模型列表（提前声明，供 image_analyze 工具闭包引用，登录部分赋值）
+  let gatewayApiKey = ''
+  let gatewayBaseUrl = ''
+  let gatewayModels: GatewayModel[] = []
+  let currentModelId = ''
+
   // —— 会话（多会话，内存态）——
   const sessions = new Map<string, { id: string; title: string; session: Session }>()
   let currentSessionId: string | null = null
@@ -190,8 +219,41 @@ export async function bootstrap(): Promise<Runtime> {
     })
   })
 
+  // —— 图片识别工具（模型不支持多模态时，AI 调它用视觉模型分析图片）——
+  const imageAnalyzeTool: ToolContract = {
+    name: 'image_analyze',
+    description: '分析图片内容并返回文字描述。当需要理解图片内容、但当前模型无法直接查看图片时使用。',
+    inputSchema: {
+      type: 'object',
+      properties: { imageUrl: { type: 'string', description: '图片的 URL 或 data: URL' } },
+      required: ['imageUrl'],
+    },
+    riskLevel: 'readonly',
+    execute: async (args) => {
+      const imageUrl = String(args.imageUrl ?? '')
+      if (!imageUrl) return '（未提供图片）'
+      const visionModel = gatewayModels.find((m) => isVisionModel(m.id))
+      if (!visionModel) return '（无可用视觉模型）'
+      try {
+        const provider = new DeepSeekProvider({ apiKey: gatewayApiKey, baseUrl: gatewayBaseUrl, model: visionModel.id })
+        const res = await provider.complete([
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: '请详细描述这张图片的内容，包括主体、文字、场景等。' },
+              { type: 'image_url', image_url: { url: imageUrl } },
+            ],
+          },
+        ])
+        return res.text ?? '（未能识别图片）'
+      } catch (err) {
+        return `（图片识别失败：${err instanceof Error ? err.message : String(err)}）`
+      }
+    },
+  }
+
   // —— 工具（包装：落 trace）——
-  const baseTools = atomicTools()
+  const baseTools = [...atomicTools(), imageAnalyzeTool]
   const tools: ToolContract[] = baseTools.map((t) => ({
     ...t,
     execute: async (args) => {
@@ -222,10 +284,7 @@ export async function bootstrap(): Promise<Runtime> {
   // 启动时恢复本地凭证（有 gateway apiKey 则视为已登录，模型调用走 apiKey）
   let loggedIn = false
   let username: string | null = null
-  let gatewayModels: GatewayModel[] = []
   let selectedTier: ModelTier = 'flagship'
-  let gatewayApiKey = ''
-  let gatewayBaseUrl = ''
   try {
     const raw = await fs.readFile(join(homedir(), '.shanhai', 'config.json'), 'utf8')
     const cfg = JSON.parse(raw) as {
@@ -237,6 +296,7 @@ export async function bootstrap(): Promise<Runtime> {
       username = g.account?.username ?? null
       gatewayApiKey = g.apiKey
       gatewayBaseUrl = g.baseUrl ?? ''
+      currentModelId = g.selectedModelId ?? ''
       // 构造当前模型（网关模型列表拉不到时兜底，保证模型下拉有内容）
       if (g.selectedModelId) {
         gatewayModels = [{ id: g.selectedModelId, name: g.selectedModelId, tier: selectedTier, apiKey: g.apiKey, baseUrl: g.baseUrl ?? '' }]
@@ -338,10 +398,16 @@ export async function bootstrap(): Promise<Runtime> {
     },
 
     switchModel(modelId) {
+      currentModelId = modelId
       // 通过网关转发到对应模型（保持网关 baseUrl，只改 model 参数）
       if (gatewayApiKey && gatewayBaseUrl) {
         model = new DeepSeekProvider({ apiKey: gatewayApiKey, baseUrl: gatewayBaseUrl, model: modelId })
       }
+      // 持久化选中模型到 config.json（下次打开不再重复选择）
+      void persistSelectedModel(modelId)
+    },
+    getCurrentModelId() {
+      return currentModelId
     },
     stop() {
       stopped = true

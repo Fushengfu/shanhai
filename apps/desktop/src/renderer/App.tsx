@@ -51,6 +51,7 @@ declare global {
       onToolTrace(cb: (trace: ToolTrace) => void): () => void
       onDelta(cb: (text: string) => void): () => void
       switchModel(id: string): Promise<void>
+      getCurrentModelId(): Promise<string>
       stop(): Promise<void>
       speak(text: string): Promise<void>
       screenshot(): Promise<string>
@@ -87,9 +88,11 @@ export function App() {
       setUsername(s.username)
       if (s.loggedIn) {
         void refreshSessions()
-        void api.listModels().then((list) => {
+        void api.listModels().then(async (list) => {
           setModels(list)
-          if (list.length > 0) setSelectedModel(list[0]!.id)
+          // 恢复上次选中的模型（缓存），而不是默认第一个
+          const current = await api.getCurrentModelId()
+          setSelectedModel(current && list.some((m) => m.id === current) ? current : (list[0]?.id ?? ''))
         })
       }
     })
