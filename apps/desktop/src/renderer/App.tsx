@@ -426,7 +426,7 @@ export function App() {
                           }}
                           style={{ padding: '8px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, color: m.id === selectedModel ? '#1677ff' : '#333', background: m.id === selectedModel ? '#f0f5ff' : 'transparent' }}
                         >
-                          {m.name}（{tierLabel(m.tier)}）
+                          {m.name}
                         </div>
                       ))}
                     </div>
@@ -593,13 +593,6 @@ function IconChevronDown() {
       <path d="M6 9l6 6 6-6" />
     </svg>
   )
-}
-
-/** 模型层级中文标签 */
-function tierLabel(tier: string): string {
-  if (tier === 'value') return '性价比'
-  if (tier === 'vision') return '视觉'
-  return '旗舰'
 }
 
 function readFileAsDataUrl(file: File): Promise<string> {
