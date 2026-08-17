@@ -219,6 +219,58 @@ export async function bootstrap(): Promise<Runtime> {
     })
   })
 
+  // —— 能力实例（提前创建，供工具使用）——
+  const computerUse = createSystemComputerUseService()
+  const voice = createSystemVoiceService()
+  const memory = new MemoryStore()
+
+  // —— computer-use 工具（操作电脑：截图/点击/输入/按键，形成视觉闭环）——
+  const computerTools: ToolContract[] = [
+    {
+      name: 'computer_screenshot',
+      description: '截取当前屏幕并返回截图（base64）。用于查看桌面/窗口当前状态，可配合 image_analyze 分析后再操作。',
+      inputSchema: { type: 'object', properties: {} },
+      riskLevel: 'readonly',
+      execute: async () => {
+        const buf = await computerUse.screenshot()
+        return { imageBase64: Buffer.from(buf).toString('base64') }
+      },
+    },
+    {
+      name: 'computer_click',
+      description: '在屏幕指定坐标 (x, y) 点击鼠标。',
+      inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'] },
+      riskLevel: 'irreversible',
+      approvalRequired: true,
+      execute: async (args) => {
+        await computerUse.clickAt(Number(args.x), Number(args.y))
+        return { ok: true }
+      },
+    },
+    {
+      name: 'computer_type',
+      description: '在当前焦点处输入文字。',
+      inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+      riskLevel: 'irreversible',
+      approvalRequired: true,
+      execute: async (args) => {
+        await computerUse.typeText(String(args.text))
+        return { ok: true }
+      },
+    },
+    {
+      name: 'computer_key',
+      description: '按下键盘按键（如 enter、tab、space、escape 等）。',
+      inputSchema: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] },
+      riskLevel: 'irreversible',
+      approvalRequired: true,
+      execute: async (args) => {
+        await computerUse.pressKey(String(args.key))
+        return { ok: true }
+      },
+    },
+  ]
+
   // —— 图片识别工具（模型不支持多模态时，AI 调它用视觉模型分析图片）——
   const imageAnalyzeTool: ToolContract = {
     name: 'image_analyze',
@@ -253,7 +305,7 @@ export async function bootstrap(): Promise<Runtime> {
   }
 
   // —— 工具（包装：落 trace）——
-  const baseTools = [...atomicTools(), imageAnalyzeTool]
+  const baseTools = [...atomicTools(), imageAnalyzeTool, ...computerTools]
   const tools: ToolContract[] = baseTools.map((t) => ({
     ...t,
     execute: async (args) => {
@@ -306,10 +358,7 @@ export async function bootstrap(): Promise<Runtime> {
     // 无凭证，未登录
   }
 
-  // —— 其余能力（真实能力）——
-  const memory = new MemoryStore()
-  const voice = createSystemVoiceService()
-  const computerUse = createSystemComputerUseService()
+  // —— 其余能力 ——
   let stopped = false
 
   // 装配底座服务（声明式 inject）

@@ -65,10 +65,18 @@ export function createMockModel(responses: ModelResponse[]): Model {
   }
 }
 
+export interface TokenUsage {
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+}
+
 export interface DeepSeekOptions {
   apiKey: string
   baseUrl: string
   model: string
+  /** 每次调用后回传 token 用量（成本统计） */
+  onUsage?: (usage: TokenUsage) => void
 }
 
 /** 网关响应 choice（网关包装在 { code, data } 里，兼容裸 OpenAI 格式） */
@@ -106,10 +114,22 @@ export class DeepSeekProvider implements Model {
     // 网关响应：{ code, data: { choices: [...] } } 包装（兼容裸 OpenAI 格式）
     const raw = (await res.json()) as {
       code?: number
-      data?: { choices?: GatewayChoice[] }
+      data?: {
+        choices?: GatewayChoice[]
+        usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+      }
       choices?: GatewayChoice[]
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
     }
     const payload = raw.data ?? raw
+    const usage = payload.usage
+    if (usage && this.opts.onUsage) {
+      this.opts.onUsage({
+        promptTokens: usage.prompt_tokens ?? 0,
+        completionTokens: usage.completion_tokens ?? 0,
+        totalTokens: usage.total_tokens ?? 0,
+      })
+    }
     const message = payload.choices?.[0]?.message
     const toolCall = message?.tool_calls?.[0]
     if (toolCall) {
