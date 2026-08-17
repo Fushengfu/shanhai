@@ -286,7 +286,7 @@ export function App() {
         </header>
 
         {/* 消息区 */}
-        <div ref={listRef} style={{ flex: 1, overflowY: 'auto', padding: 16, background: '#fafafa' }}>
+        <div ref={listRef} style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: 16, background: '#fafafa' }}>
           {items.map((it, i) => {
             if (it.kind === 'user') {
               return (
@@ -298,7 +298,7 @@ export function App() {
             if (it.kind === 'assistant') {
               return (
                 <div key={i} style={{ marginBottom: 12 }}>
-                  <div style={{ display: 'inline-block', maxWidth: '85%', padding: '10px 14px', borderRadius: 12, background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,0.08)', fontSize: 14, lineHeight: 1.6, color: '#333' }}>
+                  <div style={{ display: 'inline-block', maxWidth: '85%', minWidth: 0, padding: '10px 14px', borderRadius: 12, background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,0.08)', fontSize: 14, lineHeight: 1.6, color: '#333', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
                     <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
                       {it.content}
                     </ReactMarkdown>
@@ -478,6 +478,8 @@ function bubble(bg: string, color: string): React.CSSProperties {
     color,
     maxWidth: '80%',
     whiteSpace: 'pre-wrap',
+    overflowWrap: 'break-word',
+    wordBreak: 'break-word',
     boxShadow: bg === '#fff' ? '0 1px 2px rgba(0,0,0,0.08)' : 'none',
   }
 }
@@ -630,6 +632,9 @@ const markdownComponents = {
         {props.children}
       </a>
     )
+  },
+  img(props: { src?: string; alt?: string }) {
+    return <img src={props.src} alt={props.alt} style={{ maxWidth: '100%', height: 'auto', borderRadius: 8, display: 'block' }} />
   },
 }
 
