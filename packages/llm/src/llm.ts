@@ -116,7 +116,7 @@ export class DeepSeekProvider implements Model {
     return { text: message?.content ?? '' }
   }
 
-  /** SSE 流式：OpenAI 兼容 /chat/completions（stream: true），逐行解析 data: 事件 */
+  /** SSE 流式：逐行解析，累积工具调用 arguments 分片，产出 text 增量 + 完整 toolCall */
   async *stream(messages: ChatMessage[], tools?: ToolContract[]): AsyncIterable<StreamChunk> {
     const res = await fetch(`${this.opts.baseUrl.replace(/\/$/, '')}/api/v1/chat/completions`, {
       method: 'POST',
@@ -140,6 +140,29 @@ export class DeepSeekProvider implements Model {
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
+    let toolCallAcc: { id?: string; name?: string; argsText: string } | null = null
+
+    const handleLine = (line: string): StreamChunk[] => {
+      const ev = parseSseLine(line)
+      const out: StreamChunk[] = []
+      if (!ev) return out
+      if (ev.text !== undefined) {
+        if (toolCallAcc) {
+          const tc = flushToolCall(toolCallAcc)
+          if (tc) out.push(tc)
+          toolCallAcc = null
+        }
+        out.push({ text: ev.text })
+      }
+      if (ev.toolCall) {
+        if (!toolCallAcc) toolCallAcc = { id: ev.toolCall.id, name: ev.toolCall.name, argsText: '' }
+        if (ev.toolCall.id) toolCallAcc.id = ev.toolCall.id
+        if (ev.toolCall.name) toolCallAcc.name = ev.toolCall.name
+        toolCallAcc.argsText += ev.toolCall.argsDelta ?? ''
+      }
+      return out
+    }
+
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
@@ -147,40 +170,49 @@ export class DeepSeekProvider implements Model {
       const lines = buffer.split('\n')
       buffer = lines.pop() ?? ''
       for (const line of lines) {
-        const chunk = parseSseLine(line)
-        if (chunk) yield chunk
+        for (const chunk of handleLine(line)) yield chunk
       }
     }
-    const last = parseSseLine(buffer)
-    if (last) yield last
+    for (const chunk of handleLine(buffer)) yield chunk
+    if (toolCallAcc) {
+      const tc = flushToolCall(toolCallAcc)
+      if (tc) yield tc
+    }
   }
 }
 
-/** 解析单行 SSE `data: {...}`，返回文本或工具调用片段 */
-export function parseSseLine(line: string): StreamChunk | null {
+/** 累积完成的工具调用 → StreamChunk */
+function flushToolCall(acc: { id?: string; name?: string; argsText: string }): StreamChunk | null {
+  if (!acc.name) return null
+  return { toolCall: { id: acc.id, name: acc.name, args: safeParse(acc.argsText || '{}') } }
+}
+
+interface SseDeltaEvent {
+  text?: string
+  toolCall?: { id?: string; name?: string; argsDelta?: string }
+}
+
+/** 解析单行 SSE `data: {...}`，返回 text 增量或 tool_calls 分片 */
+function parseSseLine(line: string): SseDeltaEvent | null {
   const trimmed = line.trim()
   if (!trimmed.startsWith('data:')) return null
   const data = trimmed.slice(5).trim()
   if (!data || data === '[DONE]') return null
   try {
     const parsed = JSON.parse(data) as {
-      choices?: Array<{ delta?: { content?: string; tool_calls?: Array<{ id: string; function: { name?: string; arguments?: string } }> } }>
+      choices?: Array<{
+        delta?: {
+          content?: string
+          tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>
+        }
+      }>
     }
     const delta = parsed.choices?.[0]?.delta
-    if (typeof delta?.content === 'string' && delta.content) {
-      return { text: delta.content }
-    }
+    const text = typeof delta?.content === 'string' && delta.content ? delta.content : undefined
     const tc = delta?.tool_calls?.[0]
-    if (tc) {
-      return {
-        toolCall: {
-          id: tc.id,
-          name: tc.function?.name ?? '',
-          args: safeParse(tc.function?.arguments ?? '{}'),
-        },
-      }
-    }
-    return null
+    const toolCall = tc ? { id: tc.id, name: tc.function?.name, argsDelta: tc.function?.arguments ?? '' } : undefined
+    if (text === undefined && !toolCall) return null
+    return { text, toolCall }
   } catch {
     return null
   }

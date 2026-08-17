@@ -8,10 +8,38 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 
 let runtime: Runtime | null = null
 
+/** 主进程 → 渲染进程 事件推送（流式增量 / 工具过程 / 审批请求） */
+function registerPush(win: BrowserWindow): void {
+  if (!runtime) return
+  runtime.onDelta((text) => {
+    if (!win.isDestroyed()) win.webContents.send('chat:delta', text)
+  })
+  runtime.onToolTrace((trace) => {
+    if (!win.isDestroyed()) win.webContents.send('tool:trace', trace)
+  })
+  runtime.onApprovalRequest((req) => {
+    if (!win.isDestroyed()) win.webContents.send('approval:request', req)
+  })
+}
+
+/** 渲染进程 → 主进程 调用（登录 / 会话 / 模型 / 审批 / 跑任务） */
+function registerIpc(): void {
+  ipcMain.handle('auth:status', async () => ({ loggedIn: runtime!.loggedIn, username: runtime!.username }))
+  ipcMain.handle('auth:login', async (_e, u: string, p: string) => runtime!.login(u, p))
+  ipcMain.handle('auth:logout', async () => runtime!.logout())
+  ipcMain.handle('auth:listModels', async () => runtime!.listModels())
+  ipcMain.handle('session:list', async () => runtime!.listSessions())
+  ipcMain.handle('session:switch', async (_e, id: string) => runtime!.switchSession(id))
+  ipcMain.handle('approval:respond', async (_e, outcome: 'allowed-once' | 'rejected') => runtime!.respondApproval(outcome))
+  ipcMain.handle('chat:run', async (_e, message: string) => runtime!.run(message))
+}
+
 async function createWindow(): Promise<void> {
   const win = new BrowserWindow({
-    width: 1000,
-    height: 700,
+    width: 1080,
+    height: 760,
+    titleBarStyle: 'hiddenInset',
+    trafficLightPosition: { x: 16, y: 16 },
     webPreferences: {
       preload: join(__dirname, '../preload/index.cjs'),
       contextIsolation: true,
@@ -25,30 +53,12 @@ async function createWindow(): Promise<void> {
     await win.loadFile(join(__dirname, '../renderer/index.html'))
   }
 
-  // 调试监听（renderer 加载/报错）
-  win.webContents.on('did-finish-load', () => {
-    console.log('[renderer] did-finish-load')
-  })
-  win.webContents.on('did-fail-load', (_e, code, desc, url) => {
-    console.error('[renderer] did-fail-load', code, desc, url)
-  })
-  win.webContents.on('console-message', (_e, _level, message) => {
-    console.log('[renderer:console]', message)
-  })
-
-  // 跑任务：流式把 assistant/delta 推给 renderer（UI 实时逐字渲染）
-  ipcMain.handle('chat:run', async (_event, message: string) => {
-    if (!runtime) throw new Error('runtime not ready')
-    return runtime.agent.run(message, {
-      onDelta: (text) => {
-        if (!win.isDestroyed()) win.webContents.send('chat:delta', text)
-      },
-    })
-  })
+  registerPush(win)
 }
 
 app.whenReady().then(async () => {
   runtime = await bootHost()
+  registerIpc()
   await createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) void createWindow()
