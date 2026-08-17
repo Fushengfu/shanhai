@@ -31,7 +31,9 @@ function registerIpc(): void {
   ipcMain.handle('session:list', async () => runtime!.listSessions())
   ipcMain.handle('session:switch', async (_e, id: string) => runtime!.switchSession(id))
   ipcMain.handle('approval:respond', async (_e, outcome: 'allowed-once' | 'rejected') => runtime!.respondApproval(outcome))
-  ipcMain.handle('chat:run', async (_e, message: string) => runtime!.run(message))
+  ipcMain.handle('chat:run', async (_e, message: string, attachments?: Array<Record<string, unknown>>) =>
+    runtime!.run(message, { attachments: attachments as never }),
+  )
   ipcMain.handle('model:switch', async (_e, id: string) => runtime!.switchModel(id))
   ipcMain.handle('chat:stop', async () => runtime!.stop())
   ipcMain.handle('voice:speak', async (_e, text: string) => {

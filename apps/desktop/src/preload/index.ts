@@ -18,6 +18,15 @@ export interface ApprovalRequest {
   riskLevel: string
 }
 
+/** 多模态内容片段（与 llm 包 ContentPart 对应） */
+export interface ContentPart {
+  type: 'text' | 'image_url' | 'input_audio' | 'input_video'
+  text?: string
+  image_url?: { url: string }
+  input_audio?: { data: string; format: string }
+  input_video?: { data: string; format: string }
+}
+
 export interface ShanhaiBridge {
   // 认证
   status(): Promise<{ loggedIn: boolean; username: string | null }>
@@ -33,7 +42,7 @@ export interface ShanhaiBridge {
   // 工具过程
   onToolTrace(cb: (trace: ToolTrace) => void): () => void
   // 聊天
-  run(message: string): Promise<string>
+  run(message: string, attachments?: ContentPart[]): Promise<string>
   onDelta(cb: (text: string) => void): () => void
   // 模型 / 中断 / 语音 / 电脑
   switchModel(id: string): Promise<void>

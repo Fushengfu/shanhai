@@ -2,7 +2,7 @@ import { Kernel } from '@shanhai/kernel'
 import { Session } from '@shanhai/session'
 import { ApprovalService } from '@shanhai/approval'
 import { AgentLoop } from '@shanhai/agent'
-import type { Model } from '@shanhai/llm'
+import type { Model, ContentPart } from '@shanhai/llm'
 import { createMockModel, DeepSeekProvider } from '@shanhai/llm'
 import { atomicTools, type ToolContract } from '@shanhai/tools'
 import { MemoryStore } from '@shanhai/memory'
@@ -72,8 +72,8 @@ export interface Runtime {
   /** 中断当前任务 */
   stop(): void
 
-  /** 跑一次任务（端到端 ReAct） */
-  run(message: string, opts?: { maxSteps?: number }): Promise<string>
+  /** 跑一次任务（端到端 ReAct，支持多模态附件） */
+  run(message: string, opts?: { maxSteps?: number; attachments?: ContentPart[] }): Promise<string>
 }
 
 /** 从本地凭证装配真实网关模型；无凭证则 mock 兜底 */
@@ -91,6 +91,35 @@ async function createGatewayModel(): Promise<Model> {
     // 无凭证，走 mock
   }
   return createMockModel([{ text: '你好，我是山海智能体。' }])
+}
+
+function inferTier(id: string): ModelTier {
+  if (/flash|step-3/i.test(id)) return 'value'
+  return 'flagship'
+}
+
+/** 用 apiKey 拉取网关完整模型列表（/api/v1/models，13 个模型，各自 baseUrl） */
+async function fetchGatewayModels(apiKey: string, baseUrl: string): Promise<GatewayModel[]> {
+  try {
+    const res = await fetch(`${baseUrl.replace(/\/$/, '')}/api/v1/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    })
+    if (!res.ok) return []
+    const data = (await res.json()) as {
+      code?: number
+      data?: { data?: Array<{ id: string; displayName?: string; baseUrl?: string; model?: string }> }
+    }
+    const list = data.data?.data ?? []
+    return list.map((m) => ({
+      id: m.id,
+      name: m.displayName ?? m.id,
+      tier: inferTier(m.id),
+      apiKey,
+      baseUrl: m.baseUrl ?? baseUrl,
+    }))
+  } catch {
+    return []
+  }
 }
 
 /** 真实语音：TTS 走 macOS say（真实发声），STT 需系统麦克风权限（暂返回空） */
@@ -195,6 +224,8 @@ export async function bootstrap(): Promise<Runtime> {
   let username: string | null = null
   let gatewayModels: GatewayModel[] = []
   let selectedTier: ModelTier = 'flagship'
+  let gatewayApiKey = ''
+  let gatewayBaseUrl = ''
   try {
     const raw = await fs.readFile(join(homedir(), '.shanhai', 'config.json'), 'utf8')
     const cfg = JSON.parse(raw) as {
@@ -204,6 +235,8 @@ export async function bootstrap(): Promise<Runtime> {
     if (g?.apiKey) {
       loggedIn = true
       username = g.account?.username ?? null
+      gatewayApiKey = g.apiKey
+      gatewayBaseUrl = g.baseUrl ?? ''
       // 构造当前模型（网关模型列表拉不到时兜底，保证模型下拉有内容）
       if (g.selectedModelId) {
         gatewayModels = [{ id: g.selectedModelId, name: g.selectedModelId, tier: selectedTier, apiKey: g.apiKey, baseUrl: g.baseUrl ?? '' }]
@@ -262,7 +295,11 @@ export async function bootstrap(): Promise<Runtime> {
       await credentials.clear()
     },
     async listModels() {
-      // 启动时已从 config.json 构造当前模型，这里直接返回（网关列表拉不到时兜底）
+      // 用 apiKey 拉取网关完整模型列表（13 个模型，各自 baseUrl），失败则回退到当前模型
+      if (gatewayApiKey && gatewayBaseUrl) {
+        const list = await fetchGatewayModels(gatewayApiKey, gatewayBaseUrl)
+        if (list.length > 0) gatewayModels = list
+      }
       return gatewayModels
     },
     selectedTier,
@@ -301,9 +338,9 @@ export async function bootstrap(): Promise<Runtime> {
     },
 
     switchModel(modelId) {
-      const target = gatewayModels.find((m) => m.id === modelId)
-      if (target && target.apiKey && target.baseUrl) {
-        model = new DeepSeekProvider({ apiKey: target.apiKey, baseUrl: target.baseUrl, model: target.id })
+      // 通过网关转发到对应模型（保持网关 baseUrl，只改 model 参数）
+      if (gatewayApiKey && gatewayBaseUrl) {
+        model = new DeepSeekProvider({ apiKey: gatewayApiKey, baseUrl: gatewayBaseUrl, model: modelId })
       }
     },
     stop() {

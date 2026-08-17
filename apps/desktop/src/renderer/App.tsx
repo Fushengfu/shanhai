@@ -28,6 +28,14 @@ interface GatewayModel {
   baseUrl: string
 }
 
+interface ContentPart {
+  type: 'text' | 'image_url' | 'input_audio' | 'input_video'
+  text?: string
+  image_url?: { url: string }
+  input_audio?: { data: string; format: string }
+  input_video?: { data: string; format: string }
+}
+
 declare global {
   interface Window {
     shanhai?: {
@@ -38,7 +46,7 @@ declare global {
       listSessions(): Promise<Array<{ id: string; title: string }>>
       switchSession(id: string): Promise<void>
       respondApproval(outcome: 'allowed-once' | 'rejected'): Promise<void>
-      run(message: string): Promise<string>
+      run(message: string, attachments?: ContentPart[]): Promise<string>
       onApprovalRequest(cb: (req: ApprovalRequest) => void): () => void
       onToolTrace(cb: (trace: ToolTrace) => void): () => void
       onDelta(cb: (text: string) => void): () => void
@@ -61,6 +69,9 @@ export function App() {
   const [sessions, setSessions] = useState<Array<{ id: string; title: string }>>([])
   const [models, setModels] = useState<GatewayModel[]>([])
   const [selectedModel, setSelectedModel] = useState('')
+  const [modelMenuOpen, setModelMenuOpen] = useState(false)
+  const [attachments, setAttachments] = useState<Array<{ type: 'image' | 'audio' | 'video'; name: string; dataUrl: string }>>([])
+  const fileRef = useRef<HTMLInputElement>(null)
   const [items, setItems] = useState<ChatItem[]>([])
   const [streaming, setStreaming] = useState('')
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null)
@@ -130,19 +141,31 @@ export function App() {
 
   async function send(): Promise<void> {
     const text = input.trim()
-    if (!text || busy) return
+    if ((!text && attachments.length === 0) || busy) return
     setInput('')
     setItems((prev) => [...prev, { kind: 'user', content: text }])
     setStreaming('')
     setBusy(true)
+    // 构造多模态 ContentPart（图片 data URL / 音频视频 base64）
+    const parts: ContentPart[] = attachments.map((a) => {
+      if (a.type === 'image') return { type: 'image_url', image_url: { url: a.dataUrl } }
+      const m = /^data:([^;]+);base64,(.+)$/.exec(a.dataUrl)
+      const mime = m?.[1] ?? ''
+      const data = m?.[2] ?? ''
+      const format = mime.split('/')[1] ?? ''
+      return a.type === 'audio'
+        ? { type: 'input_audio', input_audio: { data, format } }
+        : { type: 'input_video', input_video: { data, format } }
+    })
     try {
-      const result = (await window.shanhai?.run(text)) ?? ''
+      const result = (await window.shanhai?.run(text, parts)) ?? ''
       setItems((prev) => [...prev, { kind: 'assistant', content: result }])
     } catch (err) {
       setItems((prev) => [...prev, { kind: 'assistant', content: `错误：${String(err)}` }])
     } finally {
       setStreaming('')
       setBusy(false)
+      setAttachments([])
     }
   }
 
@@ -162,6 +185,38 @@ export function App() {
 
   function stopSend(): void {
     void window.shanhai?.stop()
+  }
+
+  async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>): Promise<void> {
+    const files = e.target.files
+    if (!files) return
+    for (const file of Array.from(files)) {
+      const type = file.type.startsWith('image/')
+        ? 'image'
+        : file.type.startsWith('audio/')
+          ? 'audio'
+          : file.type.startsWith('video/')
+            ? 'video'
+            : null
+      if (!type) continue
+      const dataUrl = await readFileAsDataUrl(file)
+      setAttachments((prev) => [...prev, { type, name: file.name, dataUrl }])
+    }
+    e.target.value = ''
+  }
+
+  async function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>): Promise<void> {
+    const items = e.clipboardData?.items
+    if (!items) return
+    for (const item of Array.from(items)) {
+      if (item.type.startsWith('image/')) {
+        const file = item.getAsFile()
+        if (file) {
+          const dataUrl = await readFileAsDataUrl(file)
+          setAttachments((prev) => [...prev, { type: 'image', name: `pasted-${Date.now()}.png`, dataUrl }])
+        }
+      }
+    }
   }
 
   if (!loggedIn) {
@@ -311,6 +366,28 @@ export function App() {
         {/* 输入区（单卡片：textarea + 底部功能行 + 发送按钮） */}
         <div style={{ padding: '12px 16px 16px', borderTop: '1px solid #eee', background: '#fff' }}>
           <div style={{ border: '1px solid #d9d9d9', borderRadius: 16, padding: '10px 12px 8px 16px', background: '#fff' }}>
+            {attachments.length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
+                {attachments.map((a, i) => (
+                  <div key={i} style={{ position: 'relative' }}>
+                    {a.type === 'image' ? (
+                      <img src={a.dataUrl} alt={a.name} style={{ width: 56, height: 56, objectFit: 'cover', borderRadius: 8, border: '1px solid #eee', display: 'block' }} />
+                    ) : (
+                      <div style={{ width: 56, height: 56, borderRadius: 8, border: '1px solid #eee', background: '#f7f7f8', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#888' }}>
+                        {a.type === 'audio' ? <IconMic /> : <IconMonitor />}
+                      </div>
+                    )}
+                    <button
+                      onClick={() => setAttachments((prev) => prev.filter((_, idx) => idx !== i))}
+                      style={{ position: 'absolute', top: -6, right: -6, width: 18, height: 18, borderRadius: '50%', border: 'none', background: '#ff4d4f', color: '#fff', fontSize: 12, lineHeight: '18px', cursor: 'pointer', padding: 0 }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <input ref={fileRef} type="file" accept="image/*,audio/*,video/*" multiple style={{ display: 'none' }} onChange={(e) => void handleFileSelect(e)} />
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -320,6 +397,7 @@ export function App() {
                   void send()
                 }
               }}
+              onPaste={(e) => void handlePaste(e)}
               autoFocus
               rows={3}
               placeholder="输入任务，Enter 发送，Shift+Enter 换行"
@@ -327,25 +405,33 @@ export function App() {
             />
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                <button title="附件" style={iconBtn}><IconPaperclip /></button>
-                <select
-                  value={selectedModel}
-                  onChange={(e) => {
-                    setSelectedModel(e.target.value)
-                    void window.shanhai?.switchModel(e.target.value)
-                  }}
-                  style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid #ddd', fontSize: 12, color: '#555', background: '#fff', outline: 'none' }}
-                >
-                  {models.length === 0 ? (
-                    <option value="">默认模型</option>
-                  ) : (
-                    models.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.name}（{m.tier}）
-                      </option>
-                    ))
+                <button title="附件" onClick={() => fileRef.current?.click()} style={iconBtn}><IconPaperclip /></button>
+                <div style={{ position: 'relative' }}>
+                  <button
+                    onClick={() => setModelMenuOpen((v) => !v)}
+                    style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid #ddd', fontSize: 12, color: '#555', background: '#fff', outline: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                  >
+                    {models.find((m) => m.id === selectedModel)?.name ?? '选择模型'}
+                    <IconChevronDown />
+                  </button>
+                  {modelMenuOpen && (
+                    <div style={{ position: 'absolute', bottom: '110%', left: 0, minWidth: 240, maxHeight: 320, overflowY: 'auto', background: '#fff', border: '1px solid #e0e0e0', borderRadius: 10, boxShadow: '0 4px 16px rgba(0,0,0,0.12)', zIndex: 20, padding: 4 }}>
+                      {models.map((m) => (
+                        <div
+                          key={m.id}
+                          onClick={() => {
+                            setSelectedModel(m.id)
+                            void window.shanhai?.switchModel(m.id)
+                            setModelMenuOpen(false)
+                          }}
+                          style={{ padding: '8px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, color: m.id === selectedModel ? '#1677ff' : '#333', background: m.id === selectedModel ? '#f0f5ff' : 'transparent' }}
+                        >
+                          {m.name}（{tierLabel(m.tier)}）
+                        </div>
+                      ))}
+                    </div>
                   )}
-                </select>
+                </div>
                 <button title="操作电脑" onClick={() => void window.shanhai?.screenshot()} style={iconBtn}><IconMonitor /></button>
               </div>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
@@ -499,6 +585,30 @@ function IconStop() {
       <rect x="6" y="6" width="12" height="12" rx="2" />
     </svg>
   )
+}
+
+function IconChevronDown() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M6 9l6 6 6-6" />
+    </svg>
+  )
+}
+
+/** 模型层级中文标签 */
+function tierLabel(tier: string): string {
+  if (tier === 'value') return '性价比'
+  if (tier === 'vision') return '视觉'
+  return '旗舰'
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result as string)
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
+  })
 }
 
 // Markdown 渲染组件（代码块高亮 / 行内代码 / 链接等）

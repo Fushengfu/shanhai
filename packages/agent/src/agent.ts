@@ -1,4 +1,4 @@
-import type { ChatMessage, Model, ModelResponse, ToolCall } from '@shanhai/llm'
+import type { ChatMessage, Model, ModelResponse, ToolCall, ContentPart } from '@shanhai/llm'
 import type { ToolContract } from '@shanhai/tools'
 import type { Session } from '@shanhai/session'
 import type { ApprovalService } from '@shanhai/approval'
@@ -8,6 +8,8 @@ export interface AgentLoopOptions {
   systemPrompt?: string
   /** 流式增量回调（UI 实时逐字渲染用） */
   onDelta?: (text: string) => void
+  /** 多模态附件（图片/音频/视频） */
+  attachments?: ContentPart[]
 }
 
 /**
@@ -46,9 +48,14 @@ export class AgentLoop {
       }
     }
 
-    // 追加当前消息
+    // 追加当前消息（含多模态附件）
     this.session.append('user/message', { content: message })
-    messages.push({ role: 'user', content: message })
+    const attachments = options?.attachments
+    if (attachments && attachments.length > 0) {
+      messages.push({ role: 'user', content: [{ type: 'text', text: message }, ...attachments] })
+    } else {
+      messages.push({ role: 'user', content: message })
+    }
 
     this.session.append('turn/start', { turn: 1 })
     const onDelta = options?.onDelta

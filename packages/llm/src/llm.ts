@@ -28,14 +28,22 @@ export interface ChatMessage {
   toolCallId?: string
 }
 
+export interface Usage {
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+}
+
 export interface ModelResponse {
   text?: string
   toolCall?: ToolCall
+  usage?: Usage
 }
 
 export interface StreamChunk {
   text?: string
   toolCall?: ToolCall
+  usage?: Usage
 }
 
 /** 模型接口：complete（一次性）+ 可选 stream（流式） */
