@@ -35,6 +35,11 @@ export interface ShanhaiBridge {
   // 聊天
   run(message: string): Promise<string>
   onDelta(cb: (text: string) => void): () => void
+  // 模型 / 中断 / 语音 / 电脑
+  switchModel(id: string): Promise<void>
+  stop(): Promise<void>
+  speak(text: string): Promise<void>
+  screenshot(): Promise<string>
 }
 
 const bridge: ShanhaiBridge = {
@@ -46,6 +51,10 @@ const bridge: ShanhaiBridge = {
   switchSession: (id) => ipcRenderer.invoke('session:switch', id),
   respondApproval: (outcome) => ipcRenderer.invoke('approval:respond', outcome),
   run: (message) => ipcRenderer.invoke('chat:run', message),
+  switchModel: (id) => ipcRenderer.invoke('model:switch', id),
+  stop: () => ipcRenderer.invoke('chat:stop'),
+  speak: (text) => ipcRenderer.invoke('voice:speak', text),
+  screenshot: () => ipcRenderer.invoke('computer:shot'),
   onApprovalRequest: (cb) => {
     const listener = (_e: unknown, req: ApprovalRequest) => cb(req)
     ipcRenderer.on('approval:request', listener)

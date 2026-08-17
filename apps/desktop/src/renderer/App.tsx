@@ -42,6 +42,10 @@ declare global {
       onApprovalRequest(cb: (req: ApprovalRequest) => void): () => void
       onToolTrace(cb: (trace: ToolTrace) => void): () => void
       onDelta(cb: (text: string) => void): () => void
+      switchModel(id: string): Promise<void>
+      stop(): Promise<void>
+      speak(text: string): Promise<void>
+      screenshot(): Promise<string>
     }
   }
 }
@@ -147,6 +151,17 @@ export function App() {
       await window.shanhai?.respondApproval(outcome)
       setPendingApproval(null)
     }
+  }
+
+  function speakLast(): void {
+    const last = [...items].reverse().find((it) => it.kind === 'assistant')
+    if (last && last.kind === 'assistant') {
+      void window.shanhai?.speak(last.content)
+    }
+  }
+
+  function stopSend(): void {
+    void window.shanhai?.stop()
   }
 
   if (!loggedIn) {
@@ -315,7 +330,10 @@ export function App() {
                 <button title="附件" style={iconBtn}><IconPaperclip /></button>
                 <select
                   value={selectedModel}
-                  onChange={(e) => setSelectedModel(e.target.value)}
+                  onChange={(e) => {
+                    setSelectedModel(e.target.value)
+                    void window.shanhai?.switchModel(e.target.value)
+                  }}
                   style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid #ddd', fontSize: 12, color: '#555', background: '#fff', outline: 'none' }}
                 >
                   {models.length === 0 ? (
@@ -328,28 +346,29 @@ export function App() {
                     ))
                   )}
                 </select>
-                <button title="操作电脑" style={iconBtn}><IconMonitor /></button>
+                <button title="操作电脑" onClick={() => void window.shanhai?.screenshot()} style={iconBtn}><IconMonitor /></button>
               </div>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                <button title="语音输入" style={iconBtn}><IconMic /></button>
+                <button title="语音朗读" onClick={speakLast} style={iconBtn}><IconMic /></button>
                 <button
-                  onClick={() => void send()}
-                  disabled={busy || !input.trim()}
-                  title="发送"
+                  onClick={() => (busy ? stopSend() : void send())}
+                  disabled={!busy && !input.trim()}
+                  title={busy ? '停止' : '发送'}
                   style={{
                     width: 36,
                     height: 36,
                     borderRadius: 18,
                     border: 'none',
-                    background: busy || !input.trim() ? '#d9d9d9' : '#1677ff',
+                    background: busy ? '#ff4d4f' : !input.trim() ? '#d9d9d9' : '#1677ff',
                     color: '#fff',
-                    fontSize: 18,
-                    lineHeight: '36px',
-                    cursor: busy || !input.trim() ? 'not-allowed' : 'pointer',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    cursor: !busy && !input.trim() ? 'not-allowed' : 'pointer',
                     flexShrink: 0,
                   }}
                 >
-                  <IconSend />
+                  {busy ? <IconStop /> : <IconSend />}
                 </button>
               </div>
             </div>
@@ -470,6 +489,14 @@ function IconLogout() {
       <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
       <path d="M16 17l5-5-5-5" />
       <path d="M21 12H9" />
+    </svg>
+  )
+}
+
+function IconStop() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+      <rect x="6" y="6" width="12" height="12" rx="2" />
     </svg>
   )
 }

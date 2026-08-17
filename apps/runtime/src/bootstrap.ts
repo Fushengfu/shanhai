@@ -13,6 +13,10 @@ import { createMockComputerUseService, type ComputerUseService } from '@shanhai/
 import { promises as fs } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { exec as execCallback } from 'node:child_process'
+import { promisify } from 'node:util'
+
+const execAsync = promisify(execCallback)
 
 /** 工具调用过程事件（推给 UI 展示「思考 → 工具 → 结果」） */
 export interface ToolTrace {
@@ -63,6 +67,11 @@ export interface Runtime {
   /** 流式增量回调 */
   onDelta(cb: (text: string) => void): () => void
 
+  /** 切换模型（动态更新 provider，后续对话用新模型） */
+  switchModel(modelId: string): void
+  /** 中断当前任务 */
+  stop(): void
+
   /** 跑一次任务（端到端 ReAct） */
   run(message: string, opts?: { maxSteps?: number }): Promise<string>
 }
@@ -82,6 +91,44 @@ async function createGatewayModel(): Promise<Model> {
     // 无凭证，走 mock
   }
   return createMockModel([{ text: '你好，我是山海智能体。' }])
+}
+
+/** 真实语音：TTS 走 macOS say（真实发声），STT 需系统麦克风权限（暂返回空） */
+function createSystemVoiceService(): VoiceService {
+  return {
+    transcribe: async () => '',
+    synthesize: async (text) => {
+      await execAsync(`say ${JSON.stringify(text)}`).catch(() => undefined)
+      return new TextEncoder().encode(text).buffer as ArrayBuffer
+    },
+  }
+}
+
+/** 真实 computer-use：截图走 macOS screencapture，键鼠走 System Events */
+function createSystemComputerUseService(): ComputerUseService {
+  return {
+    screenshot: async () => {
+      const tmp = `/tmp/shanhai-shot-${Date.now()}.png`
+      await execAsync(`screencapture -x "${tmp}"`)
+      const buf = await fs.readFile(tmp)
+      await fs.rm(tmp, { force: true })
+      return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer
+    },
+    clickAt: async (x, y) => {
+      await execAsync(`osascript -e 'tell application "System Events" to click at {${x}, ${y}}'`).catch(() => undefined)
+    },
+    typeText: async (text) => {
+      await execAsync(`osascript -e 'tell application "System Events" to keystroke ${JSON.stringify(text)}'`).catch(() => undefined)
+    },
+    pressKey: async (key) => {
+      await execAsync(`osascript -e 'tell application "System Events" to key code ${keyCode(key)}'`).catch(() => undefined)
+    },
+  }
+}
+
+function keyCode(key: string): number {
+  const map: Record<string, number> = { enter: 36, return: 36, space: 49, tab: 48, escape: 53, esc: 53, left: 123, right: 124, up: 126, down: 125 }
+  return map[key.toLowerCase()] ?? 0
 }
 
 /**
@@ -136,7 +183,7 @@ export async function bootstrap(): Promise<Runtime> {
   }))
 
   // —— 模型 + agent ——
-  const model = await createGatewayModel()
+  let model = await createGatewayModel()
   let sessionRef = sessions.get(currentSessionId!)!.session
   const deltaCallbacks = new Set<(text: string) => void>()
 
@@ -166,10 +213,11 @@ export async function bootstrap(): Promise<Runtime> {
     // 无凭证，未登录
   }
 
-  // —— 其余能力 ——
+  // —— 其余能力（真实能力）——
   const memory = new MemoryStore()
-  const voice = createMockVoiceService()
-  const computerUse = createMockComputerUseService()
+  const voice = createSystemVoiceService()
+  const computerUse = createSystemComputerUseService()
+  let stopped = false
 
   // 装配底座服务（声明式 inject）
   await kernel.plugin({
@@ -252,14 +300,33 @@ export async function bootstrap(): Promise<Runtime> {
       }
     },
 
-    run: (message, opts) => {
+    switchModel(modelId) {
+      const target = gatewayModels.find((m) => m.id === modelId)
+      if (target && target.apiKey && target.baseUrl) {
+        model = new DeepSeekProvider({ apiKey: target.apiKey, baseUrl: target.baseUrl, model: target.id })
+      }
+    },
+    stop() {
+      stopped = true
+    },
+
+    run: async (message, opts) => {
+      stopped = false
       const loop = new AgentLoop(model, tools, sessionRef, approval)
-      return loop.run(message, {
-        ...opts,
-        onDelta: (text) => {
-          deltaCallbacks.forEach((cb) => cb(text))
-        },
-      })
+      try {
+        return await loop.run(message, {
+          ...opts,
+          onDelta: (text) => {
+            if (stopped) throw new Error('__stopped__')
+            deltaCallbacks.forEach((cb) => cb(text))
+          },
+        })
+      } catch (err) {
+        if (err instanceof Error && err.message === '__stopped__') {
+          return '（已中断，历史已保留，可继续输入以续跑）'
+        }
+        throw err
+      }
     },
   }
 }

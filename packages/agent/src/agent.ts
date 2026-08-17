@@ -30,6 +30,24 @@ export class AgentLoop {
     const maxSteps = options?.maxSteps ?? 10
     const messages: ChatMessage[] = []
     if (options?.systemPrompt) messages.push({ role: 'system', content: options.systemPrompt })
+
+    // 从 session 事件日志回放历史（多轮对话 + 断点续跑：中断后历史仍在 session）
+    for (const e of this.session.list()) {
+      if (e.type === 'user/message') {
+        messages.push({ role: 'user', content: (e.data as { content: string }).content })
+      } else if (e.type === 'assistant/message') {
+        messages.push({ role: 'assistant', content: (e.data as { content: string }).content })
+      } else if (e.type === 'tool/call') {
+        const d = e.data as { callId: string; name: string; args: Record<string, unknown> }
+        messages.push({ role: 'assistant', content: '', toolCall: { id: d.callId, name: d.name, args: d.args } })
+      } else if (e.type === 'tool/result') {
+        const d = e.data as { callId: string; result?: unknown; error?: string }
+        messages.push({ role: 'tool', content: JSON.stringify(d.result ?? d.error ?? ''), toolCallId: d.callId })
+      }
+    }
+
+    // 追加当前消息
+    this.session.append('user/message', { content: message })
     messages.push({ role: 'user', content: message })
 
     this.session.append('turn/start', { turn: 1 })
