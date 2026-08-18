@@ -60,8 +60,13 @@ export interface ShanhaiBridge {
   deleteSession(id: string): Promise<void>
   getSessionWorkdir(id?: string): Promise<string>
   setSessionWorkdir(id: string, workdir: string): Promise<void>
+  saveUploadedFile(fileName: string, dataBase64: string): Promise<string>
+  listBrowserWindows(sessionId?: string): Promise<Array<{ appId: string; url: string; title: string; label?: string }>>
+  showBrowserWindow(appId: string): Promise<void>
+  closeBrowserWindow(appId: string): Promise<void>
   selectDirectory(defaultPath?: string): Promise<string | null>
-  getSessionHistory(id?: string): Promise<Array<{ kind: 'user' | 'assistant' | 'tool'; content?: string; trace?: ToolTrace; attachments?: unknown[] }>>
+  getSessionHistory(id?: string): Promise<Array<{ kind: 'user' | 'assistant' | 'tool'; content?: string; reasoningContent?: string; trace?: ToolTrace; attachments?: unknown[] }>>
+  getSessionTrace(id?: string): Promise<Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string; reasoningContent?: string; toolCalls?: Array<{ id: string; name: string; args: Record<string, unknown> }>; toolCallId?: string; turn: number; timestamp: number }>>
   // 审批
   onApprovalRequest(cb: (req: ApprovalRequest) => void): () => void
   respondApproval(outcome: 'allowed-once' | 'rejected', requestId: string): Promise<void>
@@ -73,6 +78,7 @@ export interface ShanhaiBridge {
   resume(sessionId: string): Promise<string>
   hasIncompleteTurn(sessionId: string): Promise<boolean>
   onDelta(cb: (sessionId: string, text: string) => void): () => void
+  onReasoning(cb: (sessionId: string, text: string) => void): () => void
   // 审批策略（安全模式）
   getApprovalPolicy(): Promise<'ask' | 'never'>
   setApprovalPolicy(policy: 'ask' | 'never'): Promise<void>
@@ -81,10 +87,9 @@ export interface ShanhaiBridge {
   getCurrentModelId(): Promise<string>
   stop(): Promise<void>
   speak(text: string): Promise<void>
-  screenshot(): Promise<string>
-  // token 用量
+  // token 用量（会话级）
   getTokenStats(): Promise<TokenSnapshot>
-  onTokenStats(cb: (stats: TokenSnapshot) => void): () => void
+  onTokenStats(cb: (sessionId: string, stats: TokenSnapshot) => void): () => void
 }
 
 const bridge: ShanhaiBridge = {
@@ -102,8 +107,13 @@ const bridge: ShanhaiBridge = {
   deleteSession: (id) => ipcRenderer.invoke('session:delete', id),
   getSessionWorkdir: (id) => ipcRenderer.invoke('session:workdir', id),
   setSessionWorkdir: (id, workdir) => ipcRenderer.invoke('session:setWorkdir', id, workdir),
+  saveUploadedFile: (fileName, dataBase64) => ipcRenderer.invoke('file:saveUpload', fileName, dataBase64),
+  listBrowserWindows: (sessionId) => ipcRenderer.invoke('browser:list', sessionId),
+  showBrowserWindow: (appId) => ipcRenderer.invoke('browser:show', appId),
+  closeBrowserWindow: (appId) => ipcRenderer.invoke('browser:close', appId),
   selectDirectory: (defaultPath) => ipcRenderer.invoke('dialog:selectDirectory', defaultPath),
   getSessionHistory: (id) => ipcRenderer.invoke('session:history', id),
+  getSessionTrace: (id) => ipcRenderer.invoke('session:trace', id),
   respondApproval: (outcome, requestId) => ipcRenderer.invoke('approval:respond', outcome, requestId),
   run: (message, attachments) => ipcRenderer.invoke('chat:run', message, attachments),
   resend: (sessionId, userMessageIndex, newContent) => ipcRenderer.invoke('chat:resend', sessionId, userMessageIndex, newContent),
@@ -115,10 +125,9 @@ const bridge: ShanhaiBridge = {
   getCurrentModelId: () => ipcRenderer.invoke('model:current'),
   stop: () => ipcRenderer.invoke('chat:stop'),
   speak: (text) => ipcRenderer.invoke('voice:speak', text),
-  screenshot: () => ipcRenderer.invoke('computer:shot'),
   getTokenStats: () => ipcRenderer.invoke('token:stats'),
   onTokenStats: (cb) => {
-    const listener = (_e: unknown, stats: TokenSnapshot) => cb(stats)
+    const listener = (_e: unknown, sessionId: string, stats: TokenSnapshot) => cb(sessionId, stats)
     ipcRenderer.on('token:stats', listener)
     return () => ipcRenderer.removeListener('token:stats', listener)
   },
@@ -136,6 +145,11 @@ const bridge: ShanhaiBridge = {
     const listener = (_e: unknown, sessionId: string, text: string) => cb(sessionId, text)
     ipcRenderer.on('chat:delta', listener)
     return () => ipcRenderer.removeListener('chat:delta', listener)
+  },
+  onReasoning: (cb) => {
+    const listener = (_e: unknown, sessionId: string, text: string) => cb(sessionId, text)
+    ipcRenderer.on('chat:reasoning', listener)
+    return () => ipcRenderer.removeListener('chat:reasoning', listener)
   },
 }
 

@@ -25,6 +25,7 @@
     "@shanhai/agent": "workspace:*",
     "@shanhai/approval": "workspace:*",
     "@shanhai/auth": "workspace:*",
+    "@shanhai/browser-use": "workspace:*",
     "@shanhai/compaction": "workspace:*",
     "@shanhai/computer-use": "workspace:*",
     "@shanhai/kernel": "workspace:*",

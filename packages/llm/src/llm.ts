@@ -34,6 +34,8 @@ export interface Usage {
   promptTokens: number
   completionTokens: number
   totalTokens: number
+  /** 命中缓存的 prompt token 数（prompt_tokens_details.cached_tokens，无则 0） */
+  cachedPromptTokens?: number
 }
 
 export interface ModelResponse {
@@ -75,6 +77,8 @@ export interface TokenUsage {
   promptTokens: number
   completionTokens: number
   totalTokens: number
+  /** 命中缓存的 prompt token 数（prompt_tokens_details.cached_tokens，无则 0） */
+  cachedPromptTokens?: number
 }
 
 export interface DeepSeekOptions {
@@ -91,6 +95,24 @@ interface GatewayChoice {
     content?: string
     reasoning_content?: string
     tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>
+  }
+}
+
+/** 网关 usage（含 prompt_tokens_details.cached_tokens 缓存命中） */
+interface GatewayUsage {
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+  prompt_tokens_details?: { cached_tokens?: number }
+}
+
+/** 网关 usage → TokenUsage（解析缓存命中 token） */
+function toTokenUsage(u: GatewayUsage): TokenUsage {
+  return {
+    promptTokens: u.prompt_tokens ?? 0,
+    completionTokens: u.completion_tokens ?? 0,
+    totalTokens: u.total_tokens ?? 0,
+    cachedPromptTokens: u.prompt_tokens_details?.cached_tokens ?? 0,
   }
 }
 
@@ -172,10 +194,10 @@ export class DeepSeekProvider implements Model {
       error?: string | { message?: string }
       data?: {
         choices?: GatewayChoice[]
-        usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+        usage?: GatewayUsage
       }
       choices?: GatewayChoice[]
-      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+      usage?: GatewayUsage
     }
     // 网关返回错误（如模型不支持 image_url 多模态），响亮抛错，不静默吞
     if (raw.error) {
@@ -188,11 +210,7 @@ export class DeepSeekProvider implements Model {
     const payload = raw.data ?? raw
     const usage = payload.usage
     if (usage && this.opts.onUsage) {
-      this.opts.onUsage({
-        promptTokens: usage.prompt_tokens ?? 0,
-        completionTokens: usage.completion_tokens ?? 0,
-        totalTokens: usage.total_tokens ?? 0,
-      })
+      this.opts.onUsage(toTokenUsage(usage))
     }
     const message = payload.choices?.[0]?.message
     const toolCall = message?.tool_calls?.[0]
@@ -313,7 +331,7 @@ function parseSseLine(line: string): SseDeltaEvent | null {
   if (!data || data === '[DONE]') return null
   let parsed: {
     error?: string | { message?: string }
-    usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+    usage?: GatewayUsage
     choices?: Array<{
       delta?: {
         content?: string
@@ -334,13 +352,7 @@ function parseSseLine(line: string): SseDeltaEvent | null {
   }
   // 流末尾 usage（stream_options.include_usage 时网关返回）
   if (parsed.usage) {
-    return {
-      usage: {
-        promptTokens: parsed.usage.prompt_tokens ?? 0,
-        completionTokens: parsed.usage.completion_tokens ?? 0,
-        totalTokens: parsed.usage.total_tokens ?? 0,
-      },
-    }
+    return { usage: toTokenUsage(parsed.usage) }
   }
   const delta = parsed.choices?.[0]?.delta
   const text = typeof delta?.content === 'string' && delta.content ? delta.content : undefined

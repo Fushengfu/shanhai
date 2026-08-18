@@ -122,8 +122,16 @@ export function createAtomicTools(getCwd: () => string): ToolContract[] {
     approvalRequired: true,
     execute: async (args) => {
       const path = resolvePath(String(args.path))
-      await fs.writeFile(path, String(args.content), 'utf8')
-      return { ok: true, path }
+      const content = String(args.content)
+      // 写入前读取旧内容，供前端渲染 git diff 效果；文件不存在则为 null（新建）
+      let before: string | null = null
+      try {
+        before = await fs.readFile(path, 'utf8')
+      } catch {
+        before = null
+      }
+      await fs.writeFile(path, content, 'utf8')
+      return { ok: true, path, before, after: content, isNew: before === null }
     },
   }
 

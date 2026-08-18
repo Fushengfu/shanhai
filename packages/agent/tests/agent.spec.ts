@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import type { Model, StreamChunk } from '@shanhai/llm'
+import type { Model, StreamChunk, ContentPart } from '@shanhai/llm'
 import { createMockModel } from '@shanhai/llm'
 import type { ToolContract } from '@shanhai/tools'
 import { Session } from '@shanhai/session'
@@ -62,5 +62,29 @@ describe('AgentLoop（ReAct）', () => {
     const model = createMockModel([{ toolCall: { name: 'echo', args: {} } }])
     const loop = new AgentLoop(model, [echoTool()], session, new ApprovalService())
     await expect(loop.run('x', { maxSteps: 3 })).rejects.toThrow('did not converge')
+  })
+
+  it('图片降级：modelContent 存在时落盘保留原始 message + attachments，发模型用降级内容', async () => {
+    const session = new Session()
+    const sent: string[] = []
+    const model: Model = {
+      complete: async (messages) => {
+        sent.push(typeof messages[0]?.content === 'string' ? (messages[0].content as string) : 'non-string')
+        return { text: 'ok' }
+      },
+    }
+    const attachments: ContentPart[] = [{ type: 'image_url', image_url: { url: 'data:image/png;base64,xxx' } }]
+    const loop = new AgentLoop(model, [], session, new ApprovalService())
+    const result = await loop.run('这张图有啥', {
+      attachments,
+      modelContent: '这张图有啥\n\n【图片】这是一张手机截图',
+    })
+    expect(result).toBe('ok')
+    // 落盘的 user/message 必须保留原始文本 + 原始图片附件（重启后历史能恢复图片，而非变成描述文字）
+    const userEvt = session.list().find((e) => e.type === 'user/message')
+    expect((userEvt!.data as { content: string }).content).toBe('这张图有啥')
+    expect((userEvt!.data as { attachments?: unknown[] }).attachments).toEqual(attachments)
+    // 发给模型的是降级后的文字内容
+    expect(sent[0]).toBe('这张图有啥\n\n【图片】这是一张手机截图')
   })
 })

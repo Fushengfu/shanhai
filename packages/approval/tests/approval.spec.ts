@@ -50,4 +50,28 @@ describe('ApprovalService', () => {
     })
     expect(outcome).toBe('unavailable')
   })
+
+  it('会话级审批策略：各会话独立，从事件日志回放（安全模式会话隔离）', async () => {
+    const sessionA = new Session()
+    const sessionB = new Session()
+    const service = new ApprovalService(async () => 'allowed-once')
+
+    // 会话 A 设为 never（append approval/policy 事件）
+    sessionA.append('approval/policy', { policy: 'never' })
+
+    // requiresApproval：A 用 never，B 用默认 ask
+    expect(service.requiresApproval(tool({ riskLevel: 'irreversible' }), sessionA)).toBe(false)
+    expect(service.requiresApproval(tool({ riskLevel: 'irreversible' }), sessionB)).toBe(true)
+
+    // request：A 拒绝，B 放行
+    const outA = await service.request(sessionA, { id: 'a', toolName: 't', args: {}, riskLevel: 'irreversible' })
+    const outB = await service.request(sessionB, { id: 'b', toolName: 't', args: {}, riskLevel: 'irreversible' })
+    expect(outA).toBe('rejected')
+    expect(outB).toBe('allowed-once')
+
+    // 会话 B 切到 never 后，A 仍保持自己的策略
+    sessionB.append('approval/policy', { policy: 'never' })
+    expect(service.requiresApproval(tool({ riskLevel: 'irreversible' }), sessionB)).toBe(false)
+    expect(service.requiresApproval(tool({ riskLevel: 'irreversible' }), sessionA)).toBe(false)
+  })
 })

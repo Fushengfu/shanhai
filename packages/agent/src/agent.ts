@@ -8,8 +8,12 @@ export interface AgentLoopOptions {
   systemPrompt?: string
   /** 流式增量回调（UI 实时逐字渲染用） */
   onDelta?: (text: string) => void
+  /** 流式思考增量回调（推理模型先输出 reasoning_content，UI 实时渲染「思考过程」用） */
+  onReasoning?: (text: string) => void
   /** 多模态附件（图片/音频/视频） */
   attachments?: ContentPart[]
+  /** 发给模型的内容（可选）。图片降级等场景下：落盘仍保留原始 message + attachments，发给模型改用降级后的文字 */
+  modelContent?: string
 }
 
 /**
@@ -30,7 +34,7 @@ export class AgentLoop {
   ) {}
 
   async run(message: string, options?: AgentLoopOptions): Promise<string> {
-    const maxSteps = options?.maxSteps ?? 10
+    const maxSteps = options?.maxSteps ?? 30
     const messages: ChatMessage[] = []
     if (options?.systemPrompt) messages.push({ role: 'system', content: options.systemPrompt })
 
@@ -52,10 +56,13 @@ export class AgentLoop {
       }
     }
 
-    // 追加当前消息（含多模态附件，附件一并写入事件日志，回放时还原）
+    // 追加当前消息（含多模态附件，附件一并写入事件日志，回放时还原）。
+    // 落盘永远保留原始 message + attachments；发给模型的内容在有 modelContent 时用降级后的文字（如图片降级）
     const attachments = options?.attachments
     this.session.append('user/message', { content: message, attachments: (attachments ?? []) as unknown[] })
-    if (attachments && attachments.length > 0) {
+    if (options?.modelContent !== undefined) {
+      messages.push({ role: 'user', content: options.modelContent })
+    } else if (attachments && attachments.length > 0) {
       messages.push({ role: 'user', content: [{ type: 'text', text: message }, ...attachments] })
     } else {
       messages.push({ role: 'user', content: message })
@@ -63,9 +70,10 @@ export class AgentLoop {
 
     this.session.append('turn/start', { turn: 1 })
     const onDelta = options?.onDelta
+    const onReasoning = options?.onReasoning
 
     for (let step = 0; step < maxSteps; step++) {
-      const response = await this.decide(messages, onDelta)
+      const response = await this.decide(messages, onDelta, onReasoning)
       if (response.toolCall) {
         await this.handleToolCall(messages, response.toolCall, response.reasoningContent)
         continue
@@ -75,16 +83,36 @@ export class AgentLoop {
       this.session.append('turn/end', { turn: 1, text })
       return text
     }
-    throw new Error(`agent loop did not converge within ${maxSteps} steps`)
+    // 达到步数上限：不直接抛错，追加一条强制收敛指令，让模型基于已有执行结果直接给出最终结论
+    messages.push({
+      role: 'user',
+      content: `已到达最大工具调用步数（${maxSteps} 步）。请不要再调用任何工具，基于以上已完成的执行结果，直接给出最终结论。`,
+    })
+    const final = await this.decide(messages, onDelta, onReasoning)
+    if (final.toolCall) {
+      // 极端情况：模型仍坚持调用工具（如陷入死循环），保留保护性报错
+      throw new Error(`agent loop did not converge within ${maxSteps} steps`)
+    }
+    const text = final.text ?? ''
+    this.session.append('assistant/message', { content: text, reasoningContent: final.reasoningContent })
+    this.session.append('turn/end', { turn: 1, text })
+    return text
   }
 
-  private async decide(messages: ChatMessage[], onDelta?: (text: string) => void): Promise<ModelResponse> {
+  private async decide(
+    messages: ChatMessage[],
+    onDelta?: (text: string) => void,
+    onReasoning?: (text: string) => void,
+  ): Promise<ModelResponse> {
     if (this.model.stream) {
       let text = ''
       let reasoningContent = ''
       let toolCall: ToolCall | undefined
       for await (const chunk of this.model.stream(messages, this.tools)) {
-        if (chunk.reasoningContent) reasoningContent += chunk.reasoningContent
+        if (chunk.reasoningContent) {
+          reasoningContent += chunk.reasoningContent
+          onReasoning?.(chunk.reasoningContent)
+        }
         if (chunk.text) {
           text += chunk.text
           this.session.append('assistant/delta', { text: chunk.text })
@@ -118,8 +146,8 @@ export class AgentLoop {
       return
     }
 
-    // 审批门
-    if (this.approval.requiresApproval(tool)) {
+    // 审批门（会话级审批策略：requiresApproval 从该会话事件日志回放 policy）
+    if (this.approval.requiresApproval(tool, this.session)) {
       const outcome = await this.approval.request(this.session, {
         id: callId,
         toolName: call.name,

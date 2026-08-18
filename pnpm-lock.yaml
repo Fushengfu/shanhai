@@ -23,9 +23,15 @@ importers:
 
   apps/desktop:
     dependencies:
+      '@shanhai/browser-use':
+        specifier: workspace:*
+        version: link:../../packages/browser-use
       '@shanhai/runtime':
         specifier: workspace:*
         version: link:../runtime
+      html-to-image:
+        specifier: ^1.11.13
+        version: 1.11.13
       react:
         specifier: ^18.3.1
         version: 18.3.1
@@ -75,6 +81,9 @@ importers:
       '@shanhai/auth':
         specifier: workspace:*
         version: link:../../packages/auth
+      '@shanhai/browser-use':
+        specifier: workspace:*
+        version: link:../../packages/browser-use
       '@shanhai/compaction':
         specifier: workspace:*
         version: link:../../packages/compaction
@@ -170,6 +179,25 @@ importers:
         version: 2.1.9(@types/node@22.20.1)
 
   packages/auth:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      tsup:
+        specifier: ^8.3.5
+        version: 8.5.1(postcss@8.5.26)(typescript@5.9.3)
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
+  packages/browser-use:
+    dependencies:
+      '@shanhai/tools':
+        specifier: workspace:*
+        version: link:../tools
     devDependencies:
       '@types/node':
         specifier: ^22.10.2
@@ -1163,6 +1191,9 @@ packages:
 
   hast-util-whitespace@3.0.0:
     resolution: {integrity: sha512-88JUN06ipLwsnv+dVn+OIYOvAuvBMy/Qoi6O7mQHxdPXpjy+Cd6xRkWwux7DKO+4sYILtLBRIKgsdpS2gQc7qw==}
+
+  html-to-image@1.11.13:
+    resolution: {integrity: sha512-cuOPoI7WApyhBElTTb9oqsawRvZ0rHhaHwghRLlTuffoD1B2aDemlCruLeZrUIIdvG7gs9xeELEPm6PhuASqrg==}
 
   html-url-attributes@3.0.1:
     resolution: {integrity: sha512-ol6UPyBWqsrO6EJySPz2O7ZSr856WDrEzM5zMqp+FJJLGMW35cLYmmZnl0vztAZxRUoNZJFTCohfjuIJ8I4QBQ==}
@@ -2410,6 +2441,8 @@ snapshots:
   hast-util-whitespace@3.0.0:
     dependencies:
       '@types/hast': 3.0.5
+
+  html-to-image@1.11.13: {}
 
   html-url-attributes@3.0.1: {}
 

@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { toPng } from 'html-to-image'
 
 interface ToolTrace {
   kind: 'tool-call' | 'tool-result'
@@ -50,12 +51,15 @@ interface TokenSnapshot {
   contextLength: number
   lastPrompt: number
   contextUsageRatio: number
+  turnCachedPromptTokens: number
+  totalCachedPromptTokens: number
+  cacheHitRatio: number
   turnCount: number
 }
 
 type HistoryItem =
   | { kind: 'user'; content?: string; attachments?: unknown[] }
-  | { kind: 'assistant'; content?: string }
+  | { kind: 'assistant'; content?: string; reasoningContent?: string }
   | { kind: 'tool'; trace?: ToolTrace }
 
 declare global {
@@ -75,8 +79,13 @@ declare global {
       deleteSession(id: string): Promise<void>
       getSessionWorkdir(id?: string): Promise<string>
       setSessionWorkdir(id: string, workdir: string): Promise<void>
+      saveUploadedFile(fileName: string, dataBase64: string): Promise<string>
+      listBrowserWindows(sessionId?: string): Promise<Array<{ appId: string; url: string; title: string; label?: string }>>
+      showBrowserWindow(appId: string): Promise<void>
+      closeBrowserWindow(appId: string): Promise<void>
       selectDirectory(defaultPath?: string): Promise<string | null>
       getSessionHistory(id?: string): Promise<HistoryItem[]>
+      getSessionTrace(id?: string): Promise<Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string; reasoningContent?: string; toolCalls?: Array<{ id: string; name: string; args: Record<string, unknown> }>; toolCallId?: string; turn: number; timestamp: number }>>
       respondApproval(outcome: 'allowed-once' | 'rejected', requestId: string): Promise<void>
       run(message: string, attachments?: ContentPart[]): Promise<string>
       resend(sessionId: string, userMessageIndex: number, newContent?: string): Promise<string>
@@ -87,30 +96,31 @@ declare global {
       onApprovalRequest(cb: (req: ApprovalRequest) => void): () => void
       onToolTrace(cb: (trace: ToolTrace) => void): () => void
       onDelta(cb: (sessionId: string, text: string) => void): () => void
+      onReasoning(cb: (sessionId: string, text: string) => void): () => void
       switchModel(id: string): Promise<void>
       getCurrentModelId(): Promise<string>
       stop(): Promise<void>
       speak(text: string): Promise<void>
-      screenshot(): Promise<string>
       getTokenStats(): Promise<TokenSnapshot>
-      onTokenStats(cb: (stats: TokenSnapshot) => void): () => void
+      onTokenStats(cb: (sessionId: string, stats: TokenSnapshot) => void): () => void
     }
   }
 }
 
 type ChatItem =
   | { kind: 'user'; content: string; images?: string[] }
-  | { kind: 'assistant'; content: string }
+  | { kind: 'assistant'; content: string; reasoningContent?: string }
   | { kind: 'tool'; trace: ToolTrace }
 
 /** 每个会话独立的 UI 状态（支持并行会话：切换会话后，后台会话继续跑，互不串扰） */
 interface SessionUIState {
   items: ChatItem[]
   streaming: string
+  streamingReasoning: string
   busy: boolean
 }
 
-const EMPTY_SESSION: SessionUIState = { items: [], streaming: '', busy: false }
+const EMPTY_SESSION: SessionUIState = { items: [], streaming: '', streamingReasoning: '', busy: false }
 
 export function App() {
   const [loggedIn, setLoggedIn] = useState(false)
@@ -124,15 +134,28 @@ export function App() {
   const [selectedModel, setSelectedModel] = useState('')
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
   const [customModelDrawerOpen, setCustomModelDrawerOpen] = useState(false)
+  const [tracePanelOpen, setTracePanelOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null)
   const [editingTitle, setEditingTitle] = useState('')
   const modelMenuRef = useRef<HTMLDivElement>(null)
-  const [tokenStats, setTokenStats] = useState<TokenSnapshot | null>(null)
-  const [attachments, setAttachments] = useState<Array<{ type: 'image' | 'audio' | 'video'; name: string; dataUrl: string }>>([])
+  // token 用量按会话隔离：每个会话独立的累计/本轮/上下文/缓存命中统计
+  const [tokenStatsBySession, setTokenStatsBySession] = useState<Record<string, TokenSnapshot>>({})
+  const [attachments, setAttachments] = useState<Array<{ type: 'image' | 'audio' | 'video' | 'file'; name: string; dataUrl: string; mime: string; size: number }>>([])
+  // 当前会话打开的浏览器窗口（agent 自主打开，标签区展示，可手动关闭）
+  const [browserWindows, setBrowserWindows] = useState<Array<{ appId: string; url: string; title: string; label?: string }>>([])
   const fileRef = useRef<HTMLInputElement>(null)
-  const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null)
+  // 图片预览：点击输入框/聊天历史里的图片放大查看（遮罩层，点击或 Esc 关闭）
+  const [previewImage, setPreviewImage] = useState<string | null>(null)
+  // 审批请求按会话隔离：每个会话一个队列，弹窗只显示当前会话的待审批请求（并行会话互不串扰）
+  const [approvalQueues, setApprovalQueues] = useState<Record<string, ApprovalRequest[]>>({})
+  // 跟踪当前会话 id（供审批回调等闭包读取最新值，避免捕获旧 state）
+  const currentSessionIdRef = useRef('')
+  // 每个会话的输入框草稿（输入到一半切换会话，切回来草稿不丢）
+  const draftRef = useRef<Record<string, { input: string; attachments: Array<{ type: 'image' | 'audio' | 'video' | 'file'; name: string; dataUrl: string; mime: string; size: number }> }>>({})
   const [input, setInput] = useState('')
+  // 输入法组合中标记：中文等 IME 用回车选词时不应触发发送（keydown 时 isComposing 为 true）
+  const isComposingRef = useRef(false)
   const listRef = useRef<HTMLDivElement>(null)
   // 安全模式（审批策略）：ask=危险操作每次询问，never=从不询问直接执行
   const [approvalPolicy, setApprovalPolicyState] = useState<'ask' | 'never'>('ask')
@@ -146,6 +169,8 @@ export function App() {
   const [queueCount, setQueueCount] = useState(0)
 
   const cur = sessionMap[currentSessionId] ?? EMPTY_SESSION
+  // 当前会话的待审批请求（会话级隔离：只显示当前会话队列的头一个，并行会话互不串扰）
+  const curApproval = (approvalQueues[currentSessionId] ?? [])[0] ?? null
   const systemModels = models.filter((m) => !m.custom)
   const customModels = models.filter((m) => m.custom)
   const workDir = sessions.find((s) => s.id === currentSessionId)?.workDir ?? ''
@@ -187,6 +212,9 @@ export function App() {
     const offDelta = api.onDelta((sessionId, text) => {
       patchSession(sessionId, (s) => ({ streaming: s.streaming + text }))
     })
+    const offReasoning = api.onReasoning((sessionId, text) => {
+      patchSession(sessionId, (s) => ({ streamingReasoning: s.streamingReasoning + text }))
+    })
     const offTrace = api.onToolTrace((trace) => {
       patchSession(trace.sessionId, (s) => {
         if (trace.kind === 'tool-result') {
@@ -200,13 +228,22 @@ export function App() {
         }
         return { items: [...s.items, { kind: 'tool', trace }] }
       })
+      // 浏览器工具执行后同步窗口标签（agent 打开/关闭窗口 → 标签区实时刷新）
+      if (trace.name?.startsWith('browser_')) {
+        void window.shanhai?.listBrowserWindows(trace.sessionId).then((wins) => setBrowserWindows(wins ?? [])).catch(() => undefined)
+      }
     })
-    const offApproval = api.onApprovalRequest((req) => setPendingApproval(req))
-    const offToken = api.onTokenStats((s) => setTokenStats(s))
-    void api.getTokenStats().then((s) => setTokenStats(s)).catch(() => undefined)
+    const offApproval = api.onApprovalRequest((req) => {
+      // 审批请求按 sessionId 路由到对应会话队列，只影响发起审批的会话，不串扰当前会话
+      const sid = req.sessionId ?? currentSessionIdRef.current
+      if (!sid) return
+      setApprovalQueues((prev) => ({ ...prev, [sid]: [...(prev[sid] ?? []), req] }))
+    })
+    const offToken = api.onTokenStats((sessionId, s) => setTokenStatsBySession((prev) => ({ ...prev, [sessionId]: s })))
     void api.getApprovalPolicy().then((p) => setApprovalPolicyState(p)).catch(() => undefined)
     return () => {
       offDelta()
+      offReasoning()
       offTrace()
       offApproval()
       offToken()
@@ -216,7 +253,7 @@ export function App() {
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight })
-  }, [cur.items, cur.streaming, pendingApproval])
+  }, [cur.items, cur.streaming, curApproval])
 
   // 模型下拉：点击窗口其他位置时关闭弹窗
   useEffect(() => {
@@ -259,6 +296,13 @@ export function App() {
       delete next[id]
       return next
     })
+    // 同步清掉该会话的待审批队列和输入框草稿（后端 deleteSession 也会拒绝其 pending 审批）
+    setApprovalQueues((prev) => {
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+    delete draftRef.current[id]
     loadedSessions.current.delete(id)
     await refreshSessions()
     // 若删除的是当前会话，切到剩余第一个
@@ -285,12 +329,42 @@ export function App() {
     await saveWorkdir(picked)
   }
 
+  /** 刷新当前会话的浏览器窗口列表（会话级隔离，agent 打开/关闭窗口后同步到标签区） */
+  async function refreshBrowserWindows(sessionId?: string): Promise<void> {
+    const sid = sessionId ?? currentSessionId ?? ''
+    const wins = (await window.shanhai?.listBrowserWindows(sid)) ?? []
+    setBrowserWindows(wins)
+  }
+
+  /** 点击标签：显示并聚焦对应浏览器窗口（恢复被遮挡/最小化的窗口） */
+  async function showBrowserWindow(appId: string): Promise<void> {
+    await window.shanhai?.showBrowserWindow(appId)
+  }
+
+  /** 手动关闭一个浏览器窗口 */
+  async function closeBrowserWindow(appId: string): Promise<void> {
+    await window.shanhai?.closeBrowserWindow(appId)
+    void refreshBrowserWindows()
+  }
+
   async function switchToSession(id: string): Promise<void> {
+    // 保存当前会话输入框草稿，切回来不丢
+    if (currentSessionId) {
+      draftRef.current[currentSessionId] = { input, attachments }
+    }
     setCurrentSessionId(id)
-    setInput('')
-    setAttachments([])
-    setPendingApproval(null)
+    currentSessionIdRef.current = id
+    // 恢复目标会话草稿（若有），否则清空输入框
+    const draft = draftRef.current[id]
+    setInput(draft?.input ?? '')
+    setAttachments(draft?.attachments ?? [])
     await window.shanhai?.switchSession(id)
+    // 会话级审批策略：切到该会话时同步其安全模式到 UI
+    void window.shanhai?.getApprovalPolicy().then((p) => setApprovalPolicyState(p)).catch(() => undefined)
+    // 会话级 token 统计：切会话后拉取该会话的用量（底部状态栏隔离）
+    void window.shanhai?.getTokenStats().then((s) => setTokenStatsBySession((prev) => ({ ...prev, [id]: s }))).catch(() => undefined)
+    // 会话级浏览器窗口：切会话后同步该会话打开的浏览器窗口到标签区
+    void refreshBrowserWindows(id)
     // 检查是否有未完成的消息（决定是否显示「继续执行」按钮）
     const incomplete = (await window.shanhai?.hasIncompleteTurn(id)) ?? false
     setIncompleteTurn(incomplete)
@@ -299,18 +373,22 @@ export function App() {
     loadedSessions.current.add(id)
     const history = (await window.shanhai?.getSessionHistory(id)) ?? []
     const items = historyToItems(history)
-    patchSession(id, { items, streaming: '', busy: false })
+    patchSession(id, { items, streaming: '', streamingReasoning: '', busy: false })
   }
 
   async function createSession(): Promise<void> {
     const id = await window.shanhai?.createSession()
     if (!id) return
     loadedSessions.current.add(id)
-    patchSession(id, { items: [], streaming: '', busy: false })
+    patchSession(id, { items: [], streaming: '', streamingReasoning: '', busy: false })
+    // 保存当前会话草稿，新建会话输入框清空
+    if (currentSessionId) {
+      draftRef.current[currentSessionId] = { input, attachments }
+    }
     setCurrentSessionId(id)
+    currentSessionIdRef.current = id
     setInput('')
     setAttachments([])
-    setPendingApproval(null)
     await refreshSessions()
   }
 
@@ -366,14 +444,14 @@ export function App() {
 
   /** 队列模式：任务执行中提交的消息进入队列，任务完成后自动逐条执行（对齐 taco 的 addToQueue/injectQueuedMessage） */
   async function doRun(sid: string, text: string, parts: ContentPart[], images: string[]): Promise<void> {
-    patchSession(sid, (s) => ({ items: [...s.items, { kind: 'user', content: text, images }], streaming: '', busy: true }))
+    patchSession(sid, (s) => ({ items: [...s.items, { kind: 'user', content: text, images }], streaming: '', streamingReasoning: '', busy: true }))
     try {
       const result = (await window.shanhai?.run(text, parts)) ?? ''
       patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: result }] }))
     } catch (err) {
       patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }] }))
     } finally {
-      patchSession(sid, { streaming: '', busy: false })
+      patchSession(sid, { streaming: '', streamingReasoning: '', busy: false })
       setIncompleteTurn(false)
       // 出队：执行队列中下一条消息
       const q = pendingQueue.current[sid]
@@ -391,47 +469,79 @@ export function App() {
     const text = input.trim()
     if (!text && attachments.length === 0) return
     const images = attachments.filter((a) => a.type === 'image').map((a) => a.dataUrl)
-    const parts: ContentPart[] = attachments.map((a) => {
-      if (a.type === 'image') return { type: 'image_url', image_url: { url: a.dataUrl } }
+    const parts: ContentPart[] = []
+    const fileNotes: string[] = []
+    for (const a of attachments) {
+      if (a.type === 'image') {
+        parts.push({ type: 'image_url', image_url: { url: a.dataUrl } })
+        continue
+      }
+      if (a.type === 'file') {
+        // 普通文件：保存到会话工作目录，让 agent 用 read_file 读取（不塞进多模态消息，避免请求体膨胀）
+        const base64 = a.dataUrl.replace(/^data:[^;]+;base64,/, '')
+        try {
+          const savedPath = (await window.shanhai?.saveUploadedFile(a.name, base64)) ?? a.name
+          fileNotes.push(`${a.name}（${formatBytes(a.size)}）→ ${savedPath}`)
+        } catch {
+          fileNotes.push(`${a.name}（${formatBytes(a.size)}）`)
+        }
+        continue
+      }
+      // audio / video
       const m = /^data:([^;]+);base64,(.+)$/.exec(a.dataUrl)
       const mime = m?.[1] ?? ''
       const data = m?.[2] ?? ''
       const format = mime.split('/')[1] ?? ''
-      return a.type === 'audio'
-        ? { type: 'input_audio', input_audio: { data, format } }
-        : { type: 'input_video', input_video: { data, format } }
-    })
+      parts.push(
+        a.type === 'audio'
+          ? { type: 'input_audio', input_audio: { data, format } }
+          : { type: 'input_video', input_video: { data, format } },
+      )
+    }
+    // 文件说明拼进消息文本（agent 据此 read_file 读取工作目录里的文件）
+    const finalText = fileNotes.length > 0 ? `${text}${text ? '\n\n' : ''}[已附加文件]\n${fileNotes.join('\n')}` : text
     setInput('')
     setAttachments([])
+    delete draftRef.current[sid]
     if (cur.busy) {
       // 当前任务执行中：新消息进入队列，任务完成后自动执行（队列模式，不丢弃）
-      pendingQueue.current[sid] = [...(pendingQueue.current[sid] ?? []), { text, parts, images }]
+      pendingQueue.current[sid] = [...(pendingQueue.current[sid] ?? []), { text: finalText, parts, images }]
       setQueueCount(pendingQueue.current[sid].length)
       return
     }
-    void doRun(sid, text, parts, images)
+    void doRun(sid, finalText, parts, images)
   }
 
   async function respondApproval(outcome: 'allowed-once' | 'rejected'): Promise<void> {
-    if (pendingApproval) {
-      await window.shanhai?.respondApproval(outcome, pendingApproval.id)
-      setPendingApproval(null)
-    }
+    // 只响应当前会话队列的头一个待审批请求（会话级隔离）
+    const sid = currentSessionId
+    const req = (approvalQueues[sid] ?? [])[0]
+    if (!req) return
+    await window.shanhai?.respondApproval(outcome, req.id)
+    setApprovalQueues((prev) => {
+      const q = (prev[sid] ?? []).slice(1)
+      const next = { ...prev }
+      if (q.length > 0) next[sid] = q
+      else delete next[sid]
+      return next
+    })
   }
 
   /** 重新发送：截断到该用户消息重新生成（对齐 taco 的 resendFromExisting，直接重发，不填回输入框） */
   function resendMessage(userIndex: number): void {
     const sid = currentSessionId
     if (!sid) return
+    // 立即进入繁忙态（发送按钮变「停止」），截断重跑期间保持可中断
+    patchSession(sid, (s) => ({ ...s, busy: true, streaming: '', streamingReasoning: '' }))
     // 先从前端视图移除该消息及其后的回复，再走后端截断 + 重跑
     void window.shanhai?.resend(sid, userIndex).then((result) => {
       patchSession(sid, (s) => {
         // 前端重新加载历史，拿到截断后的最新状态
-        return { items: s.items, streaming: '', busy: false }
+        return { items: s.items, streaming: '', streamingReasoning: '', busy: false }
       })
       void reloadSessionItems(sid, result)
     }).catch((err) => {
-      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }] }))
+      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }], streaming: '', streamingReasoning: '', busy: false }))
     })
   }
 
@@ -439,10 +549,11 @@ export function App() {
   function editResend(userIndex: number, newContent: string): void {
     const sid = currentSessionId
     if (!sid) return
+    patchSession(sid, (s) => ({ ...s, busy: true, streaming: '', streamingReasoning: '' }))
     void window.shanhai?.resend(sid, userIndex, newContent).then((result) => {
       void reloadSessionItems(sid, result)
     }).catch((err) => {
-      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }] }))
+      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }], streaming: '', streamingReasoning: '', busy: false }))
     })
   }
 
@@ -450,17 +561,18 @@ export function App() {
   function resumeMessage(): void {
     const sid = currentSessionId
     if (!sid) return
+    patchSession(sid, (s) => ({ ...s, busy: true, streaming: '', streamingReasoning: '' }))
     void window.shanhai?.resume(sid).then((result) => {
       void reloadSessionItems(sid, result)
     }).catch((err) => {
-      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }] }))
+      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }], streaming: '', streamingReasoning: '', busy: false }))
     })
   }
 
   /** 从后端重新拉取会话历史，刷新前端视图（重发/编辑/续跑后截断状态与后端对齐） */
   async function reloadSessionItems(sid: string, _result: string): Promise<void> {
     const history = (await window.shanhai?.getSessionHistory(sid)) ?? []
-    patchSession(sid, { items: historyToItems(history), streaming: '', busy: false })
+    patchSession(sid, { items: historyToItems(history), streaming: '', streamingReasoning: '', busy: false })
   }
 
   function speakLast(): void {
@@ -484,10 +596,9 @@ export function App() {
           ? 'audio'
           : file.type.startsWith('video/')
             ? 'video'
-            : null
-      if (!type) continue
+            : 'file'
       const dataUrl = await readFileAsDataUrl(file)
-      setAttachments((prev) => [...prev, { type, name: file.name, dataUrl }])
+      setAttachments((prev) => [...prev, { type, name: file.name, dataUrl, mime: file.type, size: file.size }])
     }
     e.target.value = ''
   }
@@ -500,11 +611,14 @@ export function App() {
         const file = item.getAsFile()
         if (file) {
           const dataUrl = await readFileAsDataUrl(file)
-          setAttachments((prev) => [...prev, { type: 'image', name: `pasted-${Date.now()}.png`, dataUrl }])
+          setAttachments((prev) => [...prev, { type: 'image', name: `pasted-${Date.now()}.png`, dataUrl, mime: file.type || 'image/png', size: file.size }])
         }
       }
     }
   }
+
+  // 空状态：当前会话还没有任何消息（新建会话 / 首次使用默认会话）
+  const isEmpty = cur.items.length === 0
 
   return (
     <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', fontFamily: 'system-ui, sans-serif' }}>
@@ -599,19 +713,71 @@ export function App() {
             <IconSidebar />
           </button>
           <div style={{ fontWeight: 600, fontSize: 14 }}>山海</div>
+          <button
+            onClick={() => setTracePanelOpen(true)}
+            title="查看执行轨迹"
+            style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 12px', borderRadius: 8, border: '1px solid #eee', background: '#fff', color: '#666', fontSize: 12, cursor: 'pointer', ...({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) }}
+          >
+            <IconActivity />
+            轨迹
+          </button>
         </header>
 
-        {/* 消息区 */}
-        <div ref={listRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: 16, background: '#fafafa' }}>
+        {/* 浏览器窗口标签条：当前会话 agent 打开的内置浏览器窗口（放聊天界面顶部，不影响窗口拖动） */}
+        {browserWindows.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', padding: '8px 16px', borderBottom: '1px solid #eee', background: '#fff', flexShrink: 0 } as React.CSSProperties}>
+            <span style={{ fontSize: 11, color: '#999', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+              <IconMonitor />
+              浏览器
+            </span>
+            {browserWindows.map((w) => (
+              <div
+                key={w.appId}
+                onClick={() => void showBrowserWindow(w.appId)}
+                title={w.label || w.title || w.url}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 8, border: '1px solid #e0e0e0', background: '#fafafa', fontSize: 12, color: '#333', maxWidth: 240, cursor: 'pointer' }}
+              >
+                <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: '#52c41a', flexShrink: 0 }} />
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                  {w.label || w.title || w.url || w.appId}
+                </span>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    void closeBrowserWindow(w.appId)
+                  }}
+                  title="关闭浏览器窗口"
+                  style={{ border: 'none', background: 'transparent', cursor: 'pointer', color: '#999', fontSize: 14, padding: 0, lineHeight: 1, flexShrink: 0 }}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* 消息区：空状态居中显示欢迎信息（输入框也居中），非空显示消息列表并滚动 */}
+        <div
+          ref={listRef}
+          style={
+            isEmpty
+              ? { flex: '0 0 auto', minHeight: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '36px 16px 4px', overflow: 'hidden' }
+              : { flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: 16, background: '#fafafa' }
+          }
+        >
+          {isEmpty ? (
+            <WelcomeHero onSuggestion={setInput} />
+          ) : (
+            <>
           {(() => {
             let userIdx = 0
             return cur.items.map((it, i) => {
               if (it.kind === 'user') {
                 const idx = userIdx++
-                return <UserMessage key={i} content={it.content} images={it.images} userIndex={idx} busy={cur.busy} onResend={resendMessage} onEditResend={editResend} />
+                return <UserMessage key={i} content={it.content} images={it.images} userIndex={idx} busy={cur.busy} onResend={resendMessage} onEditResend={editResend} onPreviewImage={(url) => setPreviewImage(url)} />
               }
               if (it.kind === 'assistant') {
-                return <AssistantMessage key={i} content={it.content} />
+                return <AssistantMessage key={i} content={it.content} reasoningContent={it.reasoningContent} onPreviewImage={(url) => setPreviewImage(url)} />
               }
               // 工具过程（按类型渲染：调用 / 完成 / 出错，点击展开查看详情）
               const t = it.trace
@@ -620,14 +786,19 @@ export function App() {
           })()}
           {cur.busy && !cur.streaming && (
             <div style={{ marginBottom: 8 }}>
-              <span style={bubble('#fff', '#333')}>
-                思考中
-                <ThinkingDots />
-              </span>
+              {cur.streamingReasoning ? (
+                <ReasoningBlock content={cur.streamingReasoning} streaming />
+              ) : (
+                <span style={bubble('#fff', '#333')}>
+                  思考中
+                  <ThinkingDots />
+                </span>
+              )}
             </div>
           )}
           {cur.streaming && (
             <div style={{ marginBottom: 8 }}>
+              {cur.streamingReasoning && <ReasoningBlock content={cur.streamingReasoning} />}
               <span style={bubble('#fff', '#333')}>
                 {cur.streaming}
                 <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
@@ -646,10 +817,12 @@ export function App() {
               </button>
             </div>
           )}
+            </>
+          )}
         </div>
 
-        {/* 审批弹窗（输入框上方浮动） */}
-        {pendingApproval && (
+        {/* 审批弹窗（输入框上方浮动，会话级隔离：只显示当前会话的待审批请求） */}
+        {curApproval && (
           <div
             style={{
               position: 'absolute',
@@ -668,9 +841,9 @@ export function App() {
               <IconWarn />
               需要确认危险操作
             </div>
-            <div style={{ color: '#555', marginBottom: 4 }}>工具：{pendingApproval.toolName}（风险 {pendingApproval.riskLevel}）</div>
+            <div style={{ color: '#555', marginBottom: 4 }}>工具：{curApproval.toolName}（风险 {curApproval.riskLevel}）</div>
             <div style={{ color: '#555', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-              {formatArgs(pendingApproval.args)}
+              {formatArgs(curApproval.args)}
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
               <button onClick={() => void respondApproval('allowed-once')} style={btn('#1677ff', '#fff')}>
@@ -683,18 +856,28 @@ export function App() {
           </div>
         )}
 
-        {/* 输入区（单卡片：textarea + 底部功能行 + 发送按钮） */}
-        <div style={{ padding: '12px 16px 16px', borderTop: '1px solid #eee', background: '#fff' }}>
-          <div style={{ border: '1px solid #d9d9d9', borderRadius: 16, padding: '10px 12px 8px 16px', background: '#fff' }}>
+        {/* 输入区（单卡片：textarea + 底部功能行 + 发送按钮）；空状态垂直居中，非空固定在底部 */}
+        <div style={isEmpty ? { padding: '8px 16px 28px', flex: 1, minHeight: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' } : { padding: '12px 16px 16px', borderTop: '1px solid #eee', background: '#fff' }}>
+          <div style={{ border: '1px solid #d9d9d9', borderRadius: 16, padding: '10px 12px 8px 16px', background: '#fff', width: '100%', maxWidth: isEmpty ? 760 : 'none' }}>
             {attachments.length > 0 && (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
                 {attachments.map((a, i) => (
                   <div key={i} style={{ position: 'relative' }}>
                     {a.type === 'image' ? (
-                      <img src={a.dataUrl} alt={a.name} style={{ width: 56, height: 56, objectFit: 'cover', borderRadius: 8, border: '1px solid #eee', display: 'block' }} />
+                      <img
+                        src={a.dataUrl}
+                        alt={a.name}
+                        onClick={() => setPreviewImage(a.dataUrl)}
+                        style={{ width: 56, height: 56, objectFit: 'cover', borderRadius: 8, border: '1px solid #eee', display: 'block', cursor: 'zoom-in' }}
+                      />
                     ) : (
-                      <div style={{ width: 56, height: 56, borderRadius: 8, border: '1px solid #eee', background: '#f7f7f8', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#888' }}>
-                        {a.type === 'audio' ? <IconMic /> : <IconMonitor />}
+                      <div style={{ width: 56, height: 56, borderRadius: 8, border: '1px solid #eee', background: '#f7f7f8', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#888', gap: 2, padding: '0 4px', boxSizing: 'border-box' }}>
+                        {a.type === 'file' ? <IconFile /> : a.type === 'audio' ? <IconMic /> : <IconMonitor />}
+                        {a.type === 'file' && (
+                          <div style={{ fontSize: 8, lineHeight: 1.1, color: '#999', maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {a.name.length > 8 ? `${a.name.slice(0, 8)}…` : a.name}
+                          </div>
+                        )}
                       </div>
                     )}
                     <button
@@ -707,7 +890,7 @@ export function App() {
                 ))}
               </div>
             )}
-            <input ref={fileRef} type="file" accept="image/*,audio/*,video/*" multiple style={{ display: 'none' }} onChange={(e) => void handleFileSelect(e)} />
+            <input ref={fileRef} type="file" multiple style={{ display: 'none' }} onChange={(e) => void handleFileSelect(e)} />
             {queueCount > 0 && (
               <div style={{ marginBottom: 6, fontSize: 12, color: '#fa8c16', display: 'flex', alignItems: 'center', gap: 4 }}>
                 <IconClock />
@@ -717,8 +900,11 @@ export function App() {
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              onCompositionStart={() => { isComposingRef.current = true }}
+              onCompositionEnd={() => { isComposingRef.current = false }}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
+                const composing = isComposingRef.current || e.nativeEvent.isComposing
+                if (e.key === 'Enter' && !e.shiftKey && !composing) {
                   e.preventDefault()
                   void send()
                 }
@@ -729,15 +915,17 @@ export function App() {
               placeholder="输入任务，Enter 发送，Shift+Enter 换行"
               style={{ width: '100%', border: 'none', outline: 'none', resize: 'none', fontSize: 14, lineHeight: 1.6, background: 'transparent', minHeight: 60, maxHeight: 200, fontFamily: 'inherit', display: 'block', boxSizing: 'border-box' }}
             />
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4, gap: 8 }}>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center', flex: 1, minWidth: 0 }}>
                 <button title="附件" onClick={() => fileRef.current?.click()} style={iconBtn}><IconPaperclip /></button>
                 <div ref={modelMenuRef} style={{ position: 'relative' }}>
                   <button
                     onClick={() => setModelMenuOpen((v) => !v)}
-                    style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid #ddd', fontSize: 12, color: '#555', background: '#fff', outline: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                    style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid #ddd', fontSize: 12, color: '#555', background: '#fff', outline: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: 180, minWidth: 0 }}
                   >
-                    {models.find((m) => m.id === selectedModel)?.name ?? (loggedIn ? '选择模型' : '未登录')}
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 140 }}>
+                      {models.find((m) => m.id === selectedModel)?.name ?? (loggedIn ? '选择模型' : '未登录')}
+                    </span>
                     <IconChevronDown />
                   </button>
                   {modelMenuOpen && (
@@ -811,9 +999,7 @@ export function App() {
                 >
                   <IconFolder />
                   <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{workDirName}</span>
-                  <IconEdit />
                 </button>
-                <button title="操作电脑" onClick={() => void window.shanhai?.screenshot()} style={iconBtn}><IconMonitor /></button>
                 <div ref={approvalMenuRef} style={{ position: 'relative' }}>
                   <button
                     onClick={() => setApprovalMenuOpen((v) => !v)}
@@ -848,7 +1034,7 @@ export function App() {
                   )}
                 </div>
               </div>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 }}>
                 <button title="语音朗读" onClick={speakLast} style={iconBtn}><IconMic /></button>
                 <button
                   onClick={() => (cur.busy ? stopSend() : void send())}
@@ -876,7 +1062,7 @@ export function App() {
         </div>
 
         {/* token 用量状态栏（累计 / 本轮 / 上下文占比） */}
-        <TokenStatusBar stats={tokenStats} />
+        <TokenStatusBar stats={tokenStatsBySession[currentSessionId] ?? null} />
       </div>
 
       {/* 登录弹窗（未登录时点左下角头像弹出；登录态下主界面照常可用） */}
@@ -897,7 +1083,47 @@ export function App() {
         />
       )}
 
-      <style>{`html, body, #root { margin: 0; height: 100%; overflow: hidden; } @keyframes blink { 50% { opacity: 0 } } @keyframes slideIn { from { transform: translateX(100%) } to { transform: translateX(0) } } @keyframes bounce { 0%, 80%, 100% { transform: translateY(0); opacity: 0.35 } 40% { transform: translateY(-3px); opacity: 1 } }`}</style>
+      {/* 执行轨迹面板：当前会话请求大模型的消息痕迹 + 工具调用痕迹（含角色与元数据） */}
+      {tracePanelOpen && <TracePanel sessionId={currentSessionId} busy={cur.busy} streamingReasoning={cur.streamingReasoning} streaming={cur.streaming} onClose={() => setTracePanelOpen(false)} />}
+
+      <style>{`* { box-sizing: border-box; } html, body, #root { margin: 0; height: 100%; overflow: hidden; } @keyframes blink { 50% { opacity: 0 } } @keyframes slideIn { from { transform: translateX(100%) } to { transform: translateX(0) } } @keyframes bounce { 0%, 80%, 100% { transform: translateY(0); opacity: 0.35 } 40% { transform: translateY(-3px); opacity: 1 } } @keyframes spin { to { transform: rotate(360deg) } }`}</style>
+
+      {/* 图片预览遮罩层：点击输入框/聊天历史里的图片放大查看，点击背景或 Esc 关闭 */}
+      {previewImage && <ImagePreview src={previewImage} onClose={() => setPreviewImage(null)} />}
+    </div>
+  )
+}
+
+/** 图片预览遮罩层：全屏半透明背景 + 居中大图，点击背景或 Esc 关闭 */
+function ImagePreview({ src, onClose }: { src: string; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.72)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 1000,
+        cursor: 'zoom-out',
+      }}
+    >
+      <img
+        src={src}
+        alt="预览"
+        onClick={(e) => e.stopPropagation()}
+        style={{ maxWidth: '92%', maxHeight: '92%', objectFit: 'contain', borderRadius: 8, boxShadow: '0 8px 40px rgba(0,0,0,0.5)' }}
+      />
     </div>
   )
 }
@@ -911,9 +1137,20 @@ function historyToItems(history: HistoryItem[]): ChatItem[] {
         .filter((x): x is string => typeof x === 'string' && x.length > 0)
       out.push({ kind: 'user', content: h.content ?? '', images })
     } else if (h.kind === 'assistant') {
-      out.push({ kind: 'assistant', content: h.content ?? '' })
+      out.push({ kind: 'assistant', content: h.content ?? '', reasoningContent: h.reasoningContent })
     } else if (h.trace) {
-      out.push({ kind: 'tool', trace: h.trace })
+      const trace = h.trace
+      if (trace.kind === 'tool-result') {
+        // 合并到同 callId 的 tool-call 条目（否则同一工具调用会显示「执行中」+「已完成」两条）
+        const idx = [...out].reverse().findIndex((it) => it.kind === 'tool' && it.trace.kind === 'tool-call' && it.trace.callId === trace.callId)
+        if (idx >= 0) {
+          const realIdx = out.length - 1 - idx
+          const base = (out[realIdx] as Extract<ChatItem, { kind: 'tool' }>).trace
+          out[realIdx] = { kind: 'tool', trace: { ...base, kind: 'tool-result', result: trace.result, error: trace.error } }
+          continue
+        }
+      }
+      out.push({ kind: 'tool', trace })
     }
   }
   return out
@@ -945,6 +1182,40 @@ function prettyValue(v: unknown): string {
   } catch {
     return String(v)
   }
+}
+
+/** 空状态欢迎页：产品名 + 欢迎语 + 能力点 + 快捷提问（点击填入输入框） */
+function WelcomeHero({ onSuggestion }: { onSuggestion: (text: string) => void }) {
+  const suggestions = [
+    '帮我写一段 Python 脚本',
+    '解释一下当前项目结构',
+    '用一句话介绍你自己',
+    '帮我分析一个文件',
+  ]
+  return (
+    <div style={{ textAlign: 'center', maxWidth: 640, width: '100%', paddingBottom: 8 }}>
+      <div style={{ fontSize: 44, fontWeight: 700, color: '#1677ff', letterSpacing: 2, marginBottom: 10 }}>山海</div>
+      <div style={{ fontSize: 18, fontWeight: 600, color: '#333', marginBottom: 8 }}>欢迎使用山海 AI 助手</div>
+      <div style={{ fontSize: 13, color: '#888', lineHeight: 1.7, marginBottom: 22 }}>
+        一个可自我升级的桌面智能体：多专家编排、真实工具执行、会话级隔离。
+        <br />
+        登录后解锁全部模型，也支持接入你自己的模型服务商。
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center' }}>
+        {suggestions.map((s) => (
+          <button
+            key={s}
+            onClick={() => onSuggestion(s)}
+            style={{ padding: '8px 14px', borderRadius: 18, border: '1px solid #e5e5e5', background: '#fff', color: '#555', fontSize: 13, cursor: 'pointer', transition: 'border-color 0.2s' }}
+            onMouseEnter={(e) => (e.currentTarget.style.borderColor = '#1677ff')}
+            onMouseLeave={(e) => (e.currentTarget.style.borderColor = '#e5e5e5')}
+          >
+            {s}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
 }
 
 function bubble(bg: string, color: string): React.CSSProperties {
@@ -1025,6 +1296,16 @@ function IconPaperclip() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+    </svg>
+  )
+}
+
+function IconGlobe() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10" />
+      <path d="M2 12h20" />
+      <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
     </svg>
   )
 }
@@ -1225,6 +1506,14 @@ function readFileAsDataUrl(file: File): Promise<string> {
   })
 }
 
+/** 把字节数格式化成可读文本（B/KB/MB） */
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return ''
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
 /** 思考中提示：三个依次跳动的点 */
 function ThinkingDots() {
   return (
@@ -1276,28 +1565,37 @@ function CodeBlock({ children }: { children?: React.ReactNode }) {
   )
 }
 
-const markdownComponents = {
-  code(props: { className?: string; children?: React.ReactNode }) {
-    const hasLang = /language-[\w-]+/.test(props.className ?? '')
-    if (!props.className || !hasLang) {
+function makeMarkdownComponents(onImageClick?: (url: string) => void) {
+  return {
+    code(props: { className?: string; children?: React.ReactNode }) {
+      const hasLang = /language-[\w-]+/.test(props.className ?? '')
+      if (!props.className || !hasLang) {
+        return (
+          <code style={{ background: '#f0f0f0', padding: '2px 5px', borderRadius: 4, fontSize: '0.9em', fontFamily: 'ui-monospace, monospace' }}>
+            {props.children}
+          </code>
+        )
+      }
+      return <CodeBlock>{props.children}</CodeBlock>
+    },
+    a(props: { href?: string; children?: React.ReactNode }) {
       return (
-        <code style={{ background: '#f0f0f0', padding: '2px 5px', borderRadius: 4, fontSize: '0.9em', fontFamily: 'ui-monospace, monospace' }}>
+        <a href={props.href} target="_blank" rel="noreferrer" style={{ color: '#1677ff' }}>
           {props.children}
-        </code>
+        </a>
       )
-    }
-    return <CodeBlock>{props.children}</CodeBlock>
-  },
-  a(props: { href?: string; children?: React.ReactNode }) {
-    return (
-      <a href={props.href} target="_blank" rel="noreferrer" style={{ color: '#1677ff' }}>
-        {props.children}
-      </a>
-    )
-  },
-  img(props: { src?: string; alt?: string }) {
-    return <img src={props.src} alt={props.alt} style={{ maxWidth: '100%', height: 'auto', borderRadius: 8, display: 'block' }} />
-  },
+    },
+    img(props: { src?: string; alt?: string }) {
+      return (
+        <img
+          src={props.src}
+          alt={props.alt}
+          onClick={() => props.src && onImageClick?.(props.src)}
+          style={{ maxWidth: '100%', height: 'auto', borderRadius: 8, display: 'block', cursor: onImageClick ? 'zoom-in' : 'default' }}
+        />
+      )
+    },
+  }
 }
 
 function LoginModal({ onClose, onLogin }: { onClose: () => void; onLogin: (u: string, p: string) => Promise<void> }) {
@@ -1412,7 +1710,20 @@ function SessionRow(props: {
       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }} title={s.title}>
         {s.title}
       </span>
-      {props.busy && <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#1677ff', flexShrink: 0 }} />}
+      {props.busy && (
+        <span
+          title="任务执行中"
+          style={{
+            width: 12,
+            height: 12,
+            borderRadius: '50%',
+            border: '2px solid #d9e8ff',
+            borderTopColor: '#1677ff',
+            flexShrink: 0,
+            animation: 'spin 0.8s linear infinite',
+          }}
+        />
+      )}
       {(hover || props.active) && (
         <span style={{ display: 'inline-flex', gap: 2, flexShrink: 0 }}>
           <button
@@ -1445,30 +1756,86 @@ function TokenStatusBar({ stats }: { stats: TokenSnapshot | null }) {
   if (!stats) {
     return <div style={{ padding: '6px 16px', borderTop: '1px solid #eee', background: '#fff', fontSize: 11, color: '#bbb' }}>token 用量统计中…</div>
   }
-  const pct = Math.round((stats.contextUsageRatio || 0) * 100)
   return (
     <div style={{ padding: '6px 16px', borderTop: '1px solid #eee', background: '#fff', fontSize: 11, color: '#888', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap', fontFamily: 'ui-monospace, monospace' }}>
       <span title="本次启动以来累计 token">
         累计 <b style={{ color: '#555' }}>{fmtTokens(stats.total)}</b>
         <span style={{ color: '#bbb' }}>（入 {fmtTokens(stats.totalPrompt)} / 出 {fmtTokens(stats.totalCompletion)}）</span>
       </span>
-      <span title="当前这轮任务消耗的 token">
-        本轮 <b style={{ color: '#1677ff' }}>{fmtTokens(stats.turn)}</b>
+      <span title="本轮实时输入/输出 token（模型每次返回 usage 时更新）">
+        本轮 <b style={{ color: '#1677ff' }}>入 {fmtTokens(stats.turnPrompt)} / 出 {fmtTokens(stats.turnCompletion)}</b>
+      </span>
+      <span title="本轮 prompt 缓存命中率（命中缓存 token / 本轮输入 token）">
+        缓存命中 <b style={{ color: (stats.cacheHitRatio || 0) > 0 ? '#52c41a' : '#999' }}>{Math.round((stats.cacheHitRatio || 0) * 100)}%</b>
       </span>
       <span title="当前会话累计完成的任务循环轮次（一次完整的「用户消息 → 最终回复」算一轮）">
         轮次 <b style={{ color: '#1677ff' }}>{stats.turnCount}</b>
       </span>
-      <span title="当前会话上下文窗口占用（最近一次请求的 prompt token / 模型上下文长度）" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+      <span title="当前会话上下文窗口占用" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
         上下文
-        <span style={{ width: 120, height: 6, borderRadius: 3, background: '#f0f0f0', overflow: 'hidden', display: 'inline-block' }}>
-          <span style={{ display: 'block', height: '100%', width: `${Math.min(pct, 100)}%`, background: pct > 80 ? '#ff4d4f' : pct > 60 ? '#faad14' : '#1677ff', transition: 'width 0.3s ease' }} />
-        </span>
-        <b style={{ color: '#555' }}>{pct}%</b>
-        <span style={{ color: '#bbb' }}>
-          {fmtTokens(stats.lastPrompt)} / {stats.contextLength > 0 ? fmtTokens(stats.contextLength) : '未知'}
-        </span>
+        <ContextRing stats={stats} />
       </span>
     </div>
+  )
+}
+
+/** 上下文窗口占用环形指示器：中间显示百分比，悬停弹出详情（最大窗口/当前占用/剩余可用/占比） */
+function ContextRing({ stats }: { stats: TokenSnapshot }) {
+  const [hover, setHover] = useState(false)
+  const pct = Math.round((stats.contextUsageRatio || 0) * 100)
+  const r = 9
+  const c = 2 * Math.PI * r
+  const color = pct > 80 ? '#ff4d4f' : pct > 60 ? '#faad14' : '#1677ff'
+  const remaining = stats.contextLength > 0 ? Math.max(stats.contextLength - stats.lastPrompt, 0) : 0
+  return (
+    <span
+      style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', cursor: 'help' }}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+    >
+      <svg width={22} height={22} viewBox="0 0 24 24">
+        <circle cx={12} cy={12} r={r} fill="none" stroke="#f0f0f0" strokeWidth={3.5} />
+        <circle
+          cx={12}
+          cy={12}
+          r={r}
+          fill="none"
+          stroke={color}
+          strokeWidth={3.5}
+          strokeDasharray={c}
+          strokeDashoffset={c * (1 - Math.min(pct, 100) / 100)}
+          strokeLinecap="round"
+          transform="rotate(-90 12 12)"
+          style={{ transition: 'stroke-dashoffset 0.3s ease' }}
+        />
+        <text x={12} y={12.5} textAnchor="middle" dominantBaseline="central" fontSize={6.5} fill="#555" fontWeight={600}>
+          {pct}%
+        </text>
+      </svg>
+      {hover && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: '150%',
+            right: 0,
+            padding: '8px 12px',
+            borderRadius: 8,
+            background: 'rgba(0,0,0,0.85)',
+            color: '#fff',
+            fontSize: 11,
+            whiteSpace: 'nowrap',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.2)',
+            zIndex: 100,
+            lineHeight: 1.7,
+          }}
+        >
+          <div>最大窗口：{stats.contextLength > 0 ? `${fmtTokens(stats.contextLength)} tokens` : '未知'}</div>
+          <div>当前占用：{fmtTokens(stats.lastPrompt)} tokens</div>
+          <div>剩余可用：{stats.contextLength > 0 ? `${fmtTokens(remaining)} tokens` : '未知'}</div>
+          <div>上下文占比：{pct}%</div>
+        </div>
+      )}
+    </span>
   )
 }
 
@@ -1757,6 +2124,17 @@ async function copyText(text: string): Promise<void> {
   }
 }
 
+/** 把 AI 回复的气泡 DOM 节点原样截图成图片写入剪贴板（html-to-image 精确还原渲染效果，与界面显示一致，2x 高清） */
+async function copyAssistantAsImage(node: HTMLElement | null): Promise<void> {
+  if (!node) throw new Error('未找到要复制的消息节点')
+  const dataUrl = await toPng(node, {
+    pixelRatio: 2,
+    backgroundColor: '#ffffff',
+  })
+  const blob = await (await fetch(dataUrl)).blob()
+  await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+}
+
 interface MessageAction {
   key: string
   icon: React.ReactNode
@@ -1792,13 +2170,14 @@ function MessageActions({ actions }: { actions: MessageAction[] }) {
 }
 
 /** 用户消息气泡：右对齐，气泡下方常显「编辑 / 复制 / 重新发送」；编辑为内联编辑（Enter 确认 / Esc 取消，参考 taco） */
-function UserMessage({ content, images, userIndex, busy, onResend, onEditResend }: {
+function UserMessage({ content, images, userIndex, busy, onResend, onEditResend, onPreviewImage }: {
   content: string
   images?: string[]
   userIndex: number
   busy: boolean
   onResend: (userIndex: number) => void
   onEditResend: (userIndex: number, newContent: string) => void
+  onPreviewImage: (url: string) => void
 }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(content)
@@ -1812,7 +2191,13 @@ function UserMessage({ content, images, userIndex, busy, onResend, onEditResend 
   return (
     <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
       {images?.map((img, j) => (
-        <img key={j} src={img} alt="附件" style={{ maxWidth: 200, maxHeight: 200, borderRadius: 8, display: 'block', marginBottom: 4, objectFit: 'cover' }} />
+        <img
+          key={j}
+          src={img}
+          alt="附件"
+          onClick={() => onPreviewImage(img)}
+          style={{ maxWidth: 200, maxHeight: 200, borderRadius: 8, display: 'block', marginBottom: 4, objectFit: 'cover', cursor: 'zoom-in' }}
+        />
       ))}
       {editing ? (
         <div style={{ width: '100%', maxWidth: '85%', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
@@ -1858,17 +2243,46 @@ function UserMessage({ content, images, userIndex, busy, onResend, onEditResend 
   )
 }
 
-/** AI 助手消息卡片：左对齐，气泡下方固定显示「复制」图标操作 */
-function AssistantMessage({ content }: { content: string }) {
+/** 「思考过程」折叠区块（参考 DSH / DeepSeek：灰底、可折叠，与正式回答区分） */
+function ReasoningBlock({ content, streaming }: { content: string; streaming?: boolean }) {
+  const [open, setOpen] = useState(!!streaming)
+  return (
+    <div style={{ marginBottom: 8, maxWidth: '85%' }}>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '4px 10px', borderRadius: 8, border: '1px solid #eee', background: '#f7f7f8', color: '#888', fontSize: 12, cursor: 'pointer' }}
+      >
+        <span style={{ display: 'inline-flex', color: '#999', transform: open ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform .15s' }}>
+          <IconChevronDown />
+        </span>
+        {streaming ? '正在思考…' : '思考过程'}
+      </button>
+      {open && (
+        <div style={{ marginTop: 4, padding: '8px 12px', borderRadius: 8, background: '#f7f7f8', color: '#888', fontSize: 12, lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 240, overflowY: 'auto' }}>
+          {content}
+          {streaming && <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** AI 助手消息卡片：左对齐，思考过程（可折叠）+ 正式回答，气泡下方固定显示「复制 / 复制为图片」操作 */
+function AssistantMessage({ content, reasoningContent, onPreviewImage }: { content: string; reasoningContent?: string; onPreviewImage: (url: string) => void }) {
+  const bubbleRef = useRef<HTMLDivElement>(null)
   return (
     <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
-      <div style={{ maxWidth: '85%', padding: '10px 14px', borderRadius: 16, borderTopLeftRadius: 4, background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,0.06)', fontSize: 14, lineHeight: 1.65, color: '#333', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+      {reasoningContent && <ReasoningBlock content={reasoningContent} />}
+      <div ref={bubbleRef} style={{ maxWidth: '85%', padding: '10px 14px', borderRadius: 16, borderTopLeftRadius: 4, background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,0.06)', fontSize: 14, lineHeight: 1.65, color: '#333', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents(onPreviewImage)}>
           {content}
         </ReactMarkdown>
       </div>
       <MessageActions
-        actions={[{ key: 'copy', icon: <IconCopy />, label: '复制', run: () => copyText(content) }]}
+        actions={[
+          { key: 'copy', icon: <IconCopy />, label: '复制', run: () => copyText(content) },
+          { key: 'copyImage', icon: <IconImage />, label: '复制为图片', run: () => copyAssistantAsImage(bubbleRef.current) },
+        ]}
       />
     </div>
   )
@@ -1879,6 +2293,14 @@ function IconError() {
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
       <circle cx="12" cy="12" r="10" />
       <path d="M15 9l-6 6M9 9l6 6" />
+    </svg>
+  )
+}
+
+function IconActivity() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
     </svg>
   )
 }
@@ -1895,6 +2317,23 @@ const TOOL_META: Record<string, { title: string; icon: React.ReactNode }> = {
   computer_screenshot: { title: '屏幕截图', icon: <IconMonitor /> },
   computer_ocr: { title: '文字识别', icon: <IconMonitor /> },
   computer_action: { title: '电脑操作', icon: <IconMonitor /> },
+  browser_create: { title: '创建浏览器窗口', icon: <IconGlobe /> },
+  browser_list: { title: '列出浏览器窗口', icon: <IconGlobe /> },
+  browser_navigate: { title: '打开网页', icon: <IconGlobe /> },
+  browser_close: { title: '关闭浏览器窗口', icon: <IconGlobe /> },
+  browser_screenshot: { title: '网页截图', icon: <IconGlobe /> },
+  browser_get_info: { title: '读取页面信息', icon: <IconGlobe /> },
+  browser_get_content: { title: '读取页面内容', icon: <IconGlobe /> },
+  browser_evaluate: { title: '执行页面脚本', icon: <IconGlobe /> },
+  browser_click: { title: '点击页面元素', icon: <IconGlobe /> },
+  browser_type: { title: '页面输入', icon: <IconGlobe /> },
+  browser_scroll: { title: '滚动页面', icon: <IconGlobe /> },
+  browser_wait: { title: '等待元素', icon: <IconGlobe /> },
+  browser_get_console_logs: { title: '查看控制台日志', icon: <IconGlobe /> },
+  browser_get_network_requests: { title: '查看网络请求', icon: <IconGlobe /> },
+  browser_get_cookies: { title: '读取 Cookie', icon: <IconGlobe /> },
+  browser_set_cookie: { title: '设置 Cookie', icon: <IconGlobe /> },
+  browser_clear_cookies: { title: '清除 Cookie', icon: <IconGlobe /> },
 }
 
 /** 从工具参数提取一行摘要（读/写 → 路径，命令 → 命令，列目录 → 路径，电脑操作 → 动作） */
@@ -1907,6 +2346,14 @@ function toolSummary(name: string, args?: Record<string, unknown>): string {
   if (name === 'image_analyze') return String(a.imageUrl ?? '').slice(0, 48)
   if (name === 'computer_action') return String(a.action ?? '')
   if (name === 'computer_screenshot' || name === 'computer_ocr') return ''
+  if (name === 'browser_navigate') return String(a.url ?? '')
+  if (name === 'browser_create') return a.url ? String(a.url) : a.appId ? String(a.appId) : ''
+  if (name === 'browser_click') return String(a.selector ?? '')
+  if (name === 'browser_type') return String(a.selector ?? '')
+  if (name === 'browser_get_content') return a.selector ? String(a.selector) : ''
+  if (name === 'browser_wait') return String(a.selector ?? '')
+  if (name === 'browser_scroll') return String(a.direction ?? '')
+  if (name === 'browser_close' || name === 'browser_list') return a.appId ? String(a.appId) : ''
   return ''
 }
 
@@ -1920,6 +2367,17 @@ function redactSecret(text: string): string {
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text
   return `${text.slice(0, max)}…（共 ${text.length} 字）`
+}
+
+/** 把工具结果转成可读字符串：字符串原样返回，对象/数组用 JSON 序列化（避免 [object Object]） */
+function stringifyResult(result: unknown): string {
+  if (result === null || result === undefined) return ''
+  if (typeof result === 'string') return result
+  try {
+    return JSON.stringify(result, null, 2)
+  } catch {
+    return String(result)
+  }
 }
 
 /** 终端结果卡片：命令 + stdout/stderr（深色终端样式） */
@@ -1938,6 +2396,150 @@ function TerminalBlock({ command, stdout, stderr }: { command: string; stdout: s
           {stderr && <span style={{ color: '#f48771' }}>{stderr}</span>}
         </div>
       )}
+    </div>
+  )
+}
+
+// ===== 行级 diff（git diff 风格，用于 write_file 结果展示）=====
+
+type DiffLineType = 'context' | 'add' | 'del' | 'fold'
+
+interface DiffLine {
+  type: DiffLineType
+  text: string
+  oldLine?: number
+  newLine?: number
+}
+
+/** 用 LCS 计算两段文本的行级差异（经过公共前后缀裁剪后中间段通常较小，DP 可接受） */
+function lcsDiff(a: string[], b: string[], oldStart: number, newStart: number): DiffLine[] {
+  const n = a.length
+  const m = b.length
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0))
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i]![j] = a[i] === b[j] ? dp[i + 1]![j + 1]! + 1 : Math.max(dp[i + 1]![j]!, dp[i]![j + 1]!)
+    }
+  }
+  const out: DiffLine[] = []
+  let i = 0
+  let j = 0
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      out.push({ type: 'context', text: a[i]!, oldLine: oldStart + i, newLine: newStart + j })
+      i++
+      j++
+    } else if (dp[i + 1]![j]! >= dp[i]![j + 1]!) {
+      out.push({ type: 'del', text: a[i]!, oldLine: oldStart + i })
+      i++
+    } else {
+      out.push({ type: 'add', text: b[j]!, newLine: newStart + j })
+      j++
+    }
+  }
+  while (i < n) {
+    out.push({ type: 'del', text: a[i]!, oldLine: oldStart + i })
+    i++
+  }
+  while (j < m) {
+    out.push({ type: 'add', text: b[j]!, newLine: newStart + j })
+    j++
+  }
+  return out
+}
+
+/** 计算完整 diff，并折叠大段未变上下文（变更行前后保留 3 行，中间折叠标记） */
+function computeDiff(before: string, after: string): DiffLine[] {
+  const a = before.split('\n')
+  const b = after.split('\n')
+  const n = a.length
+  const m = b.length
+  // 去掉公共前缀
+  let start = 0
+  while (start < n && start < m && a[start] === b[start]) start++
+  // 去掉公共后缀（不与前缀重叠）
+  let endA = n
+  let endB = m
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+    endA--
+    endB--
+  }
+  const lines: DiffLine[] = []
+  for (let i = 0; i < start; i++) lines.push({ type: 'context', text: a[i]!, oldLine: i + 1, newLine: i + 1 })
+  const midA = a.slice(start, endA)
+  const midB = b.slice(start, endB)
+  if (midA.length > 4000 || midB.length > 4000) {
+    // 中间段过大：退化为整段替换，避免 DP 内存爆炸
+    for (const t of midA) lines.push({ type: 'del', text: t })
+    for (const t of midB) lines.push({ type: 'add', text: t })
+  } else {
+    lines.push(...lcsDiff(midA, midB, start + 1, start + 1))
+  }
+  for (let i = 0; i < n - endA; i++) lines.push({ type: 'context', text: a[endA + i]!, oldLine: endA + i + 1, newLine: endB + i + 1 })
+
+  // 折叠：变更行（add/del）前后各保留 ctx 行上下文，其余 context 折叠
+  const ctx = 3
+  const keep = new Set<number>()
+  lines.forEach((l, i) => {
+    if (l.type === 'add' || l.type === 'del') {
+      for (let d = -ctx; d <= ctx; d++) {
+        const j = i + d
+        if (j >= 0 && j < lines.length) keep.add(j)
+      }
+    }
+  })
+  const out: DiffLine[] = []
+  let lastKept = -1
+  for (let i = 0; i < lines.length; i++) {
+    if (keep.has(i)) {
+      if (lastKept >= 0 && i - lastKept > 1) {
+        out.push({ type: 'fold', text: `⋯ ${i - lastKept - 1} 行未变` })
+      }
+      out.push(lines[i]!)
+      lastKept = i
+    }
+  }
+  return out
+}
+
+/** 文件变更卡片：git diff 风格（- 红 / + 绿 / 上下文灰），新建与修改文件都适用 */
+function DiffBlock({ before, after, path, isNew }: { before: string; after: string; path?: string; isNew?: boolean }) {
+  const treatAsNew = isNew || before === ''
+  const diffLines: DiffLine[] = treatAsNew
+    ? after.split('\n').map((t, i): DiffLine => ({ type: 'add', text: t, newLine: i + 1 }))
+    : computeDiff(before, after)
+  const addCount = diffLines.filter((l) => l.type === 'add').length
+  const delCount = diffLines.filter((l) => l.type === 'del').length
+  return (
+    <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 12 }}>
+      {path && (
+        <div style={{ padding: '6px 12px', borderBottom: '1px solid #f0f0f0', color: '#999', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {path} · {treatAsNew ? `新建文件，+${addCount}` : `+${addCount} −${delCount}`}
+        </div>
+      )}
+      <div style={{ maxHeight: 360, overflowY: 'auto' }}>
+        {diffLines.map((l, i) => {
+          if (l.type === 'fold') {
+            return (
+              <div key={i} style={{ padding: '3px 12px', color: '#999', fontSize: 11, background: '#fafafa', textAlign: 'center', userSelect: 'none' }}>
+                {l.text}
+              </div>
+            )
+          }
+          const bg = l.type === 'add' ? '#e6ffec' : l.type === 'del' ? '#ffebe9' : 'transparent'
+          const sign = l.type === 'add' ? '+' : l.type === 'del' ? '−' : ' '
+          const signColor = l.type === 'add' ? '#1a7f37' : l.type === 'del' ? '#cf222e' : '#bbb'
+          const textColor = l.type === 'del' ? '#82071e' : l.type === 'add' ? '#116329' : '#444'
+          return (
+            <div key={i} style={{ display: 'flex', background: bg, minHeight: 18 }}>
+              <span style={{ width: 34, textAlign: 'right', paddingRight: 8, color: '#bbb', flexShrink: 0, userSelect: 'none', background: 'rgba(0,0,0,0.02)' }}>{l.oldLine ?? ''}</span>
+              <span style={{ width: 34, textAlign: 'right', paddingRight: 8, color: '#bbb', flexShrink: 0, userSelect: 'none', background: 'rgba(0,0,0,0.02)' }}>{l.newLine ?? ''}</span>
+              <span style={{ width: 20, textAlign: 'center', color: signColor, flexShrink: 0, userSelect: 'none', fontWeight: 600 }}>{sign}</span>
+              <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', flex: 1, color: textColor }}>{l.text || ' '}</span>
+            </div>
+          )
+        })}
+      </div>
     </div>
   )
 }
@@ -1997,13 +2599,21 @@ function renderToolResult(name: string, result: unknown, error: string | undefin
     const src = String(result)
     return src ? <img src={src} alt="截图" style={{ display: 'block', maxWidth: '100%', maxHeight: 320, objectFit: 'contain' }} /> : null
   }
+  if (name === 'browser_screenshot') {
+    const r = result as { imageBase64?: string }
+    const src = r.imageBase64 ? `data:image/png;base64,${r.imageBase64}` : ''
+    return src ? <img src={src} alt="网页截图" style={{ display: 'block', maxWidth: '100%', maxHeight: 320, objectFit: 'contain' }} /> : null
+  }
   if (name === 'write_file') {
-    const r = result as { ok?: boolean; path?: string }
+    const r = result as { ok?: boolean; path?: string; before?: string | null; after?: string; isNew?: boolean }
+    if (typeof r.after === 'string') {
+      return <DiffBlock before={r.before ?? ''} after={r.after} path={r.path} isNew={!!r.isNew} />
+    }
     return <div style={{ padding: '10px 12px', color: '#389e0d', fontSize: 12 }}>✓ 已写入 {r.path ?? ''}</div>
   }
   return (
     <pre style={{ margin: 0, padding: '10px 12px', fontFamily: 'ui-monospace, monospace', fontSize: 12, lineHeight: 1.5, color: '#444', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 320, overflowY: 'auto' }}>
-      {redactSecret(truncate(String(result), 4000))}
+      {redactSecret(truncate(stringifyResult(result), 4000))}
     </pre>
   )
 }
@@ -2044,10 +2654,149 @@ function ToolStep({ trace }: { trace: ToolTrace }) {
         )}
       </div>
       {expanded && expandable && (
-        <div style={{ marginLeft: 20, marginTop: 4, border: '1px solid #f0f0f0', borderRadius: 8, background: '#fafafa', overflow: 'hidden' }}>
+        <div style={{ marginTop: 4, maxWidth: '85%', border: '1px solid #f0f0f0', borderRadius: 8, background: '#fafafa', overflow: 'hidden' }}>
           {resultBody}
         </div>
       )}
+    </div>
+  )
+}
+
+// ===== 执行轨迹面板（DSH Tracing 风格：展示请求大模型的消息痕迹 + 工具调用痕迹，含角色与元数据）=====
+
+type TraceEntry = {
+  role: 'system' | 'user' | 'assistant' | 'tool'
+  content: string
+  reasoningContent?: string
+  toolCalls?: Array<{ id: string; name: string; args: Record<string, unknown> }>
+  toolCallId?: string
+  turn: number
+  timestamp: number
+}
+
+const ROLE_META: Record<TraceEntry['role'], { label: string; color: string; bg: string }> = {
+  system: { label: '系统', color: '#8c8c8c', bg: '#f5f5f5' },
+  user: { label: '用户', color: '#1677ff', bg: '#f0f7ff' },
+  assistant: { label: '助手', color: '#389e0d', bg: '#f6ffed' },
+  tool: { label: '工具', color: '#fa8c16', bg: '#fff7e6' },
+}
+
+/** 单条消息痕迹：索引 #N + 角色标签 + 轮次 + 时间 + 元数据（reasoning / tool_calls / tool_call_id）+ 内容 */
+function TraceRow({ m, index }: { m: TraceEntry; index: number }) {
+  const meta = ROLE_META[m.role]
+  const time = new Date(m.timestamp).toLocaleTimeString('zh-CN', { hour12: false })
+  return (
+    <div style={{ marginBottom: 10, border: '1px solid #f0f0f0', borderRadius: 8, background: '#fff', overflow: 'hidden' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', background: meta.bg, borderBottom: '1px solid #f0f0f0' }}>
+        <span style={{ fontSize: 11, color: '#bbb', fontFamily: 'ui-monospace, monospace', flexShrink: 0 }}>#{index}</span>
+        <span style={{ fontSize: 11, fontWeight: 600, color: meta.color, padding: '1px 8px', borderRadius: 10, background: '#fff', border: `1px solid ${meta.color}` }}>{meta.label}</span>
+        {m.turn > 0 && <span style={{ fontSize: 11, color: '#999' }}>第 {m.turn} 轮</span>}
+        <span style={{ fontSize: 11, color: '#bbb' }}>{time}</span>
+        {m.toolCallId && <span style={{ fontSize: 11, color: '#bbb', fontFamily: 'ui-monospace, monospace' }}>tool_call_id: {m.toolCallId}</span>}
+      </div>
+      <div style={{ padding: '8px 12px' }}>
+        {m.reasoningContent && (
+          <div style={{ marginBottom: 6, padding: '6px 10px', borderRadius: 6, background: '#f7f7f8', color: '#888', fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 200, overflowY: 'auto' }}>
+            <span style={{ color: '#9254de', fontWeight: 600 }}>reasoning_content：</span>
+            {m.reasoningContent}
+          </div>
+        )}
+        {m.toolCalls && m.toolCalls.length > 0 && (
+          <div style={{ marginBottom: 6 }}>
+            {m.toolCalls.map((tc) => (
+              <div key={tc.id} style={{ padding: '6px 10px', borderRadius: 6, background: '#fff7e6', border: '1px solid #ffe7ba', fontSize: 12 }}>
+                <span style={{ color: '#fa8c16', fontWeight: 600 }}>tool_call → {tc.name}</span>
+                <span style={{ color: '#bbb', fontFamily: 'ui-monospace, monospace' }}> id={tc.id}</span>
+                <pre style={{ margin: '4px 0 0', fontFamily: 'ui-monospace, monospace', fontSize: 11, color: '#666', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 160, overflowY: 'auto' }}>
+                  {JSON.stringify(tc.args, null, 2)}
+                </pre>
+              </div>
+            ))}
+          </div>
+        )}
+        {m.content ? (
+          <div style={{ fontSize: 13, lineHeight: 1.6, color: '#333', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 320, overflowY: 'auto', fontFamily: m.role === 'tool' ? 'ui-monospace, monospace' : 'system-ui, sans-serif' }}>
+            {m.role === 'assistant' && !m.toolCalls ? (
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents(() => undefined)}>
+                {m.content}
+              </ReactMarkdown>
+            ) : (
+              m.content
+            )}
+          </div>
+        ) : (
+          <div style={{ color: '#ccc', fontSize: 12 }}>（无内容）</div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function TracePanel({ sessionId, busy, streamingReasoning, streaming, onClose }: {
+  sessionId: string
+  busy: boolean
+  streamingReasoning: string
+  streaming: string
+  onClose: () => void
+}) {
+  const [trace, setTrace] = useState<TraceEntry[]>([])
+  useEffect(() => {
+    let alive = true
+    void window.shanhai?.getSessionTrace(sessionId).then((t) => { if (alive) setTrace(t ?? []) }).catch(() => undefined)
+    return () => { alive = false }
+  }, [sessionId])
+
+  // Esc 关闭轨迹面板（标准交互，也便于键盘操作）
+  useEffect(() => {
+    function onKey(e: KeyboardEvent): void {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const roleCount = (r: TraceEntry['role']): number => trace.filter((m) => m.role === r).length
+  const toolCallCount = trace.filter((m) => m.toolCalls && m.toolCalls.length > 0).length
+
+  return (
+    <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 115, fontFamily: 'system-ui, sans-serif', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', height: '100%', background: '#fff', display: 'flex', flexDirection: 'column' }}>
+        <div style={{ padding: '16px 20px', borderBottom: '1px solid #eee', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ fontWeight: 600, fontSize: 15, display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ color: '#666' }}><IconActivity /></span>
+            执行轨迹
+            <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>
+              消息 {trace.length} · 工具调用 {toolCallCount} · 系统 {roleCount('system')} / 用户 {roleCount('user')} / 助手 {roleCount('assistant')} / 工具 {roleCount('tool')}
+            </span>
+          </div>
+          <button onClick={onClose} style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#999', padding: 4, display: 'inline-flex' }}>
+            <IconClose />
+          </button>
+        </div>
+
+        <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px' }}>
+          {trace.length === 0 && !busy && (
+            <div style={{ textAlign: 'center', color: '#bbb', padding: '80px 0', fontSize: 14 }}>暂无执行痕迹，发送一条消息开始</div>
+          )}
+          {trace.map((m, i) => (
+            <TraceRow key={i} m={m} index={i + 1} />
+          ))}
+          {/* 流式进行中的思考 / 回答实时追加到轨迹末尾（尚未落盘为 assistant/message） */}
+          {streamingReasoning && (
+            <TraceRow m={{ role: 'assistant', content: '', reasoningContent: streamingReasoning, turn: 0, timestamp: Date.now() }} index={trace.length + 1} />
+          )}
+          {streaming && (
+            <TraceRow m={{ role: 'assistant', content: streaming, turn: 0, timestamp: Date.now() }} index={trace.length + 2} />
+          )}
+          {busy && !streamingReasoning && !streaming && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#999', fontSize: 13 }}>
+              <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#9254de' }} />
+              思考中
+              <ThinkingDots />
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   )
 }

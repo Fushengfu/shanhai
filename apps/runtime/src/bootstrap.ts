@@ -1,5 +1,5 @@
 import { Kernel } from '@shanhai/kernel'
-import { Session, type SessionEvent } from '@shanhai/session'
+import { Session, effectiveApprovalPolicy, type SessionEvent } from '@shanhai/session'
 import { ApprovalService } from '@shanhai/approval'
 import { AgentLoop } from '@shanhai/agent'
 import type { Model, ContentPart, TokenUsage } from '@shanhai/llm'
@@ -10,9 +10,10 @@ import { FileCredentialStore, AuthService } from '@shanhai/auth'
 import type { GatewayModel, ModelTier } from '@shanhai/auth'
 import type { VoiceService } from '@shanhai/voice'
 import { createComputerUseTools, type ComputerUseService, type OcrWord } from '@shanhai/computer-use'
+import { createBrowserUseTools, createMockBrowserUseService, type BrowserUseService } from '@shanhai/browser-use'
 import { promises as fs } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, basename } from 'node:path'
 import { exec as execCallback } from 'node:child_process'
 import { promisify } from 'node:util'
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -54,6 +55,12 @@ export interface TokenSnapshot {
   lastPrompt: number
   /** 上下文窗口占比 0~1（lastPrompt / contextLength，contextLength 为 0 时返回 0） */
   contextUsageRatio: number
+  /** 本轮缓存命中 token（prompt_tokens_details.cached_tokens） */
+  turnCachedPromptTokens: number
+  /** 累计缓存命中 token */
+  totalCachedPromptTokens: number
+  /** 本轮缓存命中率 0~1（缓存命中 token / 本轮输入 token，无输入则 0） */
+  cacheHitRatio: number
   /** 累计执行轮次（当前会话内，一次完整的「用户消息 → 最终回复」任务循环算一轮） */
   turnCount: number
 }
@@ -67,6 +74,7 @@ export interface Runtime {
   credentials: FileCredentialStore
   voice: VoiceService
   computerUse: ComputerUseService
+  browserUse: BrowserUseService
 
   /** 登录状态 */
   loggedIn: boolean
@@ -96,8 +104,26 @@ export interface Runtime {
   getSessionWorkdir(id?: string): string
   /** 修改指定会话工作目录 */
   setSessionWorkdir(id: string, workdir: string): void
+  /** 把用户上传的普通文件（非媒体）保存到当前会话工作目录，返回绝对路径（供 read_file 等工具读取） */
+  saveUploadedFile(fileName: string, dataBase64: string): Promise<string>
+  /** 列出指定会话（缺省当前会话）打开的浏览器窗口（会话级隔离） */
+  listBrowserWindows(sessionId?: string): Promise<Array<{ appId: string; url: string; title: string }>>
+  /** 显示并聚焦指定浏览器窗口（用户点击标签恢复窗口） */
+  showBrowserWindow(appId: string): Promise<void>
+  /** 关闭指定浏览器窗口（appId 为 list 返回的完整标识） */
+  closeBrowserWindow(appId: string): Promise<void>
   /** 获取指定会话的历史消息（UI 切换会话时加载；不传 id 用当前会话） */
-  getSessionHistory(id?: string): Array<{ kind: 'user' | 'assistant' | 'tool'; content?: string; trace?: ToolTrace; attachments?: unknown[] }>
+  getSessionHistory(id?: string): Array<{ kind: 'user' | 'assistant' | 'tool'; content?: string; reasoningContent?: string; trace?: ToolTrace; attachments?: unknown[] }>
+  /** 获取指定会话的完整执行痕迹（请求大模型的消息角色 + 工具调用 + 元数据，供轨迹面板查看） */
+  getSessionTrace(id?: string): Array<{
+    role: 'system' | 'user' | 'assistant' | 'tool'
+    content: string
+    reasoningContent?: string
+    toolCalls?: Array<{ id: string; name: string; args: Record<string, unknown> }>
+    toolCallId?: string
+    turn: number
+    timestamp: number
+  }>
   /** 新建会话（可指定工作目录），返回会话 id */
   createSession(title?: string, workdir?: string): string
   /** 当前会话的历史消息（用于 UI 切换会话时回放） */
@@ -112,11 +138,13 @@ export interface Runtime {
 
   /** 流式增量回调（sessionId 标识来源会话） */
   onDelta(cb: (sessionId: string, text: string) => void): () => void
+  /** 流式思考增量回调（推理模型 reasoning_content，UI 实时渲染「思考过程」） */
+  onReasoning(cb: (sessionId: string, text: string) => void): () => void
 
-  /** 当前 token 用量快照（累计 / 本轮 / 上下文占比） */
+  /** 当前 token 用量快照（累计 / 本轮 / 上下文占比 / 缓存命中，会话级） */
   getTokenStats(): TokenSnapshot
-  /** token 用量变化回调（模型每次返回 usage 时推送） */
-  onTokenStats(cb: (stats: TokenSnapshot) => void): () => void
+  /** token 用量变化回调（模型每次返回 usage 时推送，带 sessionId 标识所属会话） */
+  onTokenStats(cb: (sessionId: string, stats: TokenSnapshot) => void): () => void
 
   /** 切换模型（动态更新 provider，后续对话用新模型，并持久化到本地） */
   switchModel(modelId: string): void
@@ -394,35 +422,16 @@ function keyCode(key: string): number {
   return map[key.toLowerCase()] ?? 0
 }
 
-/** 单条工具结果持久化时允许的最大字符数（超过则截断，防止 read_file 大文件 / run_command 大输出撑爆会话 JSON） */
-const MAX_RESULT_CHARS = 20000
-
-/** 持久化前降级附件：base64 图片/音视频数据不落盘（几 MB 会撑爆 JSON），只保留类型标记 */
-function sanitizeAttachment(a: unknown): unknown {
-  if (typeof a !== 'object' || a === null) return a
-  const part = a as {
-    type?: string
-    image_url?: { url?: string }
-    input_audio?: { data?: string; format?: string }
-    input_video?: { data?: string; format?: string }
-  }
-  if (part.type === 'image_url' && part.image_url?.url?.startsWith('data:')) {
-    return { type: 'image_url', image_url: { url: '' } }
-  }
-  if (part.type === 'input_audio' && part.input_audio?.data) {
-    return { type: 'input_audio', input_audio: { data: '', format: part.input_audio.format ?? '' } }
-  }
-  if (part.type === 'input_video' && part.input_video?.data) {
-    return { type: 'input_video', input_video: { data: '', format: part.input_video.format ?? '' } }
-  }
-  return a
-}
-
 /**
  * host 装配：用内核装配底座服务 + 能力插件。
  * 暴露登录 / 会话 / 模型 / 工具过程 / 审批 等产品能力。
  */
-export async function bootstrap(): Promise<Runtime> {
+export interface BootstrapOptions {
+  /** 浏览器后端（桌面端注入 Electron 内置浏览器；CLI 模式缺省走 mock） */
+  browserUse?: BrowserUseService
+}
+
+export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime> {
   const kernel = new Kernel()
 
   // 网关凭证 + 模型列表（提前声明，供 image_analyze 工具闭包引用，登录部分赋值）
@@ -450,29 +459,9 @@ export async function bootstrap(): Promise<Runtime> {
   async function persistSession(meta: SessionMeta): Promise<void> {
     try {
       await fs.mkdir(sessionsDir, { recursive: true })
-      // 持久化前清理（防止会话 JSON 随对话无限膨胀）：
-      // 1) 丢弃 assistant/delta（流式增量冗余，最终 assistant/message 已含完整内容）
-      // 2) 附件 base64 降级为占位（几 MB 图片/音视频不落盘，模型回放本来就用占位符）
-      // 3) tool/result 的 result/error 超长截断（read_file 读大文件、run_command 大量输出会撑爆 JSON）
-      const events = meta.session
-        .list()
-        .filter((e) => e.type !== 'assistant/delta')
-        .map((e) => {
-          if (e.type === 'tool/result') {
-            const d = e.data as { callId: string; name: string; result?: unknown; error?: string }
-            const trunc = (v: unknown): unknown => {
-              if (typeof v === 'string' && v.length > MAX_RESULT_CHARS) {
-                return `${v.slice(0, MAX_RESULT_CHARS)}\n…（结果过长已截断，共 ${v.length} 字）`
-              }
-              return v
-            }
-            return { ...e, data: { ...d, result: trunc(d.result), error: d.error ? trunc(d.error) : d.error } }
-          }
-          if (e.type !== 'user/message') return e
-          const d = e.data as { content: string; attachments?: unknown[] }
-          if (!Array.isArray(d.attachments) || d.attachments.length === 0) return e
-          return { ...e, data: { ...d, attachments: d.attachments.map(sanitizeAttachment) } }
-        })
+      // 只丢弃 assistant/delta（流式增量中间态，最终 assistant/message 已含完整内容，属去冗余而非丢数据）；
+      // tool/result、附件 base64 等原始数据一律完整保留，不截断、不降级。
+      const events = meta.session.list().filter((e) => e.type !== 'assistant/delta')
       const data = { id: meta.id, title: meta.title, workDir: meta.workDir, events }
       await fs.writeFile(join(sessionsDir, `${meta.id}.json`), JSON.stringify(data, null, 2), { mode: 0o600 })
     } catch {
@@ -527,25 +516,36 @@ export async function bootstrap(): Promise<Runtime> {
   // —— 工具过程 + 审批桥（审批按 requestId 独立 resolve，支持并行会话）——
   const toolTraceCallbacks = new Set<(trace: ToolTrace) => void>()
   const approvalCallbacks = new Set<(req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }) => void>()
-  const pendingApprovals = new Map<string, { resolve: (outcome: ApprovalOutcome) => void }>()
+  const pendingApprovals = new Map<string, { resolve: (outcome: ApprovalOutcome) => void; sessionId?: string }>()
 
   const approval = new ApprovalService(async (req) => {
     approvalCallbacks.forEach((cb) => cb({ id: req.id, sessionId: req.sessionId, toolName: req.toolName, args: req.args, riskLevel: req.riskLevel }))
     return new Promise<ApprovalOutcome>((resolve) => {
-      pendingApprovals.set(req.id, { resolve })
+      // 记录发起审批的会话 id：删除会话时按会话拒绝其待审批请求，避免 agent 永久卡在 await
+      pendingApprovals.set(req.id, { resolve, sessionId: req.sessionId })
     })
   })
 
-  // 审批策略（安全模式）：ask=危险操作每次询问，never=从不询问直接执行；持久化到 config.json
-  let approvalPolicy: 'ask' | 'never' = 'ask'
+  // 审批策略（安全模式）改为「会话级」：每个会话独立的安全模式，通过 approval/policy 事件持久化到会话 JSON。
+  // 这里不再维护全局 policy 变量；会话级 policy 由 ApprovalService 从会话事件日志回放（effectiveApprovalPolicy）。
+  /** 读取指定会话（缺省当前会话）的审批策略：从事件日志回放，缺省 'ask' */
+  const sessionApprovalPolicy = (sid?: string): 'ask' | 'never' => {
+    const meta = sessions.get(sid ?? currentSessionId ?? '')
+    if (!meta) return 'ask'
+    return effectiveApprovalPolicy(meta.session.list()) ?? 'ask'
+  }
 
   // —— 能力实例（提前创建，供工具使用）——
   const computerUse = createSystemComputerUseService()
+  const browserUse: BrowserUseService = options.browserUse ?? createMockBrowserUseService()
   const voice = createSystemVoiceService()
   const memory = new MemoryStore()
 
   // —— computer-use 插件（操作电脑：截图 / OCR 定位 / 统一动作，形成「截图→定位→动作→验证」闭环）——
   const computerTools: ToolContract[] = createComputerUseTools(computerUse)
+
+  // —— browser-use 插件（操作内置浏览器：导航 / 点击 / 输入 / 提取 / 截图 / 网络 / Cookie）——
+  const browserTools: ToolContract[] = createBrowserUseTools(browserUse)
 
   // —— 图片识别：用视觉模型分析图片（当前模型不支持多模态时降级用）——
   const analyzeImageWithVision = async (imageUrl: string): Promise<string> => {
@@ -605,44 +605,82 @@ export async function bootstrap(): Promise<Runtime> {
     const sid = sessionContext.getStore() ?? currentSessionId ?? ''
     return sessions.get(sid)?.workDir ?? join(homedir(), 'shanhai', 'workspace')
   }
+  /** 运行时环境快照：系统提示词里注入的「环境信息」全部来自这里，随每次请求自动采集（不写死） */
+  interface RuntimeEnvironment {
+    osName: string
+    platform: string
+    arch: string
+    time: string
+    shell: string
+    home: string
+    cwd: string
+    lang: string
+  }
+
   /**
-   * 系统提示词：告诉模型「当前环境」（时间 / 工作目录 / Shell / 系统类型）+ 工具调用约束。
-   * 让 AI 了解运行环境，文件/命令操作都锚定到当前工作目录。
+   * 自动采集当前运行环境快照（时间 / 操作系统 / Shell / 主目录 / 工作目录 / 语言）。
+   * 每次构建系统提示词时实时调用，保证环境信息始终是「初始化时自动注入」而非硬编码。
+   */
+  const collectEnvironment = (cwd: string): RuntimeEnvironment => {
+    const osNames: Record<string, string> = { darwin: 'macOS', win32: 'Windows', linux: 'Linux' }
+    return {
+      osName: osNames[process.platform] ?? process.platform,
+      platform: process.platform,
+      arch: process.arch,
+      time: new Date().toLocaleString('zh-CN', { hour12: false }),
+      shell: process.env.SHELL ?? process.env.ComSpec ?? 'unknown',
+      home: homedir(),
+      cwd,
+      lang: 'zh-CN',
+    }
+  }
+
+  /**
+   * 系统提示词：告诉模型「当前环境」（时间 / 工作目录 / Shell / 系统类型 / 语言）+ 工具调用约束。
+   * 环境信息由 collectEnvironment 自动注入，文件/命令操作都锚定到当前工作目录。
    */
   const buildSystemPrompt = (cwd: string): string => {
-    const osNames: Record<string, string> = { darwin: 'macOS', win32: 'Windows', linux: 'Linux' }
-    const osName = osNames[process.platform] ?? process.platform
-    const now = new Date().toLocaleString('zh-CN', { hour12: false })
-    const shell = process.env.SHELL ?? process.env.ComSpec ?? 'unknown'
+    const env = collectEnvironment(cwd)
     return [
       '你是「山海」，一个运行在用户电脑上的桌面端 AI 智能体助手。你可以读取文件、编写代码、执行命令、列出目录来帮助用户完成任务。',
       '',
       '【当前环境】',
-      `- 操作系统：${osName}（${process.platform}/${process.arch}）`,
-      `- 当前时间：${now}`,
-      `- Shell：${shell}`,
-      `- 用户主目录：${homedir()}`,
-      `- 当前工作目录：${cwd}`,
+      `- 操作系统：${env.osName}（${env.platform}/${env.arch}）`,
+      `- 当前时间：${env.time}`,
+      `- Shell：${env.shell}`,
+      `- 用户主目录：${env.home}`,
+      `- 当前工作目录：${env.cwd}`,
+      `- 语言：${env.lang}（优先用中文回复）`,
       '',
       '【工具使用规则】',
       '1. 所有文件操作（read_file / write_file / list_dir）和命令执行（run_command）都必须围绕「当前工作目录」进行。',
       '2. 文件路径既可以是绝对路径，也可以是相对于当前工作目录的相对路径；优先使用相对路径，把操作范围限制在工作目录内。',
       '3. 需要了解项目结构时，用 list_dir 以树形列出目录。',
-      `4. 执行命令时注意当前是 ${osName} 系统，使用对应的命令语法（如 macOS/Linux 用 ls、cat，Windows 用 dir、type）。`,
+      `4. 执行命令时注意当前是 ${env.osName} 系统，使用对应的命令语法（如 macOS/Linux 用 ls、cat，Windows 用 dir、type）。`,
       '5. 执行有风险的操作（写文件、运行命令）前会请求用户确认，请把要做的改动讲清楚再调用工具。',
+      '6. 需要访问网页/网站、验证前端页面、提取网页数据时，用 browser_navigate 打开页面，配合 browser_get_content / browser_evaluate / browser_screenshot 观察，browser_click / browser_type 操作；截图前要有明确目的，排查问题先看 browser_get_console_logs。',
     ].join('\n')
   }
-  const baseTools = [...createAtomicTools(getSessionCwd), imageAnalyzeTool, ...computerTools]
+  const baseTools = [...createAtomicTools(getSessionCwd), imageAnalyzeTool, ...computerTools, ...browserTools]
   const tools: ToolContract[] = baseTools.map((t) => ({
     ...t,
     execute: async (args) => {
       const sid = sessionContext.getStore() ?? currentSessionId ?? ''
       const callId = `${t.name}-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      // 浏览器工具：注入会话 id 作为 appId（会话级隔离窗口），agent 传短名时拼接为「会话id:短名」。
+      // 若 appId 已是完整标识（等于会话 id 或含会话前缀，如 browser_create 的返回值），直接复用，
+      // 避免二次拼接导致窗口错位；否则按短名拼接会话前缀（默认短名 default）。
+      let effectiveArgs = args
+      if (t.name.startsWith('browser_')) {
+        const raw = typeof args.appId === 'string' ? args.appId : ''
+        const appId = raw && (raw === sid || raw.startsWith(`${sid}:`)) ? raw : `${sid}:${raw || 'default'}`
+        effectiveArgs = { ...args, appId }
+      }
       toolTraceCallbacks.forEach((cb) =>
         cb({ kind: 'tool-call', sessionId: sid, callId, name: t.name, args, approvalRequired: t.approvalRequired, approved: false }),
       )
       try {
-        const result = await t.execute(args)
+        const result = await t.execute(effectiveArgs)
         // 结果 trace 带上 args：前端按工具类型渲染摘要（路径/命令）时需要它
         toolTraceCallbacks.forEach((cb) => cb({ kind: 'tool-result', sessionId: sid, callId, name: t.name, args, result }))
         return result
@@ -654,60 +692,88 @@ export async function bootstrap(): Promise<Runtime> {
     },
   }))
 
-  // —— token 统计（累计 / 本轮 / 上下文占比，UI 底部状态栏展示）——
-  const tokenStats = {
-    totalPrompt: 0,
-    totalCompletion: 0,
-    total: 0,
-    turnPrompt: 0,
-    turnCompletion: 0,
-    turn: 0,
-    contextLength: 0,
-    lastPrompt: 0,
+  // —— token 统计（累计 / 本轮 / 上下文占比，UI 底部状态栏展示；会话级隔离：每个会话独立累计，互不串扰）——
+  interface TokenAccumulator {
+    totalPrompt: number
+    totalCompletion: number
+    total: number
+    turnPrompt: number
+    turnCompletion: number
+    turn: number
+    contextLength: number
+    lastPrompt: number
+    turnCachedPromptTokens: number
+    totalCachedPromptTokens: number
   }
-  const tokenCallbacks = new Set<(stats: TokenSnapshot) => void>()
+  const tokenStats = new Map<string, TokenAccumulator>()
+  const tokenCallbacks = new Set<(sessionId: string, stats: TokenSnapshot) => void>()
 
-  /** 当前会话累计完成的任务循环轮次（一次完整的「用户消息 → 最终回复」= 一轮，从事件日志统计，重启后自动恢复） */
-  const countCompletedTurns = (): number => {
-    const meta = currentSessionId ? sessions.get(currentSessionId) : undefined
+  /** 获取（或初始化）指定会话的 token 累计器 */
+  const sessionStats = (sid: string): TokenAccumulator => {
+    let s = tokenStats.get(sid)
+    if (!s) {
+      s = { totalPrompt: 0, totalCompletion: 0, total: 0, turnPrompt: 0, turnCompletion: 0, turn: 0, contextLength: 0, lastPrompt: 0, turnCachedPromptTokens: 0, totalCachedPromptTokens: 0 }
+      tokenStats.set(sid, s)
+    }
+    return s
+  }
+
+  /** 指定会话累计完成的任务循环轮次（一次完整的「用户消息 → 最终回复」= 一轮，从事件日志统计，重启后自动恢复） */
+  const countCompletedTurns = (sid?: string): number => {
+    const meta = sessions.get(sid ?? currentSessionId ?? '')
     if (!meta) return 0
     return meta.session.list().filter((e) => e.type === 'turn/end').length
   }
 
-  const snapshot = (): TokenSnapshot => ({
-    totalPrompt: tokenStats.totalPrompt,
-    totalCompletion: tokenStats.totalCompletion,
-    total: tokenStats.total,
-    turnPrompt: tokenStats.turnPrompt,
-    turnCompletion: tokenStats.turnCompletion,
-    turn: tokenStats.turn,
-    contextLength: tokenStats.contextLength,
-    lastPrompt: tokenStats.lastPrompt,
-    contextUsageRatio: tokenStats.contextLength > 0 ? tokenStats.lastPrompt / tokenStats.contextLength : 0,
-    turnCount: countCompletedTurns(),
-  })
-
-  const emitTokenStats = (): void => {
-    const s = snapshot()
-    tokenCallbacks.forEach((cb) => cb(s))
+  const snapshot = (sid?: string): TokenSnapshot => {
+    const s = sessionStats(sid ?? currentSessionId ?? '')
+    // contextLength 兜底当前模型（切模型/登录后写入当前会话，未写入时用模型属性兜底）
+    const ctxLen = s.contextLength > 0 ? s.contextLength : allModels().find((m) => m.id === currentModelId)?.contextLength ?? 0
+    return {
+      totalPrompt: s.totalPrompt,
+      totalCompletion: s.totalCompletion,
+      total: s.total,
+      turnPrompt: s.turnPrompt,
+      turnCompletion: s.turnCompletion,
+      turn: s.turn,
+      contextLength: ctxLen,
+      lastPrompt: s.lastPrompt,
+      contextUsageRatio: ctxLen > 0 ? s.lastPrompt / ctxLen : 0,
+      turnCachedPromptTokens: s.turnCachedPromptTokens,
+      totalCachedPromptTokens: s.totalCachedPromptTokens,
+      cacheHitRatio: s.turnPrompt > 0 ? s.turnCachedPromptTokens / s.turnPrompt : 0,
+      turnCount: countCompletedTurns(sid),
+    }
   }
 
-  /** 每次模型返回 usage 时累计（流式末尾 / 一次性 complete 均触发） */
+  const emitTokenStats = (sid?: string): void => {
+    const target = sid ?? currentSessionId ?? ''
+    const s = snapshot(target)
+    tokenCallbacks.forEach((cb) => cb(target, s))
+  }
+
+  /** 每次模型返回 usage 时累计（流式末尾 / 一次性 complete 均触发），按发起会话隔离 */
   const onUsage = (usage: TokenUsage): void => {
-    tokenStats.totalPrompt += usage.promptTokens
-    tokenStats.totalCompletion += usage.completionTokens
-    tokenStats.total += usage.totalTokens
-    tokenStats.turnPrompt += usage.promptTokens
-    tokenStats.turnCompletion += usage.completionTokens
-    tokenStats.turn += usage.totalTokens
-    tokenStats.lastPrompt = usage.promptTokens
-    emitTokenStats()
+    const sid = sessionContext.getStore() ?? currentSessionId ?? ''
+    const s = sessionStats(sid)
+    const cached = usage.cachedPromptTokens ?? 0
+    s.totalPrompt += usage.promptTokens
+    s.totalCompletion += usage.completionTokens
+    s.total += usage.totalTokens
+    s.turnPrompt += usage.promptTokens
+    s.turnCompletion += usage.completionTokens
+    s.turn += usage.totalTokens
+    s.lastPrompt = usage.promptTokens
+    s.turnCachedPromptTokens += cached
+    s.totalCachedPromptTokens += cached
+    emitTokenStats(sid)
   }
 
-  /** 刷新当前模型的上下文窗口长度（模型切换/登录后调用） */
+  /** 刷新当前模型的上下文窗口长度（模型切换/登录后调用），写入当前会话 */
   const refreshContextLength = (): void => {
     const m = allModels().find((m) => m.id === currentModelId)
-    tokenStats.contextLength = m?.contextLength ?? 0
+    const s = sessionStats(currentSessionId ?? '')
+    s.contextLength = m?.contextLength ?? 0
     emitTokenStats()
   }
 
@@ -715,6 +781,7 @@ export async function bootstrap(): Promise<Runtime> {
   let model = await createGatewayModel(onUsage)
   let sessionRef = sessions.get(currentSessionId!)!.session
   const deltaCallbacks = new Set<(sessionId: string, text: string) => void>()
+  const reasoningCallbacks = new Set<(sessionId: string, text: string) => void>()
   refreshContextLength()
 
   // —— 登录 ——
@@ -756,11 +823,7 @@ export async function bootstrap(): Promise<Runtime> {
     if (Array.isArray(g?.customModels)) {
       customModels = g.customModels.map((m) => ({ ...m, custom: true }))
     }
-    // 恢复审批策略（安全模式）
-    if (g?.approvalPolicy === 'ask' || g?.approvalPolicy === 'never') {
-      approvalPolicy = g.approvalPolicy
-      approval.setPolicy(approvalPolicy)
-    }
+    // 审批策略（安全模式）已是会话级：从各会话事件日志回放（approval/policy 事件），无需从 config.json 全局恢复
   } catch {
     // 无凭证，未登录
   }
@@ -799,37 +862,43 @@ export async function bootstrap(): Promise<Runtime> {
     if (!meta) throw new Error(`会话不存在: ${sid}`)
     const targetSession = meta.session
     stoppedSessions.delete(sid)
-    // 本轮任务开始时清零 turn 统计，模型每次返回 usage 时重新累计
-    tokenStats.turnPrompt = 0
-    tokenStats.turnCompletion = 0
-    tokenStats.turn = 0
-    emitTokenStats()
-    let finalMessage = message
-    let finalAttachments = opts?.attachments
-    // 图片降级：当前模型不支持视觉时，先用视觉模型把图片转成文字描述，再发给当前模型
+    // 本轮任务开始时清零 turn 统计（会话级），模型每次返回 usage 时重新累计
+    const statAcc = sessionStats(sid)
+    statAcc.turnPrompt = 0
+    statAcc.turnCompletion = 0
+    statAcc.turn = 0
+    statAcc.turnCachedPromptTokens = 0
+    emitTokenStats(sid)
+    // 图片降级：当前模型不支持视觉时，先用视觉模型把图片转成文字描述，再发给当前模型。
+    // 关键：降级只影响「发给模型的内容」（modelContent），落盘的 user/message 仍保留原始文本 + 原始图片附件，
+    // 这样重启后历史记录里的图片能恢复显示，而不是变成【图片】描述文字。
+    let modelContent: string | undefined
     const currentModelMeta = gatewayModels.find((m) => m.id === currentModelId)
-    if (finalAttachments && finalAttachments.length > 0 && !modelSupportsVision(currentModelMeta)) {
+    if (opts?.attachments && opts.attachments.length > 0 && !modelSupportsVision(currentModelMeta)) {
       const parts: string[] = []
-      for (const p of finalAttachments) {
+      for (const p of opts.attachments) {
         if (p.type === 'image_url') {
           parts.push(`【图片】${await analyzeImageWithVision(p.image_url.url)}`)
         }
       }
       const desc = parts.filter(Boolean).join('\n')
-      finalMessage = message ? `${message}\n\n${desc}` : desc
-      finalAttachments = undefined
+      modelContent = message ? `${message}\n\n${desc}` : desc
     }
     const loop = new AgentLoop(model, tools, targetSession, approval, sid)
     try {
       return await sessionContext.run(sid, () =>
-        loop.run(finalMessage, {
+        loop.run(message, {
           ...opts,
           // 系统提示词告知当前工作目录：让模型知道文件/命令操作的锚点，并约束工具调用围绕工作目录
           systemPrompt: buildSystemPrompt(meta.workDir),
-          attachments: finalAttachments,
+          attachments: opts?.attachments,
+          modelContent,
           onDelta: (text) => {
             if (stoppedSessions.has(sid)) throw new Error('__stopped__')
             deltaCallbacks.forEach((cb) => cb(sid, text))
+          },
+          onReasoning: (text) => {
+            reasoningCallbacks.forEach((cb) => cb(sid, text))
           },
         }),
       )
@@ -855,6 +924,7 @@ export async function bootstrap(): Promise<Runtime> {
     credentials,
     voice,
     computerUse,
+    browserUse,
 
     loggedIn,
     username,
@@ -991,6 +1061,10 @@ export async function bootstrap(): Promise<Runtime> {
       if (target) {
         currentSessionId = id
         sessionRef = target.session
+        // 会话级审批策略：切到该会话时同步全局默认（供该会话无 approval/policy 事件时兜底）
+        approval.setPolicy(effectiveApprovalPolicy(target.session.list()) ?? 'ask')
+        // 切会话时广播该会话的 token 统计（底部状态栏会话级隔离）
+        emitTokenStats(id)
       }
     },
     renameSession(id, title) {
@@ -1004,6 +1078,13 @@ export async function bootstrap(): Promise<Runtime> {
     async deleteSession(id) {
       const meta = sessions.get(id)
       if (!meta) return
+      // 删除会话前，拒绝该会话所有待审批请求，避免 agent 永久卡在 await
+      for (const [requestId, p] of pendingApprovals) {
+        if (p.sessionId === id) {
+          p.resolve('rejected')
+          pendingApprovals.delete(requestId)
+        }
+      }
       sessions.delete(id)
       await fs.rm(join(sessionsDir, `${id}.json`), { force: true }).catch(() => undefined)
       // 当前会话被删：切到剩余第一个；无剩余则新建一个空会话
@@ -1029,16 +1110,38 @@ export async function bootstrap(): Promise<Runtime> {
       meta.workDir = trimmed
       void persistSession(meta)
     },
+    async saveUploadedFile(fileName, dataBase64) {
+      const dir = currentWorkDir()
+      await fs.mkdir(dir, { recursive: true })
+      // 防路径穿越：只取文件名（丢弃任何路径部分），加时间戳前缀避免重名覆盖
+      const safeName = `${Date.now()}-${basename(fileName || 'file')}`
+      const target = join(dir, safeName)
+      await fs.writeFile(target, Buffer.from(dataBase64, 'base64'))
+      return target
+    },
+    async listBrowserWindows(sessionId) {
+      const sid = sessionId ?? currentSessionId ?? ''
+      const all = await browserUse.list()
+      // 会话级隔离：只返回该会话（appId 等于 sid 或 sid: 前缀）的窗口
+      return all.filter((w) => w.appId === sid || w.appId.startsWith(`${sid}:`))
+    },
+    async showBrowserWindow(appId) {
+      await browserUse.show(appId)
+    },
+    async closeBrowserWindow(appId) {
+      await browserUse.close(appId)
+    },
     getSessionHistory(id) {
       const target = sessions.get(id ?? currentSessionId ?? '')
       if (!target) return []
-      const out: Array<{ kind: 'user' | 'assistant' | 'tool'; content?: string; trace?: ToolTrace; attachments?: unknown[] }> = []
+      const out: Array<{ kind: 'user' | 'assistant' | 'tool'; content?: string; reasoningContent?: string; trace?: ToolTrace; attachments?: unknown[] }> = []
       for (const e of target.session.list()) {
         if (e.type === 'user/message') {
           const d = e.data as { content: string; attachments?: unknown[] }
           out.push({ kind: 'user', content: d.content, attachments: d.attachments })
         } else if (e.type === 'assistant/message') {
-          out.push({ kind: 'assistant', content: (e.data as { content: string }).content })
+          const d = e.data as { content: string; reasoningContent?: string }
+          out.push({ kind: 'assistant', content: d.content, reasoningContent: d.reasoningContent })
         } else if (e.type === 'tool/call') {
           const d = e.data as { callId: string; name: string; args: Record<string, unknown> }
           out.push({ kind: 'tool', trace: { kind: 'tool-call', sessionId: target.id, callId: d.callId, name: d.name, args: d.args } })
@@ -1046,6 +1149,40 @@ export async function bootstrap(): Promise<Runtime> {
           const d = e.data as { callId: string; name: string; result?: unknown; error?: string }
           out.push({ kind: 'tool', trace: { kind: 'tool-result', sessionId: target.id, callId: d.callId, name: d.name, result: d.result, error: d.error } })
         }
+      }
+      return out
+    },
+    getSessionTrace(id) {
+      const target = sessions.get(id ?? currentSessionId ?? '')
+      if (!target) return []
+      const out: Array<{
+        role: 'system' | 'user' | 'assistant' | 'tool'
+        content: string
+        reasoningContent?: string
+        toolCalls?: Array<{ id: string; name: string; args: Record<string, unknown> }>
+        toolCallId?: string
+        turn: number
+        timestamp: number
+      }> = []
+      let turn = 0
+      for (const e of target.session.list()) {
+        if (e.type === 'turn/start') {
+          turn = (e.data as { turn: number }).turn
+        } else if (e.type === 'user/message') {
+          const d = e.data as { content: string; attachments?: unknown[] }
+          out.push({ role: 'user', content: d.content, turn, timestamp: e.timestamp })
+        } else if (e.type === 'assistant/message') {
+          const d = e.data as { content: string; reasoningContent?: string }
+          out.push({ role: 'assistant', content: d.content, reasoningContent: d.reasoningContent, turn, timestamp: e.timestamp })
+        } else if (e.type === 'tool/call') {
+          const d = e.data as { callId: string; name: string; args: Record<string, unknown>; reasoningContent?: string }
+          out.push({ role: 'assistant', content: '', reasoningContent: d.reasoningContent, toolCalls: [{ id: d.callId, name: d.name, args: d.args }], turn, timestamp: e.timestamp })
+        } else if (e.type === 'tool/result') {
+          const d = e.data as { callId: string; name: string; result?: unknown; error?: string }
+          const text = d.error ?? (typeof d.result === 'string' ? d.result : JSON.stringify(d.result ?? ''))
+          out.push({ role: 'tool', content: text, toolCallId: d.callId, turn, timestamp: e.timestamp })
+        }
+        // assistant/delta 是流式中间态（最终内容在 assistant/message），approval/* 为审批痕迹，轨迹面板聚焦消息痕迹
       }
       return out
     },
@@ -1091,6 +1228,13 @@ export async function bootstrap(): Promise<Runtime> {
       deltaCallbacks.add(cb)
       return () => {
         deltaCallbacks.delete(cb)
+      }
+    },
+
+    onReasoning(cb) {
+      reasoningCallbacks.add(cb)
+      return () => {
+        reasoningCallbacks.delete(cb)
       }
     },
 
@@ -1192,30 +1336,16 @@ export async function bootstrap(): Promise<Runtime> {
     },
 
     getApprovalPolicy() {
-      return approvalPolicy
+      return sessionApprovalPolicy()
     },
 
     setApprovalPolicy(policy) {
-      approvalPolicy = policy
+      const meta = currentSessionId ? sessions.get(currentSessionId) : undefined
+      if (!meta) return
+      // 会话级：向当前会话事件日志追加 approval/policy 事件（持久化到会话 JSON，重启后回放恢复）
+      meta.session.append('approval/policy', { policy })
       approval.setPolicy(policy)
-      // 持久化到 config.json（下次启动恢复）
-      void (async () => {
-        try {
-          const path = join(homedir(), '.shanhai', 'config.json')
-          let cfg: Record<string, unknown> = {}
-          try {
-            cfg = JSON.parse(await fs.readFile(path, 'utf8')) as Record<string, unknown>
-          } catch {
-            // 新文件
-          }
-          const g = (cfg.gateway as Record<string, unknown> | undefined) ?? {}
-          g.approvalPolicy = policy
-          cfg.gateway = g
-          await fs.writeFile(path, JSON.stringify(cfg, null, 2), { mode: 0o600 })
-        } catch {
-          // 忽略持久化失败
-        }
-      })()
+      void persistSession(meta)
     },
   }
 }

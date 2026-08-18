@@ -1,4 +1,5 @@
 import type { ToolContract } from '@shanhai/tools'
+import { effectiveApprovalPolicy } from '@shanhai/session'
 import type { ApprovalOutcome, ApprovalPolicy, Session } from '@shanhai/session'
 
 export interface ApprovalRequest {
@@ -34,8 +35,14 @@ export class ApprovalService {
     this.policy = policy
   }
 
-  requiresApproval(tool: ToolContract): boolean {
-    if (this.policy === 'never') return false
+  /**
+   * 判断工具是否需要审批。
+   * 传入 session 时按「会话级审批策略」判断（从该会话事件日志回放 approval/policy，缺省回退全局默认）；
+   * 不传 session 则用全局默认策略。
+   */
+  requiresApproval(tool: ToolContract, session?: Session): boolean {
+    const policy = session ? (effectiveApprovalPolicy(session.list()) ?? this.policy) : this.policy
+    if (policy === 'never') return false
     if (tool.approvalRequired === true) return true
     return tool.riskLevel === 'irreversible' || tool.riskLevel === 'high'
   }
@@ -47,8 +54,10 @@ export class ApprovalService {
       args: req.args,
       riskLevel: req.riskLevel,
     })
+    // 会话级审批策略：优先从该会话事件日志回放，缺省回退全局默认（支持并行会话各自独立的安全模式）
+    const policy = effectiveApprovalPolicy(session.list()) ?? this.policy
     let outcome: ApprovalOutcome
-    if (this.policy === 'never') {
+    if (policy === 'never') {
       outcome = 'rejected'
     } else if (!this.approver) {
       outcome = 'unavailable'
