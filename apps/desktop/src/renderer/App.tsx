@@ -1,9 +1,10 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
 interface ToolTrace {
   kind: 'tool-call' | 'tool-result'
+  sessionId: string
   callId: string
   name: string
   args?: Record<string, unknown>
@@ -15,6 +16,7 @@ interface ToolTrace {
 
 interface ApprovalRequest {
   id: string
+  sessionId?: string
   toolName: string
   args: Record<string, unknown>
   riskLevel: string
@@ -26,6 +28,7 @@ interface GatewayModel {
   tier: string
   apiKey: string
   baseUrl: string
+  custom?: boolean
 }
 
 interface ContentPart {
@@ -36,20 +39,29 @@ interface ContentPart {
   input_video?: { data: string; format: string }
 }
 
+type HistoryItem =
+  | { kind: 'user'; content?: string; attachments?: unknown[] }
+  | { kind: 'assistant'; content?: string }
+  | { kind: 'tool'; trace?: ToolTrace }
+
 declare global {
   interface Window {
     shanhai?: {
       status(): Promise<{ loggedIn: boolean; username: string | null }>
-      login(u: string, p: string): Promise<{ username: string }>
+      login(u: string, p: string): Promise<{ username: string; nickname?: string }>
       logout(): Promise<void>
       listModels(): Promise<GatewayModel[]>
+      addCustomModel(model: { name: string; baseUrl: string; apiKey: string; model: string }): Promise<GatewayModel>
+      removeCustomModel(id: string): Promise<void>
       listSessions(): Promise<Array<{ id: string; title: string }>>
+      createSession(title?: string): Promise<string>
       switchSession(id: string): Promise<void>
-      respondApproval(outcome: 'allowed-once' | 'rejected'): Promise<void>
+      getSessionHistory(id?: string): Promise<HistoryItem[]>
+      respondApproval(outcome: 'allowed-once' | 'rejected', requestId: string): Promise<void>
       run(message: string, attachments?: ContentPart[]): Promise<string>
       onApprovalRequest(cb: (req: ApprovalRequest) => void): () => void
       onToolTrace(cb: (trace: ToolTrace) => void): () => void
-      onDelta(cb: (text: string) => void): () => void
+      onDelta(cb: (sessionId: string, text: string) => void): () => void
       switchModel(id: string): Promise<void>
       getCurrentModelId(): Promise<string>
       stop(): Promise<void>
@@ -60,25 +72,52 @@ declare global {
 }
 
 type ChatItem =
-  | { kind: 'user'; content: string }
+  | { kind: 'user'; content: string; images?: string[] }
   | { kind: 'assistant'; content: string }
   | { kind: 'tool'; trace: ToolTrace }
+
+/** 每个会话独立的 UI 状态（支持并行会话：切换会话后，后台会话继续跑，互不串扰） */
+interface SessionUIState {
+  items: ChatItem[]
+  streaming: string
+  busy: boolean
+}
+
+const EMPTY_SESSION: SessionUIState = { items: [], streaming: '', busy: false }
 
 export function App() {
   const [loggedIn, setLoggedIn] = useState(false)
   const [username, setUsername] = useState<string | null>(null)
+  const [loginOpen, setLoginOpen] = useState(false)
   const [sessions, setSessions] = useState<Array<{ id: string; title: string }>>([])
+  const [currentSessionId, setCurrentSessionId] = useState('')
+  const [sessionMap, setSessionMap] = useState<Record<string, SessionUIState>>({})
+  const loadedSessions = useRef<Set<string>>(new Set())
   const [models, setModels] = useState<GatewayModel[]>([])
   const [selectedModel, setSelectedModel] = useState('')
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
+  const [addModelOpen, setAddModelOpen] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [attachments, setAttachments] = useState<Array<{ type: 'image' | 'audio' | 'video'; name: string; dataUrl: string }>>([])
   const fileRef = useRef<HTMLInputElement>(null)
-  const [items, setItems] = useState<ChatItem[]>([])
-  const [streaming, setStreaming] = useState('')
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null)
-  const [busy, setBusy] = useState(false)
   const [input, setInput] = useState('')
   const listRef = useRef<HTMLDivElement>(null)
+
+  const cur = sessionMap[currentSessionId] ?? EMPTY_SESSION
+  const systemModels = models.filter((m) => !m.custom)
+  const customModels = models.filter((m) => m.custom)
+
+  const patchSession = useCallback(
+    (id: string, patch: Partial<SessionUIState> | ((s: SessionUIState) => Partial<SessionUIState>)) => {
+      setSessionMap((prev) => {
+        const base = prev[id] ?? EMPTY_SESSION
+        const next = typeof patch === 'function' ? { ...base, ...patch(base) } : { ...base, ...patch }
+        return { ...prev, [id]: next }
+      })
+    },
+    [],
+  )
 
   useEffect(() => {
     const api = window.shanhai
@@ -86,29 +125,37 @@ export function App() {
     void api.status().then((s) => {
       setLoggedIn(s.loggedIn)
       setUsername(s.username)
-      if (s.loggedIn) {
-        void refreshSessions()
-        void api.listModels().then(async (list) => {
-          setModels(list)
-          // 恢复上次选中的模型（缓存），而不是默认第一个
-          const current = await api.getCurrentModelId()
-          setSelectedModel(current && list.some((m) => m.id === current) ? current : (list[0]?.id ?? ''))
-        })
-      }
     })
-    const offDelta = api.onDelta((text) => setStreaming((prev) => prev + text))
+    void api
+      .listSessions()
+      .then((list) => {
+        setSessions(list)
+        const first = list[0]
+        if (first) {
+          void switchToSession(first.id)
+        }
+      })
+      .catch(() => undefined)
+    void api.listModels().then(async (list) => {
+      setModels(list)
+      const current = await api.getCurrentModelId()
+      setSelectedModel(current && list.some((m) => m.id === current) ? current : (list[0]?.id ?? ''))
+    })
+    const offDelta = api.onDelta((sessionId, text) => {
+      patchSession(sessionId, (s) => ({ streaming: s.streaming + text }))
+    })
     const offTrace = api.onToolTrace((trace) => {
-      setItems((prev) => {
+      patchSession(trace.sessionId, (s) => {
         if (trace.kind === 'tool-result') {
-          const idx = [...prev].reverse().findIndex((it) => it.kind === 'tool' && it.trace.callId === trace.callId)
+          const idx = [...s.items].reverse().findIndex((it) => it.kind === 'tool' && it.trace.callId === trace.callId)
           if (idx >= 0) {
-            const arr = [...prev]
+            const arr = [...s.items]
             const realIdx = arr.length - 1 - idx
             arr[realIdx] = { kind: 'tool', trace: { ...trace, result: trace.result, error: trace.error } }
-            return arr
+            return { items: arr }
           }
         }
-        return [...prev, { kind: 'tool', trace }]
+        return { items: [...s.items, { kind: 'tool', trace }] }
       })
     })
     const offApproval = api.onApprovalRequest((req) => setPendingApproval(req))
@@ -117,39 +164,86 @@ export function App() {
       offTrace()
       offApproval()
     }
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [patchSession])
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight })
-  }, [items, streaming, pendingApproval])
+  }, [cur.items, cur.streaming, pendingApproval])
 
   async function refreshSessions(): Promise<void> {
     const list = (await window.shanhai?.listSessions()) ?? []
     setSessions(list)
   }
 
+  async function switchToSession(id: string): Promise<void> {
+    setCurrentSessionId(id)
+    setInput('')
+    setAttachments([])
+    setPendingApproval(null)
+    await window.shanhai?.switchSession(id)
+    if (loadedSessions.current.has(id)) return
+    loadedSessions.current.add(id)
+    const history = (await window.shanhai?.getSessionHistory(id)) ?? []
+    const items = historyToItems(history)
+    patchSession(id, { items, streaming: '', busy: false })
+  }
+
+  async function createSession(): Promise<void> {
+    const id = await window.shanhai?.createSession()
+    if (!id) return
+    loadedSessions.current.add(id)
+    patchSession(id, { items: [], streaming: '', busy: false })
+    setCurrentSessionId(id)
+    setInput('')
+    setAttachments([])
+    setPendingApproval(null)
+    await refreshSessions()
+  }
+
   async function handleLogin(u: string, p: string): Promise<void> {
     const r = await window.shanhai!.login(u, p)
     setLoggedIn(true)
     setUsername(r.username)
-    await refreshSessions()
+    setLoginOpen(false)
+    // 登录成功后刷新模型列表（含 apiKey/baseUrl），切换到真实网关模型
+    const list = await window.shanhai!.listModels()
+    setModels(list)
+    const current = await window.shanhai!.getCurrentModelId()
+    setSelectedModel(current && list.some((m) => m.id === current) ? current : (list[0]?.id ?? ''))
   }
 
   async function handleLogout(): Promise<void> {
     await window.shanhai?.logout()
     setLoggedIn(false)
     setUsername(null)
-    setItems([])
+    setModels([])
+    setSelectedModel('')
+  }
+
+  async function handleAddModel(input: { name: string; baseUrl: string; apiKey: string; model: string }): Promise<void> {
+    const m = await window.shanhai?.addCustomModel(input)
+    if (m) {
+      setModels((prev) => [...prev, m])
+      setSelectedModel(m.id)
+      await window.shanhai?.switchModel(m.id)
+      setModelMenuOpen(false)
+    }
+  }
+
+  async function handleRemoveModel(id: string): Promise<void> {
+    await window.shanhai?.removeCustomModel(id)
+    setModels((prev) => prev.filter((m) => m.id !== id))
+    if (selectedModel === id) setSelectedModel('')
   }
 
   async function send(): Promise<void> {
+    const sid = currentSessionId
+    if (!sid) return
     const text = input.trim()
-    if ((!text && attachments.length === 0) || busy) return
+    if ((!text && attachments.length === 0) || cur.busy) return
     setInput('')
-    setItems((prev) => [...prev, { kind: 'user', content: text }])
-    setStreaming('')
-    setBusy(true)
-    // 构造多模态 ContentPart（图片 data URL / 音频视频 base64）
+    const images = attachments.filter((a) => a.type === 'image').map((a) => a.dataUrl)
     const parts: ContentPart[] = attachments.map((a) => {
       if (a.type === 'image') return { type: 'image_url', image_url: { url: a.dataUrl } }
       const m = /^data:([^;]+);base64,(.+)$/.exec(a.dataUrl)
@@ -160,27 +254,31 @@ export function App() {
         ? { type: 'input_audio', input_audio: { data, format } }
         : { type: 'input_video', input_video: { data, format } }
     })
+    patchSession(sid, (s) => ({
+      items: [...s.items, { kind: 'user', content: text, images }],
+      streaming: '',
+      busy: true,
+    }))
+    setAttachments([])
     try {
       const result = (await window.shanhai?.run(text, parts)) ?? ''
-      setItems((prev) => [...prev, { kind: 'assistant', content: result }])
+      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: result }] }))
     } catch (err) {
-      setItems((prev) => [...prev, { kind: 'assistant', content: `错误：${String(err)}` }])
+      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }] }))
     } finally {
-      setStreaming('')
-      setBusy(false)
-      setAttachments([])
+      patchSession(sid, { streaming: '', busy: false })
     }
   }
 
   async function respondApproval(outcome: 'allowed-once' | 'rejected'): Promise<void> {
     if (pendingApproval) {
-      await window.shanhai?.respondApproval(outcome)
+      await window.shanhai?.respondApproval(outcome, pendingApproval.id)
       setPendingApproval(null)
     }
   }
 
   function speakLast(): void {
-    const last = [...items].reverse().find((it) => it.kind === 'assistant')
+    const last = [...cur.items].reverse().find((it) => it.kind === 'assistant')
     if (last && last.kind === 'assistant') {
       void window.shanhai?.speak(last.content)
     }
@@ -222,76 +320,116 @@ export function App() {
     }
   }
 
-  if (!loggedIn) {
-    return <LoginView onLogin={handleLogin} />
-  }
-
   return (
     <div style={{ display: 'flex', height: '100vh', fontFamily: 'system-ui, sans-serif' }}>
-      {/* 侧边栏：会话列表 */}
+      {/* 侧边栏：会话列表（可折叠） */}
       <aside
         style={
           {
-            width: 200,
-            borderRight: '1px solid #eee',
+            width: sidebarCollapsed ? 0 : 200,
+            borderRight: sidebarCollapsed ? 'none' : '1px solid #eee',
             background: '#f7f7f8',
             display: 'flex',
             flexDirection: 'column',
+            overflow: 'hidden',
+            transition: 'width 0.2s ease',
             WebkitAppRegion: 'drag',
           } as React.CSSProperties
         }
       >
-        <div style={{ padding: '42px 12px 12px', fontWeight: 600, fontSize: 14, WebkitAppRegion: 'no-drag' } as React.CSSProperties}>会话</div>
+        <div style={{ padding: '42px 12px 8px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+          <span style={{ fontWeight: 600, fontSize: 14 }}>会话</span>
+          <button onClick={() => void createSession()} title="新增会话" style={smallIconBtn}>
+            <IconPlus />
+          </button>
+        </div>
         <div style={{ flex: 1, overflowY: 'auto', WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
           {sessions.map((s) => (
             <div
               key={s.id}
-              onClick={() => void window.shanhai?.switchSession(s.id)}
-              style={{ padding: '8px 12px', cursor: 'pointer', fontSize: 13, color: '#333', borderBottom: '1px solid #eee' }}
+              onClick={() => void switchToSession(s.id)}
+              style={{
+                padding: '8px 12px',
+                cursor: 'pointer',
+                fontSize: 13,
+                color: '#333',
+                borderBottom: '1px solid #eee',
+                background: s.id === currentSessionId ? '#e8f1ff' : 'transparent',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+              }}
             >
-              {s.title}
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title}</span>
+              {(sessionMap[s.id]?.busy ?? false) && (
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#1677ff', flexShrink: 0, marginLeft: 6 }} />
+              )}
             </div>
           ))}
         </div>
-        {/* 侧边栏底部：账号头像 + 昵称 + 退出 */}
+        {/* 侧边栏底部：账号头像 + 昵称 + 退出（未登录点击头像弹登录窗） */}
         <div style={{ padding: 12, borderTop: '1px solid #eee', display: 'flex', alignItems: 'center', gap: 8, WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
-          <div style={{ width: 32, height: 32, borderRadius: '50%', background: '#1677ff', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+          <div
+            onClick={() => {
+              if (!loggedIn) setLoginOpen(true)
+            }}
+            title={loggedIn ? username ?? '' : '点击登录'}
+            style={{ width: 32, height: 32, borderRadius: '50%', background: loggedIn ? '#1677ff' : '#d9d9d9', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, cursor: loggedIn ? 'default' : 'pointer' }}
+          >
             <IconAvatar />
           </div>
-          <div style={{ flex: 1, minWidth: 0, fontSize: 13, fontWeight: 500, color: '#333', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {username ?? '未登录'}
+          <div
+            onClick={() => {
+              if (!loggedIn) setLoginOpen(true)
+            }}
+            style={{ flex: 1, minWidth: 0, fontSize: 13, fontWeight: 500, color: '#333', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: loggedIn ? 'default' : 'pointer' }}
+          >
+            {loggedIn ? (username ?? '已登录') : '未登录'}
           </div>
-          <button onClick={() => void handleLogout()} title="退出登录" style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#999', padding: 4, display: 'inline-flex' }}>
-            <IconLogout />
-          </button>
+          {loggedIn && (
+            <button onClick={() => void handleLogout()} title="退出登录" style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#999', padding: 4, display: 'inline-flex' }}>
+              <IconLogout />
+            </button>
+          )}
         </div>
       </aside>
 
       {/* 主区 */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative' }}>
-        {/* 顶栏（可拖拽窗口） */}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative', minWidth: 0 }}>
+        {/* 顶栏（可拖拽窗口）+ 侧边栏折叠按钮 */}
         <header
           style={
             {
               padding: '12px 16px 12px 80px',
               borderBottom: '1px solid #eee',
               display: 'flex',
-              justifyContent: 'space-between',
               alignItems: 'center',
+              gap: 10,
               WebkitAppRegion: 'drag',
             } as React.CSSProperties
           }
         >
+          <button onClick={() => setSidebarCollapsed((v) => !v)} title={sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} style={{ ...smallIconBtn, WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+            <IconSidebar />
+          </button>
           <div style={{ fontWeight: 600, fontSize: 14 }}>山海</div>
         </header>
 
         {/* 消息区 */}
         <div ref={listRef} style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: 16, background: '#fafafa' }}>
-          {items.map((it, i) => {
+          {cur.items.map((it, i) => {
             if (it.kind === 'user') {
               return (
                 <div key={i} style={{ marginBottom: 12, textAlign: 'right' }}>
-                  <span style={bubble('#1677ff', '#fff')}>{it.content}</span>
+                  {it.images?.map((img, j) => (
+                    <img
+                      key={j}
+                      src={img}
+                      alt="附件"
+                      style={{ maxWidth: 200, maxHeight: 200, borderRadius: 8, display: 'block', marginLeft: 'auto', marginBottom: 4, objectFit: 'cover' }}
+                    />
+                  ))}
+                  {it.content && <span style={bubble('#1677ff', '#fff')}>{it.content}</span>}
                 </div>
               )
             }
@@ -312,7 +450,7 @@ export function App() {
               <div key={i} style={{ marginBottom: 8, fontSize: 12 }}>
                 <div style={{ display: 'inline-flex', alignItems: 'flex-start', gap: 4, padding: '6px 10px', borderRadius: 8, background: t.error ? '#fff2f0' : '#f0f0f0', color: t.error ? '#cf1322' : '#555', maxWidth: '90%' }}>
                   {t.kind === 'tool-call' ? <IconWrench /> : <IconCheck />}
-                  <span style={{ whiteSpace: 'pre-wrap' }}>
+                  <span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
                     {t.kind === 'tool-call'
                       ? `调用工具 ${t.name}(${JSON.stringify(t.args ?? {})})`
                       : `${t.name}${t.error ? ' 出错: ' + t.error : ' → ' + JSON.stringify(t.result)}`}
@@ -321,10 +459,10 @@ export function App() {
               </div>
             )
           })}
-          {streaming && (
+          {cur.streaming && (
             <div style={{ marginBottom: 12 }}>
               <span style={bubble('#fff', '#333')}>
-                {streaming}
+                {cur.streaming}
                 <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
               </span>
             </div>
@@ -352,7 +490,7 @@ export function App() {
               需要确认危险操作
             </div>
             <div style={{ color: '#555', marginBottom: 4 }}>工具：{pendingApproval.toolName}（风险 {pendingApproval.riskLevel}）</div>
-            <div style={{ color: '#888', marginBottom: 10, whiteSpace: 'pre-wrap', fontSize: 12 }}>
+            <div style={{ color: '#888', marginBottom: 10, whiteSpace: 'pre-wrap', fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
               {JSON.stringify(pendingApproval.args, null, 2)}
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
@@ -414,12 +552,34 @@ export function App() {
                     onClick={() => setModelMenuOpen((v) => !v)}
                     style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid #ddd', fontSize: 12, color: '#555', background: '#fff', outline: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4 }}
                   >
-                    {models.find((m) => m.id === selectedModel)?.name ?? '选择模型'}
+                    {models.find((m) => m.id === selectedModel)?.name ?? (loggedIn ? '选择模型' : '未登录')}
                     <IconChevronDown />
                   </button>
                   {modelMenuOpen && (
-                    <div style={{ position: 'absolute', bottom: '110%', left: 0, minWidth: 240, maxHeight: 320, overflowY: 'auto', background: '#fff', border: '1px solid #e0e0e0', borderRadius: 10, boxShadow: '0 4px 16px rgba(0,0,0,0.12)', zIndex: 20, padding: 4 }}>
-                      {models.map((m) => (
+                    <div style={{ position: 'absolute', bottom: '110%', left: 0, minWidth: 260, maxHeight: 360, overflowY: 'auto', background: '#fff', border: '1px solid #e0e0e0', borderRadius: 10, boxShadow: '0 4px 16px rgba(0,0,0,0.12)', zIndex: 20, padding: 4 }}>
+                      <div style={{ padding: '6px 10px', fontSize: 11, color: '#999', fontWeight: 600 }}>系统内置</div>
+                      {systemModels.length === 0 ? (
+                        <div style={{ padding: '8px 10px', color: '#bbb', fontSize: 12 }}>请先登录以加载模型</div>
+                      ) : (
+                        systemModels.map((m) => (
+                          <div
+                            key={m.id}
+                            onClick={() => {
+                              setSelectedModel(m.id)
+                              void window.shanhai?.switchModel(m.id)
+                              setModelMenuOpen(false)
+                            }}
+                            style={{ padding: '8px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, color: m.id === selectedModel ? '#1677ff' : '#333', background: m.id === selectedModel ? '#f0f5ff' : 'transparent', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
+                          >
+                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</span>
+                            {m.id === selectedModel && <IconCheck />}
+                          </div>
+                        ))
+                      )}
+                      {customModels.length > 0 && (
+                        <div style={{ padding: '6px 10px', fontSize: 11, color: '#999', fontWeight: 600, marginTop: 4, borderTop: '1px solid #f0f0f0' }}>我的模型</div>
+                      )}
+                      {customModels.map((m) => (
                         <div
                           key={m.id}
                           onClick={() => {
@@ -427,11 +587,35 @@ export function App() {
                             void window.shanhai?.switchModel(m.id)
                             setModelMenuOpen(false)
                           }}
-                          style={{ padding: '8px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, color: m.id === selectedModel ? '#1677ff' : '#333', background: m.id === selectedModel ? '#f0f5ff' : 'transparent' }}
+                          style={{ padding: '8px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, color: m.id === selectedModel ? '#1677ff' : '#333', background: m.id === selectedModel ? '#f0f5ff' : 'transparent', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
                         >
-                          {m.name}
+                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</span>
+                          <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                            {m.id === selectedModel && <IconCheck />}
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                void handleRemoveModel(m.id)
+                              }}
+                              title="删除"
+                              style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#999', padding: 0, display: 'inline-flex' }}
+                            >
+                              <IconClose />
+                            </button>
+                          </span>
                         </div>
                       ))}
+                      <div style={{ borderTop: '1px solid #f0f0f0', marginTop: 4, paddingTop: 4 }}>
+                        <button
+                          onClick={() => {
+                            setModelMenuOpen(false)
+                            setAddModelOpen(true)
+                          }}
+                          style={{ width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px dashed #d9d9d9', background: '#fff', cursor: 'pointer', fontSize: 12, color: '#555', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}
+                        >
+                          <IconPlus /> 添加自定义模型
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -440,33 +624,57 @@ export function App() {
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                 <button title="语音朗读" onClick={speakLast} style={iconBtn}><IconMic /></button>
                 <button
-                  onClick={() => (busy ? stopSend() : void send())}
-                  disabled={!busy && !input.trim()}
-                  title={busy ? '停止' : '发送'}
+                  onClick={() => (cur.busy ? stopSend() : void send())}
+                  disabled={!cur.busy && !input.trim()}
+                  title={cur.busy ? '停止' : '发送'}
                   style={{
                     width: 36,
                     height: 36,
                     borderRadius: 18,
                     border: 'none',
-                    background: busy ? '#ff4d4f' : !input.trim() ? '#d9d9d9' : '#1677ff',
+                    background: cur.busy ? '#ff4d4f' : !input.trim() ? '#d9d9d9' : '#1677ff',
                     color: '#fff',
                     display: 'inline-flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    cursor: !busy && !input.trim() ? 'not-allowed' : 'pointer',
+                    cursor: !cur.busy && !input.trim() ? 'not-allowed' : 'pointer',
                     flexShrink: 0,
                   }}
                 >
-                  {busy ? <IconStop /> : <IconSend />}
+                  {cur.busy ? <IconStop /> : <IconSend />}
                 </button>
               </div>
             </div>
           </div>
         </div>
       </div>
+
+      {/* 登录弹窗（未登录时点左下角头像弹出；登录态下主界面照常可用） */}
+      {loginOpen && <LoginModal onClose={() => setLoginOpen(false)} onLogin={handleLogin} />}
+
+      {/* 添加自定义模型弹窗 */}
+      {addModelOpen && <AddModelModal onClose={() => setAddModelOpen(false)} onAdd={handleAddModel} />}
+
       <style>{`@keyframes blink { 50% { opacity: 0 } }`}</style>
     </div>
   )
+}
+
+function historyToItems(history: HistoryItem[]): ChatItem[] {
+  const out: ChatItem[] = []
+  for (const h of history) {
+    if (h.kind === 'user') {
+      const images = (h.attachments ?? [])
+        .map((a) => (a as ContentPart)?.image_url?.url)
+        .filter((x): x is string => typeof x === 'string' && x.length > 0)
+      out.push({ kind: 'user', content: h.content ?? '', images })
+    } else if (h.kind === 'assistant') {
+      out.push({ kind: 'assistant', content: h.content ?? '' })
+    } else if (h.trace) {
+      out.push({ kind: 'tool', trace: h.trace })
+    }
+  }
+  return out
 }
 
 function bubble(bg: string, color: string): React.CSSProperties {
@@ -499,6 +707,18 @@ const iconBtn: React.CSSProperties = {
   alignItems: 'center',
   justifyContent: 'center',
   color: '#555',
+}
+
+const smallIconBtn: React.CSSProperties = {
+  padding: 4,
+  borderRadius: 6,
+  border: 'none',
+  background: 'transparent',
+  cursor: 'pointer',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  color: '#666',
 }
 
 // SVG 图标（禁止字符图标，统一用内联 SVG 线条图标）
@@ -600,6 +820,31 @@ function IconChevronDown() {
   )
 }
 
+function IconSidebar() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <line x1="9" y1="4" x2="9" y2="20" />
+    </svg>
+  )
+}
+
+function IconPlus() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 5v14M5 12h14" />
+    </svg>
+  )
+}
+
+function IconClose() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18 6L6 18M6 6l12 12" />
+    </svg>
+  )
+}
+
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
@@ -609,7 +854,7 @@ function readFileAsDataUrl(file: File): Promise<string> {
   })
 }
 
-// Markdown 渲染组件（代码块高亮 / 行内代码 / 链接等）
+// Markdown 渲染组件（代码块高亮 / 行内代码 / 链接 / 图片宽度限制）
 const markdownComponents = {
   code(props: { className?: string; children?: React.ReactNode }) {
     const hasLang = /language-[\w-]+/.test(props.className ?? '')
@@ -638,7 +883,7 @@ const markdownComponents = {
   },
 }
 
-function LoginView({ onLogin }: { onLogin: (u: string, p: string) => Promise<void> }) {
+function LoginModal({ onClose, onLogin }: { onClose: () => void; onLogin: (u: string, p: string) => Promise<void> }) {
   const [u, setU] = useState('')
   const [p, setP] = useState('')
   const [err, setErr] = useState('')
@@ -658,8 +903,14 @@ function LoginView({ onLogin }: { onLogin: (u: string, p: string) => Promise<voi
   }
 
   return (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: '#f0f2f5', fontFamily: 'system-ui, sans-serif' }}>
-      <div style={{ width: 340, padding: 32, background: '#fff', borderRadius: 12, boxShadow: '0 4px 20px rgba(0,0,0,0.08)' }}>
+    <div
+      onClick={onClose}
+      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100, fontFamily: 'system-ui, sans-serif' }}
+    >
+      <div onClick={(e) => e.stopPropagation()} style={{ width: 340, padding: 32, background: '#fff', borderRadius: 12, boxShadow: '0 4px 20px rgba(0,0,0,0.15)', position: 'relative' }}>
+        <button onClick={onClose} style={{ position: 'absolute', top: 12, right: 12, border: 'none', background: 'none', cursor: 'pointer', color: '#999', padding: 4 }}>
+          <IconClose />
+        </button>
         <h1 style={{ fontSize: 20, marginBottom: 4, textAlign: 'center' }}>山海</h1>
         <p style={{ fontSize: 13, color: '#888', textAlign: 'center', marginBottom: 24 }}>账号密码登录</p>
         <input
@@ -679,12 +930,76 @@ function LoginView({ onLogin }: { onLogin: (u: string, p: string) => Promise<voi
           placeholder="密码"
           style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #ddd', fontSize: 14, marginBottom: 12, boxSizing: 'border-box', outline: 'none' }}
         />
-        {err && <p style={{ color: '#ff4d4f', fontSize: 12, marginBottom: 8 }}>{err}</p>}
+        {err && <p style={{ color: '#ff4d4f', fontSize: 12, marginBottom: 8, wordBreak: 'break-word' }}>{err}</p>}
         <button onClick={() => void submit()} disabled={loading} style={{ width: '100%', padding: 10, borderRadius: 8, border: 'none', background: '#1677ff', color: '#fff', fontSize: 14, cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.6 : 1 }}>
           {loading ? '登录中…' : '登录'}
         </button>
         <p style={{ fontSize: 11, color: '#bbb', textAlign: 'center', marginTop: 16 }}>密码仅在登录瞬间使用，绝不落盘</p>
       </div>
+    </div>
+  )
+}
+
+function AddModelModal({ onClose, onAdd }: { onClose: () => void; onAdd: (m: { name: string; baseUrl: string; apiKey: string; model: string }) => Promise<void> }) {
+  const [name, setName] = useState('')
+  const [baseUrl, setBaseUrl] = useState('')
+  const [apiKey, setApiKey] = useState('')
+  const [model, setModel] = useState('')
+  const [err, setErr] = useState('')
+  const [loading, setLoading] = useState(false)
+
+  async function submit(): Promise<void> {
+    if (!name || !baseUrl || !apiKey || !model) {
+      setErr('请填写完整：名称、端点、API Key、模型参数')
+      return
+    }
+    setLoading(true)
+    setErr('')
+    try {
+      await onAdd({ name, baseUrl, apiKey, model })
+      onClose()
+    } catch (e) {
+      setErr(String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div
+      onClick={onClose}
+      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 110, fontFamily: 'system-ui, sans-serif' }}
+    >
+      <div onClick={(e) => e.stopPropagation()} style={{ width: 360, padding: 28, background: '#fff', borderRadius: 12, boxShadow: '0 4px 20px rgba(0,0,0,0.15)', position: 'relative' }}>
+        <button onClick={onClose} style={{ position: 'absolute', top: 12, right: 12, border: 'none', background: 'none', cursor: 'pointer', color: '#999', padding: 4 }}>
+          <IconClose />
+        </button>
+        <h2 style={{ fontSize: 17, marginBottom: 4, textAlign: 'center' }}>添加自定义模型</h2>
+        <p style={{ fontSize: 12, color: '#888', textAlign: 'center', marginBottom: 20 }}>接入你自己的 OpenAI 兼容端点</p>
+        <Field label="名称" value={name} onChange={setName} placeholder="例如：我的 GPT-4o" />
+        <Field label="端点 (baseUrl)" value={baseUrl} onChange={setBaseUrl} placeholder="https://api.openai.com/v1" />
+        <Field label="API Key" value={apiKey} onChange={setApiKey} placeholder="sk-..." password />
+        <Field label="模型参数 (model)" value={model} onChange={setModel} placeholder="gpt-4o" />
+        {err && <p style={{ color: '#ff4d4f', fontSize: 12, marginBottom: 8, wordBreak: 'break-word' }}>{err}</p>}
+        <button onClick={() => void submit()} disabled={loading} style={{ width: '100%', padding: 10, borderRadius: 8, border: 'none', background: '#1677ff', color: '#fff', fontSize: 14, cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.6 : 1 }}>
+          {loading ? '保存中…' : '保存'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function Field({ label, value, onChange, placeholder, password }: { label: string; value: string; onChange: (v: string) => void; placeholder?: string; password?: boolean }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 12, color: '#666', marginBottom: 4 }}>{label}</div>
+      <input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        type={password ? 'password' : 'text'}
+        placeholder={placeholder}
+        style={{ width: '100%', padding: 9, borderRadius: 8, border: '1px solid #ddd', fontSize: 13, boxSizing: 'border-box', outline: 'none' }}
+      />
     </div>
   )
 }

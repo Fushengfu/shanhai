@@ -6,6 +6,8 @@ export interface ApprovalRequest {
   toolName: string
   args: Record<string, unknown>
   riskLevel: string
+  /** 发起审批的会话 id（并行会话时用于路由展示） */
+  sessionId?: string
 }
 
 export type Approver = (req: ApprovalRequest) => ApprovalOutcome | Promise<ApprovalOutcome>

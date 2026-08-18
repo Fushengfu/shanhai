@@ -88,12 +88,23 @@ interface GatewayChoice {
   }
 }
 
+/**
+ * 拼接 chat/completions 完整 URL，兼容两种 baseUrl：
+ * - `https://aigateway.bjctykj.com`（不带后缀）→ 拼 /api/v1/chat/completions
+ * - `https://aigateway.bjctykj.com/api/v1`（带后缀）→ 拼 /chat/completions
+ */
+function chatCompletionsUrl(baseUrl: string): string {
+  const b = baseUrl.replace(/\/+$/, '')
+  if (/\/api\/v\d+$/.test(b) || /\/v\d+$/.test(b)) return `${b}/chat/completions`
+  return `${b}/api/v1/chat/completions`
+}
+
 /** DeepSeek provider：网关 OpenAI 兼容 /api/v1/chat/completions（fetch） */
 export class DeepSeekProvider implements Model {
   constructor(private readonly opts: DeepSeekOptions) {}
 
   async complete(messages: ChatMessage[], tools?: ToolContract[]): Promise<ModelResponse> {
-    const res = await fetch(`${this.opts.baseUrl.replace(/\/$/, '')}/api/v1/chat/completions`, {
+    const res = await fetch(chatCompletionsUrl(this.opts.baseUrl), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -114,12 +125,21 @@ export class DeepSeekProvider implements Model {
     // 网关响应：{ code, data: { choices: [...] } } 包装（兼容裸 OpenAI 格式）
     const raw = (await res.json()) as {
       code?: number
+      error?: string | { message?: string }
       data?: {
         choices?: GatewayChoice[]
         usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
       }
       choices?: GatewayChoice[]
       usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+    }
+    // 网关返回错误（如模型不支持 image_url 多模态），响亮抛错，不静默吞
+    if (raw.error) {
+      const msg = typeof raw.error === 'string' ? raw.error : (raw.error.message ?? JSON.stringify(raw.error))
+      throw new Error(msg)
+    }
+    if (raw.code !== undefined && raw.code !== 0) {
+      throw new Error(`gateway error code ${raw.code}`)
     }
     const payload = raw.data ?? raw
     const usage = payload.usage
@@ -146,7 +166,7 @@ export class DeepSeekProvider implements Model {
 
   /** SSE 流式：逐行解析，累积工具调用 arguments 分片，产出 text 增量 + 完整 toolCall */
   async *stream(messages: ChatMessage[], tools?: ToolContract[]): AsyncIterable<StreamChunk> {
-    const res = await fetch(`${this.opts.baseUrl.replace(/\/$/, '')}/api/v1/chat/completions`, {
+    const res = await fetch(chatCompletionsUrl(this.opts.baseUrl), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -220,30 +240,37 @@ interface SseDeltaEvent {
   toolCall?: { id?: string; name?: string; argsDelta?: string }
 }
 
-/** 解析单行 SSE `data: {...}`，返回 text 增量或 tool_calls 分片 */
+/** 解析单行 SSE `data: {...}`，返回 text 增量或 tool_calls 分片；网关返回 error 时抛错 */
 function parseSseLine(line: string): SseDeltaEvent | null {
   const trimmed = line.trim()
   if (!trimmed.startsWith('data:')) return null
   const data = trimmed.slice(5).trim()
   if (!data || data === '[DONE]') return null
-  try {
-    const parsed = JSON.parse(data) as {
-      choices?: Array<{
-        delta?: {
-          content?: string
-          tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>
-        }
-      }>
-    }
-    const delta = parsed.choices?.[0]?.delta
-    const text = typeof delta?.content === 'string' && delta.content ? delta.content : undefined
-    const tc = delta?.tool_calls?.[0]
-    const toolCall = tc ? { id: tc.id, name: tc.function?.name, argsDelta: tc.function?.arguments ?? '' } : undefined
-    if (text === undefined && !toolCall) return null
-    return { text, toolCall }
-  } catch {
-    return null
+  let parsed: {
+    error?: string | { message?: string }
+    choices?: Array<{
+      delta?: {
+        content?: string
+        tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>
+      }
+    }>
   }
+  try {
+    parsed = JSON.parse(data)
+  } catch {
+    return null // 非 JSON（如注释行），忽略
+  }
+  // 网关返回错误（如模型不支持 image_url 多模态），响亮抛错，不静默吞
+  if (parsed.error) {
+    const msg = typeof parsed.error === 'string' ? parsed.error : (parsed.error.message ?? JSON.stringify(parsed.error))
+    throw new Error(msg)
+  }
+  const delta = parsed.choices?.[0]?.delta
+  const text = typeof delta?.content === 'string' && delta.content ? delta.content : undefined
+  const tc = delta?.tool_calls?.[0]
+  const toolCall = tc ? { id: tc.id, name: tc.function?.name, argsDelta: tc.function?.arguments ?? '' } : undefined
+  if (text === undefined && !toolCall) return null
+  return { text, toolCall }
 }
 
 function safeParse(json: string): Record<string, unknown> {

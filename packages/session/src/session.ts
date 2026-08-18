@@ -24,7 +24,8 @@ export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unava
 export interface EventData {
   'turn/start': { turn: number }
   'turn/end': { turn: number; text: string }
-  'user/message': { content: string }
+  /** content 为文本；attachments 为多模态附件（图片/音频/视频），会话回放时一并还原 */
+  'user/message': { content: string; attachments?: unknown[] }
   'assistant/delta': { text: string }
   'assistant/message': { content: string }
   'tool/call': { callId: string; name: string; args: Record<string, unknown> }
@@ -51,6 +52,14 @@ export class Session {
 
   list(): SessionEvent[] {
     return [...this.events]
+  }
+
+  /** 从历史事件恢复（会话持久化加载用），返回恢复的事件数 */
+  restore(events: SessionEvent[]): number {
+    for (const e of events) {
+      this.events.push(e as SessionEvent)
+    }
+    return events.length
   }
 }
 

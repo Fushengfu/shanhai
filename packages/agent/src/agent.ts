@@ -26,6 +26,7 @@ export class AgentLoop {
     private readonly tools: ToolContract[],
     private readonly session: Session,
     private readonly approval: ApprovalService,
+    private readonly sessionId?: string,
   ) {}
 
   async run(message: string, options?: AgentLoopOptions): Promise<string> {
@@ -36,7 +37,12 @@ export class AgentLoop {
     // 从 session 事件日志回放历史（多轮对话 + 断点续跑：中断后历史仍在 session）
     for (const e of this.session.list()) {
       if (e.type === 'user/message') {
-        messages.push({ role: 'user', content: (e.data as { content: string }).content })
+        const d = e.data as { content: string; attachments?: ContentPart[] }
+        if (d.attachments && d.attachments.length > 0) {
+          messages.push({ role: 'user', content: [{ type: 'text', text: d.content }, ...d.attachments] })
+        } else {
+          messages.push({ role: 'user', content: d.content })
+        }
       } else if (e.type === 'assistant/message') {
         messages.push({ role: 'assistant', content: (e.data as { content: string }).content })
       } else if (e.type === 'tool/call') {
@@ -48,9 +54,9 @@ export class AgentLoop {
       }
     }
 
-    // 追加当前消息（含多模态附件）
-    this.session.append('user/message', { content: message })
+    // 追加当前消息（含多模态附件，附件一并写入事件日志，回放时还原）
     const attachments = options?.attachments
+    this.session.append('user/message', { content: message, attachments: (attachments ?? []) as unknown[] })
     if (attachments && attachments.length > 0) {
       messages.push({ role: 'user', content: [{ type: 'text', text: message }, ...attachments] })
     } else {
@@ -111,6 +117,7 @@ export class AgentLoop {
         toolName: call.name,
         args: call.args,
         riskLevel: tool.riskLevel,
+        sessionId: this.sessionId,
       })
       if (outcome !== 'allowed-once') {
         const error = `approval ${outcome}`

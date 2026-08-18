@@ -8,11 +8,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 
 let runtime: Runtime | null = null
 
-/** 主进程 → 渲染进程 事件推送（流式增量 / 工具过程 / 审批请求） */
+/** 主进程 → 渲染进程 事件推送（流式增量 / 工具过程 / 审批请求，均带 sessionId 路由） */
 function registerPush(win: BrowserWindow): void {
   if (!runtime) return
-  runtime.onDelta((text) => {
-    if (!win.isDestroyed()) win.webContents.send('chat:delta', text)
+  runtime.onDelta((sessionId, text) => {
+    if (!win.isDestroyed()) win.webContents.send('chat:delta', sessionId, text)
   })
   runtime.onToolTrace((trace) => {
     if (!win.isDestroyed()) win.webContents.send('tool:trace', trace)
@@ -29,13 +29,17 @@ function registerIpc(): void {
   ipcMain.handle('auth:logout', async () => runtime!.logout())
   ipcMain.handle('auth:listModels', async () => runtime!.listModels())
   ipcMain.handle('session:list', async () => runtime!.listSessions())
+  ipcMain.handle('session:create', async (_e, title?: string) => runtime!.createSession(title))
   ipcMain.handle('session:switch', async (_e, id: string) => runtime!.switchSession(id))
-  ipcMain.handle('approval:respond', async (_e, outcome: 'allowed-once' | 'rejected') => runtime!.respondApproval(outcome))
+  ipcMain.handle('session:history', async (_e, id?: string) => runtime!.getSessionHistory(id))
+  ipcMain.handle('approval:respond', async (_e, outcome: 'allowed-once' | 'rejected', requestId: string) => runtime!.respondApproval(outcome, requestId))
   ipcMain.handle('chat:run', async (_e, message: string, attachments?: Array<Record<string, unknown>>) =>
     runtime!.run(message, { attachments: attachments as never }),
   )
   ipcMain.handle('model:switch', async (_e, id: string) => runtime!.switchModel(id))
   ipcMain.handle('model:current', async () => runtime!.getCurrentModelId())
+  ipcMain.handle('model:addCustom', async (_e, input: { name: string; baseUrl: string; apiKey: string; model: string }) => runtime!.addCustomModel(input))
+  ipcMain.handle('model:removeCustom', async (_e, id: string) => runtime!.removeCustomModel(id))
   ipcMain.handle('chat:stop', async () => runtime!.stop())
   ipcMain.handle('voice:speak', async (_e, text: string) => {
     await runtime!.voice.synthesize(text)
