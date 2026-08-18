@@ -127,6 +127,21 @@ export interface Runtime {
 
   /** 跑一次任务（端到端 ReAct，支持多模态附件；绑定当前会话，切换会话后后台继续跑） */
   run(message: string, opts?: { maxSteps?: number; attachments?: ContentPart[] }): Promise<string>
+
+  /**
+   * 重新发送某条用户消息（参考 DSH / taco 的 resendFromExisting）：
+   * 截断到该用户消息之前，重新生成回复。newContent 传了则用新内容（编辑后重发）。
+   * userMessageIndex 为该会话内用户消息的序号（0 起）。
+   */
+  resend(sessionId: string, userMessageIndex: number, newContent?: string): Promise<string>
+  /** 继续执行：把最后一条用户消息重新生成（断点恢复 / 中断后续跑） */
+  resume(sessionId: string): Promise<string>
+  /** 会话是否存在「未完成的消息」（最后一条用户消息之后没有 assistant/message 或 turn/end） */
+  hasIncompleteTurn(sessionId: string): boolean
+  /** 当前审批策略（安全模式） */
+  getApprovalPolicy(): 'ask' | 'never'
+  /** 切换审批策略（安全模式），并持久化到本地 */
+  setApprovalPolicy(policy: 'ask' | 'never'): void
 }
 
 /** 从本地凭证装配真实网关模型；无凭证则 mock 兜底 */
@@ -379,6 +394,9 @@ function keyCode(key: string): number {
   return map[key.toLowerCase()] ?? 0
 }
 
+/** 单条工具结果持久化时允许的最大字符数（超过则截断，防止 read_file 大文件 / run_command 大输出撑爆会话 JSON） */
+const MAX_RESULT_CHARS = 20000
+
 /** 持久化前降级附件：base64 图片/音视频数据不落盘（几 MB 会撑爆 JSON），只保留类型标记 */
 function sanitizeAttachment(a: unknown): unknown {
   if (typeof a !== 'object' || a === null) return a
@@ -432,13 +450,24 @@ export async function bootstrap(): Promise<Runtime> {
   async function persistSession(meta: SessionMeta): Promise<void> {
     try {
       await fs.mkdir(sessionsDir, { recursive: true })
-      // 持久化前清理：
-      // 1) 丢弃 assistant/delta（流式增量冗余，最终 assistant/message 已含完整内容，避免 JSON 随对话膨胀）
+      // 持久化前清理（防止会话 JSON 随对话无限膨胀）：
+      // 1) 丢弃 assistant/delta（流式增量冗余，最终 assistant/message 已含完整内容）
       // 2) 附件 base64 降级为占位（几 MB 图片/音视频不落盘，模型回放本来就用占位符）
+      // 3) tool/result 的 result/error 超长截断（read_file 读大文件、run_command 大量输出会撑爆 JSON）
       const events = meta.session
         .list()
         .filter((e) => e.type !== 'assistant/delta')
         .map((e) => {
+          if (e.type === 'tool/result') {
+            const d = e.data as { callId: string; name: string; result?: unknown; error?: string }
+            const trunc = (v: unknown): unknown => {
+              if (typeof v === 'string' && v.length > MAX_RESULT_CHARS) {
+                return `${v.slice(0, MAX_RESULT_CHARS)}\n…（结果过长已截断，共 ${v.length} 字）`
+              }
+              return v
+            }
+            return { ...e, data: { ...d, result: trunc(d.result), error: d.error ? trunc(d.error) : d.error } }
+          }
           if (e.type !== 'user/message') return e
           const d = e.data as { content: string; attachments?: unknown[] }
           if (!Array.isArray(d.attachments) || d.attachments.length === 0) return e
@@ -506,6 +535,9 @@ export async function bootstrap(): Promise<Runtime> {
       pendingApprovals.set(req.id, { resolve })
     })
   })
+
+  // 审批策略（安全模式）：ask=危险操作每次询问，never=从不询问直接执行；持久化到 config.json
+  let approvalPolicy: 'ask' | 'never' = 'ask'
 
   // —— 能力实例（提前创建，供工具使用）——
   const computerUse = createSystemComputerUseService()
@@ -695,7 +727,15 @@ export async function bootstrap(): Promise<Runtime> {
   try {
     const raw = await fs.readFile(join(homedir(), '.shanhai', 'config.json'), 'utf8')
     const cfg = JSON.parse(raw) as {
-      gateway?: { apiKey?: string; baseUrl?: string; selectedModelId?: string; account?: { username?: string; nickname?: string }; models?: GatewayModel[]; customModels?: GatewayModel[] }
+      gateway?: {
+        apiKey?: string
+        baseUrl?: string
+        selectedModelId?: string
+        account?: { username?: string; nickname?: string }
+        models?: GatewayModel[]
+        customModels?: GatewayModel[]
+        approvalPolicy?: 'ask' | 'never'
+      }
     }
     const g = cfg.gateway
     if (g?.apiKey) {
@@ -715,6 +755,11 @@ export async function bootstrap(): Promise<Runtime> {
     // 恢复用户自定义模型（标记 custom: true，登录态无关）
     if (Array.isArray(g?.customModels)) {
       customModels = g.customModels.map((m) => ({ ...m, custom: true }))
+    }
+    // 恢复审批策略（安全模式）
+    if (g?.approvalPolicy === 'ask' || g?.approvalPolicy === 'never') {
+      approvalPolicy = g.approvalPolicy
+      approval.setPolicy(approvalPolicy)
     }
   } catch {
     // 无凭证，未登录
@@ -740,6 +785,66 @@ export async function bootstrap(): Promise<Runtime> {
     provide: ['agent'],
     apply: (ctx) => ctx.provide('agent', () => new AgentLoop(model, tools, sessionRef, approval)),
   })
+
+  /**
+   * 在指定会话内跑一次任务（run / resend / resume 共用）。
+   * 图片降级 + ReAct 循环 + 中断处理 + 落盘。
+   */
+  const runInSession = async (
+    sid: string,
+    message: string,
+    opts?: { maxSteps?: number; attachments?: ContentPart[] },
+  ): Promise<string> => {
+    const meta = sessions.get(sid)
+    if (!meta) throw new Error(`会话不存在: ${sid}`)
+    const targetSession = meta.session
+    stoppedSessions.delete(sid)
+    // 本轮任务开始时清零 turn 统计，模型每次返回 usage 时重新累计
+    tokenStats.turnPrompt = 0
+    tokenStats.turnCompletion = 0
+    tokenStats.turn = 0
+    emitTokenStats()
+    let finalMessage = message
+    let finalAttachments = opts?.attachments
+    // 图片降级：当前模型不支持视觉时，先用视觉模型把图片转成文字描述，再发给当前模型
+    const currentModelMeta = gatewayModels.find((m) => m.id === currentModelId)
+    if (finalAttachments && finalAttachments.length > 0 && !modelSupportsVision(currentModelMeta)) {
+      const parts: string[] = []
+      for (const p of finalAttachments) {
+        if (p.type === 'image_url') {
+          parts.push(`【图片】${await analyzeImageWithVision(p.image_url.url)}`)
+        }
+      }
+      const desc = parts.filter(Boolean).join('\n')
+      finalMessage = message ? `${message}\n\n${desc}` : desc
+      finalAttachments = undefined
+    }
+    const loop = new AgentLoop(model, tools, targetSession, approval, sid)
+    try {
+      return await sessionContext.run(sid, () =>
+        loop.run(finalMessage, {
+          ...opts,
+          // 系统提示词告知当前工作目录：让模型知道文件/命令操作的锚点，并约束工具调用围绕工作目录
+          systemPrompt: buildSystemPrompt(meta.workDir),
+          attachments: finalAttachments,
+          onDelta: (text) => {
+            if (stoppedSessions.has(sid)) throw new Error('__stopped__')
+            deltaCallbacks.forEach((cb) => cb(sid, text))
+          },
+        }),
+      )
+    } catch (err) {
+      if (err instanceof Error && err.message === '__stopped__') {
+        return '（已中断，历史已保留，可点击「继续执行」续跑）'
+      }
+      throw err
+    } finally {
+      // 会话事件（用户消息/助手回复/工具过程）已追加到 session，立即落盘，重启不丢
+      await persistSession(meta)
+      // 刷新底部状态栏（累计轮次随 turn/end 变化，成功/失败/中断后都要同步）
+      emitTokenStats()
+    }
+  }
 
   return {
     kernel,
@@ -1020,55 +1125,97 @@ export async function bootstrap(): Promise<Runtime> {
     run: async (message, opts) => {
       const sid = currentSessionId
       if (!sid) throw new Error('没有活动会话')
-      const meta = sessions.get(sid)
-      if (!meta) throw new Error(`会话不存在: ${sid}`)
-      const targetSession = meta.session
-      stoppedSessions.delete(sid)
-      // 本轮任务开始时清零 turn 统计，模型每次返回 usage 时重新累计
-      tokenStats.turnPrompt = 0
-      tokenStats.turnCompletion = 0
-      tokenStats.turn = 0
-      emitTokenStats()
-      let finalMessage = message
-      let finalAttachments = opts?.attachments
-      // 图片降级：当前模型不支持视觉时，先用视觉模型把图片转成文字描述，再发给当前模型
-      const currentModelMeta = gatewayModels.find((m) => m.id === currentModelId)
-      if (finalAttachments && finalAttachments.length > 0 && !modelSupportsVision(currentModelMeta)) {
-        const parts: string[] = []
-        for (const p of finalAttachments) {
-          if (p.type === 'image_url') {
-            parts.push(`【图片】${await analyzeImageWithVision(p.image_url.url)}`)
+      return runInSession(sid, message, opts)
+    },
+
+    resend: async (sessionId, userMessageIndex, newContent) => {
+      const meta = sessions.get(sessionId)
+      if (!meta) throw new Error(`会话不存在: ${sessionId}`)
+      const events = meta.session.list()
+      // 定位第 userMessageIndex 条用户消息（0 起），拿到原内容
+      let userCount = 0
+      let targetIdx = -1
+      let originalContent = ''
+      for (let i = 0; i < events.length; i++) {
+        const e = events[i]
+        if (e?.type === 'user/message') {
+          if (userCount === userMessageIndex) {
+            targetIdx = i
+            originalContent = (e.data as { content: string }).content
+            break
           }
+          userCount++
         }
-        const desc = parts.filter(Boolean).join('\n')
-        finalMessage = message ? `${message}\n\n${desc}` : desc
-        finalAttachments = undefined
       }
-      const loop = new AgentLoop(model, tools, targetSession, approval, sid)
-      try {
-        return await sessionContext.run(sid, () =>
-          loop.run(finalMessage, {
-            ...opts,
-            // 系统提示词告知当前工作目录：让模型知道文件/命令操作的锚点，并约束工具调用围绕工作目录
-            systemPrompt: buildSystemPrompt(meta.workDir),
-            attachments: finalAttachments,
-            onDelta: (text) => {
-              if (stoppedSessions.has(sid)) throw new Error('__stopped__')
-              deltaCallbacks.forEach((cb) => cb(sid, text))
-            },
-          }),
-        )
-      } catch (err) {
-        if (err instanceof Error && err.message === '__stopped__') {
-          return '（已中断，历史已保留，可继续输入以续跑）'
+      if (targetIdx < 0) throw new Error(`用户消息不存在: #${userMessageIndex}`)
+      const content = newContent !== undefined ? newContent : originalContent
+      // 截断到该用户消息之前（丢弃它及其后的回复/工具过程），重新生成
+      meta.session.truncate(targetIdx)
+      return runInSession(sessionId, content)
+    },
+
+    resume: async (sessionId) => {
+      const meta = sessions.get(sessionId)
+      if (!meta) throw new Error(`会话不存在: ${sessionId}`)
+      const events = meta.session.list()
+      let lastUserIdx = -1
+      for (let i = events.length - 1; i >= 0; i--) {
+        if (events[i]?.type === 'user/message') {
+          lastUserIdx = i
+          break
         }
-        throw err
-      } finally {
-        // 会话事件（用户消息/助手回复/工具过程）已追加到 session，立即落盘，重启不丢
-        await persistSession(meta)
-        // 刷新底部状态栏（累计轮次随 turn/end 变化，成功/失败/中断后都要同步）
-        emitTokenStats()
       }
+      if (lastUserIdx < 0) throw new Error('没有可继续的消息')
+      const content = (events[lastUserIdx]!.data as { content: string }).content
+      meta.session.truncate(lastUserIdx)
+      return runInSession(sessionId, content)
+    },
+
+    hasIncompleteTurn(sessionId) {
+      const meta = sessions.get(sessionId)
+      if (!meta) return false
+      const events = meta.session.list()
+      let lastUserIdx = -1
+      for (let i = events.length - 1; i >= 0; i--) {
+        if (events[i]?.type === 'user/message') {
+          lastUserIdx = i
+          break
+        }
+      }
+      if (lastUserIdx < 0) return false
+      // 该用户消息之后若已有 assistant/message 或 turn/end，说明本轮已完成
+      for (let i = lastUserIdx + 1; i < events.length; i++) {
+        const t = events[i]?.type
+        if (t === 'assistant/message' || t === 'turn/end') return false
+      }
+      return true
+    },
+
+    getApprovalPolicy() {
+      return approvalPolicy
+    },
+
+    setApprovalPolicy(policy) {
+      approvalPolicy = policy
+      approval.setPolicy(policy)
+      // 持久化到 config.json（下次启动恢复）
+      void (async () => {
+        try {
+          const path = join(homedir(), '.shanhai', 'config.json')
+          let cfg: Record<string, unknown> = {}
+          try {
+            cfg = JSON.parse(await fs.readFile(path, 'utf8')) as Record<string, unknown>
+          } catch {
+            // 新文件
+          }
+          const g = (cfg.gateway as Record<string, unknown> | undefined) ?? {}
+          g.approvalPolicy = policy
+          cfg.gateway = g
+          await fs.writeFile(path, JSON.stringify(cfg, null, 2), { mode: 0o600 })
+        } catch {
+          // 忽略持久化失败
+        }
+      })()
     },
   }
 }

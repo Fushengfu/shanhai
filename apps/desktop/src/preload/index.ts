@@ -69,7 +69,13 @@ export interface ShanhaiBridge {
   onToolTrace(cb: (trace: ToolTrace) => void): () => void
   // 聊天
   run(message: string, attachments?: ContentPart[]): Promise<string>
+  resend(sessionId: string, userMessageIndex: number, newContent?: string): Promise<string>
+  resume(sessionId: string): Promise<string>
+  hasIncompleteTurn(sessionId: string): Promise<boolean>
   onDelta(cb: (sessionId: string, text: string) => void): () => void
+  // 审批策略（安全模式）
+  getApprovalPolicy(): Promise<'ask' | 'never'>
+  setApprovalPolicy(policy: 'ask' | 'never'): Promise<void>
   // 模型 / 中断 / 语音 / 电脑
   switchModel(id: string): Promise<void>
   getCurrentModelId(): Promise<string>
@@ -100,6 +106,11 @@ const bridge: ShanhaiBridge = {
   getSessionHistory: (id) => ipcRenderer.invoke('session:history', id),
   respondApproval: (outcome, requestId) => ipcRenderer.invoke('approval:respond', outcome, requestId),
   run: (message, attachments) => ipcRenderer.invoke('chat:run', message, attachments),
+  resend: (sessionId, userMessageIndex, newContent) => ipcRenderer.invoke('chat:resend', sessionId, userMessageIndex, newContent),
+  resume: (sessionId) => ipcRenderer.invoke('chat:resume', sessionId),
+  hasIncompleteTurn: (sessionId) => ipcRenderer.invoke('session:incomplete', sessionId),
+  getApprovalPolicy: () => ipcRenderer.invoke('approval:getPolicy'),
+  setApprovalPolicy: (policy) => ipcRenderer.invoke('approval:setPolicy', policy),
   switchModel: (id) => ipcRenderer.invoke('model:switch', id),
   getCurrentModelId: () => ipcRenderer.invoke('model:current'),
   stop: () => ipcRenderer.invoke('chat:stop'),

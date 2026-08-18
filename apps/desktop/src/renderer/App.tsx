@@ -79,6 +79,11 @@ declare global {
       getSessionHistory(id?: string): Promise<HistoryItem[]>
       respondApproval(outcome: 'allowed-once' | 'rejected', requestId: string): Promise<void>
       run(message: string, attachments?: ContentPart[]): Promise<string>
+      resend(sessionId: string, userMessageIndex: number, newContent?: string): Promise<string>
+      resume(sessionId: string): Promise<string>
+      hasIncompleteTurn(sessionId: string): Promise<boolean>
+      getApprovalPolicy(): Promise<'ask' | 'never'>
+      setApprovalPolicy(policy: 'ask' | 'never'): Promise<void>
       onApprovalRequest(cb: (req: ApprovalRequest) => void): () => void
       onToolTrace(cb: (trace: ToolTrace) => void): () => void
       onDelta(cb: (sessionId: string, text: string) => void): () => void
@@ -129,6 +134,16 @@ export function App() {
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null)
   const [input, setInput] = useState('')
   const listRef = useRef<HTMLDivElement>(null)
+  // 安全模式（审批策略）：ask=危险操作每次询问，never=从不询问直接执行
+  const [approvalPolicy, setApprovalPolicyState] = useState<'ask' | 'never'>('ask')
+  const [approvalMenuOpen, setApprovalMenuOpen] = useState(false)
+  const approvalMenuRef = useRef<HTMLDivElement>(null)
+  // 当前会话是否有「未完成的消息」（用于显示「继续执行」按钮）
+  const [incompleteTurn, setIncompleteTurn] = useState(false)
+  // 消息队列：任务执行中提交的新消息进入队列，任务完成后自动执行（队列模式）
+  const pendingQueue = useRef<Record<string, Array<{ text: string; parts: ContentPart[]; images: string[] }>>>({})
+  // 当前会话排队中的消息数（UI 提示「排队中 N 条」）
+  const [queueCount, setQueueCount] = useState(0)
 
   const cur = sessionMap[currentSessionId] ?? EMPTY_SESSION
   const systemModels = models.filter((m) => !m.custom)
@@ -189,6 +204,7 @@ export function App() {
     const offApproval = api.onApprovalRequest((req) => setPendingApproval(req))
     const offToken = api.onTokenStats((s) => setTokenStats(s))
     void api.getTokenStats().then((s) => setTokenStats(s)).catch(() => undefined)
+    void api.getApprovalPolicy().then((p) => setApprovalPolicyState(p)).catch(() => undefined)
     return () => {
       offDelta()
       offTrace()
@@ -213,6 +229,18 @@ export function App() {
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
   }, [modelMenuOpen])
+
+  // 安全模式下拉：点击窗口其他位置时关闭
+  useEffect(() => {
+    if (!approvalMenuOpen) return
+    function onDown(e: MouseEvent): void {
+      if (approvalMenuRef.current && !approvalMenuRef.current.contains(e.target as Node)) {
+        setApprovalMenuOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [approvalMenuOpen])
 
   async function refreshSessions(): Promise<void> {
     const list = (await window.shanhai?.listSessions()) ?? []
@@ -263,6 +291,10 @@ export function App() {
     setAttachments([])
     setPendingApproval(null)
     await window.shanhai?.switchSession(id)
+    // 检查是否有未完成的消息（决定是否显示「继续执行」按钮）
+    const incomplete = (await window.shanhai?.hasIncompleteTurn(id)) ?? false
+    setIncompleteTurn(incomplete)
+    setQueueCount(pendingQueue.current[id]?.length ?? 0)
     if (loadedSessions.current.has(id)) return
     loadedSessions.current.add(id)
     const history = (await window.shanhai?.getSessionHistory(id)) ?? []
@@ -325,12 +357,39 @@ export function App() {
     if (selectedModel === id) setSelectedModel('')
   }
 
+  /** 切换安全模式（审批策略）并持久化 */
+  function switchApprovalPolicy(policy: 'ask' | 'never'): void {
+    setApprovalPolicyState(policy)
+    setApprovalMenuOpen(false)
+    void window.shanhai?.setApprovalPolicy(policy)
+  }
+
+  /** 队列模式：任务执行中提交的消息进入队列，任务完成后自动逐条执行（对齐 taco 的 addToQueue/injectQueuedMessage） */
+  async function doRun(sid: string, text: string, parts: ContentPart[], images: string[]): Promise<void> {
+    patchSession(sid, (s) => ({ items: [...s.items, { kind: 'user', content: text, images }], streaming: '', busy: true }))
+    try {
+      const result = (await window.shanhai?.run(text, parts)) ?? ''
+      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: result }] }))
+    } catch (err) {
+      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }] }))
+    } finally {
+      patchSession(sid, { streaming: '', busy: false })
+      setIncompleteTurn(false)
+      // 出队：执行队列中下一条消息
+      const q = pendingQueue.current[sid]
+      if (q && q.length > 0) {
+        const next = q.shift()!
+        if (sid === currentSessionId) setQueueCount(q.length)
+        void doRun(sid, next.text, next.parts, next.images)
+      }
+    }
+  }
+
   async function send(): Promise<void> {
     const sid = currentSessionId
     if (!sid) return
     const text = input.trim()
-    if ((!text && attachments.length === 0) || cur.busy) return
-    setInput('')
+    if (!text && attachments.length === 0) return
     const images = attachments.filter((a) => a.type === 'image').map((a) => a.dataUrl)
     const parts: ContentPart[] = attachments.map((a) => {
       if (a.type === 'image') return { type: 'image_url', image_url: { url: a.dataUrl } }
@@ -342,20 +401,15 @@ export function App() {
         ? { type: 'input_audio', input_audio: { data, format } }
         : { type: 'input_video', input_video: { data, format } }
     })
-    patchSession(sid, (s) => ({
-      items: [...s.items, { kind: 'user', content: text, images }],
-      streaming: '',
-      busy: true,
-    }))
+    setInput('')
     setAttachments([])
-    try {
-      const result = (await window.shanhai?.run(text, parts)) ?? ''
-      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: result }] }))
-    } catch (err) {
-      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }] }))
-    } finally {
-      patchSession(sid, { streaming: '', busy: false })
+    if (cur.busy) {
+      // 当前任务执行中：新消息进入队列，任务完成后自动执行（队列模式，不丢弃）
+      pendingQueue.current[sid] = [...(pendingQueue.current[sid] ?? []), { text, parts, images }]
+      setQueueCount(pendingQueue.current[sid].length)
+      return
     }
+    void doRun(sid, text, parts, images)
   }
 
   async function respondApproval(outcome: 'allowed-once' | 'rejected'): Promise<void> {
@@ -365,9 +419,48 @@ export function App() {
     }
   }
 
-  /** 点击「重新发送」：把历史用户消息填回输入框（不自动发送，用户确认后 Enter 发送，避免误触计费） */
-  function resendMessage(text: string): void {
-    setInput(text)
+  /** 重新发送：截断到该用户消息重新生成（对齐 taco 的 resendFromExisting，直接重发，不填回输入框） */
+  function resendMessage(userIndex: number): void {
+    const sid = currentSessionId
+    if (!sid) return
+    // 先从前端视图移除该消息及其后的回复，再走后端截断 + 重跑
+    void window.shanhai?.resend(sid, userIndex).then((result) => {
+      patchSession(sid, (s) => {
+        // 前端重新加载历史，拿到截断后的最新状态
+        return { items: s.items, streaming: '', busy: false }
+      })
+      void reloadSessionItems(sid, result)
+    }).catch((err) => {
+      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }] }))
+    })
+  }
+
+  /** 编辑后重发：截断到该消息，用新内容重新生成 */
+  function editResend(userIndex: number, newContent: string): void {
+    const sid = currentSessionId
+    if (!sid) return
+    void window.shanhai?.resend(sid, userIndex, newContent).then((result) => {
+      void reloadSessionItems(sid, result)
+    }).catch((err) => {
+      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }] }))
+    })
+  }
+
+  /** 继续执行：把最后一条未完成的用户消息重新生成（断点恢复） */
+  function resumeMessage(): void {
+    const sid = currentSessionId
+    if (!sid) return
+    void window.shanhai?.resume(sid).then((result) => {
+      void reloadSessionItems(sid, result)
+    }).catch((err) => {
+      patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }] }))
+    })
+  }
+
+  /** 从后端重新拉取会话历史，刷新前端视图（重发/编辑/续跑后截断状态与后端对齐） */
+  async function reloadSessionItems(sid: string, _result: string): Promise<void> {
+    const history = (await window.shanhai?.getSessionHistory(sid)) ?? []
+    patchSession(sid, { items: historyToItems(history), streaming: '', busy: false })
   }
 
   function speakLast(): void {
@@ -510,17 +603,21 @@ export function App() {
 
         {/* 消息区 */}
         <div ref={listRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: 16, background: '#fafafa' }}>
-          {cur.items.map((it, i) => {
-            if (it.kind === 'user') {
-              return <UserMessage key={i} content={it.content} images={it.images} onResend={resendMessage} />
-            }
-            if (it.kind === 'assistant') {
-              return <AssistantMessage key={i} content={it.content} />
-            }
-            // 工具过程（按类型渲染：调用 / 完成 / 出错，点击展开查看详情）
-            const t = it.trace
-            return <ToolStep key={i} trace={t} />
-          })}
+          {(() => {
+            let userIdx = 0
+            return cur.items.map((it, i) => {
+              if (it.kind === 'user') {
+                const idx = userIdx++
+                return <UserMessage key={i} content={it.content} images={it.images} userIndex={idx} busy={cur.busy} onResend={resendMessage} onEditResend={editResend} />
+              }
+              if (it.kind === 'assistant') {
+                return <AssistantMessage key={i} content={it.content} />
+              }
+              // 工具过程（按类型渲染：调用 / 完成 / 出错，点击展开查看详情）
+              const t = it.trace
+              return <ToolStep key={i} trace={t} />
+            })
+          })()}
           {cur.busy && !cur.streaming && (
             <div style={{ marginBottom: 8 }}>
               <span style={bubble('#fff', '#333')}>
@@ -535,6 +632,18 @@ export function App() {
                 {cur.streaming}
                 <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
               </span>
+            </div>
+          )}
+          {incompleteTurn && !cur.busy && (
+            <div style={{ marginBottom: 8 }}>
+              <button
+                onClick={resumeMessage}
+                title="上次任务未完成，点击继续执行"
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 14px', borderRadius: 14, border: '1px solid #1677ff', background: '#fff', color: '#1677ff', fontSize: 13, cursor: 'pointer' }}
+              >
+                <IconRefresh />
+                继续执行
+              </button>
             </div>
           )}
         </div>
@@ -599,6 +708,12 @@ export function App() {
               </div>
             )}
             <input ref={fileRef} type="file" accept="image/*,audio/*,video/*" multiple style={{ display: 'none' }} onChange={(e) => void handleFileSelect(e)} />
+            {queueCount > 0 && (
+              <div style={{ marginBottom: 6, fontSize: 12, color: '#fa8c16', display: 'flex', alignItems: 'center', gap: 4 }}>
+                <IconClock />
+                排队中 {queueCount} 条消息，将在当前任务完成后自动执行
+              </div>
+            )}
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -699,6 +814,39 @@ export function App() {
                   <IconEdit />
                 </button>
                 <button title="操作电脑" onClick={() => void window.shanhai?.screenshot()} style={iconBtn}><IconMonitor /></button>
+                <div ref={approvalMenuRef} style={{ position: 'relative' }}>
+                  <button
+                    onClick={() => setApprovalMenuOpen((v) => !v)}
+                    title="安全模式（审批策略）"
+                    style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid #ddd', fontSize: 12, color: approvalPolicy === 'never' ? '#fa8c16' : '#555', background: '#fff', outline: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                  >
+                    <IconShield />
+                    {approvalPolicy === 'ask' ? '每次询问' : '自动执行'}
+                    <IconChevronDown />
+                  </button>
+                  {approvalMenuOpen && (
+                    <div style={{ position: 'absolute', bottom: '110%', left: 0, minWidth: 180, background: '#fff', border: '1px solid #e0e0e0', borderRadius: 10, boxShadow: '0 4px 16px rgba(0,0,0,0.12)', zIndex: 20, padding: 4 }}>
+                      <div style={{ padding: '6px 10px', fontSize: 11, color: '#999', fontWeight: 600 }}>安全模式</div>
+                      <div
+                        onClick={() => switchApprovalPolicy('ask')}
+                        style={{ padding: '8px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, color: approvalPolicy === 'ask' ? '#1677ff' : '#333', background: approvalPolicy === 'ask' ? '#f0f5ff' : 'transparent', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
+                      >
+                        <span>每次询问（推荐）</span>
+                        {approvalPolicy === 'ask' && <IconCheck />}
+                      </div>
+                      <div
+                        onClick={() => switchApprovalPolicy('never')}
+                        style={{ padding: '8px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, color: approvalPolicy === 'never' ? '#fa8c16' : '#333', background: approvalPolicy === 'never' ? '#fff7e6' : 'transparent', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
+                      >
+                        <span>自动执行（不询问）</span>
+                        {approvalPolicy === 'never' && <IconCheck />}
+                      </div>
+                      <div style={{ padding: '4px 10px 6px', fontSize: 10, color: '#bbb', lineHeight: 1.5 }}>
+                        「自动执行」下危险操作将不再弹窗确认
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                 <button title="语音朗读" onClick={speakLast} style={iconBtn}><IconMic /></button>
@@ -938,6 +1086,23 @@ function IconChevronDown() {
   return (
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M6 9l6 6 6-6" />
+    </svg>
+  )
+}
+
+function IconShield() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+    </svg>
+  )
+}
+
+function IconClock() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 6v6l4 2" />
     </svg>
   )
 }
@@ -1599,11 +1764,11 @@ interface MessageAction {
   run: () => void | Promise<void>
 }
 
-/** 消息图标操作行（参考 DSH MessageIconActions / taco：固定显示在气泡下方，图标按钮 + 点击后对勾反馈） */
+/** 消息图标操作行（参考 taco 的 msg-actions：常显在气泡下方，图标按钮 + 点击后对勾反馈） */
 function MessageActions({ actions }: { actions: MessageAction[] }) {
   const [done, setDone] = useState<string | null>(null)
   return (
-    <div style={{ display: 'flex', gap: 2, marginTop: 4, opacity: 0.5, transition: 'opacity .15s' }}>
+    <div style={{ display: 'flex', gap: 2, marginTop: 4, opacity: 0.85, transition: 'opacity .15s' }}>
       {actions.map((a) => (
         <button
           key={a.key}
@@ -1626,24 +1791,67 @@ function MessageActions({ actions }: { actions: MessageAction[] }) {
   )
 }
 
-/** 用户消息气泡：右对齐，气泡下方固定显示「复制 / 重新发送」图标操作 */
-function UserMessage({ content, images, onResend }: { content: string; images?: string[]; onResend: (text: string) => void }) {
+/** 用户消息气泡：右对齐，气泡下方常显「编辑 / 复制 / 重新发送」；编辑为内联编辑（Enter 确认 / Esc 取消，参考 taco） */
+function UserMessage({ content, images, userIndex, busy, onResend, onEditResend }: {
+  content: string
+  images?: string[]
+  userIndex: number
+  busy: boolean
+  onResend: (userIndex: number) => void
+  onEditResend: (userIndex: number, newContent: string) => void
+}) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(content)
+
+  const confirmEdit = (): void => {
+    const text = draft.trim()
+    setEditing(false)
+    if (text && text !== content) onEditResend(userIndex, text)
+  }
+
   return (
     <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
       {images?.map((img, j) => (
         <img key={j} src={img} alt="附件" style={{ maxWidth: 200, maxHeight: 200, borderRadius: 8, display: 'block', marginBottom: 4, objectFit: 'cover' }} />
       ))}
-      {content ? (
+      {editing ? (
+        <div style={{ width: '100%', maxWidth: '85%', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault()
+                confirmEdit()
+              } else if (e.key === 'Escape') {
+                setEditing(false)
+                setDraft(content)
+              }
+            }}
+            autoFocus
+            rows={3}
+            style={{ width: '100%', padding: '8px 14px', borderRadius: 12, border: '1px solid #1677ff', fontSize: 14, lineHeight: 1.6, resize: 'none', outline: 'none', boxSizing: 'border-box', fontFamily: 'inherit', background: '#fff', color: '#333', display: 'block' }}
+          />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: '#999' }}>
+            <span>Enter 确认 · Esc 取消</span>
+            <button onClick={confirmEdit} style={{ padding: '4px 12px', borderRadius: 6, border: 'none', background: '#1677ff', color: '#fff', fontSize: 12, cursor: 'pointer' }}>确认</button>
+            <button onClick={() => { setEditing(false); setDraft(content) }} style={{ padding: '4px 12px', borderRadius: 6, border: '1px solid #ddd', background: '#fff', color: '#555', fontSize: 12, cursor: 'pointer' }}>取消</button>
+          </div>
+        </div>
+      ) : content ? (
         <>
           <div style={{ maxWidth: '70%', padding: '8px 14px', borderRadius: 16, borderBottomRightRadius: 4, background: '#1677ff', color: '#fff', fontSize: 14, lineHeight: 1.6, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
             {content}
           </div>
-          <MessageActions
-            actions={[
-              { key: 'copy', icon: <IconCopy />, label: '复制', run: () => copyText(content) },
-              { key: 'resend', icon: <IconRefresh />, label: '重新发送', run: () => onResend(content) },
-            ]}
-          />
+          {!busy && (
+            <MessageActions
+              actions={[
+                { key: 'edit', icon: <IconEdit />, label: '编辑', run: () => { setEditing(true); setDraft(content) } },
+                { key: 'copy', icon: <IconCopy />, label: '复制', run: () => copyText(content) },
+                { key: 'resend', icon: <IconRefresh />, label: '重新发送', run: () => onResend(userIndex) },
+              ]}
+            />
+          )}
         </>
       ) : null}
     </div>

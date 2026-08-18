@@ -43,6 +43,13 @@ function registerIpc(): void {
   ipcMain.handle('chat:run', async (_e, message: string, attachments?: Array<Record<string, unknown>>) =>
     runtime!.run(message, { attachments: attachments as never }),
   )
+  ipcMain.handle('chat:resend', async (_e, sessionId: string, userMessageIndex: number, newContent?: string) =>
+    runtime!.resend(sessionId, userMessageIndex, newContent),
+  )
+  ipcMain.handle('chat:resume', async (_e, sessionId: string) => runtime!.resume(sessionId))
+  ipcMain.handle('session:incomplete', async (_e, sessionId: string) => runtime!.hasIncompleteTurn(sessionId))
+  ipcMain.handle('approval:getPolicy', async () => runtime!.getApprovalPolicy())
+  ipcMain.handle('approval:setPolicy', async (_e, policy: 'ask' | 'never') => runtime!.setApprovalPolicy(policy))
   ipcMain.handle('model:switch', async (_e, id: string) => runtime!.switchModel(id))
   ipcMain.handle('model:current', async () => runtime!.getCurrentModelId())
   ipcMain.handle('token:stats', async () => runtime!.getTokenStats())

@@ -21,8 +21,18 @@ export type Approver = (req: ApprovalRequest) => ApprovalOutcome | Promise<Appro
 export class ApprovalService {
   constructor(
     private readonly approver?: Approver,
-    private readonly policy: ApprovalPolicy = 'ask',
+    private policy: ApprovalPolicy = 'ask',
   ) {}
+
+  /** 当前审批策略（安全模式） */
+  getPolicy(): ApprovalPolicy {
+    return this.policy
+  }
+
+  /** 运行时切换审批策略：ask=危险操作每次询问，never=从不询问直接执行 */
+  setPolicy(policy: ApprovalPolicy): void {
+    this.policy = policy
+  }
 
   requiresApproval(tool: ToolContract): boolean {
     if (this.policy === 'never') return false

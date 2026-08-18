@@ -61,6 +61,19 @@ export class Session {
     }
     return events.length
   }
+
+  /**
+   * 截断事件日志：只保留前 count 条，丢弃其后的所有事件。
+   * 用于「重新发送 / 编辑后重发」——把某条用户消息及其之后的回复/工具过程裁掉，重新生成。
+   * 返回被删除的事件数。
+   */
+  truncate(count: number): number {
+    if (count < 0) count = 0
+    if (count >= this.events.length) return 0
+    const removed = this.events.length - count
+    this.events.length = count
+    return removed
+  }
 }
 
 /** 从事件日志回放，得出当前生效的审批策略（最近一条 approval/policy） */
