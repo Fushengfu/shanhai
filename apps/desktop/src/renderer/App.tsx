@@ -50,6 +50,7 @@ interface TokenSnapshot {
   contextLength: number
   lastPrompt: number
   contextUsageRatio: number
+  turnCount: number
 }
 
 type HistoryItem =
@@ -74,6 +75,7 @@ declare global {
       deleteSession(id: string): Promise<void>
       getSessionWorkdir(id?: string): Promise<string>
       setSessionWorkdir(id: string, workdir: string): Promise<void>
+      selectDirectory(defaultPath?: string): Promise<string | null>
       getSessionHistory(id?: string): Promise<HistoryItem[]>
       respondApproval(outcome: 'allowed-once' | 'rejected', requestId: string): Promise<void>
       run(message: string, attachments?: ContentPart[]): Promise<string>
@@ -120,8 +122,6 @@ export function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null)
   const [editingTitle, setEditingTitle] = useState('')
-  const [editingWorkdir, setEditingWorkdir] = useState(false)
-  const [workdirInput, setWorkdirInput] = useState('')
   const modelMenuRef = useRef<HTMLDivElement>(null)
   const [tokenStats, setTokenStats] = useState<TokenSnapshot | null>(null)
   const [attachments, setAttachments] = useState<Array<{ type: 'image' | 'audio' | 'video'; name: string; dataUrl: string }>>([])
@@ -133,6 +133,8 @@ export function App() {
   const cur = sessionMap[currentSessionId] ?? EMPTY_SESSION
   const systemModels = models.filter((m) => !m.custom)
   const customModels = models.filter((m) => m.custom)
+  const workDir = sessions.find((s) => s.id === currentSessionId)?.workDir ?? ''
+  const workDirName = workDir ? (workDir.split(/[\\/]/).filter(Boolean).pop() ?? '工作目录') : '选择目录'
 
   const patchSession = useCallback(
     (id: string, patch: Partial<SessionUIState> | ((s: SessionUIState) => Partial<SessionUIState>)) => {
@@ -239,14 +241,20 @@ export function App() {
     }
   }
 
-  async function saveWorkdir(): Promise<void> {
+  async function saveWorkdir(wd: string): Promise<void> {
+    const sid = currentSessionId
+    if (!sid || !wd) return
+    await window.shanhai?.setSessionWorkdir(sid, wd)
+    setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, workDir: wd } : s)))
+  }
+
+  async function pickWorkdir(): Promise<void> {
     const sid = currentSessionId
     if (!sid) return
-    const wd = workdirInput.trim()
-    if (!wd) return
-    await window.shanhai?.setSessionWorkdir(sid, wd)
-    setEditingWorkdir(false)
-    setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, workDir: wd } : s)))
+    const current = sessions.find((s) => s.id === sid)?.workDir ?? ''
+    const picked = await window.shanhai?.selectDirectory(current)
+    if (!picked) return
+    await saveWorkdir(picked)
   }
 
   async function switchToSession(id: string): Promise<void> {
@@ -357,6 +365,11 @@ export function App() {
     }
   }
 
+  /** 点击「重新发送」：把历史用户消息填回输入框（不自动发送，用户确认后 Enter 发送，避免误触计费） */
+  function resendMessage(text: string): void {
+    setInput(text)
+  }
+
   function speakLast(): void {
     const last = [...cur.items].reverse().find((it) => it.kind === 'assistant')
     if (last && last.kind === 'assistant') {
@@ -401,7 +414,7 @@ export function App() {
   }
 
   return (
-    <div style={{ display: 'flex', height: '100vh', fontFamily: 'system-ui, sans-serif' }}>
+    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', fontFamily: 'system-ui, sans-serif' }}>
       {/* 侧边栏：会话列表（可折叠） */}
       <aside
         style={
@@ -475,7 +488,7 @@ export function App() {
       </aside>
 
       {/* 主区 */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative', minWidth: 0 }}>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative', minWidth: 0, minHeight: 0, overflow: 'hidden' }}>
         {/* 顶栏（可拖拽窗口）+ 侧边栏折叠按钮 */}
         <header
           style={
@@ -493,94 +506,31 @@ export function App() {
             <IconSidebar />
           </button>
           <div style={{ fontWeight: 600, fontSize: 14 }}>山海</div>
-          {/* 当前会话工作目录：默认 ~/shanhai/workspace，可点击修改 */}
-          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6, WebkitAppRegion: 'no-drag', minWidth: 0 } as React.CSSProperties}>
-            {editingWorkdir ? (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <input
-                  value={workdirInput}
-                  onChange={(e) => setWorkdirInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') void saveWorkdir()
-                    if (e.key === 'Escape') setEditingWorkdir(false)
-                  }}
-                  autoFocus
-                  placeholder="工作目录绝对路径"
-                  style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #1677ff', fontSize: 12, width: 260, outline: 'none' }}
-                />
-                <button onClick={() => void saveWorkdir()} style={{ ...iconBtn, border: '1px solid #1677ff', color: '#1677ff' }} title="保存">
-                  <IconCheck />
-                </button>
-                <button onClick={() => setEditingWorkdir(false)} style={iconBtn} title="取消">
-                  <IconClose />
-                </button>
-              </div>
-            ) : (
-              <button
-                onClick={() => {
-                  const wd = sessions.find((s) => s.id === currentSessionId)?.workDir ?? ''
-                  setWorkdirInput(wd)
-                  setEditingWorkdir(true)
-                }}
-                title="修改工作目录"
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 8, border: '1px solid #eee', background: '#fafafa', fontSize: 12, color: '#888', cursor: 'pointer', maxWidth: 320, overflow: 'hidden' }}
-              >
-                <IconFolder />
-                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {sessions.find((s) => s.id === currentSessionId)?.workDir ?? ''}
-                </span>
-                <IconEdit />
-              </button>
-            )}
-          </div>
         </header>
 
         {/* 消息区 */}
-        <div ref={listRef} style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: 16, background: '#fafafa' }}>
+        <div ref={listRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: 16, background: '#fafafa' }}>
           {cur.items.map((it, i) => {
             if (it.kind === 'user') {
-              return (
-                <div key={i} style={{ marginBottom: 12, textAlign: 'right' }}>
-                  {it.images?.map((img, j) => (
-                    <img
-                      key={j}
-                      src={img}
-                      alt="附件"
-                      style={{ maxWidth: 200, maxHeight: 200, borderRadius: 8, display: 'block', marginLeft: 'auto', marginBottom: 4, objectFit: 'cover' }}
-                    />
-                  ))}
-                  {it.content && <span style={bubble('#1677ff', '#fff')}>{it.content}</span>}
-                </div>
-              )
+              return <UserMessage key={i} content={it.content} images={it.images} onResend={resendMessage} />
             }
             if (it.kind === 'assistant') {
-              return (
-                <div key={i} style={{ marginBottom: 12 }}>
-                  <div style={{ display: 'inline-block', maxWidth: '85%', minWidth: 0, padding: '10px 14px', borderRadius: 12, background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,0.08)', fontSize: 14, lineHeight: 1.6, color: '#333', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                      {it.content}
-                    </ReactMarkdown>
-                  </div>
-                </div>
-              )
+              return <AssistantMessage key={i} content={it.content} />
             }
-            // 工具过程（按类型显示：调用 / 结果）
+            // 工具过程（按类型渲染：调用 / 完成 / 出错，点击展开查看详情）
             const t = it.trace
-            return (
-              <div key={i} style={{ marginBottom: 8, fontSize: 12 }}>
-                <div style={{ display: 'inline-flex', alignItems: 'flex-start', gap: 4, padding: '6px 10px', borderRadius: 8, background: t.error ? '#fff2f0' : '#f0f0f0', color: t.error ? '#cf1322' : '#555', maxWidth: '90%' }}>
-                  {t.kind === 'tool-call' ? <IconWrench /> : <IconCheck />}
-                  <span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-                    {t.kind === 'tool-call'
-                      ? `调用工具 ${t.name}(${JSON.stringify(t.args ?? {})})`
-                      : `${t.name}${t.error ? ' 出错: ' + t.error : ' → ' + JSON.stringify(t.result)}`}
-                  </span>
-                </div>
-              </div>
-            )
+            return <ToolStep key={i} trace={t} />
           })}
+          {cur.busy && !cur.streaming && (
+            <div style={{ marginBottom: 8 }}>
+              <span style={bubble('#fff', '#333')}>
+                思考中
+                <ThinkingDots />
+              </span>
+            </div>
+          )}
           {cur.streaming && (
-            <div style={{ marginBottom: 12 }}>
+            <div style={{ marginBottom: 8 }}>
               <span style={bubble('#fff', '#333')}>
                 {cur.streaming}
                 <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
@@ -610,8 +560,8 @@ export function App() {
               需要确认危险操作
             </div>
             <div style={{ color: '#555', marginBottom: 4 }}>工具：{pendingApproval.toolName}（风险 {pendingApproval.riskLevel}）</div>
-            <div style={{ color: '#888', marginBottom: 10, whiteSpace: 'pre-wrap', fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-              {JSON.stringify(pendingApproval.args, null, 2)}
+            <div style={{ color: '#555', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+              {formatArgs(pendingApproval.args)}
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
               <button onClick={() => void respondApproval('allowed-once')} style={btn('#1677ff', '#fff')}>
@@ -739,6 +689,15 @@ export function App() {
                     </div>
                   )}
                 </div>
+                <button
+                  onClick={() => void pickWorkdir()}
+                  title={`工作目录：${workDir || '未设置'}（点击选择目录）`}
+                  style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid #ddd', fontSize: 12, color: '#555', background: '#fff', outline: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: 150 }}
+                >
+                  <IconFolder />
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{workDirName}</span>
+                  <IconEdit />
+                </button>
                 <button title="操作电脑" onClick={() => void window.shanhai?.screenshot()} style={iconBtn}><IconMonitor /></button>
               </div>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
@@ -790,7 +749,7 @@ export function App() {
         />
       )}
 
-      <style>{`@keyframes blink { 50% { opacity: 0 } } @keyframes slideIn { from { transform: translateX(100%) } to { transform: translateX(0) } }`}</style>
+      <style>{`html, body, #root { margin: 0; height: 100%; overflow: hidden; } @keyframes blink { 50% { opacity: 0 } } @keyframes slideIn { from { transform: translateX(100%) } to { transform: translateX(0) } } @keyframes bounce { 0%, 80%, 100% { transform: translateY(0); opacity: 0.35 } 40% { transform: translateY(-3px); opacity: 1 } }`}</style>
     </div>
   )
 }
@@ -810,6 +769,34 @@ function historyToItems(history: HistoryItem[]): ChatItem[] {
     }
   }
   return out
+}
+
+/** 把工具参数渲染成友好键值对（长字符串截断，避免直接甩 JSON） */
+function formatArgs(args: Record<string, unknown> | undefined): React.ReactNode {
+  if (!args || Object.keys(args).length === 0) return <span style={{ color: '#999' }}>（无参数）</span>
+  const entries = Object.entries(args)
+  return (
+    <div>
+      {entries.map(([k, v]) => (
+        <div key={k} style={{ marginBottom: 2 }}>
+          <span style={{ color: '#8c8c8c' }}>{k}：</span>
+          <span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>{prettyValue(v)}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function prettyValue(v: unknown): string {
+  if (v === null || v === undefined) return '（空）'
+  if (typeof v === 'string') return v.length > 300 ? `${v.slice(0, 300)}…（共 ${v.length} 字）` : v
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+  try {
+    const s = JSON.stringify(v)
+    return s.length > 300 ? `${s.slice(0, 300)}…` : s
+  } catch {
+    return String(v)
+  }
 }
 
 function bubble(bg: string, color: string): React.CSSProperties {
@@ -1008,6 +995,62 @@ function IconTrash() {
   )
 }
 
+function IconCopy() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </svg>
+  )
+}
+
+function IconRefresh() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <path d="M21 2v6h-6" />
+      <path d="M21 8a9 9 0 1 0 2 5" />
+    </svg>
+  )
+}
+
+function IconTerminal() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <path d="M4 17l6-6-6-6" />
+      <path d="M12 19h8" />
+    </svg>
+  )
+}
+
+function IconFile() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+      <path d="M14 2v6h6" />
+    </svg>
+  )
+}
+
+function IconTree() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M3 10h18" />
+      <path d="M9 10v10" />
+    </svg>
+  )
+}
+
+function IconImage() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+      <circle cx="8.5" cy="8.5" r="1.5" />
+      <path d="M21 15l-5-5L5 21" />
+    </svg>
+  )
+}
+
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
@@ -1017,7 +1060,57 @@ function readFileAsDataUrl(file: File): Promise<string> {
   })
 }
 
+/** 思考中提示：三个依次跳动的点 */
+function ThinkingDots() {
+  return (
+    <span style={{ display: 'inline-flex', gap: 3, marginLeft: 4, verticalAlign: 'middle', alignItems: 'flex-end' }}>
+      {[0, 1, 2].map((i) => (
+        <span
+          key={i}
+          style={{
+            width: 5,
+            height: 5,
+            borderRadius: '50%',
+            background: '#999',
+            display: 'inline-block',
+            animation: `bounce 1.4s ${i * 0.18}s infinite ease-in-out`,
+          }}
+        />
+      ))}
+    </span>
+  )
+}
+
 // Markdown 渲染组件（代码块高亮 / 行内代码 / 链接 / 图片宽度限制）
+function extractCodeText(children: React.ReactNode): string {
+  if (typeof children === 'string') return children
+  if (Array.isArray(children)) return children.map((c) => (typeof c === 'string' ? c : '')).join('')
+  return ''
+}
+
+/** 代码块：深色高亮 + 右上角「复制代码」按钮（点击后对勾反馈） */
+function CodeBlock({ children }: { children?: React.ReactNode }) {
+  const [copied, setCopied] = useState(false)
+  const text = extractCodeText(children)
+  return (
+    <div style={{ position: 'relative', margin: '8px 0' }}>
+      <button
+        onClick={() => {
+          void copyText(text)
+          setCopied(true)
+          window.setTimeout(() => setCopied(false), 1200)
+        }}
+        style={{ position: 'absolute', top: 8, right: 8, padding: '2px 8px', borderRadius: 6, border: '1px solid rgba(255,255,255,0.18)', background: 'rgba(255,255,255,0.08)', color: '#abb2bf', fontSize: 11, cursor: 'pointer', zIndex: 2 }}
+      >
+        {copied ? '✓ 已复制' : '复制'}
+      </button>
+      <pre style={{ background: '#282c34', color: '#abb2bf', padding: '12px 12px 12px 12px', borderRadius: 8, overflowX: 'auto', fontSize: 13, lineHeight: 1.55, margin: 0 }}>
+        <code style={{ fontFamily: 'ui-monospace, monospace' }}>{children}</code>
+      </pre>
+    </div>
+  )
+}
+
 const markdownComponents = {
   code(props: { className?: string; children?: React.ReactNode }) {
     const hasLang = /language-[\w-]+/.test(props.className ?? '')
@@ -1028,11 +1121,7 @@ const markdownComponents = {
         </code>
       )
     }
-    return (
-      <pre style={{ background: '#282c34', color: '#abb2bf', padding: 12, borderRadius: 8, overflowX: 'auto', fontSize: 13, lineHeight: 1.55, margin: '8px 0' }}>
-        <code style={{ fontFamily: 'ui-monospace, monospace' }}>{props.children}</code>
-      </pre>
-    )
+    return <CodeBlock>{props.children}</CodeBlock>
   },
   a(props: { href?: string; children?: React.ReactNode }) {
     return (
@@ -1201,6 +1290,9 @@ function TokenStatusBar({ stats }: { stats: TokenSnapshot | null }) {
       <span title="当前这轮任务消耗的 token">
         本轮 <b style={{ color: '#1677ff' }}>{fmtTokens(stats.turn)}</b>
       </span>
+      <span title="当前会话累计完成的任务循环轮次（一次完整的「用户消息 → 最终回复」算一轮）">
+        轮次 <b style={{ color: '#1677ff' }}>{stats.turnCount}</b>
+      </span>
       <span title="当前会话上下文窗口占用（最近一次请求的 prompt token / 模型上下文长度）" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
         上下文
         <span style={{ width: 120, height: 6, borderRadius: 3, background: '#f0f0f0', overflow: 'hidden', display: 'inline-block' }}>
@@ -1221,6 +1313,22 @@ function fmtTokens(n: number): string {
   return String(n)
 }
 
+/** 预置服务商（OpenAI 兼容端点）：用户只需选服务商 + 填密钥，baseUrl/模型由服务商预设 */
+const MODEL_PROVIDERS: Array<{ id: string; name: string; baseUrl: string; models: string[] }> = [
+  { id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', models: ['deepseek-chat', 'deepseek-reasoner'] },
+  { id: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'o3-mini'] },
+  { id: 'qwen', name: '通义千问 Qwen', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', models: ['qwen-max', 'qwen-plus', 'qwen-turbo', 'qwen-long'] },
+  { id: 'kimi', name: 'Kimi (Moonshot)', baseUrl: 'https://api.moonshot.cn/v1', models: ['moonshot-v1-8k', 'moonshot-v1-32k', 'moonshot-v1-128k', 'kimi-k2'] },
+  { id: 'glm', name: '智谱 GLM', baseUrl: 'https://open.bigmodel.cn/api/paas/v4', models: ['glm-4-plus', 'glm-4-air', 'glm-4-flash'] },
+  { id: 'minimax', name: 'MiniMax', baseUrl: 'https://api.minimax.chat/v1', models: ['abab6.5s-chat', 'MiniMax-Text-01'] },
+]
+
+/** 根据 baseUrl 反查服务商（编辑已配置模型时回填下拉）；匹配不到返回 undefined */
+function inferProvider(baseUrl: string): (typeof MODEL_PROVIDERS)[number] | undefined {
+  const norm = (s: string) => s.replace(/\/+$/, '').toLowerCase()
+  return MODEL_PROVIDERS.find((p) => norm(p.baseUrl) === norm(baseUrl))
+}
+
 function CustomModelDrawer(props: {
   models: GatewayModel[]
   onClose: () => void
@@ -1229,23 +1337,41 @@ function CustomModelDrawer(props: {
   onRemove: (id: string) => Promise<void>
   onSelect: (id: string) => void
 }) {
-  const [view, setView] = useState<'list' | 'form'>('list')
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [providerId, setProviderId] = useState('')
   const [name, setName] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [model, setModel] = useState('')
+  const [customModel, setCustomModel] = useState(false)
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
 
+  // 打开时默认选中第一个已配置模型，右侧立即有内容
+  useEffect(() => {
+    const first = props.models[0]
+    if (!first) return
+    setEditingId(first.id)
+    setName(first.name)
+    setBaseUrl(first.baseUrl)
+    setApiKey(first.apiKey)
+    setModel(first.model ?? first.id)
+    setProviderId(inferProvider(first.baseUrl)?.id ?? '')
+    setCustomModel(!inferProvider(first.baseUrl)?.models.includes(first.model ?? first.id))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   function openAdd(): void {
     setEditingId(null)
-    setName('')
-    setBaseUrl('')
+    const p = MODEL_PROVIDERS[0]
+    if (!p) return
+    setProviderId(p.id)
+    setName(p.name)
+    setBaseUrl(p.baseUrl)
+    setModel(p.models[0] ?? '')
+    setCustomModel(false)
     setApiKey('')
-    setModel('')
     setErr('')
-    setView('form')
   }
 
   function openEdit(m: GatewayModel): void {
@@ -1254,21 +1380,34 @@ function CustomModelDrawer(props: {
     setBaseUrl(m.baseUrl)
     setApiKey(m.apiKey)
     setModel(m.model ?? m.id)
+    const p = inferProvider(m.baseUrl)
+    setProviderId(p?.id ?? '')
+    setCustomModel(!p || !p.models.includes(m.model ?? m.id))
     setErr('')
-    setView('form')
+  }
+
+  function selectProvider(id: string): void {
+    const p = MODEL_PROVIDERS.find((x) => x.id === id)
+    if (!p) return
+    setProviderId(id)
+    setName(p.name)
+    setBaseUrl(p.baseUrl)
+    setModel(p.models[0] ?? '')
+    setCustomModel(false)
+    setErr('')
   }
 
   async function submit(): Promise<void> {
-    if (!name || !baseUrl || !apiKey || !model) {
-      setErr('请填写完整：名称、端点、API Key、模型参数')
+    const finalName = name.trim() || MODEL_PROVIDERS.find((p) => p.id === providerId)?.name || '自定义模型'
+    if (!baseUrl || !apiKey.trim() || !model.trim()) {
+      setErr('请选择服务商、填写 API Key 与模型')
       return
     }
     setLoading(true)
     setErr('')
     try {
-      if (editingId) await props.onUpdate(editingId, { name, baseUrl, apiKey, model })
-      else await props.onAdd({ name, baseUrl, apiKey, model })
-      setView('list')
+      if (editingId) await props.onUpdate(editingId, { name: finalName, baseUrl, apiKey, model })
+      else await props.onAdd({ name: finalName, baseUrl, apiKey, model })
     } catch (e) {
       setErr(String(e))
     } finally {
@@ -1276,97 +1415,145 @@ function CustomModelDrawer(props: {
     }
   }
 
+  async function remove(): Promise<void> {
+    if (!editingId) return
+    await props.onRemove(editingId)
+    openAdd()
+  }
+
+  function useModel(): void {
+    if (!editingId) return
+    props.onSelect(editingId)
+    props.onClose()
+  }
+
   return (
-    <div onClick={props.onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)', zIndex: 110, fontFamily: 'system-ui, sans-serif' }}>
-      {/* 右侧滑出抽屉 */}
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          position: 'absolute',
-          top: 0,
-          right: 0,
-          bottom: 0,
-          width: 400,
-          background: '#fff',
-          boxShadow: '-4px 0 20px rgba(0,0,0,0.15)',
-          display: 'flex',
-          flexDirection: 'column',
-          animation: 'slideIn 0.2s ease',
-        }}
-      >
+    <div onClick={props.onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 110, fontFamily: 'system-ui, sans-serif', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      {/* 全屏弹窗：左右排版 */}
+      <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', height: '100%', background: '#fff', display: 'flex', flexDirection: 'column' }}>
         <div style={{ padding: '16px 20px', borderBottom: '1px solid #eee', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div style={{ fontWeight: 600, fontSize: 15 }}>
-            {view === 'list' ? '自定义模型' : editingId ? '编辑自定义模型' : '新增自定义模型'}
-          </div>
+          <div style={{ fontWeight: 600, fontSize: 15 }}>自定义模型</div>
           <button onClick={props.onClose} style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#999', padding: 4, display: 'inline-flex' }}>
             <IconClose />
           </button>
         </div>
 
-        {view === 'list' ? (
-          <>
-            <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px' }}>
+        <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+          {/* 左侧：已配置模型列表 */}
+          <aside style={{ width: 280, borderRight: '1px solid #eee', display: 'flex', flexDirection: 'column', background: '#fafafa' }}>
+            <div style={{ padding: '12px 12px 8px', fontSize: 12, color: '#999', fontWeight: 600 }}>已配置模型</div>
+            <div style={{ flex: 1, overflowY: 'auto', padding: '0 12px 12px' }}>
               {props.models.length === 0 ? (
-                <div style={{ padding: '40px 16px', textAlign: 'center', color: '#bbb', fontSize: 13 }}>
+                <div style={{ padding: '40px 12px', textAlign: 'center', color: '#bbb', fontSize: 13 }}>
                   还没有自定义模型
                   <br />
-                  点击下方按钮接入你自己的 OpenAI 兼容端点
+                  点击下方按钮新增
                 </div>
               ) : (
                 props.models.map((m) => (
-                  <div key={m.id} style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #eee', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 500, color: '#333', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
-                      <div style={{ fontSize: 11, color: '#999', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2 }}>
-                        model: {m.model ?? m.id}
-                      </div>
-                      <div style={{ fontSize: 11, color: '#bbb', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.baseUrl}</div>
+                  <div
+                    key={m.id}
+                    onClick={() => openEdit(m)}
+                    style={{
+                      padding: '10px 12px',
+                      borderRadius: 8,
+                      marginBottom: 6,
+                      cursor: 'pointer',
+                      background: editingId === m.id ? '#e8f1ff' : '#fff',
+                      border: editingId === m.id ? '1px solid #1677ff' : '1px solid #eee',
+                    }}
+                  >
+                    <div style={{ fontSize: 13, fontWeight: 500, color: '#333', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
+                    <div style={{ fontSize: 11, color: '#999', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2 }}>
+                      model: {m.model ?? m.id}
                     </div>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flexShrink: 0 }}>
-                      <button
-                        onClick={() => {
-                          props.onSelect(m.id)
-                          props.onClose()
-                        }}
-                        title="使用此模型"
-                        style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #1677ff', background: '#fff', color: '#1677ff', fontSize: 11, cursor: 'pointer' }}
-                      >
-                        使用
-                      </button>
-                      <button onClick={() => openEdit(m)} title="编辑" style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #eee', background: '#fff', color: '#555', fontSize: 11, cursor: 'pointer' }}>
-                        编辑
-                      </button>
-                      <button onClick={() => void props.onRemove(m.id)} title="删除" style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #ffccc7', background: '#fff', color: '#ff4d4f', fontSize: 11, cursor: 'pointer' }}>
-                        删除
-                      </button>
-                    </div>
+                    <div style={{ fontSize: 11, color: '#bbb', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.baseUrl}</div>
                   </div>
                 ))
               )}
             </div>
-            <div style={{ padding: '12px 16px', borderTop: '1px solid #eee' }}>
+            <div style={{ padding: '12px', borderTop: '1px solid #eee' }}>
               <button onClick={openAdd} style={{ width: '100%', padding: '10px', borderRadius: 8, border: '1px dashed #d9d9d9', background: '#fff', cursor: 'pointer', fontSize: 13, color: '#555', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
                 <IconPlus /> 新增自定义模型
               </button>
             </div>
-          </>
-        ) : (
-          <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px' }}>
+          </aside>
+
+          {/* 右侧：选中模型的配置编辑区域 */}
+          <main style={{ flex: 1, overflowY: 'auto', padding: '24px 28px', minWidth: 0 }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#333', marginBottom: 16 }}>
+              {editingId ? '编辑自定义模型' : '新增自定义模型'}
+            </div>
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 12, color: '#666', marginBottom: 4 }}>服务商</div>
+              <select
+                value={providerId}
+                onChange={(e) => selectProvider(e.target.value)}
+                style={{ width: '100%', padding: 9, borderRadius: 8, border: '1px solid #ddd', fontSize: 13, boxSizing: 'border-box', outline: 'none', background: '#fff' }}
+              >
+                {!MODEL_PROVIDERS.some((p) => p.id === providerId) && <option value="">自定义端点</option>}
+                {MODEL_PROVIDERS.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </div>
             <Field label="名称" value={name} onChange={setName} placeholder="例如：我的 GPT-4o" />
-            <Field label="端点 (baseUrl)" value={baseUrl} onChange={setBaseUrl} placeholder="https://api.openai.com/v1" />
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 12, color: '#666', marginBottom: 4 }}>模型</div>
+              <select
+                value={customModel ? '__custom__' : model}
+                onChange={(e) => {
+                  const v = e.target.value
+                  if (v === '__custom__') {
+                    setCustomModel(true)
+                    return
+                  }
+                  setCustomModel(false)
+                  setModel(v)
+                }}
+                style={{ width: '100%', padding: 9, borderRadius: 8, border: '1px solid #ddd', fontSize: 13, boxSizing: 'border-box', outline: 'none', background: '#fff', marginBottom: 6 }}
+              >
+                {(MODEL_PROVIDERS.find((p) => p.id === providerId)?.models ?? [model]).map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+                <option value="__custom__">其他（自定义）…</option>
+              </select>
+              {customModel && (
+                <input
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  placeholder="输入模型名，如 gpt-4o"
+                  style={{ width: '100%', padding: 9, borderRadius: 8, border: '1px solid #ddd', fontSize: 13, boxSizing: 'border-box', outline: 'none' }}
+                />
+              )}
+            </div>
             <Field label="API Key" value={apiKey} onChange={setApiKey} placeholder="sk-..." password />
-            <Field label="模型参数 (model)" value={model} onChange={setModel} placeholder="gpt-4o" />
+            <div style={{ fontSize: 11, color: '#bbb', marginBottom: 12, wordBreak: 'break-all' }}>端点：{baseUrl || '（未选择服务商）'}</div>
             {err && <p style={{ color: '#ff4d4f', fontSize: 12, marginBottom: 8, wordBreak: 'break-word' }}>{err}</p>}
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button onClick={() => void submit()} disabled={loading} style={{ flex: 1, padding: 10, borderRadius: 8, border: 'none', background: '#1677ff', color: '#fff', fontSize: 14, cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.6 : 1 }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <button onClick={() => void submit()} disabled={loading} style={{ padding: '10px 20px', borderRadius: 8, border: 'none', background: '#1677ff', color: '#fff', fontSize: 14, cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.6 : 1 }}>
                 {loading ? '保存中…' : '保存'}
               </button>
-              <button onClick={() => setView('list')} style={{ padding: '10px 16px', borderRadius: 8, border: '1px solid #ddd', background: '#fff', color: '#555', fontSize: 14, cursor: 'pointer' }}>
-                取消
+              {editingId && (
+                <>
+                  <button onClick={useModel} style={{ padding: '10px 16px', borderRadius: 8, border: '1px solid #1677ff', background: '#fff', color: '#1677ff', fontSize: 14, cursor: 'pointer' }}>
+                    使用此模型
+                  </button>
+                  <button onClick={() => void remove()} style={{ padding: '10px 16px', borderRadius: 8, border: '1px solid #ffccc7', background: '#fff', color: '#ff4d4f', fontSize: 14, cursor: 'pointer' }}>
+                    删除
+                  </button>
+                </>
+              )}
+              <button onClick={props.onClose} style={{ marginLeft: 'auto', padding: '10px 16px', borderRadius: 8, border: '1px solid #ddd', background: '#fff', color: '#555', fontSize: 14, cursor: 'pointer' }}>
+                关闭
               </button>
             </div>
-          </div>
-        )}
+          </main>
+        </div>
       </div>
     </div>
   )
@@ -1383,6 +1570,276 @@ function Field({ label, value, onChange, placeholder, password }: { label: strin
         placeholder={placeholder}
         style={{ width: '100%', padding: 9, borderRadius: 8, border: '1px solid #ddd', fontSize: 13, boxSizing: 'border-box', outline: 'none' }}
       />
+    </div>
+  )
+}
+
+// ===== 消息操作（复制 / 重新发送）=====
+
+/** 把文本写入剪贴板（navigator.clipboard 优先，失败回退 execCommand） */
+async function copyText(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    ta.remove()
+  }
+}
+
+interface MessageAction {
+  key: string
+  icon: React.ReactNode
+  label: string
+  run: () => void | Promise<void>
+}
+
+/** 消息图标操作行（参考 DSH MessageIconActions / taco：固定显示在气泡下方，图标按钮 + 点击后对勾反馈） */
+function MessageActions({ actions }: { actions: MessageAction[] }) {
+  const [done, setDone] = useState<string | null>(null)
+  return (
+    <div style={{ display: 'flex', gap: 2, marginTop: 4, opacity: 0.5, transition: 'opacity .15s' }}>
+      {actions.map((a) => (
+        <button
+          key={a.key}
+          title={a.label}
+          onClick={() => {
+            try {
+              void a.run()
+            } catch {
+              /* 忽略复制失败 */
+            }
+            setDone(a.key)
+            window.setTimeout(() => setDone((v) => (v === a.key ? null : v)), 1000)
+          }}
+          style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 26, height: 26, borderRadius: 6, border: 'none', background: 'transparent', color: done === a.key ? '#1677ff' : '#999', cursor: 'pointer', padding: 0 }}
+        >
+          {done === a.key ? <IconCheck /> : a.icon}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/** 用户消息气泡：右对齐，气泡下方固定显示「复制 / 重新发送」图标操作 */
+function UserMessage({ content, images, onResend }: { content: string; images?: string[]; onResend: (text: string) => void }) {
+  return (
+    <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+      {images?.map((img, j) => (
+        <img key={j} src={img} alt="附件" style={{ maxWidth: 200, maxHeight: 200, borderRadius: 8, display: 'block', marginBottom: 4, objectFit: 'cover' }} />
+      ))}
+      {content ? (
+        <>
+          <div style={{ maxWidth: '70%', padding: '8px 14px', borderRadius: 16, borderBottomRightRadius: 4, background: '#1677ff', color: '#fff', fontSize: 14, lineHeight: 1.6, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+            {content}
+          </div>
+          <MessageActions
+            actions={[
+              { key: 'copy', icon: <IconCopy />, label: '复制', run: () => copyText(content) },
+              { key: 'resend', icon: <IconRefresh />, label: '重新发送', run: () => onResend(content) },
+            ]}
+          />
+        </>
+      ) : null}
+    </div>
+  )
+}
+
+/** AI 助手消息卡片：左对齐，气泡下方固定显示「复制」图标操作 */
+function AssistantMessage({ content }: { content: string }) {
+  return (
+    <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
+      <div style={{ maxWidth: '85%', padding: '10px 14px', borderRadius: 16, borderTopLeftRadius: 4, background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,0.06)', fontSize: 14, lineHeight: 1.65, color: '#333', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+          {content}
+        </ReactMarkdown>
+      </div>
+      <MessageActions
+        actions={[{ key: 'copy', icon: <IconCopy />, label: '复制', run: () => copyText(content) }]}
+      />
+    </div>
+  )
+}
+
+function IconError() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <circle cx="12" cy="12" r="10" />
+      <path d="M15 9l-6 6M9 9l6 6" />
+    </svg>
+  )
+}
+
+// ===== 工具调用渲染（参考 DSH ToolRow / Codex：单行摘要 + 类型卡片，不显示 JSON）=====
+
+/** 工具名 → 人类可读的中文标题 + 图标（原始工具名对普通人不可读） */
+const TOOL_META: Record<string, { title: string; icon: React.ReactNode }> = {
+  read_file: { title: '读取文件', icon: <IconFile /> },
+  write_file: { title: '写入文件', icon: <IconEdit /> },
+  run_command: { title: '执行命令', icon: <IconTerminal /> },
+  list_dir: { title: '列出目录', icon: <IconTree /> },
+  image_analyze: { title: '识别图片', icon: <IconImage /> },
+  computer_screenshot: { title: '屏幕截图', icon: <IconMonitor /> },
+  computer_ocr: { title: '文字识别', icon: <IconMonitor /> },
+  computer_action: { title: '电脑操作', icon: <IconMonitor /> },
+}
+
+/** 从工具参数提取一行摘要（读/写 → 路径，命令 → 命令，列目录 → 路径，电脑操作 → 动作） */
+function toolSummary(name: string, args?: Record<string, unknown>): string {
+  if (!args) return ''
+  const a = args
+  if (name === 'read_file' || name === 'write_file') return String(a.path ?? '')
+  if (name === 'run_command') return String(a.command ?? '')
+  if (name === 'list_dir') return a.path ? String(a.path) : '当前目录'
+  if (name === 'image_analyze') return String(a.imageUrl ?? '').slice(0, 48)
+  if (name === 'computer_action') return String(a.action ?? '')
+  if (name === 'computer_screenshot' || name === 'computer_ocr') return ''
+  return ''
+}
+
+/** 脱敏：把 token / api key / 密码等敏感字段替换为 ***，避免泄露 */
+function redactSecret(text: string): string {
+  return text
+    .replace(/((?:token|api[_-]?key|access_token|authorization|bearer|password|passwd|pwd|secret)\s*[:=]\s*)([^\s'"]+)/gi, '$1***')
+    .replace(/(bearer\s+)([a-zA-Z0-9._-]+)/gi, '$1***')
+}
+
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text
+  return `${text.slice(0, max)}…（共 ${text.length} 字）`
+}
+
+/** 终端结果卡片：命令 + stdout/stderr（深色终端样式） */
+function TerminalBlock({ command, stdout, stderr }: { command: string; stdout: string; stderr: string }) {
+  return (
+    <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 12 }}>
+      {command && (
+        <div style={{ padding: '8px 12px', background: '#282c34', color: '#61afef', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+          <span style={{ color: '#7f848e' }}>$ </span>
+          {command}
+        </div>
+      )}
+      {(stdout || stderr) && (
+        <div style={{ padding: '8px 12px', background: '#1e1e1e', color: '#d4d4d4', whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: 280, overflowY: 'auto' }}>
+          {stdout}
+          {stderr && <span style={{ color: '#f48771' }}>{stderr}</span>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 文件结果卡片：带行号的只读文件窗口（超长折叠） */
+function FileBlock({ content, path }: { content: string; path?: string }) {
+  const lines = content.split('\n')
+  const MAX = 200
+  const shown = lines.slice(0, MAX)
+  return (
+    <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 12 }}>
+      {path && (
+        <div style={{ padding: '6px 12px', borderBottom: '1px solid #f0f0f0', color: '#999', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {path} · {lines.length} 行
+        </div>
+      )}
+      <div style={{ maxHeight: 320, overflowY: 'auto', padding: '4px 0' }}>
+        {shown.map((line, i) => (
+          <div key={i} style={{ display: 'flex', padding: '0 0' }}>
+            <span style={{ width: 40, textAlign: 'right', paddingRight: 10, color: '#bbb', flexShrink: 0, userSelect: 'none' }}>{i + 1}</span>
+            <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', flex: 1, color: '#444' }}>{line || ' '}</span>
+          </div>
+        ))}
+        {lines.length > MAX && (
+          <div style={{ color: '#999', padding: '6px 12px', fontSize: 11 }}>… 共 {lines.length} 行，仅显示前 {MAX} 行</div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** 按工具类型渲染结果卡片（read → 文件行号 / run_command → 终端 / list_dir → 树形 / 截图 → 图片 / 其他 → 纯文本脱敏） */
+function renderToolResult(name: string, result: unknown, error: string | undefined, args?: Record<string, unknown>): React.ReactNode | null {
+  if (error) {
+    return (
+      <div style={{ padding: '10px 12px', color: '#cf1322', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12 }}>
+        {redactSecret(error)}
+      </div>
+    )
+  }
+  if (result === undefined || result === null) return null
+  if (name === 'run_command') {
+    const r = result as { stdout?: string; stderr?: string }
+    return <TerminalBlock command={String(args?.command ?? '')} stdout={r.stdout ?? ''} stderr={r.stderr ?? ''} />
+  }
+  if (name === 'list_dir') {
+    return (
+      <pre style={{ margin: 0, padding: '10px 12px', fontFamily: 'ui-monospace, monospace', fontSize: 12, lineHeight: 1.5, color: '#444', whiteSpace: 'pre', overflowX: 'auto', maxHeight: 320, overflowY: 'auto' }}>
+        {String(result)}
+      </pre>
+    )
+  }
+  if (name === 'read_file') {
+    return <FileBlock content={String(result)} path={String(args?.path ?? '')} />
+  }
+  if (name === 'computer_screenshot') {
+    const src = String(result)
+    return src ? <img src={src} alt="截图" style={{ display: 'block', maxWidth: '100%', maxHeight: 320, objectFit: 'contain' }} /> : null
+  }
+  if (name === 'write_file') {
+    const r = result as { ok?: boolean; path?: string }
+    return <div style={{ padding: '10px 12px', color: '#389e0d', fontSize: 12 }}>✓ 已写入 {r.path ?? ''}</div>
+  }
+  return (
+    <pre style={{ margin: 0, padding: '10px 12px', fontFamily: 'ui-monospace, monospace', fontSize: 12, lineHeight: 1.5, color: '#444', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 320, overflowY: 'auto' }}>
+      {redactSecret(truncate(String(result), 4000))}
+    </pre>
+  )
+}
+
+/** 工具执行步骤（DSH ToolRow 风格）：单行摘要（中文标题 + 摘要）+ 折叠的类型卡片 */
+function ToolStep({ trace }: { trace: ToolTrace }) {
+  const [expanded, setExpanded] = useState(false)
+  const isCall = trace.kind === 'tool-call'
+  const meta = TOOL_META[trace.name] ?? { title: trace.name, icon: <IconWrench /> }
+  const state = isCall ? 'running' : trace.error ? 'error' : 'ok'
+  const summary = toolSummary(trace.name, trace.args)
+  const resultBody = !isCall ? renderToolResult(trace.name, trace.result, trace.error, trace.args) : null
+  const expandable = resultBody !== null
+  const stateColor = state === 'error' ? '#cf1322' : state === 'running' ? '#1677ff' : '#389e0d'
+
+  return (
+    <div style={{ marginBottom: 6, fontSize: 13 }}>
+      <div
+        onClick={() => expandable && setExpanded((v) => !v)}
+        style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 10px', borderRadius: 8, background: '#fff', border: '1px solid #f0f0f0', cursor: expandable ? 'pointer' : 'default', maxWidth: '85%', boxSizing: 'border-box' }}
+      >
+        <span style={{ color: stateColor, display: 'inline-flex', flexShrink: 0 }}>{meta.icon}</span>
+        <b style={{ fontWeight: 600, color: '#333', fontSize: 13, flexShrink: 0 }}>{meta.title}</b>
+        {summary && (
+          <>
+            <span style={{ color: '#d9d9d9', flexShrink: 0 }}>·</span>
+            <span style={{ color: '#8c8c8c', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>{summary}</span>
+          </>
+        )}
+        {state === 'running' && <span style={{ color: '#1677ff', fontSize: 12, flexShrink: 0 }}>执行中…</span>}
+        {isCall && trace.approvalRequired && (
+          <span style={{ fontSize: 11, padding: '1px 6px', borderRadius: 4, background: '#fffbe6', color: '#d48806', border: '1px solid #ffe58f', flexShrink: 0 }}>待确认</span>
+        )}
+        {expandable && (
+          <span style={{ marginLeft: 'auto', color: '#bbb', display: 'inline-flex', flexShrink: 0, transform: expanded ? 'rotate(180deg)' : 'none', transition: 'transform .15s' }}>
+            <IconChevronDown />
+          </span>
+        )}
+      </div>
+      {expanded && expandable && (
+        <div style={{ marginLeft: 20, marginTop: 4, border: '1px solid #f0f0f0', borderRadius: 8, background: '#fafafa', overflow: 'hidden' }}>
+          {resultBody}
+        </div>
+      )}
     </div>
   )
 }

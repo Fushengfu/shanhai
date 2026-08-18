@@ -26,6 +26,8 @@ export interface ChatMessage {
   content: string | ContentPart[]
   toolCall?: ToolCall
   toolCallId?: string
+  /** thinking 模式下的思维链内容（DeepSeek 要求多轮时原样回传，否则 400） */
+  reasoningContent?: string
 }
 
 export interface Usage {
@@ -38,12 +40,16 @@ export interface ModelResponse {
   text?: string
   toolCall?: ToolCall
   usage?: Usage
+  /** thinking 模式思维链内容（回传用） */
+  reasoningContent?: string
 }
 
 export interface StreamChunk {
   text?: string
   toolCall?: ToolCall
   usage?: Usage
+  /** thinking 模式思维链增量（回传用） */
+  reasoningContent?: string
 }
 
 /** 模型接口：complete（一次性）+ 可选 stream（流式） */
@@ -99,6 +105,44 @@ function chatCompletionsUrl(baseUrl: string): string {
   return `${b}/api/v1/chat/completions`
 }
 
+/**
+ * 将内部 ChatMessage 序列化为 OpenAI 兼容 wire 格式。
+ * 关键：内部消息携带 toolCall / toolCallId，但必须转成网关认识的字段名，否则报错：
+ *  - assistant 带 toolCall → 输出 tool_calls + content:null（OpenAI 规范：带 tool_calls 时 content 为 null）
+ *  - tool 带 toolCallId → 输出 tool_call_id（缺失时网关报 "missing field tool_call_id"）
+ */
+function serializeMessages(messages: ChatMessage[]): Array<Record<string, unknown>> {
+  return messages.map((m) => {
+    if (m.role === 'assistant' && m.toolCall) {
+      const msg: Record<string, unknown> = {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          {
+            id: m.toolCall.id,
+            type: 'function',
+            function: {
+              name: m.toolCall.name,
+              arguments: JSON.stringify(m.toolCall.args ?? {}),
+            },
+          },
+        ],
+      }
+      // thinking 模式：assistant 带 tool_calls 也必须回传 reasoning_content，否则网关 400
+      if (m.reasoningContent) msg.reasoning_content = m.reasoningContent
+      return msg
+    }
+    if (m.role === 'tool') {
+      // tool 消息必须带 tool_call_id 关联上一条 assistant 的 tool_calls
+      return { role: 'tool', content: m.content, tool_call_id: m.toolCallId ?? '' }
+    }
+    const msg: Record<string, unknown> = { role: m.role, content: m.content }
+    // thinking 模式：assistant 文本消息回传 reasoning_content
+    if (m.role === 'assistant' && m.reasoningContent) msg.reasoning_content = m.reasoningContent
+    return msg
+  })
+}
+
 /** DeepSeek provider：网关 OpenAI 兼容 /api/v1/chat/completions（fetch） */
 export class DeepSeekProvider implements Model {
   constructor(private readonly opts: DeepSeekOptions) {}
@@ -112,7 +156,7 @@ export class DeepSeekProvider implements Model {
       },
       body: JSON.stringify({
         model: this.opts.model,
-        messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        messages: serializeMessages(messages),
         tools: tools?.map((t) => ({
           type: 'function',
           function: { name: t.name, description: t.description, parameters: t.inputSchema },
@@ -152,8 +196,10 @@ export class DeepSeekProvider implements Model {
     }
     const message = payload.choices?.[0]?.message
     const toolCall = message?.tool_calls?.[0]
+    const reasoningContent = message?.reasoning_content || undefined
     if (toolCall) {
       return {
+        reasoningContent,
         toolCall: {
           id: toolCall.id,
           name: toolCall.function.name,
@@ -161,7 +207,7 @@ export class DeepSeekProvider implements Model {
         },
       }
     }
-    return { text: message?.content ?? '' }
+    return { text: message?.content ?? '', reasoningContent }
   }
 
   /** SSE 流式：逐行解析，累积工具调用 arguments 分片，产出 text 增量 + 完整 toolCall */
@@ -174,7 +220,7 @@ export class DeepSeekProvider implements Model {
       },
       body: JSON.stringify({
         model: this.opts.model,
-        messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        messages: serializeMessages(messages),
         tools: tools?.map((t) => ({
           type: 'function',
           function: { name: t.name, description: t.description, parameters: t.inputSchema },
@@ -215,6 +261,10 @@ export class DeepSeekProvider implements Model {
         }
         out.push({ text: ev.text })
       }
+      if (ev.reasoningContent !== undefined) {
+        // thinking 模式：思维链增量单独产出，供上层累积后回传
+        out.push({ reasoningContent: ev.reasoningContent })
+      }
       if (ev.toolCall) {
         if (!toolCallAcc) toolCallAcc = { id: ev.toolCall.id, name: ev.toolCall.name, argsText: '' }
         if (ev.toolCall.id) toolCallAcc.id = ev.toolCall.id
@@ -252,6 +302,7 @@ interface SseDeltaEvent {
   text?: string
   toolCall?: { id?: string; name?: string; argsDelta?: string }
   usage?: Usage
+  reasoningContent?: string
 }
 
 /** 解析单行 SSE `data: {...}`，返回 text 增量 / tool_calls 分片 / usage；网关返回 error 时抛错 */
@@ -266,6 +317,7 @@ function parseSseLine(line: string): SseDeltaEvent | null {
     choices?: Array<{
       delta?: {
         content?: string
+        reasoning_content?: string
         tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>
       }
     }>
@@ -292,10 +344,11 @@ function parseSseLine(line: string): SseDeltaEvent | null {
   }
   const delta = parsed.choices?.[0]?.delta
   const text = typeof delta?.content === 'string' && delta.content ? delta.content : undefined
+  const reasoningContent = typeof delta?.reasoning_content === 'string' && delta.reasoning_content ? delta.reasoning_content : undefined
   const tc = delta?.tool_calls?.[0]
   const toolCall = tc ? { id: tc.id, name: tc.function?.name, argsDelta: tc.function?.arguments ?? '' } : undefined
-  if (text === undefined && !toolCall) return null
-  return { text, toolCall }
+  if (text === undefined && !toolCall && reasoningContent === undefined) return null
+  return { text, toolCall, reasoningContent }
 }
 
 function safeParse(json: string): Record<string, unknown> {

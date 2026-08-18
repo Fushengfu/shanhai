@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
-import { createMockModel, userMessageWithImages, audioContent, videoContent, userMessageWithParts } from '../src/llm'
+import { describe, it, expect, vi } from 'vitest'
+import { createMockModel, userMessageWithImages, audioContent, videoContent, userMessageWithParts, DeepSeekProvider } from '../src/llm'
 
 describe('Model 接口', () => {
   it('mock 模型按队列返回响应', async () => {
@@ -46,5 +46,64 @@ describe('多模态（视觉/音频/视频）', () => {
     ])
     const parts = msg.content as Array<{ type: string }>
     expect(parts.map((p) => p.type)).toEqual(['text', 'input_audio', 'input_video'])
+  })
+})
+
+describe('DeepSeekProvider 消息序列化（OpenAI wire 格式）', () => {
+  it('assistant 的 tool_calls 与 tool 的 tool_call_id 正确输出（修复 missing field tool_call_id）', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ code: 0, data: { choices: [{ message: { content: 'ok' } }] } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    try {
+      const provider = new DeepSeekProvider({ apiKey: 'k', baseUrl: 'https://x.com', model: 'm' })
+      await provider.complete([
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: '', toolCall: { id: 'call-1', name: 'read_file', args: { path: '/a' } } },
+        { role: 'tool', content: 'result', toolCallId: 'call-1' },
+      ])
+      const body = JSON.parse((fetchSpy.mock.calls[0]?.[1] as RequestInit).body as string) as {
+        messages: Array<Record<string, unknown>>
+      }
+      expect(body.messages[1]).toMatchObject({
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'read_file' } }],
+      })
+      expect(body.messages[2]).toEqual({ role: 'tool', content: 'result', tool_call_id: 'call-1' })
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+
+  it('thinking 模式 assistant 消息回传 reasoning_content（修复 must be passed back 400）', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ code: 0, data: { choices: [{ message: { content: 'ok' } }] } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    try {
+      const provider = new DeepSeekProvider({ apiKey: 'k', baseUrl: 'https://x.com', model: 'm' })
+      await provider.complete([
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: '答案', reasoningContent: '让我思考一下' },
+        { role: 'assistant', content: '', toolCall: { id: 'call-2', name: 'read_file', args: {} }, reasoningContent: '需要读文件' },
+        { role: 'tool', content: 'r', toolCallId: 'call-2' },
+      ])
+      const body = JSON.parse((fetchSpy.mock.calls[0]?.[1] as RequestInit).body as string) as {
+        messages: Array<Record<string, unknown>>
+      }
+      // 文本 assistant 消息回传 reasoning_content
+      expect(body.messages[1]).toMatchObject({ role: 'assistant', content: '答案', reasoning_content: '让我思考一下' })
+      // 带 tool_calls 的 assistant 消息也回传 reasoning_content
+      expect(body.messages[2]).toMatchObject({ role: 'assistant', content: null, reasoning_content: '需要读文件' })
+      // 无 reasoning 的消息不输出 reasoning_content 字段
+      expect(body.messages[3]).not.toHaveProperty('reasoning_content')
+    } finally {
+      fetchSpy.mockRestore()
+    }
   })
 })

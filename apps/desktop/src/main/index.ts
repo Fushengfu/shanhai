@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { bootHost } from '../host/index'
@@ -56,6 +56,17 @@ function registerIpc(): void {
   ipcMain.handle('computer:shot', async () => {
     const buf = await runtime!.computerUse.screenshot()
     return Buffer.from(buf).toString('base64')
+  })
+  ipcMain.handle('dialog:selectDirectory', async (_e, defaultPath?: string) => {
+    const options: Electron.OpenDialogOptions = {
+      title: '选择工作目录',
+      defaultPath: defaultPath || app.getPath('home'),
+      properties: ['openDirectory', 'createDirectory'],
+    }
+    const win = BrowserWindow.getAllWindows()[0]
+    const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+    if (result.canceled || result.filePaths.length === 0) return null
+    return result.filePaths[0]
   })
 }
 

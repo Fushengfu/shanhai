@@ -40,6 +40,7 @@ export interface TokenSnapshot {
   contextLength: number
   lastPrompt: number
   contextUsageRatio: number
+  turnCount: number
 }
 
 export interface ShanhaiBridge {
@@ -59,6 +60,7 @@ export interface ShanhaiBridge {
   deleteSession(id: string): Promise<void>
   getSessionWorkdir(id?: string): Promise<string>
   setSessionWorkdir(id: string, workdir: string): Promise<void>
+  selectDirectory(defaultPath?: string): Promise<string | null>
   getSessionHistory(id?: string): Promise<Array<{ kind: 'user' | 'assistant' | 'tool'; content?: string; trace?: ToolTrace; attachments?: unknown[] }>>
   // 审批
   onApprovalRequest(cb: (req: ApprovalRequest) => void): () => void
@@ -94,6 +96,7 @@ const bridge: ShanhaiBridge = {
   deleteSession: (id) => ipcRenderer.invoke('session:delete', id),
   getSessionWorkdir: (id) => ipcRenderer.invoke('session:workdir', id),
   setSessionWorkdir: (id, workdir) => ipcRenderer.invoke('session:setWorkdir', id, workdir),
+  selectDirectory: (defaultPath) => ipcRenderer.invoke('dialog:selectDirectory', defaultPath),
   getSessionHistory: (id) => ipcRenderer.invoke('session:history', id),
   respondApproval: (outcome, requestId) => ipcRenderer.invoke('approval:respond', outcome, requestId),
   run: (message, attachments) => ipcRenderer.invoke('chat:run', message, attachments),

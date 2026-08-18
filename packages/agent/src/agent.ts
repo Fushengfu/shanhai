@@ -38,16 +38,14 @@ export class AgentLoop {
     for (const e of this.session.list()) {
       if (e.type === 'user/message') {
         const d = e.data as { content: string; attachments?: ContentPart[] }
-        if (d.attachments && d.attachments.length > 0) {
-          messages.push({ role: 'user', content: [{ type: 'text', text: d.content }, ...d.attachments] })
-        } else {
-          messages.push({ role: 'user', content: d.content })
-        }
+        // 历史附件只回放占位符，不重新发送 base64（避免请求体巨大 / 非视觉模型 400 / 重复计费）
+        messages.push({ role: 'user', content: replayUserContent(d.content, d.attachments) })
       } else if (e.type === 'assistant/message') {
-        messages.push({ role: 'assistant', content: (e.data as { content: string }).content })
+        const d = e.data as { content: string; reasoningContent?: string }
+        messages.push({ role: 'assistant', content: d.content, reasoningContent: d.reasoningContent })
       } else if (e.type === 'tool/call') {
-        const d = e.data as { callId: string; name: string; args: Record<string, unknown> }
-        messages.push({ role: 'assistant', content: '', toolCall: { id: d.callId, name: d.name, args: d.args } })
+        const d = e.data as { callId: string; name: string; args: Record<string, unknown>; reasoningContent?: string }
+        messages.push({ role: 'assistant', content: '', toolCall: { id: d.callId, name: d.name, args: d.args }, reasoningContent: d.reasoningContent })
       } else if (e.type === 'tool/result') {
         const d = e.data as { callId: string; result?: unknown; error?: string }
         messages.push({ role: 'tool', content: JSON.stringify(d.result ?? d.error ?? ''), toolCallId: d.callId })
@@ -69,11 +67,11 @@ export class AgentLoop {
     for (let step = 0; step < maxSteps; step++) {
       const response = await this.decide(messages, onDelta)
       if (response.toolCall) {
-        await this.handleToolCall(messages, response.toolCall)
+        await this.handleToolCall(messages, response.toolCall, response.reasoningContent)
         continue
       }
       const text = response.text ?? ''
-      this.session.append('assistant/message', { content: text })
+      this.session.append('assistant/message', { content: text, reasoningContent: response.reasoningContent })
       this.session.append('turn/end', { turn: 1, text })
       return text
     }
@@ -83,8 +81,10 @@ export class AgentLoop {
   private async decide(messages: ChatMessage[], onDelta?: (text: string) => void): Promise<ModelResponse> {
     if (this.model.stream) {
       let text = ''
+      let reasoningContent = ''
       let toolCall: ToolCall | undefined
       for await (const chunk of this.model.stream(messages, this.tools)) {
+        if (chunk.reasoningContent) reasoningContent += chunk.reasoningContent
         if (chunk.text) {
           text += chunk.text
           this.session.append('assistant/delta', { text: chunk.text })
@@ -92,20 +92,28 @@ export class AgentLoop {
         }
         if (chunk.toolCall) toolCall = chunk.toolCall
       }
-      return { text, toolCall }
+      return { text, toolCall, reasoningContent: reasoningContent || undefined }
     }
     return this.model.complete(messages, this.tools)
   }
 
-  private async handleToolCall(messages: ChatMessage[], call: ToolCall): Promise<void> {
+  private async handleToolCall(messages: ChatMessage[], call: ToolCall, reasoningContent?: string): Promise<void> {
     const callId = call.id ?? `${call.name}-${Date.now()}`
-    this.session.append('tool/call', { callId, name: call.name, args: call.args })
+    // tool/call 事件落盘 reasoningContent：thinking 模式多轮回放时需回传
+    this.session.append('tool/call', { callId, name: call.name, args: call.args, reasoningContent })
+    // 构造带思维链的 assistant 工具调用消息（回传 reasoning_content 用）
+    const assistantCallMsg = (): ChatMessage => ({
+      role: 'assistant',
+      content: '',
+      toolCall: { id: callId, name: call.name, args: call.args },
+      reasoningContent,
+    })
 
     const tool = this.tools.find((t) => t.name === call.name)
     if (!tool) {
       const error = `unknown tool "${call.name}"`
       this.session.append('tool/result', { callId, name: call.name, error })
-      messages.push({ role: 'assistant', content: '', toolCall: call })
+      messages.push(assistantCallMsg())
       messages.push({ role: 'tool', content: error, toolCallId: callId })
       return
     }
@@ -122,7 +130,7 @@ export class AgentLoop {
       if (outcome !== 'allowed-once') {
         const error = `approval ${outcome}`
         this.session.append('tool/result', { callId, name: call.name, error })
-        messages.push({ role: 'assistant', content: '', toolCall: call })
+        messages.push(assistantCallMsg())
         messages.push({ role: 'tool', content: error, toolCallId: callId })
         return
       }
@@ -132,13 +140,29 @@ export class AgentLoop {
     try {
       const result = await tool.execute(call.args)
       this.session.append('tool/result', { callId, name: call.name, result })
-      messages.push({ role: 'assistant', content: '', toolCall: call })
+      messages.push(assistantCallMsg())
       messages.push({ role: 'tool', content: JSON.stringify(result), toolCallId: callId })
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err)
       this.session.append('tool/result', { callId, name: call.name, error })
-      messages.push({ role: 'assistant', content: '', toolCall: call })
+      messages.push(assistantCallMsg())
       messages.push({ role: 'tool', content: `error: ${error}`, toolCallId: callId })
     }
   }
+}
+
+/** 回放历史用户消息：附件（图片/音频/视频）不再重新发送 base64 数据，改用占位符。
+ * 原因：历史附件已在上轮被模型处理过；重新发送 base64 会导致请求体巨大、非视觉模型 400、重复计费。 */
+function replayUserContent(content: string, attachments?: ContentPart[]): string {
+  if (!attachments || attachments.length === 0) return content
+  const marks = attachments
+    .map((a) => {
+      if (a.type === 'image_url') return '[图片附件]'
+      if (a.type === 'input_audio') return '[语音附件]'
+      if (a.type === 'input_video') return '[视频附件]'
+      return ''
+    })
+    .filter(Boolean)
+    .join(' ')
+  return content ? `${content} ${marks}` : marks
 }

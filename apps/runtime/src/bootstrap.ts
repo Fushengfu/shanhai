@@ -4,12 +4,12 @@ import { ApprovalService } from '@shanhai/approval'
 import { AgentLoop } from '@shanhai/agent'
 import type { Model, ContentPart, TokenUsage } from '@shanhai/llm'
 import { createMockModel, DeepSeekProvider } from '@shanhai/llm'
-import { atomicTools, type ToolContract } from '@shanhai/tools'
+import { createAtomicTools, type ToolContract } from '@shanhai/tools'
 import { MemoryStore } from '@shanhai/memory'
 import { FileCredentialStore, AuthService } from '@shanhai/auth'
 import type { GatewayModel, ModelTier } from '@shanhai/auth'
 import type { VoiceService } from '@shanhai/voice'
-import type { ComputerUseService } from '@shanhai/computer-use'
+import { createComputerUseTools, type ComputerUseService, type OcrWord } from '@shanhai/computer-use'
 import { promises as fs } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -54,6 +54,8 @@ export interface TokenSnapshot {
   lastPrompt: number
   /** 上下文窗口占比 0~1（lastPrompt / contextLength，contextLength 为 0 时返回 0） */
   contextUsageRatio: number
+  /** 累计执行轮次（当前会话内，一次完整的「用户消息 → 最终回复」任务循环算一轮） */
+  turnCount: number
 }
 
 export interface Runtime {
@@ -260,18 +262,86 @@ function createSystemVoiceService(): VoiceService {
   }
 }
 
-/** 真实 computer-use：截图走 macOS screencapture，键鼠走 System Events */
+/** macOS Vision OCR 脚本：识别图片文字 + 精确像素坐标（左上角原点）。运行时写入临时文件用 swift 执行。 */
+const OCR_SWIFT = `
+import Vision
+import AppKit
+import Foundation
+
+guard CommandLine.arguments.count > 1 else { print("[]"); exit(0) }
+let path = CommandLine.arguments[1]
+guard let img = NSImage(contentsOfFile: path),
+      let tiff = img.tiffRepresentation,
+      let rep = NSBitmapImageRep(data: tiff),
+      let cg = rep.cgImage else { print("[]"); exit(0) }
+
+let request = VNRecognizeTextRequest()
+request.recognitionLevel = .accurate
+request.recognitionLanguages = ["zh-Hans", "en-US"]
+request.usesLanguageCorrection = true
+
+let handler = VNImageRequestHandler(cgImage: cg, options: [:])
+do { try handler.perform([request]) } catch { print("[]"); exit(0) }
+
+let w = CGFloat(cg.width)
+let h = CGFloat(cg.height)
+let words: [[String: Any]] = (request.results ?? []).compactMap { obs in
+    guard let cand = obs.topCandidates(1).first else { return nil }
+    let box = obs.boundingBox
+    // Vision 原点在左下角，转为左上角原点 + 像素坐标
+    let x0 = box.minX * w
+    let y0 = (1 - box.maxY) * h
+    let x1 = box.maxX * w
+    let y1 = (1 - box.minY) * h
+    return ["text": cand.string, "x0": x0, "y0": y0, "x1": x1, "y1": y1, "confidence": cand.confidence]
+}
+do {
+    let data = try JSONSerialization.data(withJSONObject: words)
+    if let s = String(data: data, encoding: .utf8) { print(s) } else { print("[]") }
+} catch { print("[]") }
+`
+
+/** 用 macOS Vision 对图片做 OCR，返回文字块 + 像素坐标；失败返回空数组（降级，不阻断） */
+async function ocrImage(path: string): Promise<OcrWord[]> {
+  const scriptPath = `/tmp/shanhai-ocr-${process.pid}.swift`
+  try {
+    await fs.writeFile(scriptPath, OCR_SWIFT, 'utf8')
+    const { stdout } = await execAsync(`swift "${scriptPath}" "${path}"`, { timeout: 30000 })
+    const parsed = JSON.parse(stdout.trim() || '[]') as OcrWord[]
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  } finally {
+    await fs.rm(scriptPath, { force: true }).catch(() => undefined)
+  }
+}
+
+/** 真实 computer-use：截图走 macOS screencapture，OCR 走 Vision，键鼠走 System Events */
 function createSystemComputerUseService(): ComputerUseService {
+  const screenshotToFile = async (): Promise<string> => {
+    const tmp = `/tmp/shanhai-shot-${Date.now()}.png`
+    await execAsync(`screencapture -x "${tmp}"`)
+    return tmp
+  }
+
+  const clickAtOsascript = (x: number, y: number): string =>
+    `osascript -e 'tell application "System Events" to click at {${x}, ${y}}'`
+
   return {
     screenshot: async () => {
-      const tmp = `/tmp/shanhai-shot-${Date.now()}.png`
-      await execAsync(`screencapture -x "${tmp}"`)
-      const buf = await fs.readFile(tmp)
-      await fs.rm(tmp, { force: true })
-      return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer
+      const tmp = await screenshotToFile()
+      try {
+        const buf = await fs.readFile(tmp)
+        return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer
+      } finally {
+        await fs.rm(tmp, { force: true }).catch(() => undefined)
+      }
     },
     clickAt: async (x, y) => {
-      await execAsync(`osascript -e 'tell application "System Events" to click at {${x}, ${y}}'`).catch(() => undefined)
+      await execAsync(clickAtOsascript(x, y)).catch(() => undefined)
+    },
+    doubleClickAt: async (x, y) => {
+      await execAsync(`${clickAtOsascript(x, y)} -e 'delay 0.06' -e 'tell application "System Events" to click at {${x}, ${y}}'`).catch(() => undefined)
     },
     typeText: async (text) => {
       await execAsync(`osascript -e 'tell application "System Events" to keystroke ${JSON.stringify(text)}'`).catch(() => undefined)
@@ -279,12 +349,55 @@ function createSystemComputerUseService(): ComputerUseService {
     pressKey: async (key) => {
       await execAsync(`osascript -e 'tell application "System Events" to key code ${keyCode(key)}'`).catch(() => undefined)
     },
+    scroll: async (direction, amount) => {
+      // 无 cliclick 时用方向键模拟滚动：down=下箭头(125)，up=上箭头(126)
+      const code = direction === 'down' ? 125 : 126
+      const times = Math.max(1, Math.min(Math.round(amount ?? 3), 20))
+      for (let i = 0; i < times; i++) {
+        await execAsync(`osascript -e 'tell application "System Events" to key code ${code}'`).catch(() => undefined)
+      }
+    },
+    ocr: async (imageBase64) => {
+      let tmp = ''
+      try {
+        if (imageBase64) {
+          tmp = `/tmp/shanhai-ocr-${Date.now()}.png`
+          await fs.writeFile(tmp, Buffer.from(imageBase64, 'base64'))
+        } else {
+          tmp = await screenshotToFile()
+        }
+        return await ocrImage(tmp)
+      } finally {
+        if (tmp) await fs.rm(tmp, { force: true }).catch(() => undefined)
+      }
+    },
   }
 }
 
 function keyCode(key: string): number {
   const map: Record<string, number> = { enter: 36, return: 36, space: 49, tab: 48, escape: 53, esc: 53, left: 123, right: 124, up: 126, down: 125 }
   return map[key.toLowerCase()] ?? 0
+}
+
+/** 持久化前降级附件：base64 图片/音视频数据不落盘（几 MB 会撑爆 JSON），只保留类型标记 */
+function sanitizeAttachment(a: unknown): unknown {
+  if (typeof a !== 'object' || a === null) return a
+  const part = a as {
+    type?: string
+    image_url?: { url?: string }
+    input_audio?: { data?: string; format?: string }
+    input_video?: { data?: string; format?: string }
+  }
+  if (part.type === 'image_url' && part.image_url?.url?.startsWith('data:')) {
+    return { type: 'image_url', image_url: { url: '' } }
+  }
+  if (part.type === 'input_audio' && part.input_audio?.data) {
+    return { type: 'input_audio', input_audio: { data: '', format: part.input_audio.format ?? '' } }
+  }
+  if (part.type === 'input_video' && part.input_video?.data) {
+    return { type: 'input_video', input_video: { data: '', format: part.input_video.format ?? '' } }
+  }
+  return a
 }
 
 /**
@@ -319,7 +432,19 @@ export async function bootstrap(): Promise<Runtime> {
   async function persistSession(meta: SessionMeta): Promise<void> {
     try {
       await fs.mkdir(sessionsDir, { recursive: true })
-      const data = { id: meta.id, title: meta.title, workDir: meta.workDir, events: meta.session.list() }
+      // 持久化前清理：
+      // 1) 丢弃 assistant/delta（流式增量冗余，最终 assistant/message 已含完整内容，避免 JSON 随对话膨胀）
+      // 2) 附件 base64 降级为占位（几 MB 图片/音视频不落盘，模型回放本来就用占位符）
+      const events = meta.session
+        .list()
+        .filter((e) => e.type !== 'assistant/delta')
+        .map((e) => {
+          if (e.type !== 'user/message') return e
+          const d = e.data as { content: string; attachments?: unknown[] }
+          if (!Array.isArray(d.attachments) || d.attachments.length === 0) return e
+          return { ...e, data: { ...d, attachments: d.attachments.map(sanitizeAttachment) } }
+        })
+      const data = { id: meta.id, title: meta.title, workDir: meta.workDir, events }
       await fs.writeFile(join(sessionsDir, `${meta.id}.json`), JSON.stringify(data, null, 2), { mode: 0o600 })
     } catch {
       // 忽略持久化失败
@@ -387,52 +512,8 @@ export async function bootstrap(): Promise<Runtime> {
   const voice = createSystemVoiceService()
   const memory = new MemoryStore()
 
-  // —— computer-use 工具（操作电脑：截图/点击/输入/按键，形成视觉闭环）——
-  const computerTools: ToolContract[] = [
-    {
-      name: 'computer_screenshot',
-      description: '截取当前屏幕并返回截图（base64）。用于查看桌面/窗口当前状态，可配合 image_analyze 分析后再操作。',
-      inputSchema: { type: 'object', properties: {} },
-      riskLevel: 'readonly',
-      execute: async () => {
-        const buf = await computerUse.screenshot()
-        return { imageBase64: Buffer.from(buf).toString('base64') }
-      },
-    },
-    {
-      name: 'computer_click',
-      description: '在屏幕指定坐标 (x, y) 点击鼠标。',
-      inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'] },
-      riskLevel: 'irreversible',
-      approvalRequired: true,
-      execute: async (args) => {
-        await computerUse.clickAt(Number(args.x), Number(args.y))
-        return { ok: true }
-      },
-    },
-    {
-      name: 'computer_type',
-      description: '在当前焦点处输入文字。',
-      inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
-      riskLevel: 'irreversible',
-      approvalRequired: true,
-      execute: async (args) => {
-        await computerUse.typeText(String(args.text))
-        return { ok: true }
-      },
-    },
-    {
-      name: 'computer_key',
-      description: '按下键盘按键（如 enter、tab、space、escape 等）。',
-      inputSchema: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] },
-      riskLevel: 'irreversible',
-      approvalRequired: true,
-      execute: async (args) => {
-        await computerUse.pressKey(String(args.key))
-        return { ok: true }
-      },
-    },
-  ]
+  // —— computer-use 插件（操作电脑：截图 / OCR 定位 / 统一动作，形成「截图→定位→动作→验证」闭环）——
+  const computerTools: ToolContract[] = createComputerUseTools(computerUse)
 
   // —— 图片识别：用视觉模型分析图片（当前模型不支持多模态时降级用）——
   const analyzeImageWithVision = async (imageUrl: string): Promise<string> => {
@@ -487,7 +568,39 @@ export async function bootstrap(): Promise<Runtime> {
   }
 
   // —— 工具（包装：落 trace，sessionId 从 AsyncLocalStorage 上下文取）——
-  const baseTools = [...atomicTools(), imageAnalyzeTool, ...computerTools]
+  // 当前会话工作目录：让所有文件/命令工具围绕「会话工作目录」执行
+  const getSessionCwd = (): string => {
+    const sid = sessionContext.getStore() ?? currentSessionId ?? ''
+    return sessions.get(sid)?.workDir ?? join(homedir(), 'shanhai', 'workspace')
+  }
+  /**
+   * 系统提示词：告诉模型「当前环境」（时间 / 工作目录 / Shell / 系统类型）+ 工具调用约束。
+   * 让 AI 了解运行环境，文件/命令操作都锚定到当前工作目录。
+   */
+  const buildSystemPrompt = (cwd: string): string => {
+    const osNames: Record<string, string> = { darwin: 'macOS', win32: 'Windows', linux: 'Linux' }
+    const osName = osNames[process.platform] ?? process.platform
+    const now = new Date().toLocaleString('zh-CN', { hour12: false })
+    const shell = process.env.SHELL ?? process.env.ComSpec ?? 'unknown'
+    return [
+      '你是「山海」，一个运行在用户电脑上的桌面端 AI 智能体助手。你可以读取文件、编写代码、执行命令、列出目录来帮助用户完成任务。',
+      '',
+      '【当前环境】',
+      `- 操作系统：${osName}（${process.platform}/${process.arch}）`,
+      `- 当前时间：${now}`,
+      `- Shell：${shell}`,
+      `- 用户主目录：${homedir()}`,
+      `- 当前工作目录：${cwd}`,
+      '',
+      '【工具使用规则】',
+      '1. 所有文件操作（read_file / write_file / list_dir）和命令执行（run_command）都必须围绕「当前工作目录」进行。',
+      '2. 文件路径既可以是绝对路径，也可以是相对于当前工作目录的相对路径；优先使用相对路径，把操作范围限制在工作目录内。',
+      '3. 需要了解项目结构时，用 list_dir 以树形列出目录。',
+      `4. 执行命令时注意当前是 ${osName} 系统，使用对应的命令语法（如 macOS/Linux 用 ls、cat，Windows 用 dir、type）。`,
+      '5. 执行有风险的操作（写文件、运行命令）前会请求用户确认，请把要做的改动讲清楚再调用工具。',
+    ].join('\n')
+  }
+  const baseTools = [...createAtomicTools(getSessionCwd), imageAnalyzeTool, ...computerTools]
   const tools: ToolContract[] = baseTools.map((t) => ({
     ...t,
     execute: async (args) => {
@@ -498,11 +611,12 @@ export async function bootstrap(): Promise<Runtime> {
       )
       try {
         const result = await t.execute(args)
-        toolTraceCallbacks.forEach((cb) => cb({ kind: 'tool-result', sessionId: sid, callId, name: t.name, result }))
+        // 结果 trace 带上 args：前端按工具类型渲染摘要（路径/命令）时需要它
+        toolTraceCallbacks.forEach((cb) => cb({ kind: 'tool-result', sessionId: sid, callId, name: t.name, args, result }))
         return result
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err)
-        toolTraceCallbacks.forEach((cb) => cb({ kind: 'tool-result', sessionId: sid, callId, name: t.name, error }))
+        toolTraceCallbacks.forEach((cb) => cb({ kind: 'tool-result', sessionId: sid, callId, name: t.name, args, error }))
         throw err
       }
     },
@@ -521,6 +635,13 @@ export async function bootstrap(): Promise<Runtime> {
   }
   const tokenCallbacks = new Set<(stats: TokenSnapshot) => void>()
 
+  /** 当前会话累计完成的任务循环轮次（一次完整的「用户消息 → 最终回复」= 一轮，从事件日志统计，重启后自动恢复） */
+  const countCompletedTurns = (): number => {
+    const meta = currentSessionId ? sessions.get(currentSessionId) : undefined
+    if (!meta) return 0
+    return meta.session.list().filter((e) => e.type === 'turn/end').length
+  }
+
   const snapshot = (): TokenSnapshot => ({
     totalPrompt: tokenStats.totalPrompt,
     totalCompletion: tokenStats.totalCompletion,
@@ -531,6 +652,7 @@ export async function bootstrap(): Promise<Runtime> {
     contextLength: tokenStats.contextLength,
     lastPrompt: tokenStats.lastPrompt,
     contextUsageRatio: tokenStats.contextLength > 0 ? tokenStats.lastPrompt / tokenStats.contextLength : 0,
+    turnCount: countCompletedTurns(),
   })
 
   const emitTokenStats = (): void => {
@@ -927,6 +1049,8 @@ export async function bootstrap(): Promise<Runtime> {
         return await sessionContext.run(sid, () =>
           loop.run(finalMessage, {
             ...opts,
+            // 系统提示词告知当前工作目录：让模型知道文件/命令操作的锚点，并约束工具调用围绕工作目录
+            systemPrompt: buildSystemPrompt(meta.workDir),
             attachments: finalAttachments,
             onDelta: (text) => {
               if (stoppedSessions.has(sid)) throw new Error('__stopped__')
@@ -942,6 +1066,8 @@ export async function bootstrap(): Promise<Runtime> {
       } finally {
         // 会话事件（用户消息/助手回复/工具过程）已追加到 session，立即落盘，重启不丢
         await persistSession(meta)
+        // 刷新底部状态栏（累计轮次随 turn/end 变化，成功/失败/中断后都要同步）
+        emitTokenStats()
       }
     },
   }

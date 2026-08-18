@@ -27,8 +27,8 @@ export interface EventData {
   /** content 为文本；attachments 为多模态附件（图片/音频/视频），会话回放时一并还原 */
   'user/message': { content: string; attachments?: unknown[] }
   'assistant/delta': { text: string }
-  'assistant/message': { content: string }
-  'tool/call': { callId: string; name: string; args: Record<string, unknown> }
+  'assistant/message': { content: string; reasoningContent?: string }
+  'tool/call': { callId: string; name: string; args: Record<string, unknown>; reasoningContent?: string }
   'tool/result': { callId: string; name: string; result?: unknown; error?: string }
   'approval/policy': { policy: ApprovalPolicy }
   'approval/request': { id: string; toolName: string; args: Record<string, unknown>; riskLevel: string }
