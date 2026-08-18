@@ -1046,6 +1046,13 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   ]
   const roleNameById = new Map(BUILTIN_ROLES.map((r) => [r.id, r.name]))
   const triage = new ModelTriage(model, BUILTIN_ROLES)
+
+  /** 当前模型的 token 预算：上下文窗口的 70%（留 30% 余量给回复 + 工具结果），超预算触发历史压缩 */
+  const currentContextBudget = (): number | undefined => {
+    const m = gatewayModels.find((x) => x.id === currentModelId)
+    if (m?.contextLength && m.contextLength > 0) return Math.floor(m.contextLength * 0.7)
+    return undefined
+  }
   // 专家执行轨迹回调（UI 展示多专家协作过程）
   const expertTraceCallbacks = new Set<(trace: StepTrace) => void>()
 
@@ -1054,7 +1061,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     const map = new Map<string, AgentLoop>()
     for (const role of BUILTIN_ROLES) {
       const expertSession = new Session()
-      map.set(role.id, new AgentLoop(model, tools, expertSession, approval, sid))
+      map.set(role.id, new AgentLoop(model, tools, expertSession, approval, sid, currentContextBudget()))
     }
     return map
   }
@@ -1134,7 +1141,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       // Triage 拆解异常：退化单步
       console.error('[orchestrator] Triage 拆解异常，退化单步:', err instanceof Error ? err.message : err)
     }
-    const loop = new AgentLoop(model, tools, targetSession, approval, sid)
+    const loop = new AgentLoop(model, tools, targetSession, approval, sid, currentContextBudget())
     try {
       return await sessionContext.run(sid, () =>
         loop.run(message, {

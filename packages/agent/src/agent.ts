@@ -2,6 +2,7 @@ import type { ChatMessage, Model, ModelResponse, ToolCall, ContentPart } from '@
 import type { ToolContract } from '@shanhai/tools'
 import type { Session } from '@shanhai/session'
 import type { ApprovalService } from '@shanhai/approval'
+import { estimateTokens } from '@shanhai/compaction'
 
 export interface AgentLoopOptions {
   maxSteps?: number
@@ -31,11 +32,13 @@ export class AgentLoop {
     private readonly session: Session,
     private readonly approval: ApprovalService,
     private readonly sessionId?: string,
+    /** token 预算：超预算时把早期对话历史压成摘要（undefined = 不压缩） */
+    private readonly budget?: number,
   ) {}
 
   async run(message: string, options?: AgentLoopOptions): Promise<string> {
     const maxSteps = options?.maxSteps ?? 30
-    const messages: ChatMessage[] = []
+    let messages: ChatMessage[] = []
     if (options?.systemPrompt) messages.push({ role: 'system', content: options.systemPrompt })
 
     // 从 session 事件日志回放历史（多轮对话 + 断点续跑：中断后历史仍在 session）
@@ -73,6 +76,8 @@ export class AgentLoop {
     const onReasoning = options?.onReasoning
 
     for (let step = 0; step < maxSteps; step++) {
+      // 压缩：token 超预算时把早期对话历史压成摘要，避免上下文窗口溢出
+      messages = await this.maybeCompact(messages)
       const response = await this.decide(messages, onDelta, onReasoning)
       if (response.toolCall) {
         await this.handleToolCall(messages, response.toolCall, response.reasoningContent)
@@ -97,6 +102,35 @@ export class AgentLoop {
     this.session.append('assistant/message', { content: text, reasoningContent: final.reasoningContent })
     this.session.append('turn/end', { turn: 1, text })
     return text
+  }
+
+  /** 超预算压缩：保留 system 消息，把早期对话历史用模型压成摘要，保留最近 4 条原文 */
+  private async maybeCompact(messages: ChatMessage[]): Promise<ChatMessage[]> {
+    if (!this.budget) return messages
+    if (estimateTokens(messages) <= this.budget) return messages
+    const systemMsgs = messages.filter((m) => m.role === 'system')
+    const rest = messages.filter((m) => m.role !== 'system')
+    if (rest.length <= 6) return messages
+    const head = rest.slice(0, -4)
+    const tail = rest.slice(-4)
+    let summary = ''
+    try {
+      const res = await this.model.complete(
+        [
+          {
+            role: 'system',
+            content: '你是对话摘要器。把以下对话历史压缩成简洁摘要，保留关键信息：用户需求、已完成的操作与结论、待办事项。',
+          },
+          ...head,
+        ],
+        [],
+      )
+      summary = res.text ?? ''
+    } catch {
+      // 摘要失败不阻断主流程：跳过压缩，继续用原文（可能超预算，但至少不崩）
+      return messages
+    }
+    return [...systemMsgs, { role: 'system', content: `【历史摘要】${summary}` }, ...tail]
   }
 
   private async decide(
