@@ -14,5 +14,7 @@ export default defineConfig({
   },
   test: {
     testTimeout: 10000,
+    // E2E 测试共享 ~/.shanhai/config.json 与真实网关，串行执行避免状态竞争 / 网关并发限流 500
+    fileParallelism: false,
   },
 })

@@ -28,6 +28,7 @@ interface GatewayModel {
   tier: string
   apiKey: string
   baseUrl: string
+  model?: string
   custom?: boolean
 }
 
@@ -37,6 +38,18 @@ interface ContentPart {
   image_url?: { url: string }
   input_audio?: { data: string; format: string }
   input_video?: { data: string; format: string }
+}
+
+interface TokenSnapshot {
+  totalPrompt: number
+  totalCompletion: number
+  total: number
+  turnPrompt: number
+  turnCompletion: number
+  turn: number
+  contextLength: number
+  lastPrompt: number
+  contextUsageRatio: number
 }
 
 type HistoryItem =
@@ -52,10 +65,15 @@ declare global {
       logout(): Promise<void>
       listModels(): Promise<GatewayModel[]>
       addCustomModel(model: { name: string; baseUrl: string; apiKey: string; model: string }): Promise<GatewayModel>
+      updateCustomModel(id: string, model: { name: string; baseUrl: string; apiKey: string; model: string }): Promise<GatewayModel>
       removeCustomModel(id: string): Promise<void>
-      listSessions(): Promise<Array<{ id: string; title: string }>>
-      createSession(title?: string): Promise<string>
+      listSessions(): Promise<Array<{ id: string; title: string; workDir: string }>>
+      createSession(title?: string, workdir?: string): Promise<string>
       switchSession(id: string): Promise<void>
+      renameSession(id: string, title: string): Promise<void>
+      deleteSession(id: string): Promise<void>
+      getSessionWorkdir(id?: string): Promise<string>
+      setSessionWorkdir(id: string, workdir: string): Promise<void>
       getSessionHistory(id?: string): Promise<HistoryItem[]>
       respondApproval(outcome: 'allowed-once' | 'rejected', requestId: string): Promise<void>
       run(message: string, attachments?: ContentPart[]): Promise<string>
@@ -67,6 +85,8 @@ declare global {
       stop(): Promise<void>
       speak(text: string): Promise<void>
       screenshot(): Promise<string>
+      getTokenStats(): Promise<TokenSnapshot>
+      onTokenStats(cb: (stats: TokenSnapshot) => void): () => void
     }
   }
 }
@@ -89,15 +109,21 @@ export function App() {
   const [loggedIn, setLoggedIn] = useState(false)
   const [username, setUsername] = useState<string | null>(null)
   const [loginOpen, setLoginOpen] = useState(false)
-  const [sessions, setSessions] = useState<Array<{ id: string; title: string }>>([])
+  const [sessions, setSessions] = useState<Array<{ id: string; title: string; workDir: string }>>([])
   const [currentSessionId, setCurrentSessionId] = useState('')
   const [sessionMap, setSessionMap] = useState<Record<string, SessionUIState>>({})
   const loadedSessions = useRef<Set<string>>(new Set())
   const [models, setModels] = useState<GatewayModel[]>([])
   const [selectedModel, setSelectedModel] = useState('')
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
-  const [addModelOpen, setAddModelOpen] = useState(false)
+  const [customModelDrawerOpen, setCustomModelDrawerOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null)
+  const [editingTitle, setEditingTitle] = useState('')
+  const [editingWorkdir, setEditingWorkdir] = useState(false)
+  const [workdirInput, setWorkdirInput] = useState('')
+  const modelMenuRef = useRef<HTMLDivElement>(null)
+  const [tokenStats, setTokenStats] = useState<TokenSnapshot | null>(null)
   const [attachments, setAttachments] = useState<Array<{ type: 'image' | 'audio' | 'video'; name: string; dataUrl: string }>>([])
   const fileRef = useRef<HTMLInputElement>(null)
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null)
@@ -159,10 +185,13 @@ export function App() {
       })
     })
     const offApproval = api.onApprovalRequest((req) => setPendingApproval(req))
+    const offToken = api.onTokenStats((s) => setTokenStats(s))
+    void api.getTokenStats().then((s) => setTokenStats(s)).catch(() => undefined)
     return () => {
       offDelta()
       offTrace()
       offApproval()
+      offToken()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [patchSession])
@@ -171,9 +200,53 @@ export function App() {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight })
   }, [cur.items, cur.streaming, pendingApproval])
 
+  // 模型下拉：点击窗口其他位置时关闭弹窗
+  useEffect(() => {
+    if (!modelMenuOpen) return
+    function onDown(e: MouseEvent): void {
+      if (modelMenuRef.current && !modelMenuRef.current.contains(e.target as Node)) {
+        setModelMenuOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [modelMenuOpen])
+
   async function refreshSessions(): Promise<void> {
     const list = (await window.shanhai?.listSessions()) ?? []
     setSessions(list)
+  }
+
+  async function renameSession(id: string, title: string): Promise<void> {
+    await window.shanhai?.renameSession(id, title)
+    setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, title } : s)))
+  }
+
+  async function deleteSession(id: string): Promise<void> {
+    await window.shanhai?.deleteSession(id)
+    setSessionMap((prev) => {
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+    loadedSessions.current.delete(id)
+    await refreshSessions()
+    // 若删除的是当前会话，切到剩余第一个
+    if (id === currentSessionId) {
+      const list = await window.shanhai!.listSessions()
+      if (list[0]) void switchToSession(list[0].id)
+      else setCurrentSessionId('')
+    }
+  }
+
+  async function saveWorkdir(): Promise<void> {
+    const sid = currentSessionId
+    if (!sid) return
+    const wd = workdirInput.trim()
+    if (!wd) return
+    await window.shanhai?.setSessionWorkdir(sid, wd)
+    setEditingWorkdir(false)
+    setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, workDir: wd } : s)))
   }
 
   async function switchToSession(id: string): Promise<void> {
@@ -228,6 +301,13 @@ export function App() {
       setSelectedModel(m.id)
       await window.shanhai?.switchModel(m.id)
       setModelMenuOpen(false)
+    }
+  }
+
+  async function handleUpdateModel(id: string, input: { name: string; baseUrl: string; apiKey: string; model: string }): Promise<void> {
+    const m = await window.shanhai?.updateCustomModel(id, input)
+    if (m) {
+      setModels((prev) => prev.map((x) => (x.id === id ? m : x)))
     }
   }
 
@@ -345,26 +425,26 @@ export function App() {
         </div>
         <div style={{ flex: 1, overflowY: 'auto', WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
           {sessions.map((s) => (
-            <div
+            <SessionRow
               key={s.id}
-              onClick={() => void switchToSession(s.id)}
-              style={{
-                padding: '8px 12px',
-                cursor: 'pointer',
-                fontSize: 13,
-                color: '#333',
-                borderBottom: '1px solid #eee',
-                background: s.id === currentSessionId ? '#e8f1ff' : 'transparent',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
+              session={s}
+              active={s.id === currentSessionId}
+              busy={sessionMap[s.id]?.busy ?? false}
+              editing={editingSessionId === s.id}
+              editingTitle={editingTitle}
+              onTitleChange={setEditingTitle}
+              onStartEdit={() => {
+                setEditingSessionId(s.id)
+                setEditingTitle(s.title)
               }}
-            >
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title}</span>
-              {(sessionMap[s.id]?.busy ?? false) && (
-                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#1677ff', flexShrink: 0, marginLeft: 6 }} />
-              )}
-            </div>
+              onCommitEdit={() => {
+                void renameSession(s.id, editingTitle)
+                setEditingSessionId(null)
+              }}
+              onCancelEdit={() => setEditingSessionId(null)}
+              onDelete={() => void deleteSession(s.id)}
+              onSelect={() => void switchToSession(s.id)}
+            />
           ))}
         </div>
         {/* 侧边栏底部：账号头像 + 昵称 + 退出（未登录点击头像弹登录窗） */}
@@ -413,6 +493,46 @@ export function App() {
             <IconSidebar />
           </button>
           <div style={{ fontWeight: 600, fontSize: 14 }}>山海</div>
+          {/* 当前会话工作目录：默认 ~/shanhai/workspace，可点击修改 */}
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6, WebkitAppRegion: 'no-drag', minWidth: 0 } as React.CSSProperties}>
+            {editingWorkdir ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <input
+                  value={workdirInput}
+                  onChange={(e) => setWorkdirInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') void saveWorkdir()
+                    if (e.key === 'Escape') setEditingWorkdir(false)
+                  }}
+                  autoFocus
+                  placeholder="工作目录绝对路径"
+                  style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #1677ff', fontSize: 12, width: 260, outline: 'none' }}
+                />
+                <button onClick={() => void saveWorkdir()} style={{ ...iconBtn, border: '1px solid #1677ff', color: '#1677ff' }} title="保存">
+                  <IconCheck />
+                </button>
+                <button onClick={() => setEditingWorkdir(false)} style={iconBtn} title="取消">
+                  <IconClose />
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => {
+                  const wd = sessions.find((s) => s.id === currentSessionId)?.workDir ?? ''
+                  setWorkdirInput(wd)
+                  setEditingWorkdir(true)
+                }}
+                title="修改工作目录"
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 8, border: '1px solid #eee', background: '#fafafa', fontSize: 12, color: '#888', cursor: 'pointer', maxWidth: 320, overflow: 'hidden' }}
+              >
+                <IconFolder />
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {sessions.find((s) => s.id === currentSessionId)?.workDir ?? ''}
+                </span>
+                <IconEdit />
+              </button>
+            )}
+          </div>
         </header>
 
         {/* 消息区 */}
@@ -547,7 +667,7 @@ export function App() {
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                 <button title="附件" onClick={() => fileRef.current?.click()} style={iconBtn}><IconPaperclip /></button>
-                <div style={{ position: 'relative' }}>
+                <div ref={modelMenuRef} style={{ position: 'relative' }}>
                   <button
                     onClick={() => setModelMenuOpen((v) => !v)}
                     style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid #ddd', fontSize: 12, color: '#555', background: '#fff', outline: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4 }}
@@ -609,11 +729,11 @@ export function App() {
                         <button
                           onClick={() => {
                             setModelMenuOpen(false)
-                            setAddModelOpen(true)
+                            setCustomModelDrawerOpen(true)
                           }}
                           style={{ width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px dashed #d9d9d9', background: '#fff', cursor: 'pointer', fontSize: 12, color: '#555', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}
                         >
-                          <IconPlus /> 添加自定义模型
+                          <IconPlus /> 管理自定义模型
                         </button>
                       </div>
                     </div>
@@ -647,15 +767,30 @@ export function App() {
             </div>
           </div>
         </div>
+
+        {/* token 用量状态栏（累计 / 本轮 / 上下文占比） */}
+        <TokenStatusBar stats={tokenStats} />
       </div>
 
       {/* 登录弹窗（未登录时点左下角头像弹出；登录态下主界面照常可用） */}
       {loginOpen && <LoginModal onClose={() => setLoginOpen(false)} onLogin={handleLogin} />}
 
-      {/* 添加自定义模型弹窗 */}
-      {addModelOpen && <AddModelModal onClose={() => setAddModelOpen(false)} onAdd={handleAddModel} />}
+      {/* 自定义模型管理：侧边滑出抽屉（列表 + 新增/编辑） */}
+      {customModelDrawerOpen && (
+        <CustomModelDrawer
+          models={customModels}
+          onClose={() => setCustomModelDrawerOpen(false)}
+          onAdd={handleAddModel}
+          onUpdate={handleUpdateModel}
+          onRemove={handleRemoveModel}
+          onSelect={(id) => {
+            setSelectedModel(id)
+            void window.shanhai?.switchModel(id)
+          }}
+        />
+      )}
 
-      <style>{`@keyframes blink { 50% { opacity: 0 } }`}</style>
+      <style>{`@keyframes blink { 50% { opacity: 0 } } @keyframes slideIn { from { transform: translateX(100%) } to { transform: translateX(0) } }`}</style>
     </div>
   )
 }
@@ -845,6 +980,34 @@ function IconClose() {
   )
 }
 
+function IconFolder() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+    </svg>
+  )
+}
+
+function IconEdit() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+    </svg>
+  )
+}
+
+function IconTrash() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <path d="M3 6h18" />
+      <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+      <path d="M10 11v6M14 11v6" />
+    </svg>
+  )
+}
+
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
@@ -940,13 +1103,160 @@ function LoginModal({ onClose, onLogin }: { onClose: () => void; onLogin: (u: st
   )
 }
 
-function AddModelModal({ onClose, onAdd }: { onClose: () => void; onAdd: (m: { name: string; baseUrl: string; apiKey: string; model: string }) => Promise<void> }) {
+function SessionRow(props: {
+  session: { id: string; title: string; workDir: string }
+  active: boolean
+  busy: boolean
+  editing: boolean
+  editingTitle: string
+  onTitleChange: (v: string) => void
+  onStartEdit: () => void
+  onCommitEdit: () => void
+  onCancelEdit: () => void
+  onDelete: () => void
+  onSelect: () => void
+}) {
+  const [hover, setHover] = useState(false)
+  const { session: s } = props
+
+  if (props.editing) {
+    return (
+      <div style={{ padding: '6px 12px', borderBottom: '1px solid #eee', background: props.active ? '#e8f1ff' : 'transparent' }}>
+        <input
+          value={props.editingTitle}
+          onChange={(e) => props.onTitleChange(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') props.onCommitEdit()
+            if (e.key === 'Escape') props.onCancelEdit()
+          }}
+          autoFocus
+          onBlur={props.onCommitEdit}
+          style={{ width: '100%', padding: '4px 6px', borderRadius: 6, border: '1px solid #1677ff', fontSize: 13, outline: 'none', boxSizing: 'border-box' }}
+        />
+      </div>
+    )
+  }
+
+  return (
+    <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      onClick={props.onSelect}
+      style={{
+        padding: '8px 12px',
+        cursor: 'pointer',
+        fontSize: 13,
+        color: '#333',
+        borderBottom: '1px solid #eee',
+        background: props.active ? '#e8f1ff' : 'transparent',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 6,
+      }}
+    >
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }} title={s.title}>
+        {s.title}
+      </span>
+      {props.busy && <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#1677ff', flexShrink: 0 }} />}
+      {(hover || props.active) && (
+        <span style={{ display: 'inline-flex', gap: 2, flexShrink: 0 }}>
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              props.onStartEdit()
+            }}
+            title="重命名"
+            style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#999', padding: 2, display: 'inline-flex' }}
+          >
+            <IconEdit />
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              props.onDelete()
+            }}
+            title="删除会话"
+            style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#999', padding: 2, display: 'inline-flex' }}
+          >
+            <IconTrash />
+          </button>
+        </span>
+      )}
+    </div>
+  )
+}
+
+function TokenStatusBar({ stats }: { stats: TokenSnapshot | null }) {
+  if (!stats) {
+    return <div style={{ padding: '6px 16px', borderTop: '1px solid #eee', background: '#fff', fontSize: 11, color: '#bbb' }}>token 用量统计中…</div>
+  }
+  const pct = Math.round((stats.contextUsageRatio || 0) * 100)
+  return (
+    <div style={{ padding: '6px 16px', borderTop: '1px solid #eee', background: '#fff', fontSize: 11, color: '#888', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap', fontFamily: 'ui-monospace, monospace' }}>
+      <span title="本次启动以来累计 token">
+        累计 <b style={{ color: '#555' }}>{fmtTokens(stats.total)}</b>
+        <span style={{ color: '#bbb' }}>（入 {fmtTokens(stats.totalPrompt)} / 出 {fmtTokens(stats.totalCompletion)}）</span>
+      </span>
+      <span title="当前这轮任务消耗的 token">
+        本轮 <b style={{ color: '#1677ff' }}>{fmtTokens(stats.turn)}</b>
+      </span>
+      <span title="当前会话上下文窗口占用（最近一次请求的 prompt token / 模型上下文长度）" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+        上下文
+        <span style={{ width: 120, height: 6, borderRadius: 3, background: '#f0f0f0', overflow: 'hidden', display: 'inline-block' }}>
+          <span style={{ display: 'block', height: '100%', width: `${Math.min(pct, 100)}%`, background: pct > 80 ? '#ff4d4f' : pct > 60 ? '#faad14' : '#1677ff', transition: 'width 0.3s ease' }} />
+        </span>
+        <b style={{ color: '#555' }}>{pct}%</b>
+        <span style={{ color: '#bbb' }}>
+          {fmtTokens(stats.lastPrompt)} / {stats.contextLength > 0 ? fmtTokens(stats.contextLength) : '未知'}
+        </span>
+      </span>
+    </div>
+  )
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+  return String(n)
+}
+
+function CustomModelDrawer(props: {
+  models: GatewayModel[]
+  onClose: () => void
+  onAdd: (m: { name: string; baseUrl: string; apiKey: string; model: string }) => Promise<void>
+  onUpdate: (id: string, m: { name: string; baseUrl: string; apiKey: string; model: string }) => Promise<void>
+  onRemove: (id: string) => Promise<void>
+  onSelect: (id: string) => void
+}) {
+  const [view, setView] = useState<'list' | 'form'>('list')
+  const [editingId, setEditingId] = useState<string | null>(null)
   const [name, setName] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [model, setModel] = useState('')
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
+
+  function openAdd(): void {
+    setEditingId(null)
+    setName('')
+    setBaseUrl('')
+    setApiKey('')
+    setModel('')
+    setErr('')
+    setView('form')
+  }
+
+  function openEdit(m: GatewayModel): void {
+    setEditingId(m.id)
+    setName(m.name)
+    setBaseUrl(m.baseUrl)
+    setApiKey(m.apiKey)
+    setModel(m.model ?? m.id)
+    setErr('')
+    setView('form')
+  }
 
   async function submit(): Promise<void> {
     if (!name || !baseUrl || !apiKey || !model) {
@@ -956,8 +1266,9 @@ function AddModelModal({ onClose, onAdd }: { onClose: () => void; onAdd: (m: { n
     setLoading(true)
     setErr('')
     try {
-      await onAdd({ name, baseUrl, apiKey, model })
-      onClose()
+      if (editingId) await props.onUpdate(editingId, { name, baseUrl, apiKey, model })
+      else await props.onAdd({ name, baseUrl, apiKey, model })
+      setView('list')
     } catch (e) {
       setErr(String(e))
     } finally {
@@ -966,24 +1277,96 @@ function AddModelModal({ onClose, onAdd }: { onClose: () => void; onAdd: (m: { n
   }
 
   return (
-    <div
-      onClick={onClose}
-      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 110, fontFamily: 'system-ui, sans-serif' }}
-    >
-      <div onClick={(e) => e.stopPropagation()} style={{ width: 360, padding: 28, background: '#fff', borderRadius: 12, boxShadow: '0 4px 20px rgba(0,0,0,0.15)', position: 'relative' }}>
-        <button onClick={onClose} style={{ position: 'absolute', top: 12, right: 12, border: 'none', background: 'none', cursor: 'pointer', color: '#999', padding: 4 }}>
-          <IconClose />
-        </button>
-        <h2 style={{ fontSize: 17, marginBottom: 4, textAlign: 'center' }}>添加自定义模型</h2>
-        <p style={{ fontSize: 12, color: '#888', textAlign: 'center', marginBottom: 20 }}>接入你自己的 OpenAI 兼容端点</p>
-        <Field label="名称" value={name} onChange={setName} placeholder="例如：我的 GPT-4o" />
-        <Field label="端点 (baseUrl)" value={baseUrl} onChange={setBaseUrl} placeholder="https://api.openai.com/v1" />
-        <Field label="API Key" value={apiKey} onChange={setApiKey} placeholder="sk-..." password />
-        <Field label="模型参数 (model)" value={model} onChange={setModel} placeholder="gpt-4o" />
-        {err && <p style={{ color: '#ff4d4f', fontSize: 12, marginBottom: 8, wordBreak: 'break-word' }}>{err}</p>}
-        <button onClick={() => void submit()} disabled={loading} style={{ width: '100%', padding: 10, borderRadius: 8, border: 'none', background: '#1677ff', color: '#fff', fontSize: 14, cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.6 : 1 }}>
-          {loading ? '保存中…' : '保存'}
-        </button>
+    <div onClick={props.onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)', zIndex: 110, fontFamily: 'system-ui, sans-serif' }}>
+      {/* 右侧滑出抽屉 */}
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          position: 'absolute',
+          top: 0,
+          right: 0,
+          bottom: 0,
+          width: 400,
+          background: '#fff',
+          boxShadow: '-4px 0 20px rgba(0,0,0,0.15)',
+          display: 'flex',
+          flexDirection: 'column',
+          animation: 'slideIn 0.2s ease',
+        }}
+      >
+        <div style={{ padding: '16px 20px', borderBottom: '1px solid #eee', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ fontWeight: 600, fontSize: 15 }}>
+            {view === 'list' ? '自定义模型' : editingId ? '编辑自定义模型' : '新增自定义模型'}
+          </div>
+          <button onClick={props.onClose} style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#999', padding: 4, display: 'inline-flex' }}>
+            <IconClose />
+          </button>
+        </div>
+
+        {view === 'list' ? (
+          <>
+            <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px' }}>
+              {props.models.length === 0 ? (
+                <div style={{ padding: '40px 16px', textAlign: 'center', color: '#bbb', fontSize: 13 }}>
+                  还没有自定义模型
+                  <br />
+                  点击下方按钮接入你自己的 OpenAI 兼容端点
+                </div>
+              ) : (
+                props.models.map((m) => (
+                  <div key={m.id} style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #eee', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 500, color: '#333', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
+                      <div style={{ fontSize: 11, color: '#999', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2 }}>
+                        model: {m.model ?? m.id}
+                      </div>
+                      <div style={{ fontSize: 11, color: '#bbb', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.baseUrl}</div>
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flexShrink: 0 }}>
+                      <button
+                        onClick={() => {
+                          props.onSelect(m.id)
+                          props.onClose()
+                        }}
+                        title="使用此模型"
+                        style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #1677ff', background: '#fff', color: '#1677ff', fontSize: 11, cursor: 'pointer' }}
+                      >
+                        使用
+                      </button>
+                      <button onClick={() => openEdit(m)} title="编辑" style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #eee', background: '#fff', color: '#555', fontSize: 11, cursor: 'pointer' }}>
+                        编辑
+                      </button>
+                      <button onClick={() => void props.onRemove(m.id)} title="删除" style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #ffccc7', background: '#fff', color: '#ff4d4f', fontSize: 11, cursor: 'pointer' }}>
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+            <div style={{ padding: '12px 16px', borderTop: '1px solid #eee' }}>
+              <button onClick={openAdd} style={{ width: '100%', padding: '10px', borderRadius: 8, border: '1px dashed #d9d9d9', background: '#fff', cursor: 'pointer', fontSize: 13, color: '#555', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
+                <IconPlus /> 新增自定义模型
+              </button>
+            </div>
+          </>
+        ) : (
+          <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px' }}>
+            <Field label="名称" value={name} onChange={setName} placeholder="例如：我的 GPT-4o" />
+            <Field label="端点 (baseUrl)" value={baseUrl} onChange={setBaseUrl} placeholder="https://api.openai.com/v1" />
+            <Field label="API Key" value={apiKey} onChange={setApiKey} placeholder="sk-..." password />
+            <Field label="模型参数 (model)" value={model} onChange={setModel} placeholder="gpt-4o" />
+            {err && <p style={{ color: '#ff4d4f', fontSize: 12, marginBottom: 8, wordBreak: 'break-word' }}>{err}</p>}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={() => void submit()} disabled={loading} style={{ flex: 1, padding: 10, borderRadius: 8, border: 'none', background: '#1677ff', color: '#fff', fontSize: 14, cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.6 : 1 }}>
+                {loading ? '保存中…' : '保存'}
+              </button>
+              <button onClick={() => setView('list')} style={{ padding: '10px 16px', borderRadius: 8, border: '1px solid #ddd', background: '#fff', color: '#555', fontSize: 14, cursor: 'pointer' }}>
+                取消
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )

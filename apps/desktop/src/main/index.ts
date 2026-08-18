@@ -20,6 +20,9 @@ function registerPush(win: BrowserWindow): void {
   runtime.onApprovalRequest((req) => {
     if (!win.isDestroyed()) win.webContents.send('approval:request', req)
   })
+  runtime.onTokenStats((stats) => {
+    if (!win.isDestroyed()) win.webContents.send('token:stats', stats)
+  })
 }
 
 /** 渲染进程 → 主进程 调用（登录 / 会话 / 模型 / 审批 / 跑任务） */
@@ -29,8 +32,12 @@ function registerIpc(): void {
   ipcMain.handle('auth:logout', async () => runtime!.logout())
   ipcMain.handle('auth:listModels', async () => runtime!.listModels())
   ipcMain.handle('session:list', async () => runtime!.listSessions())
-  ipcMain.handle('session:create', async (_e, title?: string) => runtime!.createSession(title))
+  ipcMain.handle('session:create', async (_e, title?: string, workdir?: string) => runtime!.createSession(title, workdir))
   ipcMain.handle('session:switch', async (_e, id: string) => runtime!.switchSession(id))
+  ipcMain.handle('session:rename', async (_e, id: string, title: string) => runtime!.renameSession(id, title))
+  ipcMain.handle('session:delete', async (_e, id: string) => runtime!.deleteSession(id))
+  ipcMain.handle('session:workdir', async (_e, id?: string) => runtime!.getSessionWorkdir(id))
+  ipcMain.handle('session:setWorkdir', async (_e, id: string, workdir: string) => runtime!.setSessionWorkdir(id, workdir))
   ipcMain.handle('session:history', async (_e, id?: string) => runtime!.getSessionHistory(id))
   ipcMain.handle('approval:respond', async (_e, outcome: 'allowed-once' | 'rejected', requestId: string) => runtime!.respondApproval(outcome, requestId))
   ipcMain.handle('chat:run', async (_e, message: string, attachments?: Array<Record<string, unknown>>) =>
@@ -38,7 +45,9 @@ function registerIpc(): void {
   )
   ipcMain.handle('model:switch', async (_e, id: string) => runtime!.switchModel(id))
   ipcMain.handle('model:current', async () => runtime!.getCurrentModelId())
+  ipcMain.handle('token:stats', async () => runtime!.getTokenStats())
   ipcMain.handle('model:addCustom', async (_e, input: { name: string; baseUrl: string; apiKey: string; model: string }) => runtime!.addCustomModel(input))
+  ipcMain.handle('model:updateCustom', async (_e, id: string, input: { name: string; baseUrl: string; apiKey: string; model: string }) => runtime!.updateCustomModel(id, input))
   ipcMain.handle('model:removeCustom', async (_e, id: string) => runtime!.removeCustomModel(id))
   ipcMain.handle('chat:stop', async () => runtime!.stop())
   ipcMain.handle('voice:speak', async (_e, text: string) => {

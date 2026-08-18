@@ -29,6 +29,19 @@ export interface ContentPart {
   input_video?: { data: string; format: string }
 }
 
+/** token 用量快照（累计 / 本轮 / 上下文占比） */
+export interface TokenSnapshot {
+  totalPrompt: number
+  totalCompletion: number
+  total: number
+  turnPrompt: number
+  turnCompletion: number
+  turn: number
+  contextLength: number
+  lastPrompt: number
+  contextUsageRatio: number
+}
+
 export interface ShanhaiBridge {
   // 认证
   status(): Promise<{ loggedIn: boolean; username: string | null }>
@@ -36,11 +49,16 @@ export interface ShanhaiBridge {
   logout(): Promise<void>
   listModels(): Promise<Array<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; custom?: boolean }>>
   addCustomModel(model: { name: string; baseUrl: string; apiKey: string; model: string }): Promise<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; custom?: boolean }>
+  updateCustomModel(id: string, model: { name: string; baseUrl: string; apiKey: string; model: string }): Promise<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; custom?: boolean }>
   removeCustomModel(id: string): Promise<void>
   // 会话
-  listSessions(): Promise<Array<{ id: string; title: string }>>
-  createSession(title?: string): Promise<string>
+  listSessions(): Promise<Array<{ id: string; title: string; workDir: string }>>
+  createSession(title?: string, workdir?: string): Promise<string>
   switchSession(id: string): Promise<void>
+  renameSession(id: string, title: string): Promise<void>
+  deleteSession(id: string): Promise<void>
+  getSessionWorkdir(id?: string): Promise<string>
+  setSessionWorkdir(id: string, workdir: string): Promise<void>
   getSessionHistory(id?: string): Promise<Array<{ kind: 'user' | 'assistant' | 'tool'; content?: string; trace?: ToolTrace; attachments?: unknown[] }>>
   // 审批
   onApprovalRequest(cb: (req: ApprovalRequest) => void): () => void
@@ -56,6 +74,9 @@ export interface ShanhaiBridge {
   stop(): Promise<void>
   speak(text: string): Promise<void>
   screenshot(): Promise<string>
+  // token 用量
+  getTokenStats(): Promise<TokenSnapshot>
+  onTokenStats(cb: (stats: TokenSnapshot) => void): () => void
 }
 
 const bridge: ShanhaiBridge = {
@@ -64,10 +85,15 @@ const bridge: ShanhaiBridge = {
   logout: () => ipcRenderer.invoke('auth:logout'),
   listModels: () => ipcRenderer.invoke('auth:listModels'),
   addCustomModel: (model) => ipcRenderer.invoke('model:addCustom', model),
+  updateCustomModel: (id, model) => ipcRenderer.invoke('model:updateCustom', id, model),
   removeCustomModel: (id) => ipcRenderer.invoke('model:removeCustom', id),
   listSessions: () => ipcRenderer.invoke('session:list'),
-  createSession: (title) => ipcRenderer.invoke('session:create', title),
+  createSession: (title, workdir) => ipcRenderer.invoke('session:create', title, workdir),
   switchSession: (id) => ipcRenderer.invoke('session:switch', id),
+  renameSession: (id, title) => ipcRenderer.invoke('session:rename', id, title),
+  deleteSession: (id) => ipcRenderer.invoke('session:delete', id),
+  getSessionWorkdir: (id) => ipcRenderer.invoke('session:workdir', id),
+  setSessionWorkdir: (id, workdir) => ipcRenderer.invoke('session:setWorkdir', id, workdir),
   getSessionHistory: (id) => ipcRenderer.invoke('session:history', id),
   respondApproval: (outcome, requestId) => ipcRenderer.invoke('approval:respond', outcome, requestId),
   run: (message, attachments) => ipcRenderer.invoke('chat:run', message, attachments),
@@ -76,6 +102,12 @@ const bridge: ShanhaiBridge = {
   stop: () => ipcRenderer.invoke('chat:stop'),
   speak: (text) => ipcRenderer.invoke('voice:speak', text),
   screenshot: () => ipcRenderer.invoke('computer:shot'),
+  getTokenStats: () => ipcRenderer.invoke('token:stats'),
+  onTokenStats: (cb) => {
+    const listener = (_e: unknown, stats: TokenSnapshot) => cb(stats)
+    ipcRenderer.on('token:stats', listener)
+    return () => ipcRenderer.removeListener('token:stats', listener)
+  },
   onApprovalRequest: (cb) => {
     const listener = (_e: unknown, req: ApprovalRequest) => cb(req)
     ipcRenderer.on('approval:request', listener)

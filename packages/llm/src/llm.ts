@@ -180,6 +180,8 @@ export class DeepSeekProvider implements Model {
           function: { name: t.name, description: t.description, parameters: t.inputSchema },
         })),
         stream: true,
+        // 请求网关在流末尾返回 usage（OpenAI 兼容；网关不支持时自动忽略，不影响流）
+        stream_options: { include_usage: true },
       }),
     })
     if (!res.ok || !res.body) {
@@ -194,6 +196,17 @@ export class DeepSeekProvider implements Model {
       const ev = parseSseLine(line)
       const out: StreamChunk[] = []
       if (!ev) return out
+      if (ev.usage) {
+        // 流末尾 usage：先结算未 flush 的工具调用，再产出 usage，并回传成本统计
+        if (toolCallAcc) {
+          const tc = flushToolCall(toolCallAcc)
+          if (tc) out.push(tc)
+          toolCallAcc = null
+        }
+        out.push({ usage: ev.usage })
+        if (this.opts.onUsage) this.opts.onUsage(ev.usage)
+        return out
+      }
       if (ev.text !== undefined) {
         if (toolCallAcc) {
           const tc = flushToolCall(toolCallAcc)
@@ -238,9 +251,10 @@ function flushToolCall(acc: { id?: string; name?: string; argsText: string }): S
 interface SseDeltaEvent {
   text?: string
   toolCall?: { id?: string; name?: string; argsDelta?: string }
+  usage?: Usage
 }
 
-/** 解析单行 SSE `data: {...}`，返回 text 增量或 tool_calls 分片；网关返回 error 时抛错 */
+/** 解析单行 SSE `data: {...}`，返回 text 增量 / tool_calls 分片 / usage；网关返回 error 时抛错 */
 function parseSseLine(line: string): SseDeltaEvent | null {
   const trimmed = line.trim()
   if (!trimmed.startsWith('data:')) return null
@@ -248,6 +262,7 @@ function parseSseLine(line: string): SseDeltaEvent | null {
   if (!data || data === '[DONE]') return null
   let parsed: {
     error?: string | { message?: string }
+    usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
     choices?: Array<{
       delta?: {
         content?: string
@@ -264,6 +279,16 @@ function parseSseLine(line: string): SseDeltaEvent | null {
   if (parsed.error) {
     const msg = typeof parsed.error === 'string' ? parsed.error : (parsed.error.message ?? JSON.stringify(parsed.error))
     throw new Error(msg)
+  }
+  // 流末尾 usage（stream_options.include_usage 时网关返回）
+  if (parsed.usage) {
+    return {
+      usage: {
+        promptTokens: parsed.usage.prompt_tokens ?? 0,
+        completionTokens: parsed.usage.completion_tokens ?? 0,
+        totalTokens: parsed.usage.total_tokens ?? 0,
+      },
+    }
   }
   const delta = parsed.choices?.[0]?.delta
   const text = typeof delta?.content === 'string' && delta.content ? delta.content : undefined

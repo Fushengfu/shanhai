@@ -2,7 +2,7 @@ import { Kernel } from '@shanhai/kernel'
 import { Session, type SessionEvent } from '@shanhai/session'
 import { ApprovalService } from '@shanhai/approval'
 import { AgentLoop } from '@shanhai/agent'
-import type { Model, ContentPart } from '@shanhai/llm'
+import type { Model, ContentPart, TokenUsage } from '@shanhai/llm'
 import { createMockModel, DeepSeekProvider } from '@shanhai/llm'
 import { atomicTools, type ToolContract } from '@shanhai/tools'
 import { MemoryStore } from '@shanhai/memory'
@@ -38,6 +38,24 @@ export interface ToolTrace {
 
 export type ApprovalOutcome = 'allowed-once' | 'rejected'
 
+/** token 用量快照（UI 底部状态栏展示：累计 / 本轮 / 上下文占比） */
+export interface TokenSnapshot {
+  /** 累计（本次启动以来的所有模型调用） */
+  totalPrompt: number
+  totalCompletion: number
+  total: number
+  /** 本轮任务（当前 run 期间） */
+  turnPrompt: number
+  turnCompletion: number
+  turn: number
+  /** 当前模型上下文窗口长度（无则 0） */
+  contextLength: number
+  /** 最近一次请求的 prompt tokens（即已占用的上下文） */
+  lastPrompt: number
+  /** 上下文窗口占比 0~1（lastPrompt / contextLength，contextLength 为 0 时返回 0） */
+  contextUsageRatio: number
+}
+
 export interface Runtime {
   kernel: Kernel
   session: Session
@@ -58,14 +76,24 @@ export interface Runtime {
   listModels(): Promise<GatewayModel[]>
   /** 新增用户自定义模型（OpenAI 兼容端点 + Key），返回落库后的模型 */
   addCustomModel(model: { name: string; baseUrl: string; apiKey: string; model: string }): Promise<GatewayModel>
+  /** 编辑用户自定义模型（按 id 更新，保留 id） */
+  updateCustomModel(id: string, model: { name: string; baseUrl: string; apiKey: string; model: string }): Promise<GatewayModel>
   /** 删除用户自定义模型 */
   removeCustomModel(id: string): Promise<void>
   /** 当前选中模型（tier 路由） */
   selectedTier: ModelTier
 
-  /** 会话列表（内存多会话） */
-  listSessions(): Array<{ id: string; title: string }>
+  /** 会话列表（内存多会话，含每会话工作目录） */
+  listSessions(): Array<{ id: string; title: string; workDir: string }>
   switchSession(id: string): void
+  /** 重命名会话标题 */
+  renameSession(id: string, title: string): void
+  /** 删除会话（当前会话被删则切到剩余第一个） */
+  deleteSession(id: string): Promise<void>
+  /** 获取指定会话工作目录（不传 id 用当前会话） */
+  getSessionWorkdir(id?: string): string
+  /** 修改指定会话工作目录 */
+  setSessionWorkdir(id: string, workdir: string): void
   /** 获取指定会话的历史消息（UI 切换会话时加载；不传 id 用当前会话） */
   getSessionHistory(id?: string): Array<{ kind: 'user' | 'assistant' | 'tool'; content?: string; trace?: ToolTrace; attachments?: unknown[] }>
   /** 新建会话（可指定工作目录），返回会话 id */
@@ -83,6 +111,11 @@ export interface Runtime {
   /** 流式增量回调（sessionId 标识来源会话） */
   onDelta(cb: (sessionId: string, text: string) => void): () => void
 
+  /** 当前 token 用量快照（累计 / 本轮 / 上下文占比） */
+  getTokenStats(): TokenSnapshot
+  /** token 用量变化回调（模型每次返回 usage 时推送） */
+  onTokenStats(cb: (stats: TokenSnapshot) => void): () => void
+
   /** 切换模型（动态更新 provider，后续对话用新模型，并持久化到本地） */
   switchModel(modelId: string): void
   /** 当前选中的模型 id（从本地缓存恢复，重启后仍记住） */
@@ -95,7 +128,7 @@ export interface Runtime {
 }
 
 /** 从本地凭证装配真实网关模型；无凭证则 mock 兜底 */
-async function createGatewayModel(): Promise<Model> {
+async function createGatewayModel(onUsage?: (usage: TokenUsage) => void): Promise<Model> {
   try {
     const raw = await fs.readFile(join(homedir(), '.shanhai', 'config.json'), 'utf8')
     const cfg = JSON.parse(raw) as {
@@ -103,7 +136,7 @@ async function createGatewayModel(): Promise<Model> {
     }
     const g = cfg.gateway
     if (g?.baseUrl && g?.apiKey && g?.selectedModelId) {
-      return new DeepSeekProvider({ apiKey: g.apiKey, baseUrl: g.baseUrl, model: g.selectedModelId })
+      return new DeepSeekProvider({ apiKey: g.apiKey, baseUrl: g.baseUrl, model: g.selectedModelId, onUsage })
     }
   } catch {
     // 无凭证，走 mock
@@ -295,7 +328,7 @@ export async function bootstrap(): Promise<Runtime> {
 
   const newSession = (title: string, workDir?: string): string => {
     const id = `s-${Date.now()}-${Math.random().toString(36).slice(2)}`
-    const meta: SessionMeta = { id, title, session: new Session(), workDir: workDir ?? join(homedir(), 'shanhai-workspace') }
+    const meta: SessionMeta = { id, title, session: new Session(), workDir: workDir ?? join(homedir(), 'shanhai', 'workspace') }
     sessions.set(id, meta)
     currentSessionId = id
     void persistSession(meta)
@@ -304,7 +337,7 @@ export async function bootstrap(): Promise<Runtime> {
 
   function currentWorkDir(): string {
     const meta = currentSessionId ? sessions.get(currentSessionId) : undefined
-    return meta?.workDir ?? join(homedir(), 'shanhai-workspace')
+    return meta?.workDir ?? join(homedir(), 'shanhai', 'workspace')
   }
 
   // 启动时加载历史会话（聊天记录持久化：重启后历史消息不丢）
@@ -320,7 +353,7 @@ export async function bootstrap(): Promise<Runtime> {
           id: data.id,
           title: data.title,
           session: new Session(),
-          workDir: data.workDir ?? join(homedir(), 'shanhai-workspace'),
+          workDir: data.workDir ?? join(homedir(), 'shanhai', 'workspace'),
         }
         if (Array.isArray(data.events)) meta.session.restore(data.events)
         sessions.set(meta.id, meta)
@@ -417,7 +450,7 @@ export async function bootstrap(): Promise<Runtime> {
     const errors: string[] = []
     for (const vm of visionModels) {
       try {
-        const provider = new DeepSeekProvider({ apiKey: gatewayApiKey, baseUrl: gatewayBaseUrl, model: vm.id })
+        const provider = new DeepSeekProvider({ apiKey: gatewayApiKey, baseUrl: gatewayBaseUrl, model: vm.id, onUsage })
         const res = await provider.complete([
           {
             role: 'user',
@@ -475,10 +508,60 @@ export async function bootstrap(): Promise<Runtime> {
     },
   }))
 
+  // —— token 统计（累计 / 本轮 / 上下文占比，UI 底部状态栏展示）——
+  const tokenStats = {
+    totalPrompt: 0,
+    totalCompletion: 0,
+    total: 0,
+    turnPrompt: 0,
+    turnCompletion: 0,
+    turn: 0,
+    contextLength: 0,
+    lastPrompt: 0,
+  }
+  const tokenCallbacks = new Set<(stats: TokenSnapshot) => void>()
+
+  const snapshot = (): TokenSnapshot => ({
+    totalPrompt: tokenStats.totalPrompt,
+    totalCompletion: tokenStats.totalCompletion,
+    total: tokenStats.total,
+    turnPrompt: tokenStats.turnPrompt,
+    turnCompletion: tokenStats.turnCompletion,
+    turn: tokenStats.turn,
+    contextLength: tokenStats.contextLength,
+    lastPrompt: tokenStats.lastPrompt,
+    contextUsageRatio: tokenStats.contextLength > 0 ? tokenStats.lastPrompt / tokenStats.contextLength : 0,
+  })
+
+  const emitTokenStats = (): void => {
+    const s = snapshot()
+    tokenCallbacks.forEach((cb) => cb(s))
+  }
+
+  /** 每次模型返回 usage 时累计（流式末尾 / 一次性 complete 均触发） */
+  const onUsage = (usage: TokenUsage): void => {
+    tokenStats.totalPrompt += usage.promptTokens
+    tokenStats.totalCompletion += usage.completionTokens
+    tokenStats.total += usage.totalTokens
+    tokenStats.turnPrompt += usage.promptTokens
+    tokenStats.turnCompletion += usage.completionTokens
+    tokenStats.turn += usage.totalTokens
+    tokenStats.lastPrompt = usage.promptTokens
+    emitTokenStats()
+  }
+
+  /** 刷新当前模型的上下文窗口长度（模型切换/登录后调用） */
+  const refreshContextLength = (): void => {
+    const m = allModels().find((m) => m.id === currentModelId)
+    tokenStats.contextLength = m?.contextLength ?? 0
+    emitTokenStats()
+  }
+
   // —— 模型 + agent ——
-  let model = await createGatewayModel()
+  let model = await createGatewayModel(onUsage)
   let sessionRef = sessions.get(currentSessionId!)!.session
   const deltaCallbacks = new Set<(sessionId: string, text: string) => void>()
+  refreshContextLength()
 
   // —— 登录 ——
   const credentials = new FileCredentialStore()
@@ -567,9 +650,10 @@ export async function bootstrap(): Promise<Runtime> {
           gatewayModels[0]
         if (target) {
           currentModelId = target.id
-          model = new DeepSeekProvider({ apiKey: gatewayApiKey, baseUrl: gatewayBaseUrl, model: currentModelId })
+          model = new DeepSeekProvider({ apiKey: gatewayApiKey, baseUrl: gatewayBaseUrl, model: currentModelId, onUsage })
         }
       }
+      refreshContextLength()
       await persistLoginToken(s.token, s.username, { nickname: s.nickname, avatar: s.avatar }, {
         apiKey: gatewayApiKey,
         baseUrl: gatewayBaseUrl,
@@ -607,10 +691,11 @@ export async function bootstrap(): Promise<Runtime> {
       // 恢复模型：优先当前选中的自定义模型（不依赖登录），否则回退 mock
       const customTarget = customModels.find((m) => m.id === currentModelId)
       if (customTarget?.apiKey && customTarget?.baseUrl) {
-        model = new DeepSeekProvider({ apiKey: customTarget.apiKey, baseUrl: customTarget.baseUrl, model: customTarget.model ?? customTarget.id })
+        model = new DeepSeekProvider({ apiKey: customTarget.apiKey, baseUrl: customTarget.baseUrl, model: customTarget.model ?? customTarget.id, onUsage })
       } else {
-        model = await createGatewayModel()
+        model = await createGatewayModel(onUsage)
       }
+      refreshContextLength()
     },
     async listModels() {
       // 系统内置 + 用户自定义（自定义 custom: true，UI 分组展示）
@@ -631,18 +716,48 @@ export async function bootstrap(): Promise<Runtime> {
       await persistCustomModels(customModels)
       return custom
     },
+    async updateCustomModel(id, input) {
+      const existing = customModels.find((m) => m.id === id)
+      if (!existing) throw new Error(`自定义模型不存在: ${id}`)
+      const updated: GatewayModel = {
+        id: existing.id,
+        name: input.name || input.model,
+        model: input.model,
+        tier: existing.tier,
+        apiKey: input.apiKey,
+        baseUrl: input.baseUrl,
+        contextLength: existing.contextLength,
+        maxTokens: existing.maxTokens,
+        temperature: existing.temperature,
+        supportsVision: existing.supportsVision,
+        supportsReasoning: existing.supportsReasoning,
+        provider: existing.provider,
+        sortOrder: existing.sortOrder,
+        description: existing.description,
+        source: existing.source,
+        custom: true,
+      }
+      customModels = customModels.map((m) => (m.id === id ? updated : m))
+      // 若正在使用该模型，同步更新 provider
+      if (currentModelId === id && updated.apiKey && updated.baseUrl) {
+        model = new DeepSeekProvider({ apiKey: updated.apiKey, baseUrl: updated.baseUrl, model: updated.model ?? updated.id, onUsage })
+      }
+      await persistCustomModels(customModels)
+      return updated
+    },
     async removeCustomModel(id) {
       customModels = customModels.filter((m) => m.id !== id)
       if (currentModelId === id) {
         currentModelId = ''
-        model = await createGatewayModel()
+        model = await createGatewayModel(onUsage)
       }
+      refreshContextLength()
       await persistCustomModels(customModels)
     },
     selectedTier,
 
     listSessions() {
-      return [...sessions.values()].map((s) => ({ id: s.id, title: s.title }))
+      return [...sessions.values()].map((s) => ({ id: s.id, title: s.title, workDir: s.workDir }))
     },
     switchSession(id) {
       const target = sessions.get(id)
@@ -650,6 +765,42 @@ export async function bootstrap(): Promise<Runtime> {
         currentSessionId = id
         sessionRef = target.session
       }
+    },
+    renameSession(id, title) {
+      const meta = sessions.get(id)
+      if (!meta) return
+      const trimmed = title.trim()
+      if (!trimmed) return
+      meta.title = trimmed
+      void persistSession(meta)
+    },
+    async deleteSession(id) {
+      const meta = sessions.get(id)
+      if (!meta) return
+      sessions.delete(id)
+      await fs.rm(join(sessionsDir, `${id}.json`), { force: true }).catch(() => undefined)
+      // 当前会话被删：切到剩余第一个；无剩余则新建一个空会话
+      if (currentSessionId === id) {
+        const next = sessions.values().next().value as SessionMeta | undefined
+        if (next) {
+          currentSessionId = next.id
+          sessionRef = next.session
+        } else {
+          newSession('新会话')
+        }
+      }
+    },
+    getSessionWorkdir(id) {
+      const meta = sessions.get(id ?? currentSessionId ?? '')
+      return meta?.workDir ?? join(homedir(), 'shanhai', 'workspace')
+    },
+    setSessionWorkdir(id, workdir) {
+      const meta = sessions.get(id)
+      if (!meta) return
+      const trimmed = workdir.trim()
+      if (!trimmed) return
+      meta.workDir = trimmed
+      void persistSession(meta)
     },
     getSessionHistory(id) {
       const target = sessions.get(id ?? currentSessionId ?? '')
@@ -672,8 +823,7 @@ export async function bootstrap(): Promise<Runtime> {
       return out
     },
     createSession(title, workdir) {
-      void workdir
-      return newSession(title ?? '新会话')
+      return newSession(title ?? '新会话', workdir)
     },
     getHistory() {
       const target = sessions.get(currentSessionId ?? '')
@@ -717,13 +867,24 @@ export async function bootstrap(): Promise<Runtime> {
       }
     },
 
+    getTokenStats() {
+      return snapshot()
+    },
+    onTokenStats(cb) {
+      tokenCallbacks.add(cb)
+      return () => {
+        tokenCallbacks.delete(cb)
+      }
+    },
+
     switchModel(modelId) {
       currentModelId = modelId
       // 从系统/自定义模型中找到目标，用其 apiKey + baseUrl + model 参数（自定义模型用自有 Key）
       const target = allModels().find((m) => m.id === modelId)
       if (target?.apiKey && target?.baseUrl) {
-        model = new DeepSeekProvider({ apiKey: target.apiKey, baseUrl: target.baseUrl, model: target.model ?? target.id })
+        model = new DeepSeekProvider({ apiKey: target.apiKey, baseUrl: target.baseUrl, model: target.model ?? target.id, onUsage })
       }
+      refreshContextLength()
       // 持久化选中模型到 config.json（下次打开不再重复选择）
       void persistSelectedModel(modelId)
     },
@@ -741,6 +902,11 @@ export async function bootstrap(): Promise<Runtime> {
       if (!meta) throw new Error(`会话不存在: ${sid}`)
       const targetSession = meta.session
       stoppedSessions.delete(sid)
+      // 本轮任务开始时清零 turn 统计，模型每次返回 usage 时重新累计
+      tokenStats.turnPrompt = 0
+      tokenStats.turnCompletion = 0
+      tokenStats.turn = 0
+      emitTokenStats()
       let finalMessage = message
       let finalAttachments = opts?.attachments
       // 图片降级：当前模型不支持视觉时，先用视觉模型把图片转成文字描述，再发给当前模型
@@ -773,6 +939,9 @@ export async function bootstrap(): Promise<Runtime> {
           return '（已中断，历史已保留，可继续输入以续跑）'
         }
         throw err
+      } finally {
+        // 会话事件（用户消息/助手回复/工具过程）已追加到 session，立即落盘，重启不丢
+        await persistSession(meta)
       }
     },
   }
