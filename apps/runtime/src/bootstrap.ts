@@ -2,7 +2,7 @@ import { Kernel, type DynamicPackage } from '@shanhai/kernel'
 import { SelfModifyRuntime } from './selfmod'
 import { Session, effectiveApprovalPolicy, type SessionEvent } from '@shanhai/session'
 import { ApprovalService } from '@shanhai/approval'
-import { AgentLoop } from '@shanhai/agent'
+import { AgentLoop, ModelTriage, Orchestrator, type RoleDefinition, type StepTrace } from '@shanhai/agent'
 import type { Model, ContentPart, TokenUsage } from '@shanhai/llm'
 import { createMockModel, DeepSeekProvider } from '@shanhai/llm'
 import { createAtomicTools, type ToolContract } from '@shanhai/tools'
@@ -182,6 +182,8 @@ export interface Runtime {
   onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
   /** browser 半卸载回调（UI 移除组件） */
   onClientRemove(cb: (pkgId: string) => void): () => void
+  /** 多专家编排轨迹回调（UI 展示 Triage 拆解 → 专家执行过程） */
+  onExpertTrace(cb: (trace: StepTrace) => void): () => void
 }
 
 /** 从本地凭证装配真实网关模型；无凭证则 mock 兜底 */
@@ -903,6 +905,39 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     apply: (ctx) => ctx.provide('agent', () => new AgentLoop(model, tools, sessionRef, approval)),
   })
 
+  // —— 多专家编排（Triage 拆解 → 路由专家 → 依赖调度 → 汇总）——
+  // 内置专家角色：每个专家 = 通用运行时 + 专属 systemPrompt。工具集复用全部基础工具，避免专家缺工具导致任务失败。
+  const BUILTIN_ROLES: RoleDefinition[] = [
+    { id: 'general', name: '通用助手', description: '日常问答、对话、信息整理', systemPrompt: '', toolSet: [], skillSet: [] },
+    { id: 'code', name: '代码专家', description: '读写代码、执行命令、排查 bug', systemPrompt: '你是「代码专家」，专注于读写代码、执行 shell 命令、排查 bug，输出严谨并给出行号与根因。', toolSet: [], skillSet: [] },
+    { id: 'writer', name: '写作专家', description: '撰写文档、文案润色', systemPrompt: '你是「写作专家」，专注于撰写文档、润色文字、结构化表达。', toolSet: [], skillSet: [] },
+    { id: 'analyst', name: '分析专家', description: '数据分析、信息提取与总结', systemPrompt: '你是「分析专家」，专注于数据分析、信息提取与总结，结论条理清晰。', toolSet: [], skillSet: [] },
+  ]
+  const roleNameById = new Map(BUILTIN_ROLES.map((r) => [r.id, r.name]))
+  const triage = new ModelTriage(model, BUILTIN_ROLES)
+  // 专家执行轨迹回调（UI 展示多专家协作过程）
+  const expertTraceCallbacks = new Set<(trace: StepTrace) => void>()
+
+  /** 构造专家池：每个角色一个 AgentLoop（独立 Session 记录执行过程，审批路由到主会话） */
+  const buildExpertAgents = (sid: string): Map<string, AgentLoop> => {
+    const map = new Map<string, AgentLoop>()
+    for (const role of BUILTIN_ROLES) {
+      const expertSession = new Session()
+      map.set(role.id, new AgentLoop(model, tools, expertSession, approval, sid))
+    }
+    return map
+  }
+
+  /** 专家专属 systemPrompt（含环境信息 + 角色人设），由 Orchestrator 在每步注入 */
+  const buildExpertSystemPrompts = (workDir: string): Map<string, string> => {
+    const base = buildSystemPrompt(workDir)
+    const map = new Map<string, string>()
+    for (const role of BUILTIN_ROLES) {
+      map.set(role.id, role.systemPrompt ? `${base}\n\n${role.systemPrompt}` : base)
+    }
+    return map
+  }
+
   /**
    * 在指定会话内跑一次任务（run / resend / resume 共用）。
    * 图片降级 + ReAct 循环 + 中断处理 + 落盘。
@@ -937,6 +972,36 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       }
       const desc = parts.filter(Boolean).join('\n')
       modelContent = message ? `${message}\n\n${desc}` : desc
+    }
+    // —— 多专家编排入口：Triage 拆解（复杂任务拆多步路由专家，简单任务单步走现有 ReAct）——
+    // 拆解失败（模型/网络/解析异常）自动退化为单步，绝不阻断主流程
+    try {
+      const plan = await sessionContext.run(sid, () => triage.route(message))
+      if (plan.steps.length > 1) {
+        // 多步编排：先落盘用户消息（专家用独立 Session，主会话手动记录用户消息 + 最终回复）
+        targetSession.append('user/message', { content: message, attachments: (opts?.attachments ?? []) as unknown[] })
+        targetSession.append('turn/start', { turn: 1 })
+        const orchestrator = new Orchestrator(triage, buildExpertAgents(sid), {
+          sessionId: sid,
+          expertNames: roleNameById,
+          expertSystemPrompts: buildExpertSystemPrompts(meta.workDir),
+          onStep: (trace) => expertTraceCallbacks.forEach((cb) => cb(trace)),
+          onDelta: (text) => {
+            if (stoppedSessions.has(sid)) throw new Error('__stopped__')
+            deltaCallbacks.forEach((cb) => cb(sid, text))
+          },
+          onReasoning: (text) => {
+            reasoningCallbacks.forEach((cb) => cb(sid, text))
+          },
+        })
+        const result = await sessionContext.run(sid, () => orchestrator.run(message))
+        targetSession.append('assistant/message', { content: result.text })
+        targetSession.append('turn/end', { turn: 1, text: result.text })
+        return result.text
+      }
+    } catch (err) {
+      // Triage 拆解异常：退化单步
+      console.error('[orchestrator] Triage 拆解异常，退化单步:', err instanceof Error ? err.message : err)
     }
     const loop = new AgentLoop(model, tools, targetSession, approval, sid)
     try {
@@ -1435,6 +1500,11 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     onClientRemove(cb) {
       clientRemoveCallbacks.add(cb)
       return () => clientRemoveCallbacks.delete(cb)
+    },
+
+    onExpertTrace(cb) {
+      expertTraceCallbacks.add(cb)
+      return () => expertTraceCallbacks.delete(cb)
     },
   }
 }

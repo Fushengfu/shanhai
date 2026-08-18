@@ -96,6 +96,18 @@ export interface ShanhaiBridge {
   respondClientRun(requestId: string, approved: boolean): Promise<void>
   onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
   onClientRemove(cb: (pkgId: string) => void): () => void
+  onExpertTrace(cb: (trace: ExpertTrace) => void): () => void
+}
+
+/** 多专家编排轨迹 */
+export interface ExpertTrace {
+  stepId: string
+  expertId: string
+  expertName: string
+  title: string
+  status: 'started' | 'completed' | 'failed'
+  result?: string
+  error?: string
 }
 
 const bridge: ShanhaiBridge = {
@@ -173,6 +185,11 @@ const bridge: ShanhaiBridge = {
     const listener = (_e: unknown, pkgId: string) => cb(pkgId)
     ipcRenderer.on('selfmod:client-remove', listener)
     return () => ipcRenderer.removeListener('selfmod:client-remove', listener)
+  },
+  onExpertTrace: (cb) => {
+    const listener = (_e: unknown, trace: ExpertTrace) => cb(trace)
+    ipcRenderer.on('expert:trace', listener)
+    return () => ipcRenderer.removeListener('expert:trace', listener)
   },
 }
 

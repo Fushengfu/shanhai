@@ -20,4 +20,6 @@ export function registerPush(win: BrowserWindow): void {
   runtime.onClientRunRequest((req) => send('selfmod:client-run-request', req))
   runtime.onClientCode((payload) => send('selfmod:client-code', payload))
   runtime.onClientRemove((pkgId) => send('selfmod:client-remove', pkgId))
+  // 多专家编排轨迹
+  runtime.onExpertTrace((trace) => send('expert:trace', trace))
 }

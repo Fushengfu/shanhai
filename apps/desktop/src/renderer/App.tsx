@@ -72,6 +72,18 @@ interface ClientRunRequest {
   purpose: string
 }
 
+/** 多专家编排轨迹（Triage 拆解 → 专家执行过程） */
+interface ExpertTrace {
+  sessionId?: string
+  stepId: string
+  expertId: string
+  expertName: string
+  title: string
+  status: 'started' | 'completed' | 'failed'
+  result?: string
+  error?: string
+}
+
 /** 动态注册到 UI 插槽的组件（browser 半 slots.register 的产物） */
 interface ClientComponentReg {
   slot: string
@@ -126,6 +138,7 @@ declare global {
       respondClientRun(requestId: string, approved: boolean): Promise<void>
       onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
       onClientRemove(cb: (pkgId: string) => void): () => void
+      onExpertTrace(cb: (trace: ExpertTrace) => void): () => void
     }
   }
 }
@@ -196,12 +209,16 @@ export function App() {
   const [clientRunRequests, setClientRunRequests] = useState<Record<string, ClientRunRequest[]>>({})
   // 每个动态包的 browser 半 disposer（factory 返回值），卸载时调用
   const clientDisposers = useRef<Map<string, () => void>>(new Map())
+  // 多专家编排轨迹（按会话隔离：Triage 拆解 → 专家执行过程）
+  const [expertTraces, setExpertTraces] = useState<Record<string, ExpertTrace[]>>({})
 
   const cur = sessionMap[currentSessionId] ?? EMPTY_SESSION
   // 当前会话的待审批请求（会话级隔离：只显示当前会话队列的头一个，并行会话互不串扰）
   const curApproval = (approvalQueues[currentSessionId] ?? [])[0] ?? null
   // 当前会话的 browser 半投递审批请求
   const curClientRunRequest = (clientRunRequests[currentSessionId] ?? [])[0] ?? null
+  // 当前会话的多专家编排轨迹
+  const curExpertTraces = expertTraces[currentSessionId] ?? []
 
   /** 执行 browser 半代码：注入 React + slots（按 pkgId 隔离），注册动态组件到指定 slot */
   const mountClientCode = (pkgId: string, code: string): void => {
@@ -329,6 +346,21 @@ export function App() {
     const offClientRemove = api.onClientRemove((pkgId) => {
       unmountClientCode(pkgId)
     })
+    // 多专家编排轨迹（按 sessionId 路由，started 追加、completed/failed 更新）
+    const offExpertTrace = api.onExpertTrace((trace) => {
+      const sid = trace.sessionId ?? currentSessionIdRef.current
+      if (!sid) return
+      setExpertTraces((prev) => {
+        const list = prev[sid] ?? []
+        const idx = list.findIndex((t) => t.stepId === trace.stepId)
+        if (idx >= 0) {
+          const next = [...list]
+          next[idx] = { ...next[idx], ...trace }
+          return { ...prev, [sid]: next }
+        }
+        return { ...prev, [sid]: [...list, trace] }
+      })
+    })
     void api.getApprovalPolicy().then((p) => setApprovalPolicyState(p)).catch(() => undefined)
     return () => {
       offDelta()
@@ -339,6 +371,7 @@ export function App() {
       offClientRun()
       offClientCode()
       offClientRemove()
+      offExpertTrace()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [patchSession])
@@ -925,6 +958,22 @@ export function App() {
             </div>
           )}
             </>
+          )}
+          {/* 多专家编排轨迹（Triage 拆解 → 专家执行过程，started → completed/failed） */}
+          {curExpertTraces.length > 0 && (
+            <div style={{ marginBottom: 8, padding: '10px 12px', borderRadius: 10, border: '1px solid #e6d7ff', background: '#faf7ff', fontSize: 12 }}>
+              <div style={{ fontWeight: 600, color: '#5b3b8e', marginBottom: 6 }}>多专家协作</div>
+              {curExpertTraces.map((t) => (
+                <div key={t.stepId} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0', color: '#666' }}>
+                  <span style={{ width: 16, textAlign: 'center', color: t.status === 'completed' ? '#52c41a' : t.status === 'failed' ? '#ff4d4f' : '#1677ff' }}>
+                    {t.status === 'completed' ? '✓' : t.status === 'failed' ? '✗' : '…'}
+                  </span>
+                  <span style={{ color: '#5b3b8e', fontWeight: 500 }}>{t.expertName}</span>
+                  <span style={{ flex: 1, overflowWrap: 'break-word', wordBreak: 'break-word' }}>{t.title}</span>
+                  {t.status === 'failed' && t.error && <span style={{ color: '#ff4d4f' }}>{t.error}</span>}
+                </div>
+              ))}
+            </div>
           )}
           {/* 自修改（K5）动态扩展区：browser 半通过 slots.register 注册的组件渲染在这里（UI 热更新落点） */}
           {(clientComponents['dynamic-extension'] ?? []).map((reg) => (
