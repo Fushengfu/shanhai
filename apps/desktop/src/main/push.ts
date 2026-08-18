@@ -16,4 +16,8 @@ export function registerPush(win: BrowserWindow): void {
   runtime.onToolTrace((trace) => send('tool:trace', trace))
   runtime.onApprovalRequest((req) => send('approval:request', req))
   runtime.onTokenStats((sessionId, stats) => send('token:stats', sessionId, stats))
+  // 自修改（K5）：browser 半投递的 round-trip 审批 + 代码投递 + 卸载
+  runtime.onClientRunRequest((req) => send('selfmod:client-run-request', req))
+  runtime.onClientCode((payload) => send('selfmod:client-code', payload))
+  runtime.onClientRemove((pkgId) => send('selfmod:client-remove', pkgId))
 }

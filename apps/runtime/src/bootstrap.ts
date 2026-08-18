@@ -1,4 +1,5 @@
-import { Kernel } from '@shanhai/kernel'
+import { Kernel, type DynamicPackage } from '@shanhai/kernel'
+import { SelfModifyRuntime } from './selfmod'
 import { Session, effectiveApprovalPolicy, type SessionEvent } from '@shanhai/session'
 import { ApprovalService } from '@shanhai/approval'
 import { AgentLoop } from '@shanhai/agent'
@@ -170,6 +171,17 @@ export interface Runtime {
   getApprovalPolicy(): 'ask' | 'never'
   /** 切换审批策略（安全模式），并持久化到本地 */
   setApprovalPolicy(policy: 'ask' | 'never'): void
+
+  /** 自修改（K5）：查看当前会话的动态插件包 / 服务 / 工具 / UI 插槽表面 */
+  selfmodInspect(sessionId?: string): unknown
+  /** 自修改：browser 半投递前的 round-trip 审批请求回调（UI 弹卡片） */
+  onClientRunRequest(cb: (req: { requestId: string; sessionId: string; pkgId: string; name: string; purpose: string }) => void): () => void
+  /** UI 应答 browser 半投递审批（approved=true 投递，false 拒绝） */
+  respondClientRun(requestId: string, approved: boolean): void
+  /** browser 半代码投递回调（UI 收到后 slots 注册渲染） */
+  onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
+  /** browser 半卸载回调（UI 移除组件） */
+  onClientRemove(cb: (pkgId: string) => void): () => void
 }
 
 /** 从本地凭证装配真实网关模型；无凭证则 mock 兜底 */
@@ -661,8 +673,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       '6. 需要访问网页/网站、验证前端页面、提取网页数据时，用 browser_navigate 打开页面，配合 browser_get_content / browser_evaluate / browser_screenshot 观察，browser_click / browser_type 操作；截图前要有明确目的，排查问题先看 browser_get_console_logs。',
     ].join('\n')
   }
-  const baseTools = [...createAtomicTools(getSessionCwd), imageAnalyzeTool, ...computerTools, ...browserTools]
-  const tools: ToolContract[] = baseTools.map((t) => ({
+  // —— 工具包装：落 trace + sessionId 注入。动态注册的自修改工具也走同一包装，保证 trace 一致 ——
+  const tools: ToolContract[] = []
+  const wrapTool = (t: ToolContract): ToolContract => ({
     ...t,
     execute: async (args) => {
       const sid = sessionContext.getStore() ?? currentSessionId ?? ''
@@ -690,7 +703,48 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         throw err
       }
     },
-  }))
+  })
+
+  // —— K5 自修改（cordis_* 工具 + vm 沙箱 + browser 半投递 + round-trip 审批）——
+  const clientRunCallbacks = new Set<(req: { requestId: string; sessionId: string; pkgId: string; name: string; purpose: string }) => void>()
+  const pendingClientRuns = new Map<string, { resolve: (approved: boolean) => void; sessionId?: string }>()
+  const clientCodeCallbacks = new Set<(payload: { pkgId: string; name: string; code: string }) => void>()
+  const clientRemoveCallbacks = new Set<(pkgId: string) => void>()
+
+  const selfmod = new SelfModifyRuntime({
+    listServices: () => ['session', 'approval', 'agent', 'memory', 'voice', 'computerUse', 'browserUse', 'model', 'credentials'],
+    listTools: () => tools.map((t) => t.name),
+    registerTool: (rawTool) => {
+      const wrapped = wrapTool(rawTool)
+      tools.push(wrapped)
+      return () => {
+        const idx = tools.indexOf(wrapped)
+        if (idx >= 0) tools.splice(idx, 1)
+      }
+    },
+    onEvent: (name, listener) => kernel.ctx.on(name, listener),
+    requestClientRun: (pkg: DynamicPackage, sessionId: string) =>
+      new Promise<boolean>((resolve) => {
+        const requestId = `client-run-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        pendingClientRuns.set(requestId, { resolve, sessionId })
+        clientRunCallbacks.forEach((cb) => cb({ requestId, sessionId, pkgId: pkg.id, name: pkg.name, purpose: pkg.purpose }))
+      }),
+    deliverClient: async (pkg: DynamicPackage) => {
+      clientCodeCallbacks.forEach((cb) => cb({ pkgId: pkg.id, name: pkg.name, code: pkg.client ?? '' }))
+    },
+    removeClient: async (pkgId: string) => {
+      clientRemoveCallbacks.forEach((cb) => cb(pkgId))
+    },
+  })
+
+  const baseTools = [
+    ...createAtomicTools(getSessionCwd),
+    imageAnalyzeTool,
+    ...computerTools,
+    ...browserTools,
+    ...selfmod.createTools(() => sessionContext.getStore() ?? currentSessionId ?? ''),
+  ]
+  tools.push(...baseTools.map(wrapTool))
 
   // —— token 统计（累计 / 本轮 / 上下文占比，UI 底部状态栏展示；会话级隔离：每个会话独立累计，互不串扰）——
   interface TokenAccumulator {
@@ -1085,6 +1139,13 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
           pendingApprovals.delete(requestId)
         }
       }
+      // 同样拒绝该会话待确认的 browser 半投递（round-trip 审批）
+      for (const [requestId, p] of pendingClientRuns) {
+        if (p.sessionId === id) {
+          p.resolve(false)
+          pendingClientRuns.delete(requestId)
+        }
+      }
       sessions.delete(id)
       await fs.rm(join(sessionsDir, `${id}.json`), { force: true }).catch(() => undefined)
       // 当前会话被删：切到剩余第一个；无剩余则新建一个空会话
@@ -1346,6 +1407,34 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       meta.session.append('approval/policy', { policy })
       approval.setPolicy(policy)
       void persistSession(meta)
+    },
+
+    selfmodInspect(sessionId) {
+      const sid = sessionId ?? currentSessionId ?? ''
+      return selfmod.inspect(sid)
+    },
+
+    onClientRunRequest(cb) {
+      clientRunCallbacks.add(cb)
+      return () => clientRunCallbacks.delete(cb)
+    },
+
+    respondClientRun(requestId, approved) {
+      const p = pendingClientRuns.get(requestId)
+      if (p) {
+        p.resolve(approved)
+        pendingClientRuns.delete(requestId)
+      }
+    },
+
+    onClientCode(cb) {
+      clientCodeCallbacks.add(cb)
+      return () => clientCodeCallbacks.delete(cb)
+    },
+
+    onClientRemove(cb) {
+      clientRemoveCallbacks.add(cb)
+      return () => clientRemoveCallbacks.delete(cb)
     },
   }
 }

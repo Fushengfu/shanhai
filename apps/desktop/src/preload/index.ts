@@ -90,6 +90,12 @@ export interface ShanhaiBridge {
   // token 用量（会话级）
   getTokenStats(): Promise<TokenSnapshot>
   onTokenStats(cb: (sessionId: string, stats: TokenSnapshot) => void): () => void
+  // 自修改（K5）
+  selfmodInspect(sessionId?: string): Promise<unknown>
+  onClientRunRequest(cb: (req: { requestId: string; sessionId: string; pkgId: string; name: string; purpose: string }) => void): () => void
+  respondClientRun(requestId: string, approved: boolean): Promise<void>
+  onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
+  onClientRemove(cb: (pkgId: string) => void): () => void
 }
 
 const bridge: ShanhaiBridge = {
@@ -150,6 +156,23 @@ const bridge: ShanhaiBridge = {
     const listener = (_e: unknown, sessionId: string, text: string) => cb(sessionId, text)
     ipcRenderer.on('chat:reasoning', listener)
     return () => ipcRenderer.removeListener('chat:reasoning', listener)
+  },
+  selfmodInspect: (sessionId) => ipcRenderer.invoke('selfmod:inspect', sessionId),
+  respondClientRun: (requestId, approved) => ipcRenderer.invoke('selfmod:respond', requestId, approved),
+  onClientRunRequest: (cb) => {
+    const listener = (_e: unknown, req: { requestId: string; sessionId: string; pkgId: string; name: string; purpose: string }) => cb(req)
+    ipcRenderer.on('selfmod:client-run-request', listener)
+    return () => ipcRenderer.removeListener('selfmod:client-run-request', listener)
+  },
+  onClientCode: (cb) => {
+    const listener = (_e: unknown, payload: { pkgId: string; name: string; code: string }) => cb(payload)
+    ipcRenderer.on('selfmod:client-code', listener)
+    return () => ipcRenderer.removeListener('selfmod:client-code', listener)
+  },
+  onClientRemove: (cb) => {
+    const listener = (_e: unknown, pkgId: string) => cb(pkgId)
+    ipcRenderer.on('selfmod:client-remove', listener)
+    return () => ipcRenderer.removeListener('selfmod:client-remove', listener)
   },
 }
 

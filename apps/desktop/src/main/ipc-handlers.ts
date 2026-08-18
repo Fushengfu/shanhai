@@ -38,6 +38,10 @@ export function registerIpc(): void {
   ipcMain.handle('approval:getPolicy', async () => runtime.getApprovalPolicy())
   ipcMain.handle('approval:setPolicy', async (_e, policy: 'ask' | 'never') => runtime.setApprovalPolicy(policy))
 
+  // —— 自修改（K5）——
+  ipcMain.handle('selfmod:inspect', async (_e, sessionId?: string) => runtime.selfmodInspect(sessionId))
+  ipcMain.handle('selfmod:respond', async (_e, requestId: string, approved: boolean) => runtime.respondClientRun(requestId, approved))
+
   // —— 聊天 ——
   ipcMain.handle('chat:run', async (_e, message: string, attachments?: Array<Record<string, unknown>>) =>
     runtime.run(message, { attachments: attachments as never }),

@@ -1,3 +1,4 @@
+import * as React from 'react'
 import { useState, useRef, useEffect, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -62,6 +63,23 @@ type HistoryItem =
   | { kind: 'assistant'; content?: string; reasoningContent?: string }
   | { kind: 'tool'; trace?: ToolTrace }
 
+/** 自修改（K5）browser 半投递的 round-trip 审批请求 */
+interface ClientRunRequest {
+  requestId: string
+  sessionId: string
+  pkgId: string
+  name: string
+  purpose: string
+}
+
+/** 动态注册到 UI 插槽的组件（browser 半 slots.register 的产物） */
+interface ClientComponentReg {
+  slot: string
+  id: string
+  pkgId: string
+  Component: React.ComponentType
+}
+
 declare global {
   interface Window {
     shanhai?: {
@@ -103,6 +121,11 @@ declare global {
       speak(text: string): Promise<void>
       getTokenStats(): Promise<TokenSnapshot>
       onTokenStats(cb: (sessionId: string, stats: TokenSnapshot) => void): () => void
+      selfmodInspect(sessionId?: string): Promise<unknown>
+      onClientRunRequest(cb: (req: ClientRunRequest) => void): () => void
+      respondClientRun(requestId: string, approved: boolean): Promise<void>
+      onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
+      onClientRemove(cb: (pkgId: string) => void): () => void
     }
   }
 }
@@ -167,10 +190,64 @@ export function App() {
   const pendingQueue = useRef<Record<string, Array<{ text: string; parts: ContentPart[]; images: string[] }>>>({})
   // 当前会话排队中的消息数（UI 提示「排队中 N 条」）
   const [queueCount, setQueueCount] = useState(0)
+  // 自修改（K5）：browser 半动态注册的 UI 组件（按 slot 分组）
+  const [clientComponents, setClientComponents] = useState<Record<string, ClientComponentReg[]>>({})
+  // 自修改（K5）：browser 半投递的 round-trip 审批请求队列（按会话隔离）
+  const [clientRunRequests, setClientRunRequests] = useState<Record<string, ClientRunRequest[]>>({})
+  // 每个动态包的 browser 半 disposer（factory 返回值），卸载时调用
+  const clientDisposers = useRef<Map<string, () => void>>(new Map())
 
   const cur = sessionMap[currentSessionId] ?? EMPTY_SESSION
   // 当前会话的待审批请求（会话级隔离：只显示当前会话队列的头一个，并行会话互不串扰）
   const curApproval = (approvalQueues[currentSessionId] ?? [])[0] ?? null
+  // 当前会话的 browser 半投递审批请求
+  const curClientRunRequest = (clientRunRequests[currentSessionId] ?? [])[0] ?? null
+
+  /** 执行 browser 半代码：注入 React + slots（按 pkgId 隔离），注册动态组件到指定 slot */
+  const mountClientCode = (pkgId: string, code: string): void => {
+    try {
+      const slotsForPkg = {
+        register: (reg: { slot: string; id: string; component: React.ComponentType }) => {
+          const fullId = `${pkgId}:${reg.id}`
+          setClientComponents((prev) => {
+            const list = prev[reg.slot] ?? []
+            return { ...prev, [reg.slot]: [...list.filter((x) => x.id !== fullId), { slot: reg.slot, id: fullId, pkgId, Component: reg.component }] }
+          })
+          return () => {
+            setClientComponents((prev) => {
+              const list = (prev[reg.slot] ?? []).filter((x) => x.id !== fullId)
+              return { ...prev, [reg.slot]: list }
+            })
+          }
+        },
+      }
+      const factory = new Function('React', 'slots', code) as (ReactNs: typeof React, slots: unknown) => unknown
+      const disposer = factory(React, slotsForPkg)
+      if (typeof disposer === 'function') clientDisposers.current.set(pkgId, disposer as () => void)
+    } catch (err) {
+      console.error('[selfmod] browser 半代码执行失败:', err)
+    }
+  }
+
+  /** 卸载某个动态包：调用其 browser 半 disposer + 移除其注册的所有组件 */
+  const unmountClientCode = (pkgId: string): void => {
+    const disposer = clientDisposers.current.get(pkgId)
+    try {
+      disposer?.()
+    } catch (err) {
+      console.error('[selfmod] browser 半 disposer 失败:', err)
+    }
+    clientDisposers.current.delete(pkgId)
+    setClientComponents((prev) => {
+      const next = { ...prev }
+      for (const slot of Object.keys(next)) {
+        const list = next[slot]
+        if (list) next[slot] = list.filter((x) => x.pkgId !== pkgId)
+      }
+      return next
+    })
+  }
+
   const systemModels = models.filter((m) => !m.custom)
   const customModels = models.filter((m) => m.custom)
   const workDir = sessions.find((s) => s.id === currentSessionId)?.workDir ?? ''
@@ -240,6 +317,18 @@ export function App() {
       setApprovalQueues((prev) => ({ ...prev, [sid]: [...(prev[sid] ?? []), req] }))
     })
     const offToken = api.onTokenStats((sessionId, s) => setTokenStatsBySession((prev) => ({ ...prev, [sessionId]: s })))
+    // 自修改（K5）：browser 半投递审批 + 代码投递 + 卸载
+    const offClientRun = api.onClientRunRequest((req) => {
+      const sid = req.sessionId ?? currentSessionIdRef.current
+      if (!sid) return
+      setClientRunRequests((prev) => ({ ...prev, [sid]: [...(prev[sid] ?? []), req] }))
+    })
+    const offClientCode = api.onClientCode((payload) => {
+      mountClientCode(payload.pkgId, payload.code)
+    })
+    const offClientRemove = api.onClientRemove((pkgId) => {
+      unmountClientCode(pkgId)
+    })
     void api.getApprovalPolicy().then((p) => setApprovalPolicyState(p)).catch(() => undefined)
     return () => {
       offDelta()
@@ -247,6 +336,9 @@ export function App() {
       offTrace()
       offApproval()
       offToken()
+      offClientRun()
+      offClientCode()
+      offClientRemove()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [patchSession])
@@ -519,6 +611,21 @@ export function App() {
     if (!req) return
     await window.shanhai?.respondApproval(outcome, req.id)
     setApprovalQueues((prev) => {
+      const q = (prev[sid] ?? []).slice(1)
+      const next = { ...prev }
+      if (q.length > 0) next[sid] = q
+      else delete next[sid]
+      return next
+    })
+  }
+
+  /** 应答 browser 半投递审批（自修改 K5：用户 approve 才投递界面） */
+  async function respondClientRun(approved: boolean): Promise<void> {
+    const sid = currentSessionId
+    const req = (clientRunRequests[sid] ?? [])[0]
+    if (!req) return
+    await window.shanhai?.respondClientRun(req.requestId, approved)
+    setClientRunRequests((prev) => {
       const q = (prev[sid] ?? []).slice(1)
       const next = { ...prev }
       if (q.length > 0) next[sid] = q
@@ -819,6 +926,12 @@ export function App() {
           )}
             </>
           )}
+          {/* 自修改（K5）动态扩展区：browser 半通过 slots.register 注册的组件渲染在这里（UI 热更新落点） */}
+          {(clientComponents['dynamic-extension'] ?? []).map((reg) => (
+            <div key={reg.id} style={{ marginBottom: 8, width: '100%' }}>
+              <reg.Component />
+            </div>
+          ))}
         </div>
 
         {/* 审批弹窗（输入框上方浮动，会话级隔离：只显示当前会话的待审批请求） */}
@@ -850,6 +963,43 @@ export function App() {
                 允许一次
               </button>
               <button onClick={() => void respondApproval('rejected')} style={btn('#fff', '#333', '1px solid #ddd')}>
+                拒绝
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* 自修改（K5）：browser 半投递审批弹窗（agent 想往界面挂 UI 时需用户确认） */}
+        {curClientRunRequest && (
+          <div
+            style={{
+              position: 'absolute',
+              bottom: 158,
+              left: 16,
+              right: 16,
+              padding: 14,
+              borderRadius: 12,
+              border: '1px solid #1677ff',
+              background: '#f0f7ff',
+              fontSize: 13,
+              boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+            }}
+          >
+            <div style={{ fontWeight: 600, marginBottom: 6, color: '#333' }}>
+              <IconCode />
+              确认投递界面组件
+            </div>
+            <div style={{ color: '#555', marginBottom: 4 }}>
+              动态包：<b>{curClientRunRequest.name}</b>（{curClientRunRequest.pkgId}）
+            </div>
+            <div style={{ color: '#555', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+              用途：{curClientRunRequest.purpose}
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={() => void respondClientRun(true)} style={btn('#1677ff', '#fff')}>
+                投递到界面
+              </button>
+              <button onClick={() => void respondClientRun(false)} style={btn('#fff', '#333', '1px solid #ddd')}>
                 拒绝
               </button>
             </div>
@@ -1332,6 +1482,15 @@ function IconWarn() {
       <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
       <path d="M12 9v4" />
       <path d="M12 17h.01" />
+    </svg>
+  )
+}
+
+function IconCode() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: '-2px', marginRight: 4 }}>
+      <polyline points="16 18 22 12 16 6" />
+      <polyline points="8 6 2 12 8 18" />
     </svg>
   )
 }
