@@ -74,6 +74,7 @@ export function registerIpc(): void {
   ipcMain.handle('voice:speak', async (_e, text: string) => {
     await runtime.voice.synthesize(text)
   })
+  ipcMain.handle('voice:transcribe', async (_e, audioBase64: string) => runtime.transcribeAudio(audioBase64))
 
   // —— 系统目录选择器 ——
   ipcMain.handle('dialog:selectDirectory', async (_e, defaultPath?: string) => {

@@ -188,6 +188,8 @@ export interface Runtime {
   listMemory(): Array<{ id: number; scope: string; key: string; value: unknown; source: string; confidence: number; timestamp: number }>
   /** 删除一条长期记忆（按 id） */
   removeMemory(id: number): void
+  /** 语音转文字（STT）：音频 base64 → 文本（真实 macOS Speech 识别，失败返回空串） */
+  transcribeAudio(audioBase64: string): Promise<string>
 }
 
 /** 从本地凭证装配真实网关模型；无凭证则 mock 兜底 */
@@ -315,7 +317,28 @@ async function persistLoginToken(
 /** 真实语音：TTS 走 macOS say（真实发声），STT 需系统麦克风权限（暂返回空） */
 function createSystemVoiceService(): VoiceService {
   return {
-    transcribe: async () => '',
+    transcribe: async (audio) => {
+      // 真实 STT：音频字节 → 临时文件 → afconvert 转 wav → macOS Speech 识别（失败返回空，不阻断）
+      if (audio.byteLength === 0) return ''
+      const base = `/tmp/shanhai-voice-${Date.now()}`
+      const src = `${base}.webm`
+      const wav = `${base}.wav`
+      try {
+        await fs.writeFile(src, Buffer.from(audio))
+        // webm(opus) → wav；失败则用原始文件直接识别（SFSpeechRecognizer 也能读部分容器格式）
+        try {
+          await execAsync(`afconvert -f WAVE -d LEI16 "${src}" "${wav}"`, { timeout: 15000 })
+        } catch {
+          return await transcribeAudioFile(src)
+        }
+        return await transcribeAudioFile(wav)
+      } catch {
+        return ''
+      } finally {
+        await fs.rm(src, { force: true }).catch(() => undefined)
+        await fs.rm(wav, { force: true }).catch(() => undefined)
+      }
+    },
     synthesize: async (text) => {
       await execAsync(`say ${JSON.stringify(text)}`).catch(() => undefined)
       return new TextEncoder().encode(text).buffer as ArrayBuffer
@@ -363,6 +386,53 @@ do {
 `
 
 /** 用 macOS Vision 对图片做 OCR，返回文字块 + 像素坐标；失败返回空数组（降级，不阻断） */
+/** macOS Speech 语音识别脚本：识别音频文件（wav/m4a/aiff）转文字。运行时写入临时文件用 swift 执行。 */
+const STT_SWIFT = `
+import Speech
+import Foundation
+
+guard CommandLine.arguments.count > 1 else { print(""); exit(0) }
+let path = CommandLine.arguments[1]
+let url = URL(fileURLWithPath: path)
+
+guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN")) ?? SFSpeechRecognizer() else {
+    print("")
+    exit(0)
+}
+
+let request = SFSpeechURLRecognitionRequest(url: url)
+request.shouldReportPartialResults = false
+
+let semaphore = DispatchSemaphore(value: 0)
+var text = ""
+
+recognizer.recognitionTask(with: request) { result, error in
+    if let result = result, result.isFinal {
+        text = result.bestTranscription.formattedString
+        semaphore.signal()
+    } else if error != nil {
+        semaphore.signal()
+    }
+}
+
+_ = semaphore.wait(timeout: .now() + 30)
+print(text)
+`
+
+/** 用 macOS Speech 识别音频文件转文字（失败返回空串，不阻断） */
+async function transcribeAudioFile(path: string): Promise<string> {
+  const scriptPath = `/tmp/shanhai-stt-${process.pid}.swift`
+  try {
+    await fs.writeFile(scriptPath, STT_SWIFT, 'utf8')
+    const { stdout } = await execAsync(`swift "${scriptPath}" "${path}"`, { timeout: 35000 })
+    return stdout.trim()
+  } catch {
+    return ''
+  } finally {
+    await fs.rm(scriptPath, { force: true }).catch(() => undefined)
+  }
+}
+
 async function ocrImage(path: string): Promise<OcrWord[]> {
   const scriptPath = `/tmp/shanhai-ocr-${process.pid}.swift`
   try {
@@ -1652,6 +1722,17 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     removeMemory(id) {
       memory.remove(id)
       void persistMemory()
+    },
+
+    async transcribeAudio(audioBase64) {
+      try {
+        if (!audioBase64) return ''
+        const buf = Buffer.from(audioBase64, 'base64')
+        if (buf.length === 0) return ''
+        return await voice.transcribe(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer)
+      } catch {
+        return ''
+      }
     },
   }
 }

@@ -4,6 +4,30 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { toPng } from 'html-to-image'
 
+/** Web Speech API 最小类型（renderer 端语音识别，Electron 内基于系统语音服务） */
+interface SpeechRecognitionAlternativeLike {
+  transcript: string
+}
+interface SpeechRecognitionResultLike {
+  isFinal: boolean
+  0?: SpeechRecognitionAlternativeLike
+}
+interface SpeechRecognitionResultListLike {
+  resultIndex: number
+  results: Array<SpeechRecognitionResultLike | undefined>
+  length: number
+}
+interface SpeechRecognitionLike {
+  lang: string
+  continuous: boolean
+  interimResults: boolean
+  onresult: ((event: SpeechRecognitionResultListLike) => void) | null
+  onend: (() => void) | null
+  onerror: ((event: unknown) => void) | null
+  start(): void
+  stop(): void
+}
+
 interface ToolTrace {
   kind: 'tool-call' | 'tool-result'
   sessionId: string
@@ -142,6 +166,7 @@ declare global {
       getCurrentModelId(): Promise<string>
       stop(): Promise<void>
       speak(text: string): Promise<void>
+      transcribeAudio(audioBase64: string): Promise<string>
       getTokenStats(): Promise<TokenSnapshot>
       onTokenStats(cb: (sessionId: string, stats: TokenSnapshot) => void): () => void
       selfmodInspect(sessionId?: string): Promise<unknown>
@@ -207,6 +232,9 @@ export function App() {
   // 输入法组合中标记：中文等 IME 用回车选词时不应触发发送（keydown 时 isComposing 为 true）
   const isComposingRef = useRef(false)
   const listRef = useRef<HTMLDivElement>(null)
+  // 语音输入：录音中标记 + Web Speech 识别实例（renderer 端原生语音识别，无需后端）
+  const [recording, setRecording] = useState(false)
+  const recognitionRef = useRef<{ stop: () => void } | null>(null)
   // 安全模式（审批策略）：ask=危险操作每次询问，never=从不询问直接执行
   const [approvalPolicy, setApprovalPolicyState] = useState<'ask' | 'never'>('ask')
   const [approvalMenuOpen, setApprovalMenuOpen] = useState(false)
@@ -729,11 +757,47 @@ export function App() {
     patchSession(sid, { items: historyToItems(history), streaming: '', streamingReasoning: '', busy: false })
   }
 
-  function speakLast(): void {
-    const last = [...cur.items].reverse().find((it) => it.kind === 'assistant')
-    if (last && last.kind === 'assistant') {
-      void window.shanhai?.speak(last.content)
+  /** 语音输入：点击开始识别，再次点击停止（renderer 端 Web Speech 原生识别，结果填入输入框） */
+  async function toggleRecording(): Promise<void> {
+    if (recording) {
+      recognitionRef.current?.stop()
+      return
     }
+    const w = window as unknown as {
+      SpeechRecognition?: new () => SpeechRecognitionLike
+      webkitSpeechRecognition?: new () => SpeechRecognitionLike
+    }
+    const SR = w.SpeechRecognition ?? w.webkitSpeechRecognition
+    if (!SR) {
+      console.error('当前环境不支持语音识别（Web Speech API 不可用）')
+      return
+    }
+    let finalText = ''
+    const recognition = new SR()
+    recognition.lang = 'zh-CN'
+    recognition.continuous = false
+    recognition.interimResults = true
+    recognition.onresult = (event: SpeechRecognitionResultListLike) => {
+      let interim = ''
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const r = event.results[i]
+        if (r && r.isFinal) finalText += r[0]?.transcript ?? ''
+        else if (r) interim += r[0]?.transcript ?? ''
+      }
+      // 实时把「最终 + 中间」结果反映到输入框（不打断用户输入，结束时统一拼接）
+      void interim
+    }
+    recognition.onend = () => {
+      setRecording(false)
+      if (finalText.trim()) setInput((prev) => (prev ? `${prev}${finalText.trim()}` : finalText.trim()))
+    }
+    recognition.onerror = (event: unknown) => {
+      console.error('语音识别错误:', event)
+      setRecording(false)
+    }
+    recognition.start()
+    recognitionRef.current = recognition
+    setRecording(true)
   }
 
   function stopSend(): void {
@@ -1256,7 +1320,13 @@ export function App() {
                 </div>
               </div>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 }}>
-                <button title="语音朗读" onClick={speakLast} style={iconBtn}><IconMic /></button>
+                <button
+                  title={recording ? '停止录音' : '语音输入（录音识别）'}
+                  onClick={() => void toggleRecording()}
+                  style={{ ...iconBtn, color: recording ? '#ff4d4f' : undefined, animation: recording ? 'blink 1s step-start infinite' : undefined }}
+                >
+                  <IconMic />
+                </button>
                 <button
                   onClick={() => (cur.busy ? stopSend() : void send())}
                   disabled={!cur.busy && !input.trim()}
@@ -2514,6 +2584,7 @@ function AssistantMessage({ content, reasoningContent, onPreviewImage }: { conte
         actions={[
           { key: 'copy', icon: <IconCopy />, label: '复制', run: () => copyText(content) },
           { key: 'copyImage', icon: <IconImage />, label: '复制为图片', run: () => copyAssistantAsImage(bubbleRef.current) },
+          { key: 'speak', icon: <IconMic />, label: '朗读', run: () => void window.shanhai?.speak(content) },
         ]}
       />
     </div>
@@ -2566,6 +2637,14 @@ const TOOL_META: Record<string, { title: string; icon: React.ReactNode }> = {
   browser_get_cookies: { title: '读取 Cookie', icon: <IconGlobe /> },
   browser_set_cookie: { title: '设置 Cookie', icon: <IconGlobe /> },
   browser_clear_cookies: { title: '清除 Cookie', icon: <IconGlobe /> },
+  rollback_file: { title: '回滚文件', icon: <IconEdit /> },
+  remember: { title: '保存记忆', icon: <IconClock /> },
+  recall_memory: { title: '召回记忆', icon: <IconClock /> },
+  cordis_inspect: { title: '查看自修改', icon: <IconCode /> },
+  cordis_define: { title: '定义动态包', icon: <IconCode /> },
+  cordis_run: { title: '运行动态包', icon: <IconCode /> },
+  cordis_stop: { title: '停止动态包', icon: <IconCode /> },
+  cordis_undefine: { title: '删除动态包', icon: <IconCode /> },
 }
 
 /** 从工具参数提取一行摘要（读/写 → 路径，命令 → 命令，列目录 → 路径，电脑操作 → 动作） */
