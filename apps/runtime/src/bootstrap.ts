@@ -1,4 +1,4 @@
-import { Kernel, type DynamicPackage } from '@shanhai/kernel'
+import { Kernel, FileSnapshotStore, type DynamicPackage } from '@shanhai/kernel'
 import { SelfModifyRuntime } from './selfmod'
 import { Session, effectiveApprovalPolicy, type SessionEvent } from '@shanhai/session'
 import { ApprovalService } from '@shanhai/approval'
@@ -14,7 +14,7 @@ import { createComputerUseTools, type ComputerUseService, type OcrWord } from '@
 import { createBrowserUseTools, createMockBrowserUseService, type BrowserUseService } from '@shanhai/browser-use'
 import { promises as fs } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, basename } from 'node:path'
+import { join, basename, isAbsolute } from 'node:path'
 import { exec as execCallback } from 'node:child_process'
 import { promisify } from 'node:util'
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -675,6 +675,50 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       '6. 需要访问网页/网站、验证前端页面、提取网页数据时，用 browser_navigate 打开页面，配合 browser_get_content / browser_evaluate / browser_screenshot 观察，browser_click / browser_type 操作；截图前要有明确目的，排查问题先看 browser_get_console_logs。',
     ].join('\n')
   }
+  // —— 写文件快照回滚（K4 安全：写前快照，可回滚恢复原文件）——
+  const snapshotDir = join(homedir(), '.shanhai', 'snapshots')
+  const snapshotStore = new FileSnapshotStore(snapshotDir)
+  // 启动时清理历史快照（上次会话的快照随会话结束已无意义，避免目录无限积累）
+  try {
+    await fs.rm(snapshotDir, { recursive: true, force: true })
+  } catch {
+    // 忽略清理失败
+  }
+  /** 把相对路径解析到会话工作目录（rollback_file 工具用） */
+  const resolveWorkPath = (p: string): string => (isAbsolute(p) ? p : join(getSessionCwd(), p))
+  /** 写前快照回调：文件存在时备份，返回快照 id（write_file 覆盖前自动调用） */
+  const snapshotFn = async (path: string): Promise<{ snapshotId: string } | undefined> => {
+    try {
+      return { snapshotId: await snapshotStore.snapshot(path) }
+    } catch {
+      return undefined
+    }
+  }
+  /** 回滚工具：把文件恢复到 write_file 之前的快照（撤销写入） */
+  const rollbackFileTool: ToolContract = {
+    name: 'rollback_file',
+    description:
+      '把文件回滚到最近一次 write_file 之前的快照，恢复原内容（撤销写入）。' +
+      'path 是目标文件路径（绝对路径或相对当前工作目录），snapshotId 是 write_file 返回结果里的 snapshotId。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '文件路径' },
+        snapshotId: { type: 'string', description: 'write_file 返回的快照 id' },
+      },
+      required: ['path', 'snapshotId'],
+    },
+    riskLevel: 'reversible',
+    execute: async (args) => {
+      const path = resolveWorkPath(String(args.path))
+      const id = String(args.snapshotId ?? '')
+      if (!id) return { ok: false, error: '缺少 snapshotId' }
+      await snapshotStore.rollback(path, id)
+      await snapshotStore.discard(path, id)
+      return { ok: true, path, rolledBack: true }
+    },
+  }
+
   // —— 工具包装：落 trace + sessionId 注入。动态注册的自修改工具也走同一包装，保证 trace 一致 ——
   const tools: ToolContract[] = []
   const wrapTool = (t: ToolContract): ToolContract => ({
@@ -740,8 +784,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   })
 
   const baseTools = [
-    ...createAtomicTools(getSessionCwd),
+    ...createAtomicTools(getSessionCwd, snapshotFn),
     imageAnalyzeTool,
+    rollbackFileTool,
     ...computerTools,
     ...browserTools,
     ...selfmod.createTools(() => sessionContext.getStore() ?? currentSessionId ?? ''),

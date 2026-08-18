@@ -27,6 +27,9 @@ export interface ToolContract {
 /** 把用户给的路径解析到会话工作目录：绝对路径原样返回，相对路径拼到工作目录下。 */
 type PathResolver = (p: string) => string
 
+/** 写前快照回调：文件存在时备份（返回快照 id），新文件返回 undefined（无需快照）。由 runtime 层注入 FileSnapshotStore。 */
+export type SnapshotFn = (path: string) => Promise<{ snapshotId: string } | undefined>
+
 /**
  * 树形列出一个目录（`tree` 风格 ASCII 输出，供 list_dir 工具直接返回给模型与前端）。
  * 隐藏文件 / node_modules / dist 默认跳过，避免噪声；maxDepth 控制深度，maxEntries 控制条目数。
@@ -79,8 +82,9 @@ async function buildDirTree(
 /**
  * 创建内置原子工具清单。所有文件/命令操作都围绕 `getCwd()` 返回的会话工作目录：
  * 相对路径解析到工作目录下，命令也以工作目录为 cwd 执行——保证「工具围绕当前工作目录」这一约束。
+ * `snapshot` 为写前快照回调（可选）：注入后 write_file 在覆盖已有文件前自动备份，支撑「信任四可」的可回退。
  */
-export function createAtomicTools(getCwd: () => string): ToolContract[] {
+export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): ToolContract[] {
   const resolvePath: PathResolver = (p) => {
     if (isAbsolute(p)) return p
     return resolve(getCwd(), p)
@@ -130,8 +134,17 @@ export function createAtomicTools(getCwd: () => string): ToolContract[] {
       } catch {
         before = null
       }
+      // 写前快照：覆盖已有文件时备份（新文件无需快照），支撑回滚
+      let snapshotId: string | undefined
+      if (before !== null && snapshot) {
+        try {
+          snapshotId = (await snapshot(path))?.snapshotId
+        } catch {
+          snapshotId = undefined
+        }
+      }
       await fs.writeFile(path, content, 'utf8')
-      return { ok: true, path, before, after: content, isNew: before === null }
+      return { ok: true, path, before, after: content, isNew: before === null, snapshotId }
     },
   }
 
