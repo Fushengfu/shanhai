@@ -184,6 +184,10 @@ export interface Runtime {
   onClientRemove(cb: (pkgId: string) => void): () => void
   /** 多专家编排轨迹回调（UI 展示 Triage 拆解 → 专家执行过程） */
   onExpertTrace(cb: (trace: StepTrace) => void): () => void
+  /** 列出长期记忆（跨会话，配置型 + 经验型） */
+  listMemory(): Array<{ id: number; scope: string; key: string; value: unknown; source: string; confidence: number; timestamp: number }>
+  /** 删除一条长期记忆（按 id） */
+  removeMemory(id: number): void
 }
 
 /** 从本地凭证装配真实网关模型；无凭证则 mock 兜底 */
@@ -555,6 +559,25 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   const voice = createSystemVoiceService()
   const memory = new MemoryStore()
 
+  // 长期记忆持久化：启动时从 ~/.shanhai/memory.json 恢复（跨会话不丢），remember 后落盘
+  const memoryFile = join(homedir(), '.shanhai', 'memory.json')
+  try {
+    const raw = await fs.readFile(memoryFile, 'utf8')
+    const entries = JSON.parse(raw) as Array<{ scope: never; key: string; value: unknown; source?: never; confidence?: number }>
+    for (const e of entries) {
+      if (e && typeof e.key === 'string') memory.save(e.scope, e.key, e.value, { source: e.source, confidence: e.confidence })
+    }
+  } catch {
+    // 无记忆文件或损坏，忽略
+  }
+  const persistMemory = async (): Promise<void> => {
+    try {
+      await fs.writeFile(memoryFile, JSON.stringify(memory.list(), null, 2), { mode: 0o600 })
+    } catch {
+      // 忽略持久化失败
+    }
+  }
+
   // —— computer-use 插件（操作电脑：截图 / OCR 定位 / 统一动作，形成「截图→定位→动作→验证」闭环）——
   const computerTools: ToolContract[] = createComputerUseTools(computerUse)
 
@@ -653,7 +676,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
    * 系统提示词：告诉模型「当前环境」（时间 / 工作目录 / Shell / 系统类型 / 语言）+ 工具调用约束。
    * 环境信息由 collectEnvironment 自动注入，文件/命令操作都锚定到当前工作目录。
    */
-  const buildSystemPrompt = (cwd: string): string => {
+  const buildSystemPrompt = (cwd: string, memoryContext?: string): string => {
     const env = collectEnvironment(cwd)
     return [
       '你是「山海」，一个运行在用户电脑上的桌面端 AI 智能体助手。你可以读取文件、编写代码、执行命令、列出目录来帮助用户完成任务。',
@@ -673,7 +696,20 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       `4. 执行命令时注意当前是 ${env.osName} 系统，使用对应的命令语法（如 macOS/Linux 用 ls、cat，Windows 用 dir、type）。`,
       '5. 执行有风险的操作（写文件、运行命令）前会请求用户确认，请把要做的改动讲清楚再调用工具。',
       '6. 需要访问网页/网站、验证前端页面、提取网页数据时，用 browser_navigate 打开页面，配合 browser_get_content / browser_evaluate / browser_screenshot 观察，browser_click / browser_type 操作；截图前要有明确目的，排查问题先看 browser_get_console_logs。',
-    ].join('\n')
+      memoryContext,
+    ]
+      .filter(Boolean)
+      .join('\n')
+  }
+
+  /** 构建长期记忆上下文：配置型全量注入 + 经验型按当前消息关键词召回（注入系统提示词） */
+  const buildMemoryContext = (message: string): string | undefined => {
+    const config = memory.list().filter((e) => e.scope !== 'task_experience' && e.scope !== 'session')
+    const experience = memory.recall('task_experience', message).slice(0, 5)
+    const all = [...config, ...experience]
+    if (all.length === 0) return undefined
+    const lines = all.map((e) => `- [${e.scope}] ${e.key}: ${typeof e.value === 'string' ? e.value : JSON.stringify(e.value)}`)
+    return `\n\n【长期记忆】\n${lines.join('\n')}`
   }
   // —— 写文件快照回滚（K4 安全：写前快照，可回滚恢复原文件）——
   const snapshotDir = join(homedir(), '.shanhai', 'snapshots')
@@ -716,6 +752,54 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       await snapshotStore.rollback(path, id)
       await snapshotStore.discard(path, id)
       return { ok: true, path, rolledBack: true }
+    },
+  }
+
+  // —— 长期记忆工具（K 记忆：显式保存 / 召回，跨会话持久于内存 + 注入系统提示词）——
+  /** 保存一条长期记忆（scope 决定层：配置型全量注入 / 经验型相关性召回） */
+  const rememberTool: ToolContract = {
+    name: 'remember',
+    description:
+      '保存一条长期记忆（跨会话生效）。当用户表达偏好、项目背景、环境约定或任务经验时使用。' +
+      'scope 可选：user_preference（用户偏好）、project_knowledge（项目知识）、environment（环境约定）、task_experience（任务经验）。' +
+      'key 是记忆名，value 是记忆内容。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', description: '记忆作用域' },
+        key: { type: 'string', description: '记忆名' },
+        value: { type: 'string', description: '记忆内容' },
+      },
+      required: ['scope', 'key', 'value'],
+    },
+    riskLevel: 'readonly',
+    execute: async (args) => {
+      const scope = String(args.scope ?? '') as never
+      const key = String(args.key ?? '')
+      const value = args.value
+      if (!scope || !key) return { ok: false, error: 'scope 和 key 不能为空' }
+      const entry = memory.save(scope, key, value)
+      await persistMemory()
+      return { ok: true, id: entry.id, scope, key }
+    },
+  }
+  /** 召回长期记忆（按作用域 + 关键词） */
+  const recallMemoryTool: ToolContract = {
+    name: 'recall_memory',
+    description: '召回长期记忆。按 scope 过滤、keyword 关键词匹配，返回最新的在前。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', description: '记忆作用域（可选）' },
+        keyword: { type: 'string', description: '关键词（可选）' },
+      },
+    },
+    riskLevel: 'readonly',
+    execute: async (args) => {
+      const scope = args.scope ? (String(args.scope) as never) : undefined
+      const keyword = args.keyword ? String(args.keyword) : undefined
+      const list = scope ? memory.recall(scope, keyword) : memory.list().reverse()
+      return { items: list }
     },
   }
 
@@ -787,6 +871,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     ...createAtomicTools(getSessionCwd, snapshotFn),
     imageAnalyzeTool,
     rollbackFileTool,
+    rememberTool,
+    recallMemoryTool,
     ...computerTools,
     ...browserTools,
     ...selfmod.createTools(() => sessionContext.getStore() ?? currentSessionId ?? ''),
@@ -973,9 +1059,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     return map
   }
 
-  /** 专家专属 systemPrompt（含环境信息 + 角色人设），由 Orchestrator 在每步注入 */
-  const buildExpertSystemPrompts = (workDir: string): Map<string, string> => {
-    const base = buildSystemPrompt(workDir)
+  /** 专家专属 systemPrompt（含环境信息 + 长期记忆 + 角色人设），由 Orchestrator 在每步注入 */
+  const buildExpertSystemPrompts = (workDir: string, message: string): Map<string, string> => {
+    const base = buildSystemPrompt(workDir, buildMemoryContext(message))
     const map = new Map<string, string>()
     for (const role of BUILTIN_ROLES) {
       map.set(role.id, role.systemPrompt ? `${base}\n\n${role.systemPrompt}` : base)
@@ -1029,7 +1115,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         const orchestrator = new Orchestrator(triage, buildExpertAgents(sid), {
           sessionId: sid,
           expertNames: roleNameById,
-          expertSystemPrompts: buildExpertSystemPrompts(meta.workDir),
+          expertSystemPrompts: buildExpertSystemPrompts(meta.workDir, message),
           onStep: (trace) => expertTraceCallbacks.forEach((cb) => cb(trace)),
           onDelta: (text) => {
             if (stoppedSessions.has(sid)) throw new Error('__stopped__')
@@ -1054,7 +1140,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         loop.run(message, {
           ...opts,
           // 系统提示词告知当前工作目录：让模型知道文件/命令操作的锚点，并约束工具调用围绕工作目录
-          systemPrompt: buildSystemPrompt(meta.workDir),
+          systemPrompt: buildSystemPrompt(meta.workDir, buildMemoryContext(message)),
           attachments: opts?.attachments,
           modelContent,
           onDelta: (text) => {
@@ -1550,6 +1636,15 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     onExpertTrace(cb) {
       expertTraceCallbacks.add(cb)
       return () => expertTraceCallbacks.delete(cb)
+    },
+
+    listMemory() {
+      return memory.list()
+    },
+
+    removeMemory(id) {
+      memory.remove(id)
+      void persistMemory()
     },
   }
 }

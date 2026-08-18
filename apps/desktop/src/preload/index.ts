@@ -97,6 +97,19 @@ export interface ShanhaiBridge {
   onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
   onClientRemove(cb: (pkgId: string) => void): () => void
   onExpertTrace(cb: (trace: ExpertTrace) => void): () => void
+  listMemory(): Promise<MemoryEntry[]>
+  removeMemory(id: number): Promise<void>
+}
+
+/** 长期记忆条目 */
+export interface MemoryEntry {
+  id: number
+  scope: string
+  key: string
+  value: unknown
+  source: string
+  confidence: number
+  timestamp: number
 }
 
 /** 多专家编排轨迹 */
@@ -191,6 +204,8 @@ const bridge: ShanhaiBridge = {
     ipcRenderer.on('expert:trace', listener)
     return () => ipcRenderer.removeListener('expert:trace', listener)
   },
+  listMemory: () => ipcRenderer.invoke('memory:list'),
+  removeMemory: (id) => ipcRenderer.invoke('memory:remove', id),
 }
 
 contextBridge.exposeInMainWorld('shanhai', bridge)

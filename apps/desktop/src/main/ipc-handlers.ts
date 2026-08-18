@@ -42,6 +42,10 @@ export function registerIpc(): void {
   ipcMain.handle('selfmod:inspect', async (_e, sessionId?: string) => runtime.selfmodInspect(sessionId))
   ipcMain.handle('selfmod:respond', async (_e, requestId: string, approved: boolean) => runtime.respondClientRun(requestId, approved))
 
+  // —— 长期记忆 ——
+  ipcMain.handle('memory:list', async () => runtime.listMemory())
+  ipcMain.handle('memory:remove', async (_e, id: number) => runtime.removeMemory(id))
+
   // —— 聊天 ——
   ipcMain.handle('chat:run', async (_e, message: string, attachments?: Array<Record<string, unknown>>) =>
     runtime.run(message, { attachments: attachments as never }),

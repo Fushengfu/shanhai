@@ -46,6 +46,14 @@ export class MemoryStore {
     return this.entries.filter((e) => e.scope === scope)
   }
 
+  /** 删除一条记忆（按 id） */
+  remove(id: number): boolean {
+    const idx = this.entries.findIndex((e) => e.id === id)
+    if (idx < 0) return false
+    this.entries.splice(idx, 1)
+    return true
+  }
+
   /** 召回：按 key / 内容关键词匹配，返回最新的在前 */
   recall(scope: MemoryScope, keyword?: string): MemoryEntry[] {
     let list = this.entries.filter((e) => e.scope === scope)
