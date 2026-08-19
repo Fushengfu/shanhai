@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { SelfModifyRuntime } from '../src/selfmod'
+import { SelfModifyRuntime } from '@shanhai/selfmod'
 import { bootstrap } from '../src/bootstrap'
 import type { ToolContract } from '@shanhai/tools'
 
@@ -130,18 +130,18 @@ describe('SelfModifyRuntime（K5 自修改）', () => {
   })
 })
 
-describe('bootstrap 集成 cordis 工具（K5 自修改接入 agent 工具表）', () => {
-  it('tools 包含 5 个 cordis_* 工具，cordis_inspect 可调用', async () => {
+describe('bootstrap 集成 plugin 工具（K5 自修改接入 agent 工具表）', () => {
+  it('tools 包含 5 个 plugin_* 工具，plugin_inspect 可调用', async () => {
     const runtime = await bootstrap()
     try {
       const names = runtime.tools.map((t) => t.name)
       expect(names).toEqual(
-        expect.arrayContaining(['cordis_inspect', 'cordis_define', 'cordis_run', 'cordis_stop', 'cordis_undefine']),
+        expect.arrayContaining(['plugin_inspect', 'plugin_define', 'plugin_run', 'plugin_stop', 'plugin_undefine']),
       )
-      const inspect = runtime.tools.find((t) => t.name === 'cordis_inspect')!
+      const inspect = runtime.tools.find((t) => t.name === 'plugin_inspect')!
       const report = (await inspect.execute({})) as { tools: string[]; packages: unknown[]; services: string[] }
       expect(report.tools).toContain('read_file')
-      expect(report.tools).toContain('cordis_run')
+      expect(report.tools).toContain('plugin_run')
       expect(report.packages).toEqual([])
       expect(report.services.length).toBeGreaterThan(0)
       // selfmodInspect 与工具返回一致（走同一份清单）
@@ -152,12 +152,12 @@ describe('bootstrap 集成 cordis 工具（K5 自修改接入 agent 工具表）
     }
   })
 
-  it('cordis_define → cordis_run 注册动态工具 → cordis_stop 移除（对 agent 工具表生效）', async () => {
+  it('plugin_define → plugin_run 注册动态工具 → plugin_stop 移除（对 agent 工具表生效）', async () => {
     const runtime = await bootstrap()
     try {
-      const define = runtime.tools.find((t) => t.name === 'cordis_define')!
-      const run = runtime.tools.find((t) => t.name === 'cordis_run')!
-      const stop = runtime.tools.find((t) => t.name === 'cordis_stop')!
+      const define = runtime.tools.find((t) => t.name === 'plugin_define')!
+      const run = runtime.tools.find((t) => t.name === 'plugin_run')!
+      const stop = runtime.tools.find((t) => t.name === 'plugin_stop')!
 
       const defined = (await define.execute({ name: 'dyn', purpose: 'test', code: HOST_TOOL_CODE })) as { id: string }
       expect(runtime.tools.map((t) => t.name)).not.toContain('dyn_tool')
@@ -176,9 +176,9 @@ describe('bootstrap 集成 cordis 工具（K5 自修改接入 agent 工具表）
   it('browser 半完整链路：run 触发 round-trip 审批 → respond → 投递 code → stop 卸载', async () => {
     const runtime = await bootstrap()
     try {
-      const define = runtime.tools.find((t) => t.name === 'cordis_define')!
-      const run = runtime.tools.find((t) => t.name === 'cordis_run')!
-      const stop = runtime.tools.find((t) => t.name === 'cordis_stop')!
+      const define = runtime.tools.find((t) => t.name === 'plugin_define')!
+      const run = runtime.tools.find((t) => t.name === 'plugin_run')!
+      const stop = runtime.tools.find((t) => t.name === 'plugin_stop')!
 
       const requests: Array<{ requestId: string; pkgId: string; name: string }> = []
       const codes: Array<{ pkgId: string; code: string }> = []

@@ -24,6 +24,7 @@
   "dependencies": {
     "@shanhai/agent": "workspace:*",
     "@shanhai/approval": "workspace:*",
+    "@shanhai/ask": "workspace:*",
     "@shanhai/auth": "workspace:*",
     "@shanhai/browser-use": "workspace:*",
     "@shanhai/compaction": "workspace:*",
@@ -32,6 +33,7 @@
     "@shanhai/llm": "workspace:*",
     "@shanhai/llm-gateway": "workspace:*",
     "@shanhai/memory": "workspace:*",
+    "@shanhai/selfmod": "workspace:*",
     "@shanhai/session": "workspace:*",
     "@shanhai/tools": "workspace:*",
     "@shanhai/voice": "workspace:*"

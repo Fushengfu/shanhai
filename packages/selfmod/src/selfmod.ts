@@ -3,12 +3,12 @@ import type { ToolContract } from '@shanhai/tools'
 import vm from 'node:vm'
 
 /**
- * K5 自修改运行时（对齐 DSH extensions）：让 agent 在会话中检查、定义、运行、停止自己的插件。
+ * K5 自修改运行时（对齐 DSH 的 extensions 机制）：让 agent 在会话中检查、定义、运行、停止自己的插件。
  *
  * 职责划分：
  * - `PluginInventory`（kernel 包）只负责「内存清单」（define / inspect / undefine 的记录壳）。
- * - 本文件负责「运行时执行」：cordis_run 的 vm 沙箱评估 host 半、browser 半投递 + round-trip 审批、
- *   以及把五个 cordis_* 工具注册为 model-facing 工具。
+ * - 本文件负责「运行时执行」：plugin_run 的 vm 沙箱评估 host 半、browser 半投递 + round-trip 审批、
+ *   以及把五个 plugin_* 工具注册为 model-facing 工具。
  *
  * 沙箱约束（对齐设计文档 1.9）：
  * - host 半在 node:vm 中评估，隔离 globals（非安全边界，信任立场等同 bash 访问）。
@@ -26,9 +26,9 @@ interface HostFacade {
 
 /** 自修改运行时对外的依赖注入点（由 bootstrap 装配，桥接到内核事件总线 / 工具注册表 / IPC） */
 export interface SelfModifyHooks {
-  /** 系统已知的服务名（cordis_inspect 报告用） */
+  /** 系统已知的服务名（plugin_inspect 报告用） */
   listServices(): string[]
-  /** 当前可见的工具名（cordis_inspect 报告用） */
+  /** 当前可见的工具名（plugin_inspect 报告用） */
   listTools(): string[]
   /** 动态注册工具（host 半 tools.register），返回撤销函数 */
   registerTool(tool: ToolContract): () => void
@@ -66,7 +66,7 @@ export class SelfModifyRuntime {
 
   constructor(private readonly hooks: SelfModifyHooks) {}
 
-  /** cordis_inspect：只读报告（服务 / 工具 / 动态 package / slot 表面），按会话过滤动态包 */
+  /** plugin_inspect：只读报告（服务 / 工具 / 动态 package / slot 表面），按会话过滤动态包 */
   inspect(sessionId: string): unknown {
     return {
       services: [...new Set([...this.hooks.listServices(), ...this.services.keys()])],
@@ -76,12 +76,12 @@ export class SelfModifyRuntime {
     }
   }
 
-  /** cordis_define：记录 package（语法检查不运行），返回卡片 */
+  /** plugin_define：记录 package（语法检查不运行），返回卡片 */
   define(def: { name: string; purpose: string; code?: string; client?: string }, sessionId: string): DynamicPackage {
     return this.inventory.define({ ...def, sessionId })
   }
 
-  /** cordis_run：vm 评估 host 半 + 投递 browser 半（带 UI 的需人 approve） */
+  /** plugin_run：vm 评估 host 半 + 投递 browser 半（带 UI 的需人 approve） */
   async run(id: string, sessionId: string): Promise<{ clientDelivered: boolean }> {
     const pkg = this.inventory.get(id)
     if (!pkg) throw new Error(`动态包不存在: ${id}`)
@@ -138,7 +138,7 @@ export class SelfModifyRuntime {
     return { clientDelivered }
   }
 
-  /** cordis_stop：撤回 host 半 + browser 半，定义保留可再跑 */
+  /** plugin_stop：撤回 host 半 + browser 半，定义保留可再跑 */
   async stop(id: string): Promise<void> {
     const pkg = this.inventory.get(id)
     if (!pkg) throw new Error(`动态包不存在: ${id}`)
@@ -151,18 +151,18 @@ export class SelfModifyRuntime {
     this.inventory.setStatus(id, 'stopped')
   }
 
-  /** cordis_undefine：停止并遗忘定义 */
+  /** plugin_undefine：停止并遗忘定义 */
   async undefine(id: string): Promise<void> {
     await this.stop(id)
     this.inventory.remove(id)
   }
 
-  /** 五个 model-facing 工具（cordis_inspect / define / run / stop / undefine） */
+  /** 五个 model-facing 工具（plugin_inspect / define / run / stop / undefine） */
   createTools(getSessionId: () => string): ToolContract[] {
     const sid = (): string => getSessionId()
 
     const inspectTool: ToolContract = {
-      name: 'cordis_inspect',
+      name: 'plugin_inspect',
       description:
         '查看当前可自我升级的运行时表面：已注册的服务、可用工具、动态插件包、UI 插槽。' +
         '当你需要了解「能往哪里挂自定义 UI / 注册什么服务 / 有哪些工具可用」时使用。',
@@ -178,12 +178,12 @@ export class SelfModifyRuntime {
     }
 
     const defineTool: ToolContract = {
-      name: 'cordis_define',
+      name: 'plugin_define',
       description:
         '定义一个新的动态插件包（仅记录、不运行）。name 是包名，purpose 说明用途，' +
         'code 是 host 半源码（运行在进程内，导出函数 (ctx) => disposer，ctx 提供 on/provide/tools.register），' +
         'client 是 browser 半源码（投递到界面，形如 (React, slots) => { slots.register({slot,id,component}) }）。' +
-        '定义后返回 dyn-<n> id，用户会看到一张卡片，需再调 cordis_run 才会真正生效。',
+        '定义后返回 dyn-<n> id，用户会看到一张卡片，需再调 plugin_run 才会真正生效。',
       inputSchema: {
         type: 'object',
         properties: {
@@ -210,13 +210,13 @@ export class SelfModifyRuntime {
     }
 
     const runTool: ToolContract = {
-      name: 'cordis_run',
+      name: 'plugin_run',
       description:
-        '运行一个已定义的动态插件包（先 cordis_define 拿到 id）。host 半在进程内执行，' +
+        '运行一个已定义的动态插件包（先 plugin_define 拿到 id）。host 半在进程内执行，' +
         'browser 半会请求用户确认后投递到界面。返回 clientDelivered 表示界面部分是否已生效。',
       inputSchema: {
         type: 'object',
-        properties: { id: { type: 'string', description: '动态包 id（cordis_define 返回的 dyn-<n>）' } },
+        properties: { id: { type: 'string', description: '动态包 id（plugin_define 返回的 dyn-<n>）' } },
         required: ['id'],
       },
       riskLevel: 'irreversible',
@@ -225,8 +225,8 @@ export class SelfModifyRuntime {
     }
 
     const stopTool: ToolContract = {
-      name: 'cordis_stop',
-      description: '撤回一个正在运行的动态插件包（host 半 + browser 半都撤销），定义保留，可再次 cordis_run。',
+      name: 'plugin_stop',
+      description: '撤回一个正在运行的动态插件包（host 半 + browser 半都撤销），定义保留，可再次 plugin_run。',
       inputSchema: {
         type: 'object',
         properties: { id: { type: 'string', description: '动态包 id（dyn-<n>）' } },
@@ -240,7 +240,7 @@ export class SelfModifyRuntime {
     }
 
     const undefineTool: ToolContract = {
-      name: 'cordis_undefine',
+      name: 'plugin_undefine',
       description: '停止并永久遗忘一个动态插件包的定义。',
       inputSchema: {
         type: 'object',

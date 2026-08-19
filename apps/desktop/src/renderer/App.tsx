@@ -2,6 +2,7 @@ import * as React from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
   ApprovalRequest,
+  AskRequest,
   AttachmentItem,
   ChatItem,
   ClientComponentReg,
@@ -40,6 +41,7 @@ import {
   IconWarn,
 } from './components/icons'
 import { bubble, btn, formatArgs, formatBytes, iconBtn, readFileAsDataUrl, smallIconBtn, ThinkingDots } from './components/ui'
+import { AskCard } from './components/AskCard'
 import { AssistantMessage } from './components/AssistantMessage'
 import { CustomModelDrawer } from './components/CustomModelDrawer'
 import { ImagePreview } from './components/ImagePreview'
@@ -81,6 +83,8 @@ export function App() {
   const [previewImage, setPreviewImage] = useState<string | null>(null)
   // 审批请求按会话隔离：每个会话一个队列，弹窗只显示当前会话的待审批请求（并行会话互不串扰）
   const [approvalQueues, setApprovalQueues] = useState<Record<string, ApprovalRequest[]>>({})
+  // AI 向用户提问按会话隔离：每个会话一个队列，弹窗只显示当前会话的待回答提问
+  const [askQueues, setAskQueues] = useState<Record<string, AskRequest[]>>({})
   // 跟踪当前会话 id（供审批回调等闭包读取最新值，避免捕获旧 state）
   const currentSessionIdRef = useRef('')
   // 每个会话的输入框草稿（输入到一半切换会话，切回来草稿不丢）
@@ -114,6 +118,8 @@ export function App() {
   const cur = sessionMap[currentSessionId] ?? EMPTY_SESSION
   // 当前会话的待审批请求（会话级隔离：只显示当前会话队列的头一个，并行会话互不串扰）
   const curApproval = (approvalQueues[currentSessionId] ?? [])[0] ?? null
+  // 当前会话的待回答提问（会话级隔离：只显示当前会话队列的头一个）
+  const curAsk = (askQueues[currentSessionId] ?? [])[0] ?? null
   // 当前会话的 browser 半投递审批请求
   const curClientRunRequest = (clientRunRequests[currentSessionId] ?? [])[0] ?? null
   // 当前会话的多专家编排轨迹
@@ -232,6 +238,12 @@ export function App() {
       if (!sid) return
       setApprovalQueues((prev) => ({ ...prev, [sid]: [...(prev[sid] ?? []), req] }))
     })
+    const offAsk = api.onAskRequest((req) => {
+      // AI 提问按 sessionId 路由到对应会话队列，会话级隔离
+      const sid = req.sessionId ?? currentSessionIdRef.current
+      if (!sid) return
+      setAskQueues((prev) => ({ ...prev, [sid]: [...(prev[sid] ?? []), req] }))
+    })
     const offToken = api.onTokenStats((sessionId, s) => setTokenStatsBySession((prev) => ({ ...prev, [sessionId]: s })))
     // 自修改（K5）：browser 半投递审批 + 代码投递 + 卸载
     const offClientRun = api.onClientRunRequest((req) => {
@@ -266,6 +278,7 @@ export function App() {
       offReasoning()
       offTrace()
       offApproval()
+      offAsk()
       offToken()
       offClientRun()
       offClientCode()
@@ -543,6 +556,21 @@ export function App() {
     if (!req) return
     await window.shanhai?.respondApproval(outcome, req.id)
     setApprovalQueues((prev) => {
+      const q = (prev[sid] ?? []).slice(1)
+      const next = { ...prev }
+      if (q.length > 0) next[sid] = q
+      else delete next[sid]
+      return next
+    })
+  }
+
+  /** 回答 AI 的提问（只响应当前会话队列的头一个，会话级隔离） */
+  async function respondAsk(answer: string): Promise<void> {
+    const sid = currentSessionId
+    const req = (askQueues[sid] ?? [])[0]
+    if (!req) return
+    await window.shanhai?.respondAsk(req.id, answer)
+    setAskQueues((prev) => {
       const q = (prev[sid] ?? []).slice(1)
       const next = { ...prev }
       if (q.length > 0) next[sid] = q
@@ -958,6 +986,15 @@ export function App() {
               </button>
             </div>
           </div>
+        )}
+
+        {/* AI 向用户提问卡片（输入框上方浮动，会话级隔离：单选/多选/填空 + 提交） */}
+        {curAsk && (
+          <AskCard
+            req={curAsk}
+            onSubmit={(answer) => void respondAsk(answer)}
+            onCancel={() => void respondAsk('（用户取消了回答）')}
+          />
         )}
 
         {/* 自修改（K5）：browser 半投递审批弹窗（agent 想往界面挂 UI 时需用户确认） */}

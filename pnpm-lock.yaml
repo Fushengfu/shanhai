@@ -78,6 +78,9 @@ importers:
       '@shanhai/approval':
         specifier: workspace:*
         version: link:../../packages/approval
+      '@shanhai/ask':
+        specifier: workspace:*
+        version: link:../../packages/ask
       '@shanhai/auth':
         specifier: workspace:*
         version: link:../../packages/auth
@@ -102,6 +105,9 @@ importers:
       '@shanhai/memory':
         specifier: workspace:*
         version: link:../../packages/memory
+      '@shanhai/selfmod':
+        specifier: workspace:*
+        version: link:../../packages/selfmod
       '@shanhai/session':
         specifier: workspace:*
         version: link:../../packages/session
@@ -161,6 +167,25 @@ importers:
       '@shanhai/session':
         specifier: workspace:*
         version: link:../session
+      '@shanhai/tools':
+        specifier: workspace:*
+        version: link:../tools
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      tsup:
+        specifier: ^8.3.5
+        version: 8.5.1(postcss@8.5.26)(typescript@5.9.3)
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
+  packages/ask:
+    dependencies:
       '@shanhai/tools':
         specifier: workspace:*
         version: link:../tools
@@ -321,6 +346,28 @@ importers:
         version: 2.1.9(@types/node@22.20.1)
 
   packages/memory:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      tsup:
+        specifier: ^8.3.5
+        version: 8.5.1(postcss@8.5.26)(typescript@5.9.3)
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
+  packages/selfmod:
+    dependencies:
+      '@shanhai/kernel':
+        specifier: workspace:*
+        version: link:../kernel
+      '@shanhai/tools':
+        specifier: workspace:*
+        version: link:../tools
     devDependencies:
       '@types/node':
         specifier: ^22.10.2

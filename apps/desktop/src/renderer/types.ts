@@ -44,6 +44,16 @@ export interface ApprovalRequest {
   riskLevel: string
 }
 
+/** AI 向用户提问请求（单选/多选/填空交互） */
+export interface AskRequest {
+  id: string
+  sessionId?: string
+  question: string
+  options?: string[]
+  multiple?: boolean
+  placeholder?: string
+}
+
 export interface GatewayModel {
   id: string
   name: string
@@ -148,6 +158,8 @@ declare global {
       getSessionHistory(id?: string): Promise<HistoryItem[]>
       getSessionTrace(id?: string): Promise<Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string; reasoningContent?: string; toolCalls?: Array<{ id: string; name: string; args: Record<string, unknown> }>; toolCallId?: string; turn: number; timestamp: number }>>
       respondApproval(outcome: 'allowed-once' | 'rejected', requestId: string): Promise<void>
+      onAskRequest(cb: (req: AskRequest) => void): () => void
+      respondAsk(requestId: string, answer: string): Promise<void>
       run(message: string, attachments?: ContentPart[]): Promise<string>
       resend(sessionId: string, userMessageIndex: number, newContent?: string): Promise<string>
       resume(sessionId: string): Promise<string>

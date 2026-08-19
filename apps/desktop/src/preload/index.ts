@@ -20,6 +20,16 @@ export interface ApprovalRequest {
   riskLevel: string
 }
 
+/** AI 向用户提问请求（单选/多选/填空交互） */
+export interface AskRequest {
+  id: string
+  sessionId?: string
+  question: string
+  options?: string[]
+  multiple?: boolean
+  placeholder?: string
+}
+
 /** 多模态内容片段（与 llm 包 ContentPart 对应） */
 export interface ContentPart {
   type: 'text' | 'image_url' | 'input_audio' | 'input_video'
@@ -70,6 +80,9 @@ export interface ShanhaiBridge {
   // 审批
   onApprovalRequest(cb: (req: ApprovalRequest) => void): () => void
   respondApproval(outcome: 'allowed-once' | 'rejected', requestId: string): Promise<void>
+  // AI 向用户提问（单选/多选/填空）
+  onAskRequest(cb: (req: AskRequest) => void): () => void
+  respondAsk(requestId: string, answer: string): Promise<void>
   // 工具过程
   onToolTrace(cb: (trace: ToolTrace) => void): () => void
   // 聊天
@@ -169,6 +182,12 @@ const bridge: ShanhaiBridge = {
     ipcRenderer.on('approval:request', listener)
     return () => ipcRenderer.removeListener('approval:request', listener)
   },
+  onAskRequest: (cb) => {
+    const listener = (_e: unknown, req: AskRequest) => cb(req)
+    ipcRenderer.on('ask:request', listener)
+    return () => ipcRenderer.removeListener('ask:request', listener)
+  },
+  respondAsk: (requestId, answer) => ipcRenderer.invoke('ask:respond', requestId, answer),
   onToolTrace: (cb) => {
     const listener = (_e: unknown, trace: ToolTrace) => cb(trace)
     ipcRenderer.on('tool:trace', listener)

@@ -1,11 +1,12 @@
 import { Kernel, FileSnapshotStore, type DynamicPackage } from '@shanhai/kernel'
-import { SelfModifyRuntime } from './selfmod'
+import { SelfModifyRuntime } from '@shanhai/selfmod'
 import { Session, effectiveApprovalPolicy, type SessionEvent } from '@shanhai/session'
 import { ApprovalService } from '@shanhai/approval'
 import { AgentLoop, ModelTriage, Orchestrator, type RoleDefinition, type StepTrace } from '@shanhai/agent'
 import type { Model, ContentPart, TokenUsage } from '@shanhai/llm'
 import { createMockModel, DeepSeekProvider } from '@shanhai/llm'
-import { createAtomicTools, type ToolContract } from '@shanhai/tools'
+import { createAtomicTools, createUtilityTools, type ToolContract } from '@shanhai/tools'
+import { createAskTools, AskService, type AskRequest } from '@shanhai/ask'
 import { MemoryStore } from '@shanhai/memory'
 import { FileCredentialStore, AuthService } from '@shanhai/auth'
 import type { GatewayModel, ModelTier } from '@shanhai/auth'
@@ -39,6 +40,8 @@ export interface ToolTrace {
 }
 
 export type ApprovalOutcome = 'allowed-once' | 'rejected'
+
+export type { AskRequest } from '@shanhai/ask'
 
 /** token 用量快照（UI 底部状态栏展示：累计 / 本轮 / 上下文占比） */
 export interface TokenSnapshot {
@@ -136,6 +139,10 @@ export interface Runtime {
   onApprovalRequest(cb: (req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }) => void): () => void
   /** UI 应答审批（requestId 定位具体审批请求，支持并行会话） */
   respondApproval(outcome: ApprovalOutcome, requestId: string): void
+  /** AI 向用户提问请求回调（UI 弹交互式卡片，req 带 sessionId，会话级隔离） */
+  onAskRequest(cb: (req: AskRequest) => void): () => void
+  /** UI 提交用户回答（requestId 定位具体提问，支持并行会话） */
+  respondAsk(requestId: string, answer: string): void
 
   /** 流式增量回调（sessionId 标识来源会话） */
   onDelta(cb: (sessionId: string, text: string) => void): () => void
@@ -628,6 +635,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   const browserUse: BrowserUseService = options.browserUse ?? createMockBrowserUseService()
   const voice = createSystemVoiceService()
   const memory = new MemoryStore()
+  // 向用户提问服务（ask_user 工具阻塞等待用户回答；UI 订阅 onRequest 弹卡片，respond 提交答案）
+  const askService = new AskService()
 
   // 长期记忆持久化：启动时从 ~/.shanhai/memory.json 恢复（跨会话不丢），remember 后落盘
   const memoryFile = join(homedir(), '.shanhai', 'memory.json')
@@ -687,23 +696,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       }
     }
     return `（图片识别失败：${errors.join('；')}）`
-  }
-
-  // —— 图片识别工具（模型不支持多模态时，AI 调它用视觉模型分析图片）——
-  const imageAnalyzeTool: ToolContract = {
-    name: 'image_analyze',
-    description: '分析图片内容并返回文字描述。当需要理解图片内容、但当前模型无法直接查看图片时使用。',
-    inputSchema: {
-      type: 'object',
-      properties: { imageUrl: { type: 'string', description: '图片的 URL 或 data: URL' } },
-      required: ['imageUrl'],
-    },
-    riskLevel: 'readonly',
-    execute: async (args) => {
-      const imageUrl = String(args.imageUrl ?? '')
-      if (!imageUrl) return '（未提供图片）'
-      return analyzeImageWithVision(imageUrl)
-    },
   }
 
   // —— 工具（包装：落 trace，sessionId 从 AsyncLocalStorage 上下文取）——
@@ -766,6 +758,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       `4. 执行命令时注意当前是 ${env.osName} 系统，使用对应的命令语法（如 macOS/Linux 用 ls、cat，Windows 用 dir、type）。`,
       '5. 执行有风险的操作（写文件、运行命令）前会请求用户确认，请把要做的改动讲清楚再调用工具。',
       '6. 需要访问网页/网站、验证前端页面、提取网页数据时，用 browser_navigate 打开页面，配合 browser_get_content / browser_evaluate / browser_screenshot 观察，browser_click / browser_type 操作；截图前要有明确目的，排查问题先看 browser_get_console_logs。',
+      '7. 需要用户协助做选择、确认或补充信息时，用 ask_user 工具向用户提问：可提供 options 让用户单选/多选，或让用户自由输入；调用后必须等待用户回答，再基于回答继续执行。',
       memoryContext,
     ]
       .filter(Boolean)
@@ -800,79 +793,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       return undefined
     }
   }
-  /** 回滚工具：把文件恢复到 write_file 之前的快照（撤销写入） */
-  const rollbackFileTool: ToolContract = {
-    name: 'rollback_file',
-    description:
-      '把文件回滚到最近一次 write_file 之前的快照，恢复原内容（撤销写入）。' +
-      'path 是目标文件路径（绝对路径或相对当前工作目录），snapshotId 是 write_file 返回结果里的 snapshotId。',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: '文件路径' },
-        snapshotId: { type: 'string', description: 'write_file 返回的快照 id' },
-      },
-      required: ['path', 'snapshotId'],
-    },
-    riskLevel: 'reversible',
-    execute: async (args) => {
-      const path = resolveWorkPath(String(args.path))
-      const id = String(args.snapshotId ?? '')
-      if (!id) return { ok: false, error: '缺少 snapshotId' }
-      await snapshotStore.rollback(path, id)
-      await snapshotStore.discard(path, id)
-      return { ok: true, path, rolledBack: true }
-    },
-  }
-
-  // —— 长期记忆工具（K 记忆：显式保存 / 召回，跨会话持久于内存 + 注入系统提示词）——
-  /** 保存一条长期记忆（scope 决定层：配置型全量注入 / 经验型相关性召回） */
-  const rememberTool: ToolContract = {
-    name: 'remember',
-    description:
-      '保存一条长期记忆（跨会话生效）。当用户表达偏好、项目背景、环境约定或任务经验时使用。' +
-      'scope 可选：user_preference（用户偏好）、project_knowledge（项目知识）、environment（环境约定）、task_experience（任务经验）。' +
-      'key 是记忆名，value 是记忆内容。',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        scope: { type: 'string', description: '记忆作用域' },
-        key: { type: 'string', description: '记忆名' },
-        value: { type: 'string', description: '记忆内容' },
-      },
-      required: ['scope', 'key', 'value'],
-    },
-    riskLevel: 'readonly',
-    execute: async (args) => {
-      const scope = String(args.scope ?? '') as never
-      const key = String(args.key ?? '')
-      const value = args.value
-      if (!scope || !key) return { ok: false, error: 'scope 和 key 不能为空' }
-      const entry = memory.save(scope, key, value)
-      await persistMemory()
-      return { ok: true, id: entry.id, scope, key }
-    },
-  }
-  /** 召回长期记忆（按作用域 + 关键词） */
-  const recallMemoryTool: ToolContract = {
-    name: 'recall_memory',
-    description: '召回长期记忆。按 scope 过滤、keyword 关键词匹配，返回最新的在前。',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        scope: { type: 'string', description: '记忆作用域（可选）' },
-        keyword: { type: 'string', description: '关键词（可选）' },
-      },
-    },
-    riskLevel: 'readonly',
-    execute: async (args) => {
-      const scope = args.scope ? (String(args.scope) as never) : undefined
-      const keyword = args.keyword ? String(args.keyword) : undefined
-      const list = scope ? memory.recall(scope, keyword) : memory.list().reverse()
-      return { items: list }
-    },
-  }
-
   // —— 工具包装：落 trace + sessionId 注入。动态注册的自修改工具也走同一包装，保证 trace 一致 ——
   const tools: ToolContract[] = []
   const wrapTool = (t: ToolContract): ToolContract => ({
@@ -905,7 +825,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
   })
 
-  // —— K5 自修改（cordis_* 工具 + vm 沙箱 + browser 半投递 + round-trip 审批）——
+  // —— K5 自修改（plugin_* 工具 + vm 沙箱 + browser 半投递 + round-trip 审批）——
   const clientRunCallbacks = new Set<(req: { requestId: string; sessionId: string; pkgId: string; name: string; purpose: string }) => void>()
   const pendingClientRuns = new Map<string, { resolve: (approved: boolean) => void; sessionId?: string }>()
   const clientCodeCallbacks = new Set<(payload: { pkgId: string; name: string; code: string }) => void>()
@@ -937,12 +857,32 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
   })
 
+  // —— 通用工具（视觉分析 / 快照回滚 / 长期记忆）+ 提问插件（ask_user）——
+  // 能力在 runtime 装配，工具定义集中在 @shanhai/tools 的 createUtilityTools 与 @shanhai/ask 的 createAskTools（不散落在 bootstrap）。
+  const utilityTools: ToolContract[] = createUtilityTools({
+    analyzeImage: analyzeImageWithVision,
+    rollbackFile: async (path, snapshotId) => {
+      const resolved = resolveWorkPath(path)
+      await snapshotStore.rollback(resolved, snapshotId)
+      await snapshotStore.discard(resolved, snapshotId)
+      return { ok: true, path: resolved, rolledBack: true }
+    },
+    memory: {
+      save: (scope, key, value) => {
+        const entry = memory.save(scope as never, key, value)
+        void persistMemory()
+        return entry
+      },
+      recall: (scope, keyword) => memory.recall(scope as never, keyword),
+      list: () => memory.list(),
+    },
+  })
+  const askTools: ToolContract[] = createAskTools(askService, () => sessionContext.getStore() ?? currentSessionId ?? '')
+
   const baseTools = [
     ...createAtomicTools(getSessionCwd, snapshotFn),
-    imageAnalyzeTool,
-    rollbackFileTool,
-    rememberTool,
-    recallMemoryTool,
+    ...utilityTools,
+    ...askTools,
     ...computerTools,
     ...browserTools,
     ...selfmod.createTools(() => sessionContext.getStore() ?? currentSessionId ?? ''),
@@ -1419,6 +1359,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
           pendingClientRuns.delete(requestId)
         }
       }
+      // 取消该会话待回答的提问（避免 agent 永久卡在等待用户回答）
+      askService.cancelSession(id)
       sessions.delete(id)
       await fs.rm(join(sessionsDir, `${id}.json`), { force: true }).catch(() => undefined)
       // 当前会话被删：切到剩余第一个；无剩余则新建一个空会话
@@ -1556,6 +1498,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         p.resolve(outcome)
         pendingApprovals.delete(requestId)
       }
+    },
+    onAskRequest(cb) {
+      return askService.onRequest(cb)
+    },
+    respondAsk(requestId, answer) {
+      askService.respond(requestId, answer)
     },
 
     onDelta(cb) {

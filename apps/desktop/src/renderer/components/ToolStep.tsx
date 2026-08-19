@@ -35,11 +35,11 @@ const TOOL_META: Record<string, { title: string; icon: React.ReactNode }> = {
   rollback_file: { title: '回滚文件', icon: <IconEdit /> },
   remember: { title: '保存记忆', icon: <IconClock /> },
   recall_memory: { title: '召回记忆', icon: <IconClock /> },
-  cordis_inspect: { title: '查看自修改', icon: <IconCode /> },
-  cordis_define: { title: '定义动态包', icon: <IconCode /> },
-  cordis_run: { title: '运行动态包', icon: <IconCode /> },
-  cordis_stop: { title: '停止动态包', icon: <IconCode /> },
-  cordis_undefine: { title: '删除动态包', icon: <IconCode /> },
+  plugin_inspect: { title: '查看自修改', icon: <IconCode /> },
+  plugin_define: { title: '定义动态包', icon: <IconCode /> },
+  plugin_run: { title: '运行动态包', icon: <IconCode /> },
+  plugin_stop: { title: '停止动态包', icon: <IconCode /> },
+  plugin_undefine: { title: '删除动态包', icon: <IconCode /> },
 }
 
 /** 从工具参数提取一行摘要（读/写 → 路径，命令 → 命令，列目录 → 路径，电脑操作 → 动作） */

@@ -38,6 +38,9 @@ export function registerIpc(): void {
   ipcMain.handle('approval:getPolicy', async () => runtime.getApprovalPolicy())
   ipcMain.handle('approval:setPolicy', async (_e, policy: 'ask' | 'never') => runtime.setApprovalPolicy(policy))
 
+  // —— AI 向用户提问（单选/多选/填空）——
+  ipcMain.handle('ask:respond', async (_e, requestId: string, answer: string) => runtime.respondAsk(requestId, answer))
+
   // —— 自修改（K5）——
   ipcMain.handle('selfmod:inspect', async (_e, sessionId?: string) => runtime.selfmodInspect(sessionId))
   ipcMain.handle('selfmod:respond', async (_e, requestId: string, approved: boolean) => runtime.respondClientRun(requestId, approved))
