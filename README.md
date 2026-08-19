@@ -15,6 +15,7 @@
 - **自修改（K5）**：聊天式自我升级，动态包 `plugin_*` 工具 + 界面热更新
 - **上下文压缩**：token 预算超限自动压历史为摘要
 - **语音**：TTS（macOS say）+ 麦克风录音识别
+- **常驻托盘**：关闭窗口最小化到系统托盘，全局快捷键（⌘+Shift+Space）唤出/隐藏窗口
 
 ## 目录结构
 
@@ -28,20 +29,22 @@ shanhai/
 │   │   └── src/renderer/         #   React 渲染进程（App.tsx 组合根 + components/ 拆分）
 │   └── runtime/                  # host 运行时（bootstrap 装配 + cli）
 ├── packages/
-│   ├── kernel/                   # ① 内核（K1 组合运行时 + K2 版本 + K4 安全 + K5 自修改）
+│   ├── kernel/                   # ① 内核（K1 组合运行时 + K2 版本 + K4 安全）
 │   ├── kernel-modules/           # ② 模块系统（K3，双端）
-│   ├── agent/                    # ③ AgentLoop + Triage 编排
-│   ├── session/                  # ④ 会话（类型化事件日志）
-│   ├── approval/                 # ⑤ 审批
-│   ├── compaction/               # ⑥ 上下文压缩
-│   ├── tools/                    # ⑦ 原子工具（read/write/run_command）
-│   ├── llm/                      # ⑧ Model 接口 + provider 适配
-│   ├── memory/                   # ⑨ 分层记忆
-│   ├── voice/                    # ⑩ 语音（STT/TTS）
-│   ├── computer-use/             # ⑪ 电脑操作（截图/OCR/键鼠）
-│   ├── browser-use/              # ⑫ 内置浏览器自动化（16 工具）
-│   ├── llm-gateway/              # ⑬ 模型网关（路由三层 + 降级）
-│   └── auth/                     # ⑭ 认证（登录/凭证）
+│   ├── selfmod/                  # ③ K5 自修改（plugin_* 五工具 + vm 沙箱）
+│   ├── agent/                    # ④ AgentLoop + Triage 编排
+│   ├── session/                  # ⑤ 会话（类型化事件日志）
+│   ├── approval/                 # ⑥ 审批
+│   ├── compaction/               # ⑦ 上下文压缩
+│   ├── tools/                    # ⑧ 原子工具（read/write/run_command + utility）
+│   ├── ask/                      # ⑨ 向用户提问（ask_user 工具）
+│   ├── llm/                      # ⑩ Model 接口 + provider 适配
+│   ├── memory/                   # ⑪ 分层记忆
+│   ├── voice/                    # ⑫ 语音（STT/TTS）
+│   ├── computer-use/             # ⑬ 电脑操作（截图/OCR/键鼠）
+│   ├── browser-use/              # ⑭ 内置浏览器自动化（16 工具）
+│   ├── llm-gateway/              # ⑮ 模型网关（路由三层 + 降级）
+│   └── auth/                     # ⑯ 认证（登录/凭证）
 └── docs/                         # 设计文档
 ```
 

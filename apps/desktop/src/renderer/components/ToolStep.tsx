@@ -5,6 +5,9 @@ import { redactSecret, stringifyResult, truncate } from './ui'
 
 // ===== 工具调用渲染（参考 DSH ToolRow / Codex：单行摘要 + 类型卡片，不显示 JSON）=====
 
+/** 已有专门交互 UI 的机制类工具：不在聊天流里以「工具步骤」卡片形式显示（避免暴露内部工具名 + 与专用卡片重复展示） */
+const HIDDEN_STEP_TOOLS = new Set(['ask_user'])
+
 /** 工具名 → 人类可读的中文标题 + 图标（原始工具名对普通人不可读） */
 const TOOL_META: Record<string, { title: string; icon: React.ReactNode }> = {
   read_file: { title: '读取文件', icon: <IconFile /> },
@@ -299,9 +302,11 @@ function renderToolResult(name: string, result: unknown, error: string | undefin
 
 /** 工具执行步骤（DSH ToolRow 风格）：单行摘要（中文标题 + 摘要）+ 折叠的类型卡片 */
 export function ToolStep({ trace }: { trace: ToolTrace }) {
+  // 机制类工具（如 ask_user 提问）已有专用交互卡片，这里不再渲染工具步骤，避免暴露内部工具名
+  if (HIDDEN_STEP_TOOLS.has(trace.name)) return null
   const [expanded, setExpanded] = useState(false)
   const isCall = trace.kind === 'tool-call'
-  const meta = TOOL_META[trace.name] ?? { title: trace.name, icon: <IconWrench /> }
+  const meta = TOOL_META[trace.name] ?? { title: '工具操作', icon: <IconWrench /> }
   const state = isCall ? 'running' : trace.error ? 'error' : 'ok'
   const summary = toolSummary(trace.name, trace.args)
   const resultBody = !isCall ? renderToolResult(trace.name, trace.result, trace.error, trace.args) : null
