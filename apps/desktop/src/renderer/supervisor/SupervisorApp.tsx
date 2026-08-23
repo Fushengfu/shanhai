@@ -192,11 +192,13 @@ export function SupervisorApp(): React.JSX.Element {
 
   const patchSession = useCallback((patch: Partial<SessionUIState> | ((s: SessionUIState) => Partial<SessionUIState>)): void => {
     const snap = getUiStoreSnapshot()
-    const base = snap.sessionMap[SUPERVISOR_SID] ?? EMPTY_SESSION
-    // 字段级 patch：只发送 patch 显式指定的字段，不展开 base（否则会把本地旧的 items 整体覆盖到主进程，
+    const existing = snap.sessionMap[SUPERVISOR_SID]
+    const base = existing ?? EMPTY_SESSION
+    // 字段级 patch：只发送 patch 显式指定的字段，不展开已有 base（否则会把本地旧的 items 整体覆盖到主进程，
     // 覆盖掉 onSessionActivity('end') 刚重建的含正文 items，导致「执行完正文消失、重启后才出现」的竞态）。
     const next = typeof patch === 'function' ? patch(base) : patch
-    patchUiStore({ sessionMap: { [SUPERVISOR_SID]: next } })
+    // 会话首次写入：补全 EMPTY_SESSION 完整字段（否则 deepMerge 会把残缺对象写入 sessionMap，白屏）
+    patchUiStore({ sessionMap: { [SUPERVISOR_SID]: existing ? next : { ...EMPTY_SESSION, ...next } } })
   }, [])
 
   // 滚动跟随：用户是否在底部，仅由滚动事件维护

@@ -251,11 +251,15 @@ export function App() {
   const patchSession = useCallback(
     (id: string, patch: Partial<SessionUIState> | ((s: SessionUIState) => Partial<SessionUIState>)) => {
       const snap = getUiStoreSnapshot()
-      const base = snap.sessionMap[id] ?? EMPTY_SESSION
-      // 字段级 patch：只发送 patch 显式指定的字段，不展开 base（否则会把本地旧的 items 整体覆盖到主进程，
+      const existing = snap.sessionMap[id]
+      const base = existing ?? EMPTY_SESSION
+      // 字段级 patch：只发送 patch 显式指定的字段，不展开已有 base（否则会把本地旧的 items 整体覆盖到主进程，
       // 覆盖掉 onSessionActivity('end') 刚重建的含正文 items，导致「执行完正文消失、重启后才出现」的竞态）。
       const next = typeof patch === 'function' ? patch(base) : patch
-      patchUiStore({ sessionMap: { [id]: next } })
+      // 会话首次写入：若 store 中尚无该会话（如切会话先写 incompleteTurn、再异步拉历史），字段级 patch
+      // 会被 deepMerge 直接把 sessionMap[id] 置为仅含 patch 字段的残缺对象（缺 items/streaming/busy），
+      // 渲染时 cur.items.length 抛 undefined 导致白屏。故首次写入必须补全 EMPTY_SESSION 的完整字段。
+      patchUiStore({ sessionMap: { [id]: existing ? next : { ...EMPTY_SESSION, ...next } } })
     },
     [],
   )
