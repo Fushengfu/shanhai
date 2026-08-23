@@ -21,7 +21,6 @@
   },
   "dependencies": {
     "@shanhai/approval": "workspace:*",
-    "@shanhai/compaction": "workspace:*",
     "@shanhai/llm": "workspace:*",
     "@shanhai/session": "workspace:*",
     "@shanhai/tools": "workspace:*"

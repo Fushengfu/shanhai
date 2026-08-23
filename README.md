@@ -9,6 +9,7 @@
 - **账号密码登录**：对接会员网关 `agent.bjctykj.com`（密码 SHA-256 加密），登录后拉取网关模型列表，也支持接入自定义 OpenAI 兼容端点
 - **多专家编排**：Triage 任务拆解 + 专家 Agent 池（ReAct 循环），真实调用工具执行任务
 - **工具执行**：读/写文件、执行命令、电脑操作（截图/OCR/键鼠）、内置浏览器自动化（16 工具）
+- **技能与 MCP**：复合技能（内置 + `~/.shanhai/skills` 用户技能目录）+ MCP 客户端接入外部工具（`~/.shanhai/mcp.json`）
 - **安全**：危险操作审批（会话级隔离）、写文件前快照回滚、能力清单强制
 - **会话**：多会话并行、事件日志持久化、断点续跑、工作目录隔离、输入草稿隔离
 - **长期记忆**：跨会话记忆（配置型 + 经验型）+ 记忆面板
@@ -35,16 +36,19 @@ shanhai/
 │   ├── agent/                    # ④ AgentLoop + Triage 编排
 │   ├── session/                  # ⑤ 会话（类型化事件日志）
 │   ├── approval/                 # ⑥ 审批
-│   ├── compaction/               # ⑦ 上下文压缩
-│   ├── tools/                    # ⑧ 原子工具（read/write/run_command + utility）
-│   ├── ask/                      # ⑨ 向用户提问（ask_user 工具）
-│   ├── llm/                      # ⑩ Model 接口 + provider 适配
-│   ├── memory/                   # ⑪ 分层记忆
-│   ├── voice/                    # ⑫ 语音（STT/TTS）
-│   ├── computer-use/             # ⑬ 电脑操作（截图/OCR/键鼠）
-│   ├── browser-use/              # ⑭ 内置浏览器自动化（16 工具）
-│   ├── llm-gateway/              # ⑮ 模型网关（路由三层 + 降级）
-│   └── auth/                     # ⑯ 认证（登录/凭证）
+│   ├── tools/                    # ⑦ 原子工具（read/write/run_command + utility）
+│   ├── ask/                      # ⑧ 向用户提问（ask_user 工具）
+│   ├── llm/                      # ⑨ Model 接口 + provider 适配
+│   ├── memory/                   # ⑩ 分层记忆
+│   ├── voice/                    # ⑪ 语音（STT/TTS）
+│   ├── computer-use/             # ⑫ 电脑操作（截图/OCR/键鼠）
+│   ├── browser-use/              # ⑬ 内置浏览器自动化（16 工具）
+│   ├── llm-gateway/              # ⑭ 模型网关（路由三层 + 降级）
+│   ├── auth/                     # ⑮ 认证（登录/凭证）
+│   ├── skills/                   # ⑯ 复合技能（skill_list/skill_read/skill_run）
+│   ├── mcp/                      # ⑰ MCP 客户端（mcp_list_tools/mcp_call）
+│   ├── terminal/                 # ⑱ 终端（可执行技能，node-pty 持久 shell）
+│   └── storage/                  # ⑲ 云存储上传（走网关 upload-token，返回 https 链接）
 └── docs/                         # 设计文档
 ```
 

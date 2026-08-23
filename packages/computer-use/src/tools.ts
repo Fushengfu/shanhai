@@ -1,6 +1,9 @@
 import type { ToolContract } from '@shanhai/tools'
 import type { ComputerAction, ComputerUseService } from './computer-use'
 
+/** 截图上传回调：把 base64 上传到云存储，返回 https 公网链接；失败返回 null（调用方回退 base64） */
+export type UploadImageFn = (imageBase64: string) => Promise<string | null>
+
 /**
  * computer-use 插件：把「操作电脑」收敛为三个统一工具，形成「截图 → 定位 → 动作 → 验证」闭环。
  *
@@ -10,22 +13,31 @@ import type { ComputerAction, ComputerUseService } from './computer-use'
  *
  * 设计原则（对齐 Taco computer-use）：桌面操作必须先截图识别再行动，禁止盲操作。
  */
-export function createComputerUseTools(service: ComputerUseService): ToolContract[] {
-  return [screenshotTool(service), ocrTool(service), actionTool(service)]
+export function createComputerUseTools(service: ComputerUseService, uploadImage?: UploadImageFn): ToolContract[] {
+  return [screenshotTool(service, uploadImage), ocrTool(service), actionTool(service)]
 }
 
-/** computer_screenshot：截取当前屏幕，返回 base64 + 尺寸（供 OCR/视觉分析） */
-function screenshotTool(service: ComputerUseService): ToolContract {
+/** computer_screenshot：截取当前屏幕，返回截图链接（上传云存储后的 https URL）；失败回退 base64 */
+function screenshotTool(service: ComputerUseService, uploadImage?: UploadImageFn): ToolContract {
   return {
     name: 'computer_screenshot',
     description:
-      '截取当前屏幕并返回截图（base64 PNG）。用于查看桌面/窗口当前状态。任何需要点击、输入、判断界面状态的操作，第一步都必须先调用它截图，再配合 computer_ocr 或 image_analyze 定位，禁止不截图直接盲操作。',
+      '截取当前屏幕并返回截图链接（上传云存储后的 https URL）。用于查看桌面/窗口当前状态。任何需要点击、输入、判断界面状态的操作，第一步都必须先调用它截图，再配合 computer_ocr 或 image_analyze 定位，禁止不截图直接盲操作。',
     inputSchema: { type: 'object', properties: {} },
     riskLevel: 'readonly',
     execute: async () => {
       const buf = await service.screenshot()
       const bytes = new Uint8Array(buf)
-      return { imageBase64: Buffer.from(bytes).toString('base64'), byteLength: bytes.length }
+      const base64 = Buffer.from(bytes).toString('base64')
+      if (uploadImage) {
+        try {
+          const url = await uploadImage(base64)
+          if (url) return { imageUrl: url, byteLength: bytes.length }
+        } catch {
+          // 上传失败：回退 base64（保证截图功能不失效）
+        }
+      }
+      return { imageBase64: base64, byteLength: bytes.length }
     },
   }
 }

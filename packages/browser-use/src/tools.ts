@@ -1,6 +1,9 @@
 import type { ToolContract } from '@shanhai/tools'
 import type { BrowserCookie, BrowserUseService } from './browser-use'
 
+/** 截图上传回调：把 base64 上传到云存储，返回 https 公网链接；失败返回 null（调用方回退 base64） */
+export type UploadImageFn = (imageBase64: string) => Promise<string | null>
+
 /**
  * browser-use 插件：把「操作内置浏览器」收敛为一组统一工具，覆盖
  * 导航 → 定位 → 动作 → 提取 → 验证 的完整闭环，对齐 Taco browser-use 的能力面。
@@ -17,15 +20,15 @@ import type { BrowserCookie, BrowserUseService } from './browser-use'
  * 2. 选择器优先用稳定标识（id / name / data-testid）
  * 3. 页面跳转/异步加载后用 browser_wait 等待关键元素
  * 4. 排查错误先 browser_get_console_logs，再决定是否截图
- * 5. 点击/输入是浏览器内的真实操作，默认需审批（安全模式 ask 下弹窗，never 下自动执行）
+ * 5. 浏览器定位为「测试 / 查资料」用途，所有操作免审批（不弹审批框，直接执行）
  */
-export function createBrowserUseTools(service: BrowserUseService): ToolContract[] {
+export function createBrowserUseTools(service: BrowserUseService, uploadImage?: UploadImageFn): ToolContract[] {
   return [
     createTool(service),
     listTool(service),
     navigateTool(service),
     closeTool(service),
-    screenshotTool(service),
+    screenshotTool(service, uploadImage),
     getInfoTool(service),
     getContentTool(service),
     evaluateTool(service),
@@ -48,20 +51,23 @@ function createTool(service: BrowserUseService): ToolContract {
   return {
     name: 'browser_create',
     description:
-      '创建新的浏览器窗口，返回窗口标识 appId。需要同时打开多个页面、或开启一个独立窗口时使用。可选传入初始 URL 直接导航，传入 title 给窗口标注用途（如「登录页」「数据采集」），方便后续用 browser_list 区分各窗口用途。后续 browser_navigate / browser_click 等操作用返回的 appId 定位该窗口。',
+      '创建新的浏览器窗口，返回窗口标识 appId。需要同时打开多个页面、或开启一个独立窗口时使用。url 必填（创建后立即打开该网址，避免空白窗口）；传入 title 给窗口标注用途（如「登录页」「数据采集」），方便后续用 browser_list 区分各窗口用途。后续 browser_navigate / browser_click 等操作用返回的 appId 定位该窗口。',
     inputSchema: {
       type: 'object',
       properties: {
         appId: { type: 'string', description: '自定义窗口短标识（可选，省略则自动生成 default/win-2/win-3…）' },
-        url: { type: 'string', description: '创建后立即打开的初始 URL（可选）' },
+        url: { type: 'string', description: '创建后立即打开的初始 URL（必填）' },
         title: { type: 'string', description: '窗口用途描述（可选，如「登录页」「数据采集」，供 AI 区分多窗口用途）' },
       },
+      required: ['url'],
     },
     riskLevel: 'reversible',
     execute: async (args) => {
+      const url = typeof args.url === 'string' ? args.url.trim() : ''
+      if (!url) throw new Error('browser_create 需要 url 参数：创建浏览器窗口必须指定要打开的网址，避免打开空白窗口')
       const appId = await service.create(
         typeof args.appId === 'string' && args.appId ? args.appId : undefined,
-        typeof args.url === 'string' && args.url ? args.url : undefined,
+        url,
         typeof args.title === 'string' && args.title ? args.title : undefined,
       )
       return { ok: true, appId }
@@ -125,17 +131,26 @@ function closeTool(service: BrowserUseService): ToolContract {
 }
 
 /** browser_screenshot：截图 */
-function screenshotTool(service: BrowserUseService): ToolContract {
+function screenshotTool(service: BrowserUseService, uploadImage?: UploadImageFn): ToolContract {
   return {
     name: 'browser_screenshot',
     description:
-      '截取当前浏览器页面，返回 base64 PNG。仅在需要视觉确认时使用（如验证 UI 显示效果），截图前必须有明确目的。配合 image_analyze 分析截图内容。',
+      '截取当前浏览器页面，返回截图链接（上传云存储后的 https URL）。仅在需要视觉确认时使用（如验证 UI 显示效果），截图前必须有明确目的。配合 image_analyze 分析截图内容。',
     inputSchema: { type: 'object', properties: { ...appIdProp } },
     riskLevel: 'readonly',
     execute: async (args) => {
       const buf = await service.screenshot(typeof args.appId === 'string' ? args.appId : undefined)
       const bytes = new Uint8Array(buf)
-      return { imageBase64: Buffer.from(bytes).toString('base64'), byteLength: bytes.length }
+      const base64 = Buffer.from(bytes).toString('base64')
+      if (uploadImage) {
+        try {
+          const url = await uploadImage(base64)
+          if (url) return { imageUrl: url, byteLength: bytes.length }
+        } catch {
+          // 上传失败：回退 base64（保证截图功能不失效）
+        }
+      }
+      return { imageBase64: base64, byteLength: bytes.length }
     },
   }
 }
@@ -208,7 +223,7 @@ function clickTool(service: BrowserUseService): ToolContract {
   return {
     name: 'browser_click',
     description:
-      '点击页面元素（按 CSS 选择器定位，如 #submit、button.login、[data-testid=ok]）。点击可能触发提交/跳转等副作用，默认需用户确认。',
+      '点击页面元素（按 CSS 选择器定位，如 #submit、button.login、[data-testid=ok]）。浏览器用于测试/查资料，无需审批，直接执行。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -217,8 +232,7 @@ function clickTool(service: BrowserUseService): ToolContract {
       },
       required: ['selector'],
     },
-    riskLevel: 'irreversible',
-    approvalRequired: true,
+    riskLevel: 'reversible',
     execute: async (args) => {
       const selector = String(args.selector ?? '')
       if (!selector) throw new Error('browser_click 需要 selector 参数')
@@ -244,8 +258,7 @@ function typeTool(service: BrowserUseService): ToolContract {
       },
       required: ['selector', 'text'],
     },
-    riskLevel: 'irreversible',
-    approvalRequired: true,
+    riskLevel: 'reversible',
     execute: async (args) => {
       const selector = String(args.selector ?? '')
       const text = String(args.text ?? '')
@@ -424,10 +437,9 @@ function setCookieTool(service: BrowserUseService): ToolContract {
 function clearCookiesTool(service: BrowserUseService): ToolContract {
   return {
     name: 'browser_clear_cookies',
-    description: '清除当前浏览器窗口所有 Cookie。会清空登录态，默认需用户确认。',
+    description: '清除当前浏览器窗口所有 Cookie。会清空登录态，无需审批，直接执行。',
     inputSchema: { type: 'object', properties: { ...appIdProp } },
     riskLevel: 'reversible',
-    approvalRequired: true,
     execute: async (args) => {
       await service.clearCookies(typeof args.appId === 'string' ? args.appId : undefined)
       return { ok: true }

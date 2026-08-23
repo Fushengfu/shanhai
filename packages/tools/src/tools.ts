@@ -1,9 +1,10 @@
 import { promises as fs } from 'node:fs'
-import { exec as execCallback } from 'node:child_process'
+import { exec as execCallback, execFile as execFileCallback } from 'node:child_process'
 import { promisify } from 'node:util'
-import { resolve, isAbsolute, join } from 'node:path'
+import { resolve, isAbsolute, join, relative } from 'node:path'
 
 const exec = promisify(execCallback)
+const execFile = promisify(execFileCallback)
 
 /** 工具风险等级（安全属性内嵌于契约） */
 export type RiskLevel = 'readonly' | 'reversible' | 'irreversible' | 'high'
@@ -21,6 +22,14 @@ export interface ToolContract {
   riskLevel: RiskLevel
   approvalRequired?: boolean
   timeoutMs?: number
+  /** 动态风险解析：统一入口工具（如 skill_run）按 args 决定审批粒度（action 级）。
+   *  返回 undefined 则回退到静态 riskLevel / approvalRequired。
+   *  outsideWorkdir：本次操作是否访问工作目录之外（供「工作目录内免审批」安全模式按范围决定是否弹窗）。 */
+  resolveRisk?: (
+    args: Record<string, unknown>,
+  ) =>
+    | { riskLevel: RiskLevel; approvalRequired?: boolean; outsideWorkdir?: boolean }
+    | Promise<{ riskLevel: RiskLevel; approvalRequired?: boolean; outsideWorkdir?: boolean }>
   execute: (args: Record<string, unknown>) => unknown | Promise<unknown>
 }
 
@@ -80,6 +89,98 @@ async function buildDirTree(
 }
 
 /**
+ * —— 命令执行环境变量注入（参考 Taco 设计）——
+ * 桌面 GUI 应用从 Finder 启动时 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin，
+ * 缺少 Homebrew(/opt/homebrew/bin)、nvm、pnpm 等路径，导致执行命令时报「命令不存在」。
+ * 这里启动一次用户登录 shell 提取完整环境（含 .zshrc/.zprofile 里配的 PATH），
+ * 与当前进程环境合并后缓存复用，run_command 执行命令时注入该完整环境。
+ */
+
+/** 解析 `env -0` 输出的 NUL 分隔 key=value */
+function parseNulSeparatedEnv(raw: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  for (const item of raw.split('\0')) {
+    if (!item) continue
+    const eq = item.indexOf('=')
+    if (eq <= 0) continue
+    env[item.slice(0, eq)] = item.slice(eq + 1)
+  }
+  return env
+}
+
+/** 合并 PATH：primary 优先、secondary 兜底，去重（Windows 用 ';' 分隔且忽略大小写） */
+function mergePathValue(primary: string, secondary: string): string {
+  const sep = process.platform === 'win32' ? ';' : ':'
+  const normalize = (p: string) =>
+    process.platform === 'win32' ? p.toLowerCase().replace(/[/\\]+$/, '') : p
+  const seen = new Set<string>()
+  const merged: string[] = []
+  for (const raw of `${primary}${sep}${secondary}`.split(sep)) {
+    const p = raw.trim()
+    if (!p) continue
+    const key = normalize(p)
+    if (seen.has(key)) continue
+    seen.add(key)
+    merged.push(p)
+  }
+  return merged.join(sep)
+}
+
+/** 启动用户登录 shell 提取完整环境变量；先交互登录 shell，失败降级登录 shell，再失败返回空 */
+async function loadLoginShellEnv(): Promise<NodeJS.ProcessEnv> {
+  if (process.platform === 'win32') return {}
+  const shell = process.env.SHELL || '/bin/zsh'
+  const attempts: Array<{ args: string[] }> = [
+    { args: ['-ilc', 'env -0'] },
+    { args: ['-lc', 'env -0'] },
+  ]
+  for (const attempt of attempts) {
+    try {
+      const { stdout } = await execFile(shell, attempt.args, {
+        encoding: 'utf8',
+        timeout: 8000,
+        maxBuffer: 8 * 1024 * 1024,
+        env: { ...process.env },
+      })
+      const parsed = parseNulSeparatedEnv(stdout)
+      if (Object.keys(parsed).length > 0) return parsed
+    } catch {
+      // 忽略，尝试下一种方式
+    }
+  }
+  return {}
+}
+
+/** 命令执行环境缓存：完整环境只在首次加载一次，之后复用，避免每条命令都起 shell 拖慢执行 */
+let commandEnvCache: NodeJS.ProcessEnv | null = null
+let commandEnvLoadingPromise: Promise<NodeJS.ProcessEnv> | null = null
+
+/** 获取 run_command 的执行环境：系统环境 + 登录 shell 环境合并，PATH 用登录 shell 优先去重 */
+async function getRunCommandEnv(): Promise<NodeJS.ProcessEnv> {
+  if (commandEnvCache) return commandEnvCache
+  if (commandEnvLoadingPromise) return commandEnvLoadingPromise
+  commandEnvLoadingPromise = (async () => {
+    const systemEnv: NodeJS.ProcessEnv = { ...process.env }
+    const shellEnv = await loadLoginShellEnv()
+    const merged: NodeJS.ProcessEnv = { ...systemEnv, ...shellEnv }
+    const shellPath = shellEnv.PATH || shellEnv.Path
+    const systemPath = systemEnv.PATH || systemEnv.Path
+    if (shellPath && systemPath) {
+      const pathValue = mergePathValue(shellPath, systemPath)
+      merged.PATH = pathValue
+      merged.Path = pathValue
+    }
+    commandEnvCache = merged
+    return merged
+  })()
+  try {
+    return await commandEnvLoadingPromise
+  } finally {
+    commandEnvLoadingPromise = null
+  }
+}
+
+/**
  * 创建内置原子工具清单。所有文件/命令操作都围绕 `getCwd()` 返回的会话工作目录：
  * 相对路径解析到工作目录下，命令也以工作目录为 cwd 执行——保证「工具围绕当前工作目录」这一约束。
  * `snapshot` 为写前快照回调（可选）：注入后 write_file 在覆盖已有文件前自动备份，支撑「信任四可」的可回退。
@@ -87,24 +188,94 @@ async function buildDirTree(
 export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): ToolContract[] {
   const resolvePath: PathResolver = (p) => {
     if (isAbsolute(p)) return p
-    return resolve(getCwd(), p)
+    const resolved = resolve(getCwd(), p)
+    // 路径穿越防护：相对路径解析后越界（../ 逃逸工作目录）时抛错，强制改用绝对路径显式访问外部文件。
+    // 绝对路径不拦截——agent 读取/写入用户指定目录外文件是显式意图，由审批层（write/run）兜底。
+    if (relative(getCwd(), resolved).startsWith('..')) {
+      throw new Error(`路径越界：相对路径 "${p}" 解析后超出工作目录，请改用绝对路径明确访问`)
+    }
+    return resolved
   }
 
-  /** read_file：读取文件内容（相对路径解析到工作目录） */
+  /** 判断绝对路径是否落在工作目录之外（只读工具用绝对路径显式访问目录外文件时需审批确认） */
+  const isOutsideWorkdir = (p: string): boolean => {
+    const rel = relative(getCwd(), resolve(p))
+    return rel.startsWith('..') || isAbsolute(rel)
+  }
+
+  /** 只读文件/目录工具的动态审批：仅当用绝对路径显式访问工作目录之外时，要求用户确认（相对路径永远在目录内，且越界已被 resolvePath 拦截）。
+   *  outsideWorkdir 供「工作目录内免审批」模式判断：相对路径视为目录内，绝对路径按是否越界判断。 */
+  const readonlyPathResolveRisk = (
+    args: Record<string, unknown>,
+  ): { riskLevel: RiskLevel; approvalRequired: boolean; outsideWorkdir: boolean } => {
+    const raw = typeof args.path === 'string' ? args.path.trim() : ''
+    if (!raw) return { riskLevel: 'readonly', approvalRequired: false, outsideWorkdir: false }
+    const outside = isAbsolute(raw) && isOutsideWorkdir(raw)
+    return { riskLevel: 'readonly', approvalRequired: outside, outsideWorkdir: outside }
+  }
+
+  /** 文件写/编辑工具的动态审批：静态风险保持 reversible + 全量审批（ask 模式不变），
+   *  额外返回 outsideWorkdir 供「工作目录内免审批」模式按范围决定是否免审批。 */
+  const fileWriteScopeRisk = (
+    args: Record<string, unknown>,
+  ): { riskLevel: RiskLevel; approvalRequired: boolean; outsideWorkdir: boolean } => {
+    const raw = typeof args.path === 'string' ? args.path.trim() : ''
+    const outside = !!raw && isAbsolute(raw) && isOutsideWorkdir(raw)
+    return { riskLevel: 'reversible', approvalRequired: true, outsideWorkdir: outside }
+  }
+
+  /** 命令是否可能访问工作目录之外（越界信号近似检测：cd 切换目录 / 绝对路径 / 家目录 ~ / 父目录 ..）。
+   *  这是保守近似——命令副作用范围无法静态精确判定，命中越界信号则在「工作目录内免审批」模式下仍审批。 */
+  const commandLooksOutsideWorkdir = (cmd: string): boolean => {
+    if (/\bcd\s+/.test(cmd)) return true
+    if (/(^|[^\w$])\/\S/.test(cmd)) return true
+    if (/~/.test(cmd)) return true
+    if (/(^|[^\w$])\.\.(\/|$)/.test(cmd)) return true
+    return false
+  }
+
+  /** 解析行号参数：接受 number 或可转数字的字符串，非法返回 undefined */
+  const toLineNumber = (v: unknown): number | undefined => {
+    if (typeof v === 'number' && Number.isFinite(v)) return v
+    if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Number(v)
+    return undefined
+  }
+
+  /** read_file：读取文件内容（相对路径解析到工作目录，支持 startLine/endLine 分段读取） */
   const readFileTool: ToolContract = {
     name: 'read_file',
     description:
       '读取指定路径的文本文件内容。当需要查看文件内容时使用。' +
-      'path 可以是绝对路径，也可以是相对于当前工作目录的相对路径（优先使用相对路径，保持操作范围在工作目录内）。',
+      'path 可以是绝对路径，也可以是相对于当前工作目录的相对路径（优先使用相对路径，保持操作范围在工作目录内）。' +
+      '大文件可用 startLine / endLine 按行范围分段读取（1-based、包含两端），避免一次读取全文导致上下文过长。',
     inputSchema: {
       type: 'object',
-      properties: { path: { type: 'string', description: '文件路径（绝对路径，或相对当前工作目录的相对路径）' } },
+      properties: {
+        path: { type: 'string', description: '文件路径（绝对路径，或相对当前工作目录的相对路径）' },
+        startLine: { type: 'number', description: '起始行号（1-based，包含，可选）' },
+        endLine: { type: 'number', description: '结束行号（1-based，包含，可选）' },
+      },
       required: ['path'],
     },
     riskLevel: 'readonly',
+    resolveRisk: readonlyPathResolveRisk,
     execute: async (args) => {
-      const path = resolvePath(String(args.path))
-      return fs.readFile(path, 'utf8')
+      if (typeof args.path !== 'string' || args.path.trim() === '') {
+        throw new Error('read_file 缺少 path 参数：请提供要读取的文件路径（相对或绝对路径）')
+      }
+      const path = resolvePath(args.path)
+      const text = await fs.readFile(path, 'utf8')
+      const startLine = toLineNumber(args.startLine)
+      const endLine = toLineNumber(args.endLine)
+      // 未指定任何行号 → 返回全文（兼容原有行为）
+      if (startLine === undefined && endLine === undefined) return text
+      const lines = text.split('\n')
+      const start = Math.max(1, Math.floor(startLine ?? 1))
+      const end = Math.floor(endLine ?? lines.length)
+      if (start > end) {
+        throw new Error(`read_file 行范围非法：startLine=${start} 大于 endLine=${end}`)
+      }
+      return lines.slice(start - 1, end).join('\n')
     },
   }
 
@@ -124,8 +295,12 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
     },
     riskLevel: 'reversible',
     approvalRequired: true,
+    resolveRisk: fileWriteScopeRisk,
     execute: async (args) => {
-      const path = resolvePath(String(args.path))
+      if (typeof args.path !== 'string' || args.path.trim() === '') {
+        throw new Error('write_file 缺少 path 参数：请提供要写入的文件路径（相对或绝对路径）')
+      }
+      const path = resolvePath(args.path)
       const content = String(args.content)
       // 写入前读取旧内容，供前端渲染 git diff 效果；文件不存在则为 null（新建）
       let before: string | null = null
@@ -148,6 +323,78 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
     },
   }
 
+  /** edit_file：编辑已有文件（替换模式，仅需提供被替换片段与新片段，token 开销小，避免重传全文） */
+  const editFileTool: ToolContract = {
+    name: 'edit_file',
+    description:
+      '编辑已有文件：将 oldText 精确替换为 newText（替换模式，只需提供要改的片段，无需重传全文，token 开销小）。' +
+      'path 可以是绝对路径，也可以是相对于当前工作目录的相对路径。' +
+      '默认只替换首次命中；当 oldText 在文件中出现多次时，需设置 replaceAll=true 替换全部，或提供更长的 oldText 上下文精确定位唯一命中；' +
+      '也可设置 expectedOccurrences 声明期望命中次数，实际命中不符则报错。修改文件默认需用户确认。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '文件路径（绝对路径，或相对当前工作目录的相对路径）' },
+        oldText: { type: 'string', description: '需要被替换的原文本（必须精确匹配）' },
+        newText: { type: 'string', description: '替换后的新文本' },
+        replaceAll: { type: 'boolean', description: '是否替换全部命中，默认 false（只替换首个命中）' },
+        expectedOccurrences: { type: 'number', description: '期望 oldText 出现的次数，实际不符则报错（可选）' },
+      },
+      required: ['path', 'oldText', 'newText'],
+    },
+    riskLevel: 'reversible',
+    approvalRequired: true,
+    resolveRisk: fileWriteScopeRisk,
+    execute: async (args) => {
+      if (typeof args.path !== 'string' || args.path.trim() === '') {
+        throw new Error('edit_file 缺少 path 参数：请提供要修改的文件路径（相对或绝对路径）')
+      }
+      if (typeof args.oldText !== 'string' || args.oldText === '') {
+        throw new Error('edit_file 缺少 oldText 参数：请提供要被替换的原文本片段')
+      }
+      const path = resolvePath(args.path)
+      const oldText = args.oldText
+      const newText = String(args.newText ?? '')
+      const replaceAll = args.replaceAll === true
+      const expectedOccurrences = typeof args.expectedOccurrences === 'number' ? args.expectedOccurrences : undefined
+
+      let before: string
+      try {
+        before = await fs.readFile(path, 'utf8')
+      } catch {
+        throw new Error(`edit_file 读取文件失败：${path} 不存在或无法读取`)
+      }
+
+      // 命中次数 = split 后段数 - 1（split/join 不做正则替换模式解析，避免 $ 等特殊字符被误解）
+      const count = before.split(oldText).length - 1
+      if (count === 0) {
+        throw new Error('edit_file 未找到 oldText：文件中不存在该文本片段，请先用 read_file 读取实际内容，确保 oldText 精确匹配')
+      }
+      if (expectedOccurrences !== undefined && count !== expectedOccurrences) {
+        throw new Error(`edit_file 命中次数不匹配：期望 ${expectedOccurrences} 处，实际 ${count} 处`)
+      }
+      if (!replaceAll && count > 1) {
+        throw new Error(`edit_file 命中 ${count} 处：请提供更长的 oldText 上下文精确定位唯一命中，或设置 replaceAll=true 替换全部`)
+      }
+
+      const after = replaceAll
+        ? before.split(oldText).join(newText)
+        : before.slice(0, before.indexOf(oldText)) + newText + before.slice(before.indexOf(oldText) + oldText.length)
+
+      // 写前快照：备份原文件，支撑回滚
+      let snapshotId: string | undefined
+      if (snapshot) {
+        try {
+          snapshotId = (await snapshot(path))?.snapshotId
+        } catch {
+          snapshotId = undefined
+        }
+      }
+      await fs.writeFile(path, after, 'utf8')
+      return { ok: true, path, occurrences: replaceAll ? count : 1, before, after, snapshotId }
+    },
+  }
+
   /** run_command：执行 shell 命令（不可逆，默认需审批），cwd 为会话工作目录 */
   const runCommandTool: ToolContract = {
     name: 'run_command',
@@ -160,13 +407,22 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
     },
     riskLevel: 'irreversible',
     approvalRequired: true,
+    resolveRisk: (args): { riskLevel: RiskLevel; approvalRequired: boolean; outsideWorkdir: boolean } => {
+      const cmd = typeof args.command === 'string' ? args.command : ''
+      return { riskLevel: 'irreversible', approvalRequired: true, outsideWorkdir: commandLooksOutsideWorkdir(cmd) }
+    },
     execute: async (args) => {
-      const { stdout, stderr } = await exec(String(args.command), { cwd: getCwd() })
+      if (typeof args.command !== 'string' || args.command.trim() === '') {
+        throw new Error('run_command 缺少 command 参数：请提供要执行的 shell 命令')
+      }
+      // 注入完整环境变量（含登录 shell 的 PATH），避免 GUI 启动的精简 PATH 导致「命令不存在」
+      const env = await getRunCommandEnv()
+      const { stdout, stderr } = await exec(args.command, { cwd: getCwd(), env })
       return { stdout, stderr }
     },
   }
 
-  /** list_dir：树形列出目录（只读，无需审批） */
+  /** list_dir：树形列出目录（只读；访问工作目录外目录时需审批确认） */
   const listDirTool: ToolContract = {
     name: 'list_dir',
     description:
@@ -180,6 +436,7 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
       },
     },
     riskLevel: 'readonly',
+    resolveRisk: readonlyPathResolveRisk,
     execute: async (args) => {
       const raw = args.path ? String(args.path) : ''
       const dir = raw ? resolvePath(raw) : getCwd()
@@ -188,5 +445,5 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
     },
   }
 
-  return [readFileTool, writeFileTool, runCommandTool, listDirTool]
+  return [readFileTool, writeFileTool, editFileTool, runCommandTool, listDirTool]
 }

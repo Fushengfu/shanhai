@@ -74,4 +74,16 @@ describe('ApprovalService', () => {
     expect(service.requiresApproval(tool({ riskLevel: 'irreversible' }), sessionB)).toBe(false)
     expect(service.requiresApproval(tool({ riskLevel: 'irreversible' }), sessionA)).toBe(false)
   })
+
+  it('workdir 策略：工作目录内免审批，访问目录外才审批', () => {
+    const service = new ApprovalService(undefined, 'workdir')
+    // 工作目录内（outsideWorkdir=false）→ 免审批，即使 irreversible / approvalRequired
+    expect(service.requiresApproval(tool({ riskLevel: 'irreversible' }), undefined, false)).toBe(false)
+    expect(service.requiresApproval(tool({ riskLevel: 'reversible', approvalRequired: true }), undefined, false)).toBe(false)
+    // 访问工作目录外（outsideWorkdir=true）→ 走原有审批逻辑
+    expect(service.requiresApproval(tool({ riskLevel: 'reversible', approvalRequired: true }), undefined, true)).toBe(true)
+    expect(service.requiresApproval(tool({ riskLevel: 'readonly' }), undefined, true)).toBe(false)
+    // 未提供范围（outsideWorkdir=undefined，如非文件工具）→ 走原有逻辑
+    expect(service.requiresApproval(tool({ riskLevel: 'irreversible' }), undefined, undefined)).toBe(true)
+  })
 })

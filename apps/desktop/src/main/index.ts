@@ -1,81 +1,23 @@
-import { app, BrowserWindow, Tray, Menu, globalShortcut, nativeImage, type NativeImage } from 'electron'
-import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { app, Tray, Menu, globalShortcut, nativeImage, type NativeImage } from 'electron'
 import { bootHost } from '../host/index'
-import { setRuntime } from './runtime'
+import { getRuntime, setRuntime } from './runtime'
+import { initUiStore } from './ui-store'
 import { registerPush } from './push'
 import { registerIpc } from './ipc-handlers'
-
-const __dirname = dirname(fileURLToPath(import.meta.url))
+import { createWindow, loadWindowContent, showChatWindow, toggleChatWindow, ICON_PATH } from './window-manager'
 
 /** 全局唤起/隐藏主窗口的快捷键（macOS 上 CommandOrControl 即 ⌘，避开 Spotlight 的 ⌘+Space） */
 const TOGGLE_SHORTCUT = 'CommandOrControl+Shift+Space'
 
-/** 菜单栏模板图标（单色「山」形 18×18，setTemplateImage 自动适配深浅色菜单栏） */
-const TRAY_ICON_BASE64 =
-  'iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAAANElEQVR4nGNgGDHgPxmYKoZRxWVU8yLRgCqGUNUgXIaRBahmELphFAGqGcRALUOoatAQBAAgtUm3eMXTrAAAAABJRU5ErkJggg=='
-
-let mainWindow: BrowserWindow | null = null
 // 保持引用防止 Tray 被 GC（模块级，仅创建时赋值）
 let tray: Tray | null = null
 let isQuitting = false
 
 function createTrayIcon(): NativeImage {
-  const image = nativeImage.createFromDataURL(`data:image/png;base64,${TRAY_ICON_BASE64}`)
-  image.setTemplateImage(true)
-  return image
-}
-
-function showMainWindow(): void {
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    void createWindow()
-    return
-  }
-  if (mainWindow.isMinimized()) mainWindow.restore()
-  mainWindow.show()
-  mainWindow.focus()
-}
-
-function toggleMainWindow(): void {
-  if (mainWindow && mainWindow.isVisible() && mainWindow.isFocused()) {
-    mainWindow.hide()
-  } else {
-    showMainWindow()
-  }
-}
-
-async function createWindow(): Promise<void> {
-  const win = new BrowserWindow({
-    width: 1080,
-    height: 760,
-    titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 16, y: 16 },
-    webPreferences: {
-      preload: join(__dirname, '../preload/index.cjs'),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  })
-  mainWindow = win
-
-  // 点红色关闭按钮 → 最小化到托盘常驻（真正退出走托盘菜单「退出」/ ⌘Q，先置 isQuitting）
-  win.on('close', (event) => {
-    if (!isQuitting) {
-      event.preventDefault()
-      win.hide()
-    }
-  })
-  win.on('closed', () => {
-    if (mainWindow === win) mainWindow = null
-  })
-
-  if (process.env.VITE_DEV_SERVER_URL) {
-    await win.loadURL(process.env.VITE_DEV_SERVER_URL)
-  } else {
-    await win.loadFile(join(__dirname, '../renderer/index.html'))
-  }
-
-  registerPush(win)
+  // 托盘图标与应用图标统一：直接用主图标缩小到菜单栏尺寸（彩色，不设模板）
+  const image = nativeImage.createFromPath(ICON_PATH)
+  const scaled = image.resize({ width: 18, height: 18 })
+  return scaled
 }
 
 function createTray(): void {
@@ -83,7 +25,7 @@ function createTray(): void {
   tray.setToolTip('山海 AI 助手')
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: '显示主窗口', click: () => showMainWindow() },
+      { label: '显示主窗口', click: () => showChatWindow() },
       { type: 'separator' },
       {
         label: '退出山海',
@@ -95,11 +37,11 @@ function createTray(): void {
     ]),
   )
   // macOS 左键单击托盘图标唤出窗口（右键仍走 contextMenu）
-  tray.on('click', () => showMainWindow())
+  tray.on('click', () => showChatWindow())
 }
 
 function registerToggleShortcut(): void {
-  const ok = globalShortcut.register(TOGGLE_SHORTCUT, () => toggleMainWindow())
+  const ok = globalShortcut.register(TOGGLE_SHORTCUT, () => toggleChatWindow())
   if (!ok) {
     console.warn(`[山海] 全局快捷键 ${TOGGLE_SHORTCUT} 注册失败（可能被其他应用占用）`)
   }
@@ -107,14 +49,45 @@ function registerToggleShortcut(): void {
 
 app.whenReady().then(async () => {
   setRuntime(await bootHost())
+  initUiStore(getRuntime())
   registerIpc()
-  await createWindow()
-  createTray()
+
+  // 桌面壳窗口（全屏壁纸，忽略鼠标作为背景层；先创建，后续窗口浮在其上）
+  const desktopWin = createWindow({ type: 'desktop' })
+  await loadWindowContent(desktopWin)
+  // Dock 窗口（底部应用图标栏，独立于桌面壳以保持可点击）
+  const dockWin = createWindow({ type: 'dock' })
+  await loadWindowContent(dockWin)
+  // 聊天窗口（浮动在桌面之上，承载对话主界面）
+  const chatWin = createWindow({ type: 'chat' })
+  await loadWindowContent(chatWin)
+  // 会话管家窗口（独立常驻，右侧停靠，承载主 Agent 单会话聊天界面）
+  const supervisorWin = createWindow({ type: 'supervisor' })
+  await loadWindowContent(supervisorWin)
+  registerPush()
+
+  // 恢复已安装插件（AI 自研应用跨会话/跨重启留存）：在窗口就绪 + 广播注册后执行，
+  // 确保 browser 半 UI 代码能正确投递到渲染进程（否则 restore 时窗口尚未创建，投递会丢失）。
+  await getRuntime().restoreInstalledPlugins()
+
+  // Dock 图标：失败只告警，绝不因图标路径无效而中断启动（历史 bug：曾因此导致窗口创建被跳过）
+  try {
+    if (process.platform === 'darwin' && app.dock) app.dock.setIcon(ICON_PATH)
+  } catch (err) {
+    console.warn('[山海] 设置 Dock 图标失败：', err)
+  }
+
+  // 托盘：失败只告警，不影响主窗口使用
+  try {
+    createTray()
+  } catch (err) {
+    console.warn('[山海] 创建托盘失败：', err)
+  }
+
   registerToggleShortcut()
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) void createWindow()
-    else showMainWindow()
+    if (app.isReady()) showChatWindow()
   })
 })
 

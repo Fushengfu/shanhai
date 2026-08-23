@@ -15,6 +15,7 @@ function makeHooks() {
     hooks: {
       listServices: () => [...services.keys()],
       listTools: () => tools.map((t) => t.name),
+      listSlots: () => ['shell.sidebar', 'dynamic-extension'],
       registerTool: (tool: ToolContract) => {
         tools.push(tool)
         return () => {

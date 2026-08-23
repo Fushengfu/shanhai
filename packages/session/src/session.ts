@@ -13,26 +13,41 @@ export type AgentEventType =
   | 'assistant/message'
   | 'tool/call'
   | 'tool/result'
+  | 'usage/record'
+  | 'model/select'
   | 'approval/policy'
   | 'approval/request'
   | 'approval/outcome'
+  | 'retry/snapshot'
 
-export type ApprovalPolicy = 'ask' | 'never'
+/**
+ * 审批策略（安全模式，会话级）：
+ * - 'ask'：危险操作每次询问（工作目录内也审批）
+ * - 'workdir'：工作目录内免审批，访问工作目录外才审批
+ * - 'never'：从不询问，所有范围直接执行
+ */
+export type ApprovalPolicy = 'ask' | 'workdir' | 'never'
 export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
 
 /** 事件 → 载荷的类型映射（类型化事件，编译期约束载荷） */
 export interface EventData {
   'turn/start': { turn: number }
   'turn/end': { turn: number; text: string }
-  /** content 为文本；attachments 为多模态附件（图片/音频/视频），会话回放时一并还原 */
-  'user/message': { content: string; attachments?: unknown[] }
+  /** content 为文本；attachments 为多模态附件（图片/音频/视频），会话回放时一并还原。injected 标记「插入模式」任务执行中注入的消息（UI 不显示为独立用户气泡） */
+  'user/message': { content: string; attachments?: unknown[]; injected?: boolean }
   'assistant/delta': { text: string }
   'assistant/message': { content: string; reasoningContent?: string }
   'tool/call': { callId: string; name: string; args: Record<string, unknown>; reasoningContent?: string }
   'tool/result': { callId: string; name: string; result?: unknown; error?: string }
+  /** 模型每次调用返回的真实 token 用量（接口返回 usage.total_tokens，非本地估算），持久化用于断点续跑时恢复压缩判断与累计 token 统计 */
+  'usage/record': { totalTokens: number; promptTokens: number; completionTokens: number; cachedPromptTokens?: number }
+  /** 会话级模型选择：切模型时向当前会话追加一条 model/select 事件，切回该会话时回放恢复 */
+  'model/select': { modelId: string }
   'approval/policy': { policy: ApprovalPolicy }
   'approval/request': { id: string; toolName: string; args: Record<string, unknown>; riskLevel: string }
   'approval/outcome': { id: string; outcome: ApprovalOutcome }
+  /** 失败重试挂起快照：重试耗尽后保存「失败节点发给模型的完整 messages 快照 + 重入位置」，供重启后精确重试（body 与失败完全一致） */
+  'retry/snapshot': { messages: unknown[]; step: number; maxSteps: number; atLimit: boolean; reason?: string }
 }
 
 export interface SessionEvent<T extends AgentEventType = AgentEventType> {
@@ -74,6 +89,20 @@ export class Session {
     this.events.length = count
     return removed
   }
+
+  /**
+   * 移除事件日志中指定类型的最后一条事件（用于覆盖/清理临时标记事件，如失败重试挂起快照 retry/snapshot）。
+   * 返回是否移除成功。
+   */
+  removeLast(type: AgentEventType): boolean {
+    for (let i = this.events.length - 1; i >= 0; i--) {
+      if (this.events[i]!.type === type) {
+        this.events.splice(i, 1)
+        return true
+      }
+    }
+    return false
+  }
 }
 
 /** 从事件日志回放，得出当前生效的审批策略（最近一条 approval/policy） */
@@ -82,6 +111,17 @@ export function effectiveApprovalPolicy(events: SessionEvent[]): ApprovalPolicy 
     const e = events[i]
     if (e?.type === 'approval/policy') {
       return (e.data as { policy: ApprovalPolicy }).policy
+    }
+  }
+  return undefined
+}
+
+/** 从事件日志回放，得出该会话最近一次选中的模型 id（最近一条 model/select），无记录返回 undefined */
+export function effectiveModelId(events: SessionEvent[]): string | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]
+    if (e?.type === 'model/select') {
+      return (e.data as { modelId: string }).modelId
     }
   }
   return undefined

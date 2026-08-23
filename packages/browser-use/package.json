@@ -20,6 +20,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@shanhai/skills": "workspace:*",
     "@shanhai/tools": "workspace:*"
   },
   "devDependencies": {

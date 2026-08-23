@@ -1,0 +1,150 @@
+import { createContext, useContext } from 'react'
+import type * as React from 'react'
+import type {
+  ApprovalRequest,
+  AskRequest,
+  AttachmentItem,
+  BrowserWindowItem,
+  ClientRunRequest,
+  ExpertTrace,
+  GatewayModel,
+  RetryPrompt,
+  SessionListItem,
+  SessionUIState,
+  TokenSnapshot,
+} from './types'
+import type { SlotComponent } from './slots'
+
+/**
+ * UI 上下文（框架派生 props 的载体）：shell（App）持有应用状态，通过 UIContext 派生给各 slot 插件组件，
+ * 业务组件不手写订阅、不硬编码 props 传递（对齐 K3「组件 props 由框架派生」）。
+ */
+
+export interface UIContextValue {
+  // —— 通用 ——
+  loggedIn: boolean
+  username: string | null
+  currentSessionId: string
+  cur: SessionUIState
+  isEmpty: boolean
+  sidebarCollapsed: boolean
+  setSidebarCollapsed: React.Dispatch<React.SetStateAction<boolean>>
+  /** 顶部状态栏（header + 浏览器标签条）实际高度，侧滑面板顶部从它下方开始 */
+  headerHeight: number
+  // 主题：亮/暗模式切换
+  theme: 'light' | 'dark'
+  toggleTheme: () => void
+
+  // —— shell.sidebar ——
+  sortedSessions: SessionListItem[]
+  sessionBusy: (id: string) => boolean
+  editingSessionId: string | null
+  editingTitle: string
+  setEditingTitle: (t: string) => void
+  createSession: () => Promise<void>
+  renameSession: (id: string, title: string) => Promise<void>
+  deleteSession: (id: string) => Promise<void>
+  switchToSession: (id: string) => Promise<void>
+  setEditingSessionId: (id: string | null) => void
+  handleLogout: () => Promise<void>
+  setLoginOpen: (v: boolean) => void
+
+  // —— shell.header ——
+  setMemoryPanelOpen: (v: boolean) => void
+  setTracePanelOpen: (v: boolean) => void
+  setSettingsPanelOpen: (v: boolean) => void
+  setExpertsPanelOpen: (v: boolean) => void
+  browserWindows: BrowserWindowItem[]
+  showBrowserWindow: (appId: string) => Promise<void>
+  closeBrowserWindow: (appId: string) => Promise<void>
+
+  // —— shell.chat ——
+  curExpertTraces: ExpertTrace[]
+  incompleteTurn: boolean
+  dynamicExtensions: SlotComponent[]
+  curApproval: ApprovalRequest | null
+  curAsk: AskRequest | null
+  curClientRunRequest: ClientRunRequest | null
+  retryPrompt: RetryPrompt | null
+  resendMessage: (userIndex: number) => void
+  editResend: (userIndex: number, newContent: string) => void
+  resumeMessage: () => void
+  setPreviewImage: (v: string | null) => void
+  respondApproval: (outcome: 'allowed-once' | 'rejected') => Promise<void>
+  respondAsk: (answer: string) => Promise<void>
+  cancelAsk: () => Promise<void>
+  respondClientRun: (approved: boolean) => Promise<void>
+  respondRetry: (action: 'retry' | 'cancel') => void
+
+  // —— shell.composer ——
+  input: string
+  setInput: (v: string) => void
+  attachments: AttachmentItem[]
+  setAttachments: React.Dispatch<React.SetStateAction<AttachmentItem[]>>
+  /** 重新上传某张上传失败的图片附件（点击重试时调用） */
+  retryImageUpload: (id: string) => void
+  queueCount: number
+  recording: boolean
+  /** 语音输入轻提示（如「未检测到有效语音」），空串表示无提示 */
+  voiceNotice: string
+  models: GatewayModel[]
+  selectedModel: string
+  setSelectedModel: (v: string) => void
+  modelMenuOpen: boolean
+  setModelMenuOpen: React.Dispatch<React.SetStateAction<boolean>>
+  systemModels: GatewayModel[]
+  customModels: GatewayModel[]
+  approvalPolicy: 'ask' | 'workdir' | 'never'
+  approvalMenuOpen: boolean
+  setApprovalMenuOpen: React.Dispatch<React.SetStateAction<boolean>>
+  workDir: string
+  workDirName: string
+  fileRef: React.RefObject<HTMLInputElement>
+  modelMenuRef: React.RefObject<HTMLDivElement>
+  approvalMenuRef: React.RefObject<HTMLDivElement>
+  isComposingRef: React.MutableRefObject<boolean>
+  send: () => Promise<void>
+  stopSend: () => void
+  toggleRecording: () => Promise<void>
+  handleFileSelect: (e: React.ChangeEvent<HTMLInputElement>) => Promise<void>
+  handlePaste: (e: React.ClipboardEvent<HTMLTextAreaElement>) => Promise<void>
+  pickWorkdir: () => Promise<void>
+  switchApprovalPolicy: (policy: 'ask' | 'workdir' | 'never') => void
+  selectModel: (id: string) => void
+  handleRemoveModel: (id: string) => Promise<void>
+  setCustomModelDrawerOpen: (v: boolean) => void
+
+  // —— shell.welcome ——
+  // （复用 setInput）
+
+  // —— shell.statusbar ——
+  currentTokenStats: TokenSnapshot | null
+
+  // —— shell.panels ——
+  customModelDrawerOpen: boolean
+  addCustomModel: (input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }) => Promise<void>
+  updateCustomModel: (id: string, input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }) => Promise<void>
+  removeCustomModel: (id: string) => Promise<void>
+  tracePanelOpen: boolean
+  memoryPanelOpen: boolean
+  settingsPanelOpen: boolean
+  expertsPanelOpen: boolean
+
+  // —— shell.terminal ——
+  terminalPanelOpen: boolean
+  setTerminalPanelOpen: (v: boolean) => void
+
+  // —— shell.overlays ——
+  loginOpen: boolean
+  handleLogin: (u: string, p: string) => Promise<void>
+  previewImage: string | null
+}
+
+export const UIContext = createContext<UIContextValue | null>(null)
+
+/** 在 slot 插件组件内读取框架派生的状态与操作 */
+export function useUIContext(): UIContextValue {
+  const ctx = useContext(UIContext)
+  if (!ctx) throw new Error('useUIContext 必须在 UIContext.Provider 内使用')
+  return ctx
+}

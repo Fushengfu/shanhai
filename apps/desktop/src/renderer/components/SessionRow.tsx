@@ -1,8 +1,10 @@
 import { useState } from 'react'
 import { IconEdit, IconTrash } from './icons'
+import { formatRelativeTime } from './ui'
 
+/** 会话列表行：现代卡片式（圆角 + 标题/副标题两行 + 活跃高亮 + hover 显示操作） */
 export function SessionRow(props: {
-  session: { id: string; title: string; workDir: string }
+  session: { id: string; title: string; workDir: string; lastActiveAt?: number }
   active: boolean
   busy: boolean
   editing: boolean
@@ -14,12 +16,19 @@ export function SessionRow(props: {
   onDelete: () => void
   onSelect: () => void
 }) {
-  const [hover, setHover] = useState(false)
   const { session: s } = props
+  const [hovered, setHovered] = useState(false)
 
   if (props.editing) {
     return (
-      <div style={{ padding: '6px 12px', borderBottom: '1px solid #eee', background: props.active ? '#e8f1ff' : 'transparent' }}>
+      <div
+        style={{
+          margin: '0 8px 2px',
+          padding: '6px 10px',
+          borderRadius: 8,
+          background: 'var(--tint-blue)',
+        }}
+      >
         <input
           value={props.editingTitle}
           onChange={(e) => props.onTitleChange(e.target.value)}
@@ -29,33 +38,76 @@ export function SessionRow(props: {
           }}
           autoFocus
           onBlur={props.onCommitEdit}
-          style={{ width: '100%', padding: '4px 6px', borderRadius: 6, border: '1px solid #1677ff', fontSize: 13, outline: 'none', boxSizing: 'border-box' }}
+          style={{
+            width: '100%',
+            padding: '5px 8px',
+            borderRadius: 6,
+            border: '1px solid var(--accent)',
+            fontSize: 13,
+            outline: 'none',
+            boxSizing: 'border-box',
+            background: 'var(--bg-panel)',
+            color: 'var(--text)',
+          }}
         />
       </div>
     )
   }
 
+  // 副标题：执行中显示「处理中」（活跃时间即当前时间，无需显示时间）；空闲后显示最后活跃时间；不再显示工作目录
+  const relTime = s.lastActiveAt ? formatRelativeTime(s.lastActiveAt) : ''
+  const subtitle = props.busy ? '处理中' : relTime
+
   return (
     <div
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
       onClick={props.onSelect}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
       style={{
-        padding: '8px 12px',
+        margin: '0 8px 2px',
+        padding: '8px 10px',
+        borderRadius: 8,
         cursor: 'pointer',
-        fontSize: 13,
-        color: '#333',
-        borderBottom: '1px solid #eee',
-        background: props.active ? '#e8f1ff' : 'transparent',
+        background: props.active ? 'var(--tint-blue)' : hovered ? 'var(--bg-hover)' : 'transparent',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
         gap: 6,
+        transition: 'background 0.12s ease',
       }}
     >
-      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }} title={s.title}>
-        {s.title}
-      </span>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div
+          title={s.title}
+          style={{
+            fontSize: 13,
+            lineHeight: '18px',
+            fontWeight: props.active ? 600 : 400,
+            color: props.active ? 'var(--accent)' : 'var(--text)',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {s.title}
+        </div>
+        {subtitle && (
+          <div
+            title={subtitle}
+            style={{
+              fontSize: 11,
+              lineHeight: '15px',
+              color: props.busy ? 'var(--accent)' : 'var(--text-muted)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              marginTop: 1,
+            }}
+          >
+            {subtitle}
+          </div>
+        )}
+      </div>
       {props.busy && (
         <span
           title="任务执行中"
@@ -63,14 +115,14 @@ export function SessionRow(props: {
             width: 12,
             height: 12,
             borderRadius: '50%',
-            border: '2px solid #d9e8ff',
-            borderTopColor: '#1677ff',
+            border: '2px solid var(--tint-blue)',
+            borderTopColor: 'var(--accent)',
             flexShrink: 0,
             animation: 'spin 0.8s linear infinite',
           }}
         />
       )}
-      {(hover || props.active) && (
+      {hovered && (
         <span style={{ display: 'inline-flex', gap: 2, flexShrink: 0 }}>
           <button
             onClick={(e) => {
@@ -78,7 +130,17 @@ export function SessionRow(props: {
               props.onStartEdit()
             }}
             title="重命名"
-            style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#999', padding: 2, display: 'inline-flex' }}
+            style={{
+              border: 'none',
+              background: 'transparent',
+              cursor: 'pointer',
+              color: 'var(--text-muted)',
+              padding: 4,
+              borderRadius: 5,
+              display: 'inline-flex',
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--bg-panel)')}
+            onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
           >
             <IconEdit />
           </button>
@@ -88,7 +150,17 @@ export function SessionRow(props: {
               props.onDelete()
             }}
             title="删除会话"
-            style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#999', padding: 2, display: 'inline-flex' }}
+            style={{
+              border: 'none',
+              background: 'transparent',
+              cursor: 'pointer',
+              color: 'var(--text-muted)',
+              padding: 4,
+              borderRadius: 5,
+              display: 'inline-flex',
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--bg-panel)')}
+            onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
           >
             <IconTrash />
           </button>

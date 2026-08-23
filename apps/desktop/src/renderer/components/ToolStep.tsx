@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { ToolTrace } from '../types'
-import { IconChevronDown, IconClock, IconCode, IconEdit, IconFile, IconGlobe, IconImage, IconMonitor, IconTerminal, IconTree, IconWrench } from './icons'
+import { IconActivity, IconAvatar, IconChevronDown, IconClock, IconCode, IconEdit, IconFile, IconGlobe, IconImage, IconMonitor, IconPlus, IconRefresh, IconSend, IconShield, IconTerminal, IconTrash, IconTree, IconUsers, IconWrench } from './icons'
 import { redactSecret, stringifyResult, truncate } from './ui'
 
 // ===== 工具调用渲染（参考 DSH ToolRow / Codex：单行摘要 + 类型卡片，不显示 JSON）=====
@@ -9,9 +9,10 @@ import { redactSecret, stringifyResult, truncate } from './ui'
 const HIDDEN_STEP_TOOLS = new Set(['ask_user'])
 
 /** 工具名 → 人类可读的中文标题 + 图标（原始工具名对普通人不可读） */
-const TOOL_META: Record<string, { title: string; icon: React.ReactNode }> = {
+export const TOOL_META: Record<string, { title: string; icon: React.ReactNode }> = {
   read_file: { title: '读取文件', icon: <IconFile /> },
   write_file: { title: '写入文件', icon: <IconEdit /> },
+  edit_file: { title: '编辑文件', icon: <IconEdit /> },
   run_command: { title: '执行命令', icon: <IconTerminal /> },
   list_dir: { title: '列出目录', icon: <IconTree /> },
   image_analyze: { title: '识别图片', icon: <IconImage /> },
@@ -43,12 +44,88 @@ const TOOL_META: Record<string, { title: string; icon: React.ReactNode }> = {
   plugin_run: { title: '运行动态包', icon: <IconCode /> },
   plugin_stop: { title: '停止动态包', icon: <IconCode /> },
   plugin_undefine: { title: '删除动态包', icon: <IconCode /> },
+  // 会话管家（主 Agent）专属工具：用于审批弹窗展示可读名称，避免暴露英文原始名
+  list_sessions: { title: '查看会话列表', icon: <IconUsers /> },
+  inspect_session: { title: '查看会话详情', icon: <IconUsers /> },
+  list_models: { title: '查看可用模型', icon: <IconActivity /> },
+  switch_session: { title: '切换激活会话', icon: <IconRefresh /> },
+  send_message: { title: '给会话下发任务', icon: <IconSend /> },
+  inject_message: { title: '给会话追加需求', icon: <IconSend /> },
+  set_session_model: { title: '切换会话模型', icon: <IconActivity /> },
+  set_session_approval: { title: '配置会话安全模式', icon: <IconShield /> },
+  create_session: { title: '新建会话', icon: <IconPlus /> },
+  rename_session: { title: '重命名会话', icon: <IconEdit /> },
+  delete_session: { title: '删除会话', icon: <IconTrash /> },
+}
+
+/** skill_run（可执行技能统一入口）的 skillId + action → 中文标题 + 图标 */
+function skillActionMeta(skillId: string, action: string): { title: string; icon: React.ReactNode } {
+  const map: Record<string, { title: string; icon: React.ReactNode }> = {
+    'computer-use:screenshot': { title: '屏幕截图', icon: <IconMonitor /> },
+    'computer-use:ocr': { title: '文字识别', icon: <IconMonitor /> },
+    'computer-use:action': { title: '电脑操作', icon: <IconMonitor /> },
+    'browser-use:create': { title: '创建浏览器窗口', icon: <IconGlobe /> },
+    'browser-use:list': { title: '列出浏览器窗口', icon: <IconGlobe /> },
+    'browser-use:navigate': { title: '打开网页', icon: <IconGlobe /> },
+    'browser-use:close': { title: '关闭浏览器窗口', icon: <IconGlobe /> },
+    'browser-use:screenshot': { title: '网页截图', icon: <IconGlobe /> },
+    'browser-use:get_info': { title: '读取页面信息', icon: <IconGlobe /> },
+    'browser-use:get_content': { title: '读取页面内容', icon: <IconGlobe /> },
+    'browser-use:evaluate': { title: '执行页面脚本', icon: <IconGlobe /> },
+    'browser-use:click': { title: '点击页面元素', icon: <IconGlobe /> },
+    'browser-use:type': { title: '页面输入', icon: <IconGlobe /> },
+    'browser-use:scroll': { title: '滚动页面', icon: <IconGlobe /> },
+    'browser-use:wait': { title: '等待元素', icon: <IconGlobe /> },
+    'browser-use:get_console_logs': { title: '查看控制台日志', icon: <IconGlobe /> },
+    'browser-use:get_network_requests': { title: '查看网络请求', icon: <IconGlobe /> },
+    'browser-use:get_cookies': { title: '读取 Cookie', icon: <IconGlobe /> },
+    'browser-use:set_cookie': { title: '设置 Cookie', icon: <IconGlobe /> },
+    'browser-use:clear_cookies': { title: '清除 Cookie', icon: <IconGlobe /> },
+  }
+  return map[`${skillId}:${action}`] ?? { title: '执行技能', icon: <IconWrench /> }
+}
+
+/** 工具名 → 中文显示名（用于审批弹窗等需要展示工具名的场景，不暴露英文原始名） */
+export function toolDisplayName(name: string, args?: Record<string, unknown>): string {
+  if (name === 'skill_run') {
+    return skillActionMeta(String(args?.skillId ?? ''), String(args?.action ?? '')).title
+  }
+  return TOOL_META[name]?.title ?? '工具操作'
+}
+
+/** 风险等级 → 中文文案（用于审批弹窗，不暴露英文枚举值） */
+export function riskLevelLabel(level: string): string {
+  const map: Record<string, string> = {
+    readonly: '只读',
+    reversible: '可逆修改',
+    irreversible: '不可逆操作',
+    high: '高风险',
+  }
+  return map[level] ?? level
+}
+
+/** skill_run 的 params 提取一行摘要（browser-use → url/selector，computer-use → 动作） */
+function skillRunSummary(args: Record<string, unknown>): string {
+  const skillId = String(args.skillId ?? '')
+  const action = String(args.action ?? '')
+  const params = args.params && typeof args.params === 'object' ? (args.params as Record<string, unknown>) : {}
+  if (skillId === 'browser-use') {
+    if (action === 'navigate') return String(params.url ?? '')
+    if (action === 'create') return params.url ? String(params.url) : params.appId ? String(params.appId) : ''
+    if (action === 'click' || action === 'type' || action === 'wait') return String(params.selector ?? '')
+    if (action === 'get_content') return params.selector ? String(params.selector) : ''
+    if (action === 'scroll') return String(params.direction ?? '')
+    if (action === 'close' || action === 'list') return params.appId ? String(params.appId) : ''
+  }
+  if (skillId === 'computer-use' && action === 'action') return String(params.action ?? '')
+  return ''
 }
 
 /** 从工具参数提取一行摘要（读/写 → 路径，命令 → 命令，列目录 → 路径，电脑操作 → 动作） */
-function toolSummary(name: string, args?: Record<string, unknown>): string {
+export function toolSummary(name: string, args?: Record<string, unknown>): string {
   if (!args) return ''
   const a = args
+  if (name === 'skill_run') return skillRunSummary(args)
   if (name === 'read_file' || name === 'write_file') return String(a.path ?? '')
   if (name === 'run_command') return String(a.command ?? '')
   if (name === 'list_dir') return a.path ? String(a.path) : '当前目录'
@@ -195,7 +272,7 @@ function DiffBlock({ before, after, path, isNew }: { before: string; after: stri
   return (
     <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 12 }}>
       {path && (
-        <div style={{ padding: '6px 12px', borderBottom: '1px solid #f0f0f0', color: '#999', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <div style={{ padding: '6px 12px', borderBottom: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {path} · {treatAsNew ? `新建文件，+${addCount}` : `+${addCount} −${delCount}`}
         </div>
       )}
@@ -203,19 +280,19 @@ function DiffBlock({ before, after, path, isNew }: { before: string; after: stri
         {diffLines.map((l, i) => {
           if (l.type === 'fold') {
             return (
-              <div key={i} style={{ padding: '3px 12px', color: '#999', fontSize: 11, background: '#fafafa', textAlign: 'center', userSelect: 'none' }}>
+              <div key={i} style={{ padding: '3px 12px', color: 'var(--text-muted)', fontSize: 11, background: 'var(--bg-sidebar)', textAlign: 'center', userSelect: 'none' }}>
                 {l.text}
               </div>
             )
           }
-          const bg = l.type === 'add' ? '#e6ffec' : l.type === 'del' ? '#ffebe9' : 'transparent'
+          const bg = l.type === 'add' ? 'var(--tint-green)' : l.type === 'del' ? 'var(--tint-red)' : 'transparent'
           const sign = l.type === 'add' ? '+' : l.type === 'del' ? '−' : ' '
-          const signColor = l.type === 'add' ? '#1a7f37' : l.type === 'del' ? '#cf222e' : '#bbb'
-          const textColor = l.type === 'del' ? '#82071e' : l.type === 'add' ? '#116329' : '#444'
+          const signColor = l.type === 'add' ? 'var(--success-text)' : l.type === 'del' ? 'var(--danger-text)' : 'var(--text-faint)'
+          const textColor = l.type === 'del' ? 'var(--danger-text)' : l.type === 'add' ? 'var(--success-text)' : 'var(--text)'
           return (
             <div key={i} style={{ display: 'flex', background: bg, minHeight: 18 }}>
-              <span style={{ width: 34, textAlign: 'right', paddingRight: 8, color: '#bbb', flexShrink: 0, userSelect: 'none', background: 'rgba(0,0,0,0.02)' }}>{l.oldLine ?? ''}</span>
-              <span style={{ width: 34, textAlign: 'right', paddingRight: 8, color: '#bbb', flexShrink: 0, userSelect: 'none', background: 'rgba(0,0,0,0.02)' }}>{l.newLine ?? ''}</span>
+              <span style={{ width: 34, textAlign: 'right', paddingRight: 8, color: 'var(--text-faint)', flexShrink: 0, userSelect: 'none', background: 'rgba(0,0,0,0.02)' }}>{l.oldLine ?? ''}</span>
+              <span style={{ width: 34, textAlign: 'right', paddingRight: 8, color: 'var(--text-faint)', flexShrink: 0, userSelect: 'none', background: 'rgba(0,0,0,0.02)' }}>{l.newLine ?? ''}</span>
               <span style={{ width: 20, textAlign: 'center', color: signColor, flexShrink: 0, userSelect: 'none', fontWeight: 600 }}>{sign}</span>
               <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', flex: 1, color: textColor }}>{l.text || ' '}</span>
             </div>
@@ -234,30 +311,38 @@ function FileBlock({ content, path }: { content: string; path?: string }) {
   return (
     <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 12 }}>
       {path && (
-        <div style={{ padding: '6px 12px', borderBottom: '1px solid #f0f0f0', color: '#999', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <div style={{ padding: '6px 12px', borderBottom: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {path} · {lines.length} 行
         </div>
       )}
       <div style={{ maxHeight: 320, overflowY: 'auto', padding: '4px 0' }}>
         {shown.map((line, i) => (
           <div key={i} style={{ display: 'flex', padding: '0 0' }}>
-            <span style={{ width: 40, textAlign: 'right', paddingRight: 10, color: '#bbb', flexShrink: 0, userSelect: 'none' }}>{i + 1}</span>
-            <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', flex: 1, color: '#444' }}>{line || ' '}</span>
+            <span style={{ width: 40, textAlign: 'right', paddingRight: 10, color: 'var(--text-faint)', flexShrink: 0, userSelect: 'none' }}>{i + 1}</span>
+            <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', flex: 1, color: 'var(--text)' }}>{line || ' '}</span>
           </div>
         ))}
         {lines.length > MAX && (
-          <div style={{ color: '#999', padding: '6px 12px', fontSize: 11 }}>… 共 {lines.length} 行，仅显示前 {MAX} 行</div>
+          <div style={{ color: 'var(--text-muted)', padding: '6px 12px', fontSize: 11 }}>… 共 {lines.length} 行，仅显示前 {MAX} 行</div>
         )}
       </div>
     </div>
   )
 }
 
+/** 从截图工具结果中提取可显示的图片 src：优先 https 链接（上传云存储），回退 base64 data URL */
+function screenshotSrc(result: unknown): string {
+  const r = result as { imageUrl?: string; imageBase64?: string }
+  if (typeof r.imageUrl === 'string' && r.imageUrl) return r.imageUrl
+  if (typeof r.imageBase64 === 'string' && r.imageBase64) return `data:image/png;base64,${r.imageBase64}`
+  return ''
+}
+
 /** 按工具类型渲染结果卡片（read → 文件行号 / run_command → 终端 / list_dir → 树形 / 截图 → 图片 / 其他 → 纯文本脱敏） */
-function renderToolResult(name: string, result: unknown, error: string | undefined, args?: Record<string, unknown>): React.ReactNode | null {
+export function renderToolResult(name: string, result: unknown, error: string | undefined, args?: Record<string, unknown>): React.ReactNode | null {
   if (error) {
     return (
-      <div style={{ padding: '10px 12px', color: '#cf1322', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12 }}>
+      <div style={{ padding: '10px 12px', color: 'var(--danger-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12 }}>
         {redactSecret(error)}
       </div>
     )
@@ -269,7 +354,7 @@ function renderToolResult(name: string, result: unknown, error: string | undefin
   }
   if (name === 'list_dir') {
     return (
-      <pre style={{ margin: 0, padding: '10px 12px', fontFamily: 'ui-monospace, monospace', fontSize: 12, lineHeight: 1.5, color: '#444', whiteSpace: 'pre', overflowX: 'auto', maxHeight: 320, overflowY: 'auto' }}>
+      <pre style={{ margin: 0, padding: '10px 12px', fontFamily: 'ui-monospace, monospace', fontSize: 12, lineHeight: 1.5, color: 'var(--text)', whiteSpace: 'pre', overflowX: 'auto', maxHeight: 320, overflowY: 'auto' }}>
         {String(result)}
       </pre>
     )
@@ -277,13 +362,16 @@ function renderToolResult(name: string, result: unknown, error: string | undefin
   if (name === 'read_file') {
     return <FileBlock content={String(result)} path={String(args?.path ?? '')} />
   }
+  if (name === 'skill_run' && args?.action === 'screenshot') {
+    const src = screenshotSrc(result)
+    return src ? <img src={src} alt="截图" style={{ display: 'block', maxWidth: '100%', maxHeight: 320, objectFit: 'contain' }} /> : null
+  }
   if (name === 'computer_screenshot') {
-    const src = String(result)
+    const src = screenshotSrc(result)
     return src ? <img src={src} alt="截图" style={{ display: 'block', maxWidth: '100%', maxHeight: 320, objectFit: 'contain' }} /> : null
   }
   if (name === 'browser_screenshot') {
-    const r = result as { imageBase64?: string }
-    const src = r.imageBase64 ? `data:image/png;base64,${r.imageBase64}` : ''
+    const src = screenshotSrc(result)
     return src ? <img src={src} alt="网页截图" style={{ display: 'block', maxWidth: '100%', maxHeight: 320, objectFit: 'contain' }} /> : null
   }
   if (name === 'write_file') {
@@ -291,10 +379,17 @@ function renderToolResult(name: string, result: unknown, error: string | undefin
     if (typeof r.after === 'string') {
       return <DiffBlock before={r.before ?? ''} after={r.after} path={r.path} isNew={!!r.isNew} />
     }
-    return <div style={{ padding: '10px 12px', color: '#389e0d', fontSize: 12 }}>✓ 已写入 {r.path ?? ''}</div>
+    return <div style={{ padding: '10px 12px', color: 'var(--success-text)', fontSize: 12 }}>✓ 已写入 {r.path ?? ''}</div>
+  }
+  if (name === 'edit_file') {
+    const r = result as { ok?: boolean; path?: string; before?: string | null; after?: string; occurrences?: number }
+    if (typeof r.after === 'string') {
+      return <DiffBlock before={r.before ?? ''} after={r.after} path={r.path} />
+    }
+    return <div style={{ padding: '10px 12px', color: 'var(--success-text)', fontSize: 12 }}>✓ 已编辑 {r.path ?? ''}</div>
   }
   return (
-    <pre style={{ margin: 0, padding: '10px 12px', fontFamily: 'ui-monospace, monospace', fontSize: 12, lineHeight: 1.5, color: '#444', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 320, overflowY: 'auto' }}>
+    <pre style={{ margin: 0, padding: '10px 12px', fontFamily: 'ui-monospace, monospace', fontSize: 12, lineHeight: 1.5, color: 'var(--text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 320, overflowY: 'auto' }}>
       {redactSecret(truncate(stringifyResult(result), 4000))}
     </pre>
   )
@@ -305,43 +400,108 @@ export function ToolStep({ trace }: { trace: ToolTrace }) {
   // 机制类工具（如 ask_user 提问）已有专用交互卡片，这里不再渲染工具步骤，避免暴露内部工具名
   if (HIDDEN_STEP_TOOLS.has(trace.name)) return null
   const [expanded, setExpanded] = useState(false)
+  const [reasoningOpen, setReasoningOpen] = useState(false)
   const isCall = trace.kind === 'tool-call'
-  const meta = TOOL_META[trace.name] ?? { title: '工具操作', icon: <IconWrench /> }
+  const meta = trace.name === 'skill_run'
+    ? skillActionMeta(String(trace.args?.skillId ?? ''), String(trace.args?.action ?? ''))
+    : TOOL_META[trace.name] ?? { title: '工具操作', icon: <IconWrench /> }
   const state = isCall ? 'running' : trace.error ? 'error' : 'ok'
   const summary = toolSummary(trace.name, trace.args)
   const resultBody = !isCall ? renderToolResult(trace.name, trace.result, trace.error, trace.args) : null
   const expandable = resultBody !== null
-  const stateColor = state === 'error' ? '#cf1322' : state === 'running' ? '#1677ff' : '#389e0d'
+  const stateColor = state === 'error' ? 'var(--danger-text)' : state === 'running' ? 'var(--accent)' : 'var(--success-text)'
 
   return (
-    <div style={{ marginBottom: 6, fontSize: 13 }}>
+    <div style={{ marginBottom: 3, fontSize: 13 }}>
+      {/* 思考信息：显示在对应执行步骤的「上方」——先思考、再执行（若该步骤有思考），紧凑无边框 */}
+      {trace.reasoning && (
+        <div style={{ marginBottom: 3 }}>
+          <button
+            onClick={() => setReasoningOpen((v) => !v)}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: 0, border: 'none', background: 'transparent', color: 'var(--text-faint)', fontSize: 12, cursor: 'pointer', lineHeight: 1.5 }}
+          >
+            <span style={{ display: 'inline-flex', color: 'var(--text-faint)', transform: reasoningOpen ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform .15s' }}>
+              <IconChevronDown />
+            </span>
+            思考
+          </button>
+          {reasoningOpen && (
+            <div style={{ marginTop: 2, paddingLeft: 10, borderLeft: '2px solid var(--border)', color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 200, overflowY: 'auto' }}>
+              {trace.reasoning}
+            </div>
+          )}
+        </div>
+      )}
       <div
         onClick={() => expandable && setExpanded((v) => !v)}
-        style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 10px', borderRadius: 8, background: '#fff', border: '1px solid #f0f0f0', cursor: expandable ? 'pointer' : 'default', maxWidth: '85%', boxSizing: 'border-box' }}
+        style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0', cursor: expandable ? 'pointer' : 'default' }}
       >
         <span style={{ color: stateColor, display: 'inline-flex', flexShrink: 0 }}>{meta.icon}</span>
-        <b style={{ fontWeight: 600, color: '#333', fontSize: 13, flexShrink: 0 }}>{meta.title}</b>
+        <b style={{ fontWeight: 600, color: 'var(--text)', fontSize: 13, flexShrink: 0 }}>{meta.title}</b>
         {summary && (
           <>
-            <span style={{ color: '#d9d9d9', flexShrink: 0 }}>·</span>
-            <span style={{ color: '#8c8c8c', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>{summary}</span>
+            <span style={{ color: 'var(--text-faint)', flexShrink: 0 }}>·</span>
+            <span style={{ color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>{summary}</span>
           </>
         )}
-        {state === 'running' && <span style={{ color: '#1677ff', fontSize: 12, flexShrink: 0 }}>执行中…</span>}
+        {state === 'running' && <span style={{ color: 'var(--accent)', fontSize: 12, flexShrink: 0 }}>执行中…</span>}
         {isCall && trace.approvalRequired && (
-          <span style={{ fontSize: 11, padding: '1px 6px', borderRadius: 4, background: '#fffbe6', color: '#d48806', border: '1px solid #ffe58f', flexShrink: 0 }}>待确认</span>
+          <span style={{ fontSize: 11, padding: '0 6px', borderRadius: 4, background: 'var(--tint-orange)', color: 'var(--warning-text)', flexShrink: 0 }}>待确认</span>
         )}
         {expandable && (
-          <span style={{ marginLeft: 'auto', color: '#bbb', display: 'inline-flex', flexShrink: 0, transform: expanded ? 'rotate(180deg)' : 'none', transition: 'transform .15s' }}>
+          <span style={{ marginLeft: 'auto', color: 'var(--text-faint)', display: 'inline-flex', flexShrink: 0, transform: expanded ? 'rotate(180deg)' : 'none', transition: 'transform .15s' }}>
             <IconChevronDown />
           </span>
         )}
       </div>
       {expanded && expandable && (
-        <div style={{ marginTop: 4, maxWidth: '85%', border: '1px solid #f0f0f0', borderRadius: 8, background: '#fafafa', overflow: 'hidden' }}>
+        <div style={{ marginTop: 3, marginLeft: 18, borderLeft: '2px solid var(--border)', overflow: 'hidden' }}>
           {resultBody}
         </div>
       )}
     </div>
+  )
+}
+
+/** 统计工具步骤执行情况（合并后的 ToolTrace 数组：每项为一次工具调用） */
+export function toolStepStats(tools: ToolTrace[]): { total: number; success: number; failed: number; running: number } {
+  let success = 0
+  let failed = 0
+  let running = 0
+  for (const t of tools) {
+    if (t.kind === 'tool-call') running++
+    else if (t.error) failed++
+    else success++
+  }
+  return { total: tools.length, success, failed, running }
+}
+
+/** 气泡顶部「步数统计」徽标：X 步 · Y 成功 · Z 失败 · W 执行中（按状态着色，无工具步骤时不渲染） */
+export function StepStats({ tools }: { tools: ToolTrace[] }) {
+  const { total, success, failed, running } = toolStepStats(tools)
+  if (total === 0) return null
+  return (
+    <>
+      <span> · </span>
+      <span>{total} 步</span>
+      {success > 0 && (
+        <>
+          <span> · </span>
+          <span style={{ color: 'var(--success-text)' }}>{success} 成功</span>
+        </>
+      )}
+      {failed > 0 && (
+        <>
+          <span> · </span>
+          <span style={{ color: 'var(--danger-text)' }}>{failed} 失败</span>
+        </>
+      )}
+      {running > 0 && (
+        <>
+          <span> · </span>
+          <span style={{ color: 'var(--accent)' }}>{running} 执行中</span>
+        </>
+      )}
+    </>
   )
 }

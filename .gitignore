@@ -45,3 +45,9 @@ poc/sandbox/workspace/*
 
 # POC 测试临时输出（测试运行时生成，不提交）
 poc/**/.tmp/
+
+# 桌面端打包产物（electron-builder 输出目录）
+release
+
+# 桌面端主进程 tsup 打包产物（由 pnpm build 生成，勿提交）
+apps/desktop/index.js

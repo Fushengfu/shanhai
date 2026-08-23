@@ -30,6 +30,8 @@ export interface Handoff {
 /** 每步执行轨迹（UI 展示多专家协作过程） */
 export interface StepTrace {
   sessionId?: string
+  /** 所属轮次序号（会话内 user 消息序号，从 1 开始）；用于把「多专家协作」卡片插到对应那一轮消息之后 */
+  turnSeq?: number
   stepId: string
   expertId: string
   expertName: string
@@ -47,7 +49,7 @@ export interface OrchestratorOptions {
   expertSystemPrompts?: Map<string, string>
   /** 每步执行轨迹回调 */
   onStep?: (trace: StepTrace) => void
-  /** 专家流式增量回调（串行调度时顺序清晰，UI 实时渲染） */
+  /** 专家流式增量回调（并行调度时多个专家输出会交错，UI 侧按 stepId 归集） */
   onDelta?: (text: string) => void
   /** 专家流式思考增量回调 */
   onReasoning?: (text: string) => void
@@ -80,18 +82,24 @@ export class Orchestrator {
       if (ready.length === 0) {
         // 有剩余步骤但都未就绪 → 环形依赖，兜底按顺序串行执行剩余步骤，避免卡死
         for (const step of pending) {
-          await this.runStep(step, results, completed, emit)
+          results.set(step.id, await this.runStep(step, results, completed, emit))
         }
+        pending.length = 0
         break
       }
 
-      // 串行调度：保证专家流式输出顺序清晰、事件日志不交错（并行作为后续优化）
+      // 从 pending 一次性移除所有就绪步骤，避免并行完成时序竞争导致误判
       for (const step of ready) {
-        const r = await this.runStep(step, results, completed, emit)
-        results.set(step.id, r)
         const idx = pending.indexOf(step)
         if (idx >= 0) pending.splice(idx, 1)
       }
+
+      // 并行调度：无依赖的就绪步骤并发执行（有依赖步骤因 deps 未满足，天然留在下一轮串行）
+      await Promise.all(
+        ready.map(async (step) => {
+          results.set(step.id, await this.runStep(step, results, completed, emit))
+        }),
+      )
     }
 
     const text = plan.steps
@@ -125,6 +133,9 @@ export class Orchestrator {
       emit(step, 'completed', { result })
       return result
     } catch (err) {
+      // 用户点「停止」：__stopped__ 不当作步骤失败吞掉，重新抛出让 Orchestrator.run 整体中断（传播到运行时返回「已中断」）
+      // 重试耗尽（网络/余额不足等基础设施故障）：同样重新抛出，中断整条编排并弹窗，而不是降级为「步骤失败」继续跑（继续跑也是徒劳）
+      if (err instanceof Error && (err.message === '__stopped__' || err.message.startsWith('__retry_exhausted__'))) throw err
       const error = err instanceof Error ? err.message : String(err)
       emit(step, 'failed', { error })
       // 单步失败不中断整条链：记录错误作为该步结果，让后续依赖步骤仍能继续

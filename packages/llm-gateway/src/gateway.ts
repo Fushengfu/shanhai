@@ -1,26 +1,32 @@
 import type { ModelTier } from '@shanhai/auth'
 import type { GatewayModel } from '@shanhai/auth'
-import type { ChatMessage, ModelResponse, StreamChunk } from '@shanhai/llm'
-import { DeepSeekProvider } from '@shanhai/llm'
+import type { ChatMessage, Model, ModelResponse, StreamChunk } from '@shanhai/llm'
+import { createModelProvider } from '@shanhai/llm'
 import type { ToolContract } from '@shanhai/tools'
 
 export interface LlmGateway {
   /** 按层级解析可用模型：override > 同层 > 其他层 > 任意 */
   resolveModel(tier: ModelTier, override?: string): GatewayModel | undefined
-  /** 调用（带降级：模型不可用 403/402 → 换候选；参数/网络错 → 直接抛） */
-  invoke(tier: ModelTier, messages: ChatMessage[], tools?: ToolContract[], override?: string): Promise<ModelResponse>
-  /** SSE 流式调用（实时增量输出，用于 UI 逐字渲染） */
-  stream(tier: ModelTier, messages: ChatMessage[], tools?: ToolContract[], override?: string): AsyncIterable<StreamChunk>
+  /** 调用（带降级：模型不可用 403/402 → 换候选；参数/网络错 → 直接抛）。userId 用于网关前缀缓存隔离 */
+  invoke(tier: ModelTier, messages: ChatMessage[], tools?: ToolContract[], override?: string, userId?: string): Promise<ModelResponse>
+  /** SSE 流式调用（实时增量输出，用于 UI 逐字渲染）。userId 用于网关前缀缓存隔离 */
+  stream(tier: ModelTier, messages: ChatMessage[], tools?: ToolContract[], override?: string, userId?: string): AsyncIterable<StreamChunk>
 }
 
 export function createLlmGateway(models: GatewayModel[]): LlmGateway {
   const byId = new Map(models.map((m) => [m.id, m]))
-  const providers = new Map<string, DeepSeekProvider>()
+  const providers = new Map<string, Model>()
 
-  function providerFor(model: GatewayModel): DeepSeekProvider {
+  function providerFor(model: GatewayModel): Model {
     let p = providers.get(model.id)
     if (!p) {
-      p = new DeepSeekProvider({ apiKey: model.apiKey, baseUrl: model.baseUrl, model: model.id })
+      p = createModelProvider({
+        apiKey: model.apiKey,
+        baseUrl: model.baseUrl,
+        model: model.model ?? model.id,
+        protocol: model.protocol,
+        maxTokens: model.maxTokens,
+      })
       providers.set(model.id, p)
     }
     return p
@@ -46,12 +52,12 @@ export function createLlmGateway(models: GatewayModel[]): LlmGateway {
       return candidates(tier, override)[0]
     },
 
-    async invoke(tier, messages, tools, override) {
+    async invoke(tier, messages, tools, override, userId) {
       const list = candidates(tier, override)
       let lastErr: unknown
       for (const model of list) {
         try {
-          return await providerFor(model).complete(messages, tools)
+          return await providerFor(model).complete(messages, tools, userId)
         } catch (err) {
           if (!isUnavailable(err)) throw err
           lastErr = err
@@ -60,10 +66,10 @@ export function createLlmGateway(models: GatewayModel[]): LlmGateway {
       throw lastErr ?? new Error(`no available model for tier ${tier}`)
     },
 
-    async *stream(tier, messages, tools, override) {
+    async *stream(tier, messages, tools, override, userId) {
       const model = this.resolveModel(tier, override)
       if (!model) throw new Error(`no model for tier ${tier}`)
-      yield* providerFor(model).stream!(messages, tools)
+      yield* providerFor(model).stream!(messages, tools, userId)
     },
   }
 }

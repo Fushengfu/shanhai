@@ -1,0 +1,49 @@
+appId: com.shanhai.desktop
+productName: 山海
+copyright: Copyright © 2026 山海
+
+# 产物输出目录与资源目录
+directories:
+  output: release
+  buildResources: assets
+
+# 打包内容：只带编译产物 + package.json；node_modules 由 electron-builder 按 dependencies 自动收集
+files:
+  - dist/**
+  - assets/**
+  - package.json
+  - "!dist/**/*.map"
+  - "!**/.DS_Store"
+
+# 原生模块与 wasm 资源必须解包到真实文件系统（asar 内无法被 worker_threads / require 原生 .node 加载）
+asarUnpack:
+  - node_modules/node-pty/**
+  - node_modules/tesseract.js/**
+  - node_modules/tesseract.js-core/**
+  - node_modules/wasm-feature-detect/**
+
+mac:
+  target:
+    - target: dmg
+      arch: [arm64]
+    - target: zip
+      arch: [arm64]
+  icon: assets/icon.icns
+  category: public.app-category.productivity
+  # 签名 + 公证所需的 hardened runtime 与 entitlements
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # 用 Developer ID Application 证书签名（本机已存在唯一一张 Developer ID Application）
+  identity: "Shenzhen Zhongyun Technology Co., Limited (AAHRV8JQ39)"
+
+dmg:
+  artifactName: Shanhai-${version}-${arch}.${ext}
+  title: 山海
+
+# 原生模块在打包前手动 @electron/rebuild（pnpm 下 npmRebuild 不可靠，故关闭）
+npmRebuild: false
+electronVersion: 43.4.0
+# 直接复用本机 node_modules 里已下载解压的 electron，避免从 GitHub 慢速重新下载
+electronDist: node_modules/electron/dist

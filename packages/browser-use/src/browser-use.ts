@@ -77,6 +77,11 @@ export interface BrowserUseService {
   getContent(selector?: string, appId?: string, includeHtml?: boolean): Promise<string>
   /** 执行 JS 表达式，返回结果 */
   evaluate(code: string, appId?: string): Promise<unknown>
+  /**
+   * 在指定窗口页面里调用 `window.__dsChat(prompt, opts)` 并等待 Promise 结果（CDP 直连页面桥接脚本用）。
+   * 长任务（网页版生成几十秒）需在实现侧加超时兜底；可选，mock / 非 Electron 后端可不实现。
+   */
+  chatWithPageBridge?(prompt: string, opts: { mode?: string; thinking?: boolean }, appId?: string): Promise<string>
   /** 页面基础信息 */
   getInfo(appId?: string): Promise<BrowserInfo>
   /** 等待元素出现（轮询检查选择器） */
@@ -97,6 +102,8 @@ export interface BrowserUseService {
   show(appId?: string): Promise<void>
   /** 关闭窗口 */
   close(appId?: string): Promise<void>
+  /** 设置「创建窗口时是否直接显示」（运行时动态生效，只影响后续新建窗口；可选，mock 可不实现） */
+  setShowOnCreate?(show: boolean): void
 }
 
 /** mock：空操作（CLI 模式 / 离线 / 测试兜底） */
@@ -121,5 +128,6 @@ export function createMockBrowserUseService(): BrowserUseService {
     clearCookies: async () => {},
     show: async () => {},
     close: async () => {},
+    setShowOnCreate: () => {},
   }
 }

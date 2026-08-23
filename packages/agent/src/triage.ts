@@ -28,8 +28,13 @@ function fallbackPlan(message: string): TaskPlan {
 export class ModelTriage {
   constructor(
     private readonly model: Model,
-    private readonly roles: RoleDefinition[] = [],
+    private roles: RoleDefinition[] = [],
   ) {}
+
+  /** 更新可用专家列表（新增/删除专家后调用，让拆解能指派到最新角色） */
+  setRoles(roles: RoleDefinition[]): void {
+    this.roles = roles
+  }
 
   async route(message: string): Promise<TaskPlan> {
     const roleLines = this.roles.map((r) => `- ${r.id}: ${r.name}（${r.description}）`).join('\n')

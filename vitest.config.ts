@@ -9,6 +9,8 @@ export default defineConfig({
     alias: [
       { find: '@shanhai/runtime', replacement: resolve(root, 'apps/runtime/src') },
       { find: '@shanhai/desktop', replacement: resolve(root, 'apps/desktop/src') },
+      // 子路径导出（/client）需在正则兜底前精确匹配，否则会被映射成 packages/<pkg>/client/src
+      { find: '@shanhai/kernel-modules/client', replacement: resolve(root, 'packages/kernel-modules/src/client') },
       { find: /^@shanhai\/(.+)$/, replacement: resolve(root, 'packages/$1/src') },
     ],
   },

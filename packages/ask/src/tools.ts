@@ -1,5 +1,5 @@
 import type { ToolContract } from '@shanhai/tools'
-import type { AskService } from './ask'
+import { ASK_CANCELLED, type AskService } from './ask'
 
 /**
  * ask 插件：把「向用户提问」收敛为 ask_user 工具。
@@ -36,12 +36,15 @@ function askUserTool(service: AskService, getSessionId: () => string): ToolContr
       const options = Array.isArray(args.options) ? args.options.map((o) => String(o)).filter(Boolean) : undefined
       const multiple = args.multiple === true
       const placeholder = args.placeholder ? String(args.placeholder) : undefined
-      return service.ask(question, {
+      const answer = await service.ask(question, {
         options: options && options.length > 0 ? options : undefined,
         multiple,
         placeholder,
         sessionId: getSessionId(),
       })
+      // 用户取消回答/选择（或会话被删除导致提问被取消）时，返回错误而非把取消标记当答案回喂模型
+      if (answer === ASK_CANCELLED) return { ok: false, error: '用户取消了回答' }
+      return answer
     },
   }
 }

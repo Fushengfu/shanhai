@@ -39,10 +39,14 @@ export class ApprovalService {
    * 判断工具是否需要审批。
    * 传入 session 时按「会话级审批策略」判断（从该会话事件日志回放 approval/policy，缺省回退全局默认）；
    * 不传 session 则用全局默认策略。
+   * @param outsideWorkdir 本次操作是否访问工作目录之外（由工具 resolveRisk 提供），
+   *  用于「workdir」策略：工作目录内（false）免审批，访问目录外（true）才审批。
    */
-  requiresApproval(tool: ToolContract, session?: Session): boolean {
+  requiresApproval(tool: ToolContract, session?: Session, outsideWorkdir?: boolean): boolean {
     const policy = session ? (effectiveApprovalPolicy(session.list()) ?? this.policy) : this.policy
     if (policy === 'never') return false
+    // 工作目录内免审批：明确判定本次操作未访问工作目录外 → 免审批
+    if (policy === 'workdir' && outsideWorkdir === false) return false
     if (tool.approvalRequired === true) return true
     return tool.riskLevel === 'irreversible' || tool.riskLevel === 'high'
   }

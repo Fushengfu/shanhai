@@ -67,4 +67,20 @@ describe('K3 模块系统', () => {
     off()
     expect(slots.renderSlot('main')).toEqual([])
   })
+
+  it('SlotRegistry 后注册覆盖 + 移除回退（核心 UI 热替换语义）', () => {
+    const slots = new SlotRegistry<string>()
+    // 核心 UI 插件先注册
+    slots.register({ slot: 'shell.composer', id: 'core:composer', component: 'CoreComposer' })
+    // selfmod 动态包后注册 → 追加到末尾，覆盖核心（渲染取最后一个）
+    const offDyn = slots.register({ slot: 'shell.composer', id: 'dyn-1:btn', component: 'DynComposer' })
+    const last = (): string | undefined => {
+      const list = slots.renderSlot('shell.composer')
+      return list[list.length - 1]?.component
+    }
+    expect(last()).toBe('DynComposer')
+    // 动态包注销 → 回退到核心组件
+    offDyn()
+    expect(last()).toBe('CoreComposer')
+  })
 })

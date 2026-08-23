@@ -1,26 +1,45 @@
-import type { BrowserWindow } from 'electron'
+import { BrowserWindow } from 'electron'
 import { getRuntime } from './runtime'
+import { getUiState, subscribeUiState, filterUiStateForWindow, windowConsumesUiState } from './ui-store'
+import { getWindowType } from './window-manager'
 
 /**
- * 主进程 → 渲染进程 事件推送。
- * 流式增量 / 工具过程 / 审批请求 / token 用量，均带 sessionId 路由，供渲染进程按会话隔离。
+ * 主进程 → 渲染进程 事件推送（广播到所有窗口）。
+ *
+ * 多窗口桌面系统：聊天核心状态（会话消息流 / 流式 / 审批 / token / 轨迹等）已上移到主进程 ui-store，
+ * 由 ui-store 监听 runtime 事件维护，此处只广播「ui:state」快照给所有窗口订阅。
+ * 仅两类事件保留直接广播（不走 store）：用户手动终端输出（高频逐字节）、自修改 K5 动态包投递。
  */
-export function registerPush(win: BrowserWindow): void {
+export function registerPush(): void {
   const runtime = getRuntime()
-  const send = (channel: string, ...args: unknown[]): void => {
-    if (!win.isDestroyed()) win.webContents.send(channel, ...args)
+
+  const broadcast = (channel: string, ...args: unknown[]): void => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.webContents.send(channel, ...args)
+    }
   }
 
-  runtime.onDelta((sessionId, text) => send('chat:delta', sessionId, text))
-  runtime.onReasoning((sessionId, text) => send('chat:reasoning', sessionId, text))
-  runtime.onToolTrace((trace) => send('tool:trace', trace))
-  runtime.onApprovalRequest((req) => send('approval:request', req))
-  runtime.onAskRequest((req) => send('ask:request', req))
-  runtime.onTokenStats((sessionId, stats) => send('token:stats', sessionId, stats))
-  // 自修改（K5）：browser 半投递的 round-trip 审批 + 代码投递 + 卸载
-  runtime.onClientRunRequest((req) => send('selfmod:client-run-request', req))
-  runtime.onClientCode((payload) => send('selfmod:client-code', payload))
-  runtime.onClientRemove((pkgId) => send('selfmod:client-remove', pkgId))
-  // 多专家编排轨迹
-  runtime.onExpertTrace((trace) => send('expert:trace', trace))
+  // 用户手动终端实时输出（会话级 + 终端级路由，高频逐字节，不经过 store）
+  runtime.onUserTerminalOutput((sessionId, terminalId, data) => broadcast('user-terminal:output', sessionId, terminalId, data))
+  // 流式正文/思考增量：高频小事件直发，不进 ui-store、不触发全量 ui:state 广播。
+  // 否则每个 token 都会把「所有会话完整历史」整体序列化广播给所有窗口，长任务几千 token = 几千次全量广播，
+  // 内存/IPC 被放大到极限（曾导致 swap 打满 + 内核 watchdog panic）。
+  runtime.onDelta((sessionId, text) => broadcast('chat:delta', sessionId, text))
+  runtime.onReasoning((sessionId, text) => broadcast('chat:reasoning', sessionId, text))
+  // 自修改（K5）：browser 半投递的 round-trip 审批 + 代码投递 + 卸载（非 store 状态）
+  runtime.onClientRunRequest((req) => broadcast('selfmod:client-run-request', req))
+  runtime.onClientCode((payload) => broadcast('selfmod:client-code', payload))
+  runtime.onClientRemove((pkgId) => broadcast('selfmod:client-remove', pkgId))
+
+  // 全局 UI 共享状态变化 → 广播快照（按窗口类型过滤：dock/supervisor-bubble 不消费共享状态直接跳过；
+  // desktop 只收登录态+壁纸精简快照；chat/supervisor/app 收完整快照。避免把含所有会话完整历史的重快照发给不消费的窗口）
+  subscribeUiState(() => {
+    const full = getUiState()
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed()) continue
+      const type = getWindowType(win)
+      if (!windowConsumesUiState(type)) continue
+      win.webContents.send('ui:state', filterUiStateForWindow(type, full))
+    }
+  })
 }

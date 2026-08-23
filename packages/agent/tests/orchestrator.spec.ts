@@ -129,4 +129,56 @@ describe('Orchestrator（多专家调度）', () => {
     expect(result.text).toContain('会失败')
     expect(result.text).toContain('继续')
   })
+
+  it('无依赖步骤并行执行（并发峰值 ≥ 2），有依赖步骤串行等待', async () => {
+    const triage = new ModelTriage(
+      createMockModel([
+        {
+          text: '{"steps":[{"id":"s1","expertId":"general","title":"并行A","deps":[]},{"id":"s2","expertId":"code","title":"并行B","deps":[]},{"id":"s3","expertId":"general","title":"汇总","deps":["s1","s2"]}]}',
+        },
+      ]),
+      ROLES,
+    )
+
+    // 通过「活跃并发计数」检测是否真的并行：s1/s2 无依赖应同时执行（峰值 ≥ 2）
+    let active = 0
+    let maxActive = 0
+    const delayModel = () => ({
+      complete: async () => {
+        active += 1
+        maxActive = Math.max(maxActive, active)
+        await new Promise((r) => setTimeout(r, 30))
+        active -= 1
+        return { text: 'ok' }
+      },
+    })
+    const agents = new Map<string, AgentLoop>()
+    agents.set('general', new AgentLoop(delayModel(), [], new Session(), new ApprovalService()))
+    agents.set('code', new AgentLoop(delayModel(), [], new Session(), new ApprovalService()))
+
+    const orch = new Orchestrator(triage, agents, { sessionId: 's1' })
+    const result = await orch.run('任务')
+    expect(result.status).toBe('completed')
+    expect(result.text).toContain('汇总')
+    // 无依赖的 s1、s2 并发执行 → 峰值至少 2（串行则恒为 1）
+    expect(maxActive).toBeGreaterThanOrEqual(2)
+  })
+
+  it('环形依赖兜底：剩余步骤串行执行不卡死', async () => {
+    const triage = new ModelTriage(
+      createMockModel([
+        {
+          text: '{"steps":[{"id":"s1","expertId":"general","title":"环A","deps":["s2"]},{"id":"s2","expertId":"general","title":"环B","deps":["s1"]}]}',
+        },
+      ]),
+      ROLES,
+    )
+    const agents = new Map<string, AgentLoop>()
+    agents.set('general', textAgent('结果'))
+    const orch = new Orchestrator(triage, agents, { sessionId: 's1' })
+    const result = await orch.run('任务')
+    expect(result.status).toBe('completed')
+    expect(result.text).toContain('环A')
+    expect(result.text).toContain('环B')
+  })
 })
