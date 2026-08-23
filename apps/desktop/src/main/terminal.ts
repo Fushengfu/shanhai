@@ -73,18 +73,35 @@ export function createElectronTerminalService(): TerminalService {
     const id = terminalId ?? DEFAULT_TERMINAL_ID
     const existing = terminals.get(id)
     if (existing) return existing
+    // 按平台选择 shell：Windows 用 PowerShell（ConPTY），macOS/Linux 用 zsh。
     // `+o promptsp` 关闭 zsh 的 PROMPT_SP：否则 zsh 启动时会在第一行输出一个反色 `%`
     // （zsh 内部初始化产生非换行输出触发的「补换行」标记），干扰用户对终端首行的阅读。
-    const proc = pty.spawn('/bin/zsh', ['-i', '+o', 'promptsp'], {
-      name: 'xterm-256color',
-      cols: 200,
-      rows: 50,
-      // 初始工作目录：用户手动终端传当前会话工作目录（默认在其下打开），agent 终端技能不传则回退主目录
-      cwd: cwd ?? homedir(),
+    const isWin = process.platform === 'win32'
+    const shellEnv: Record<string, string> = { ...process.env } as Record<string, string>
+    if (!isWin) {
       // 显式设置 UTF-8 locale：Electron 从 Finder 启动时 env 里的 LANG 可能是 C 或缺省，
       // 会导致 zsh 内 ls 等命令把中文文件名转义成八进制乱码。强制 zh_CN.UTF-8 保证中文正常显示。
-      env: { ...process.env, TERM: 'xterm-256color', LANG: 'zh_CN.UTF-8', LC_ALL: 'zh_CN.UTF-8' } as Record<string, string>,
-    })
+      // （TERM/LANG/LC_ALL 是 POSIX 概念，Windows 的 ConPTY 无需这些，故仅非 Windows 注入）
+      shellEnv.TERM = 'xterm-256color'
+      shellEnv.LANG = 'zh_CN.UTF-8'
+      shellEnv.LC_ALL = 'zh_CN.UTF-8'
+    }
+    // 初始工作目录：用户手动终端传当前会话工作目录（默认在其下打开），agent 终端技能不传则回退主目录
+    const proc = isWin
+      ? pty.spawn('powershell.exe', ['-NoLogo'], {
+          name: 'xterm-256color',
+          cols: 200,
+          rows: 50,
+          cwd: cwd ?? homedir(),
+          env: shellEnv,
+        })
+      : pty.spawn('/bin/zsh', ['-i', '+o', 'promptsp'], {
+          name: 'xterm-256color',
+          cols: 200,
+          rows: 50,
+          cwd: cwd ?? homedir(),
+          env: shellEnv,
+        })
     const st: TerminalState = { proc, name: name ?? '', buffer: '' }
     terminals.set(id, st)
     proc.onData((data) => {

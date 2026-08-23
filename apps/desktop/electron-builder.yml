@@ -42,8 +42,29 @@ dmg:
   artifactName: Shanhai-${version}-${arch}.${ext}
   title: 山海
 
+# Windows 打包：NSIS 安装包 + 便携版（portable 免 wine，便于在 mac 上交叉验证）
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+  icon: assets/icon.ico
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  artifactName: Shanhai-${version}-${arch}-setup.${ext}
+  shortcutName: 山海
+  uninstallDisplayName: 山海
+
+portable:
+  artifactName: Shanhai-${version}-${arch}-portable.${ext}
+
 # 原生模块在打包前手动 @electron/rebuild（pnpm 下 npmRebuild 不可靠，故关闭）
 npmRebuild: false
 electronVersion: 43.4.0
-# 直接复用本机 node_modules 里已下载解压的 electron，避免从 GitHub 慢速重新下载
-electronDist: node_modules/electron/dist
+# 说明：electronDist 已移除（不再写死本机 mac 版 electron）。
+#   - mac 打包：由 dist:mac 脚本通过 --config.electronDist=node_modules/electron/dist 显式复用本机已下载的 electron，保持快速；
+#   - win 交叉打包：不传 electronDist，让 electron-builder 按 electronVersion 下载对应平台的 win 版 electron。

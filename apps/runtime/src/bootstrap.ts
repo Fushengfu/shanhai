@@ -637,10 +637,17 @@ async function writeSettings(patch: Partial<AppSettings>): Promise<void> {
 /** 当前正在播放的 say 子进程：新播报来了先打断旧的，避免多条语音叠加播放 */
 let activeSay: ChildProcess | null = null
 
-/** 用 spawn 启动 say 并等待结束（可被打断 + 超时兜底） */
-function spawnSay(args: string[], timeoutMs: number): Promise<void> {
+/** 用系统语音引擎播报文本（可被打断 + 超时兜底）。
+ *  macOS 走 /usr/bin/say，Windows 走 PowerShell System.Speech SAPI（无外部依赖）。 */
+function spawnSay(text: string, voice: string, timeoutMs: number): Promise<void> {
+  const isWin = process.platform === 'win32'
+  const file = isWin ? 'powershell.exe' : '/usr/bin/say'
+  const args = isWin
+    ? ['-NoProfile', '-NonInteractive', '-Command',
+      `Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('${String(text).replace(/'/g, "''")}')`]
+    : voice ? ['-v', voice, text] : [text]
   return new Promise((resolve) => {
-    const child = spawn('/usr/bin/say', args, { stdio: 'ignore' })
+    const child = spawn(file, args, { stdio: 'ignore' })
     activeSay = child
     const timer = setTimeout(() => {
       try {
@@ -667,6 +674,8 @@ function spawnSay(args: string[], timeoutMs: number): Promise<void> {
 function createSystemVoiceService(): VoiceService {
   return {
     transcribe: async (audio) => {
+      // Windows 暂未接入 STT（macOS Speech 识别不可用），直接返回空，不阻断流程
+      if (process.platform === 'win32') return ''
       // 真实 STT：音频字节 → 临时文件 → afconvert 转 wav → macOS Speech 识别（失败返回空，不阻断）
       if (audio.byteLength === 0) return ''
       const base = `/tmp/shanhai-voice-${Date.now()}`
@@ -689,25 +698,28 @@ function createSystemVoiceService(): VoiceService {
       }
     },
     synthesize: async (text) => {
-      // 用绝对路径 execFile 调用 macOS say（避免 shell 转义 / PATH 问题），
+      // macOS：用绝对路径 execFile 调用 say（避免 shell 转义 / PATH 问题），
       // 优先选唯一中文女声 Tingting（婷婷），回退 Yue，再回退任意 zh_CN，找不到则用系统默认语音。
+      // Windows：无 say，走 PowerShell System.Speech SAPI（spawnSay 内部分发），跳过语音列表查询。
+      const isWin = process.platform === 'win32'
       let voice = ''
-      try {
-        const { stdout: list } = await execFileAsync('/usr/bin/say', ['-v', '?'], { timeout: 5000 })
-        const lines = list.split('\n').map((l: string) => l.trim())
-        const preferred = ['Tingting', 'Yue', 'Sin-ji'].find((c) =>
-          lines.some((l) => l.includes('zh_CN') && (l.startsWith(`${c} `) || l.startsWith(`${c}\t`))),
-        )
-        if (preferred) {
-          voice = preferred
-        } else {
-          const zh = lines.find((l) => l.includes('zh_CN'))
-          voice = zh?.match(/^\S+/)?.[0] ?? ''
+      if (!isWin) {
+        try {
+          const { stdout: list } = await execFileAsync('/usr/bin/say', ['-v', '?'], { timeout: 5000 })
+          const lines = list.split('\n').map((l: string) => l.trim())
+          const preferred = ['Tingting', 'Yue', 'Sin-ji'].find((c) =>
+            lines.some((l) => l.includes('zh_CN') && (l.startsWith(`${c} `) || l.startsWith(`${c}\t`))),
+          )
+          if (preferred) {
+            voice = preferred
+          } else {
+            const zh = lines.find((l) => l.includes('zh_CN'))
+            voice = zh?.match(/^\S+/)?.[0] ?? ''
+          }
+        } catch {
+          /* 查询语音列表失败则用系统默认语音 */
         }
-      } catch {
-        /* 查询语音列表失败则用系统默认语音 */
       }
-      const args = voice ? ['-v', voice, text] : [text]
       try {
         // 新播报打断上一条未播完的语音（kill 旧 say 进程），避免多条语音叠加播放
         if (activeSay) {
@@ -718,8 +730,8 @@ function createSystemVoiceService(): VoiceService {
           }
           activeSay = null
         }
-        // 设 30s 超时：避免 say 因音频设备异常卡住导致 speak 永不返回、特效不消失
-        await spawnSay(args, 30000)
+        // 设 30s 超时：避免语音引擎因音频设备异常卡住导致 speak 永不返回、特效不消失
+        await spawnSay(text, voice, 30000)
       } catch (err) {
         // 明确记录失败原因（之前 .catch 静默吞掉，无法定位「没声音」）
         console.error('[voice] say 播报失败:', err instanceof Error ? err.message : String(err))

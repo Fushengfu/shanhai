@@ -417,7 +417,10 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
       }
       // 注入完整环境变量（含登录 shell 的 PATH），避免 GUI 启动的精简 PATH 导致「命令不存在」
       const env = await getRunCommandEnv()
-      const { stdout, stderr } = await exec(args.command, { cwd: getCwd(), env })
+      // 显式指定 shell（等价于 Node 默认，但明确平台分支，便于后续扩展 Git Bash 兼容）：
+      //   win32 用 ComSpec/cmd.exe（支持 &&、|、> 等），POSIX 用 /bin/sh。agent 在 Windows 上应写 cmd 兼容命令。
+      const shell = process.platform === 'win32' ? (process.env.ComSpec ?? 'cmd.exe') : '/bin/sh'
+      const { stdout, stderr } = await exec(args.command, { cwd: getCwd(), env, shell })
       return { stdout, stderr }
     },
   }
