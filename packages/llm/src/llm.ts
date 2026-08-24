@@ -101,7 +101,7 @@ export interface HttpTrace {
   url: string
   method: string
   /** request 阶段 = 最终提交给模型接口的完整 body（序列化前对象，含 model/messages/tools 等全部字段，与 JSON.stringify 后发出内容一致）；
-   *  response 阶段 = 接口返回的完整原始文本（非流式 = 原始 JSON 字符串；流式 = 原始 SSE 文本，均不解析、不聚合） */
+   *  response 阶段 = 接口返回内容，按 JSON 结构记录：非流式 = 解析后的 JSON 对象；流式 = 解析后的 SSE 事件数组（{ stream, events }）；无法解析时回退为原始字符串 */
   body?: unknown
   /** 仅 response 阶段有意义：HTTP 状态码 */
   responseStatus?: number
@@ -254,7 +254,7 @@ export class DeepSeekProvider implements Model {
     // 先读原始文本：既用于 trace 记录完整原始响应，也用于后续 JSON 解析与错误提示
     const rawText = await res.text()
     if (!res.ok) {
-      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: rawText, responseStatus: res.status, error: `DeepSeek API ${res.status}` })
+      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText, false), responseStatus: res.status, error: `DeepSeek API ${res.status}` })
       throw new Error(`DeepSeek API ${res.status}: ${rawText}`)
     }
     // 网关响应：{ code, data: { choices: [...] } } 包装（兼容裸 OpenAI 格式）
@@ -271,10 +271,10 @@ export class DeepSeekProvider implements Model {
     try {
       raw = JSON.parse(rawText) as typeof raw
     } catch {
-      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: rawText, responseStatus: res.status, error: '响应非合法 JSON' })
+      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText, false), responseStatus: res.status, error: '响应非合法 JSON' })
       throw new Error(`DeepSeek API ${res.status}: 响应非合法 JSON`)
     }
-    this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: rawText, responseStatus: res.status })
+    this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: raw, responseStatus: res.status })
     // 网关返回错误（如模型不支持 image_url 多模态），响亮抛错，不静默吞
     if (raw.error) {
       const msg = typeof raw.error === 'string' ? raw.error : (raw.error.message ?? JSON.stringify(raw.error))
@@ -340,7 +340,7 @@ export class DeepSeekProvider implements Model {
     }
     if (!res.ok || !res.body) {
       const errText = await res.text()
-      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: errText, responseStatus: res.status, error: `DeepSeek API ${res.status}` })
+      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(errText, false), responseStatus: res.status, error: `DeepSeek API ${res.status}` })
       throw new Error(`DeepSeek API ${res.status}: ${errText}`)
     }
     const reader = res.body.getReader()
@@ -434,7 +434,7 @@ export class DeepSeekProvider implements Model {
       phase: 'response',
       url,
       method: 'POST',
-      body: rawBody,
+      body: normalizeResponseBody(rawBody, true),
       responseStatus: res.status,
     })
   }
@@ -502,6 +502,38 @@ function safeParse(json: string): Record<string, unknown> {
   } catch {
     return {}
   }
+}
+
+/**
+ * 将接口响应原始文本按 JSON 结构归一化（供 trace 落盘，避免 response 记录成转义字符串）：
+ * - 非流式：JSON.parse 成对象，失败回退为原始字符串（错误页 / 非 JSON 响应）
+ * - 流式：逐行解析 SSE `data:` 行，聚合成 { stream: true, events: [...] }（保留事件序列便于排查）
+ */
+function normalizeResponseBody(rawText: string, stream: boolean): unknown {
+  if (!stream) {
+    try {
+      return JSON.parse(rawText) as unknown
+    } catch {
+      return rawText
+    }
+  }
+  const events: unknown[] = []
+  for (const line of rawText.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('data:')) continue
+    const data = trimmed.slice(5).trim()
+    if (!data) continue
+    if (data === '[DONE]') {
+      events.push({ done: true })
+      continue
+    }
+    try {
+      events.push(JSON.parse(data) as unknown)
+    } catch {
+      events.push({ raw: data })
+    }
+  }
+  return { stream: true, events }
 }
 
 /** 构造图片内容片段（data: URL 或 https 链接） */
@@ -779,17 +811,17 @@ export class AnthropicProvider implements Model {
     }
     const rawText = await res.text()
     if (!res.ok) {
-      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: rawText, responseStatus: res.status, error: `Anthropic API ${res.status}` })
+      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText, false), responseStatus: res.status, error: `Anthropic API ${res.status}` })
       throw new Error(`Anthropic API ${res.status}: ${rawText}`)
     }
     let raw: AnthropicResponse
     try {
       raw = JSON.parse(rawText) as AnthropicResponse
     } catch {
-      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: rawText, responseStatus: res.status, error: '响应非合法 JSON' })
+      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText, false), responseStatus: res.status, error: '响应非合法 JSON' })
       throw new Error(`Anthropic API ${res.status}: 响应非合法 JSON`)
     }
-    this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: rawText, responseStatus: res.status })
+    this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: raw, responseStatus: res.status })
     return parseAnthropicResponse(raw, this.opts.onUsage)
   }
 
@@ -827,7 +859,7 @@ export class AnthropicProvider implements Model {
     }
     if (!res.ok || !res.body) {
       const errText = await res.text()
-      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: errText, responseStatus: res.status, error: `Anthropic API ${res.status}` })
+      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(errText, false), responseStatus: res.status, error: `Anthropic API ${res.status}` })
       throw new Error(`Anthropic API ${res.status}: ${errText}`)
     }
     const reader = res.body.getReader()
@@ -907,7 +939,7 @@ export class AnthropicProvider implements Model {
       phase: 'response',
       url,
       method: 'POST',
-      body: rawBody,
+      body: normalizeResponseBody(rawBody, true),
       responseStatus: res.status,
     })
   }

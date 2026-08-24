@@ -3,7 +3,7 @@ import { CORE_SLOTS } from '@shanhai/kernel-modules/client'
 import { SelfModifyRuntime } from '@shanhai/selfmod'
 import { Session, effectiveApprovalPolicy, effectiveModelId, type ApprovalPolicy, type SessionEvent } from '@shanhai/session'
 import { ApprovalService } from '@shanhai/approval'
-import { AgentLoop, ModelTriage, Orchestrator, type RoleDefinition, type StepTrace, type SuspendedSnapshot } from '@shanhai/agent'
+import { AgentLoop, ModelTriage, Orchestrator, type RoleDefinition, type StepTrace, type SuspendedSnapshot, type TaskPlan } from '@shanhai/agent'
 import type { Model, ContentPart, TokenUsage, HttpTrace, HttpTraceCallback, ChatMessage } from '@shanhai/llm'
 import { createMockModel, createModelProvider } from '@shanhai/llm'
 import { createAtomicTools, createUtilityTools, toolReasoningContext, type ToolContract } from '@shanhai/tools'
@@ -104,6 +104,16 @@ export interface AppSettings {
     /** 任务执行完、输出正文时是否自动语音播报（TTS 走 macOS say） */
     enabled: boolean
   }
+  supervisorApproval: {
+    /** 是否允许管家接管审批：true 时，管家下发的任务触发的审批由管家决策（决策后弹窗自动关闭）；
+     *  false 时无论谁下发都由用户手动审批。用户手动点击始终优先、始终可用。 */
+    enabled: boolean
+  }
+  supervisorAsk: {
+    /** 是否允许管家接管提问：true 时，管家下发的任务里会话发起的 ask_user 提问由管家代答（代答后弹窗自动关闭）；
+     *  false 时无论谁下发都由用户手动回答。用户手动回答始终优先、始终可用。 */
+    enabled: boolean
+  }
 }
 
 /** 设置补丁：允许只传某个分组的某个字段（嵌套 Partial），setSettings 据此增量合并 */
@@ -112,6 +122,8 @@ export type AppSettingsPatch = {
   messageSubmit?: Partial<AppSettings['messageSubmit']>
   debug?: Partial<AppSettings['debug']>
   voice?: Partial<AppSettings['voice']>
+  supervisorApproval?: Partial<AppSettings['supervisorApproval']>
+  supervisorAsk?: Partial<AppSettings['supervisorAsk']>
 }
 
 /** 通用设置默认值 */
@@ -120,6 +132,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   messageSubmit: { mode: 'queue' },
   debug: { traceLlm: false },
   voice: { enabled: true },
+  supervisorApproval: { enabled: false },
+  supervisorAsk: { enabled: false },
 }
 
 /** 自定义模型输入（OpenAI 兼容或 Anthropic 协议；接口地址 / 密钥 / 模型名均由用户填写） */
@@ -257,6 +271,10 @@ export interface Runtime {
   onApprovalRequest(cb: (req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }) => void): () => void
   /** UI 应答审批（requestId 定位具体审批请求，支持并行会话） */
   respondApproval(outcome: ApprovalOutcome, requestId: string): void
+  /** 审批被管家决策 resolve 后回调（requestId 定位，UI 据此关闭对应弹窗） */
+  onApprovalResolved(cb: (requestId: string) => void): () => void
+  /** 提问被管家代答 resolve 后回调（requestId 定位，UI 据此关闭对应弹窗） */
+  onAskResolved(cb: (requestId: string) => void): () => void
   /** AI 向用户提问请求回调（UI 弹交互式卡片，req 带 sessionId，会话级隔离） */
   onAskRequest(cb: (req: AskRequest) => void): () => void
   /** UI 提交用户回答（requestId 定位具体提问，支持并行会话） */
@@ -277,8 +295,8 @@ export interface Runtime {
   /** 管家向目标会话下发任务时实时广播 user 消息（供目标会话 UI 立即显示用户气泡） */
   onUserMessage(cb: (sessionId: string, message: string, turnSeq: number) => void): () => void
 
-  /** 当前 token 用量快照（累计 / 本轮 / 上下文占比 / 缓存命中，会话级） */
-  getTokenStats(): TokenSnapshot
+  /** 当前 token 用量快照（累计 / 本轮 / 上下文占比 / 缓存命中，会话级；不传 id 用当前激活会话） */
+  getTokenStats(sessionId?: string): TokenSnapshot
   /** token 用量变化回调（模型每次返回 usage 时推送，带 sessionId 标识所属会话） */
   onTokenStats(cb: (sessionId: string, stats: TokenSnapshot) => void): () => void
 
@@ -604,6 +622,8 @@ async function readSettings(): Promise<AppSettings> {
       messageSubmit: { mode: s?.messageSubmit?.mode ?? DEFAULT_SETTINGS.messageSubmit.mode },
       debug: { traceLlm: s?.debug?.traceLlm ?? DEFAULT_SETTINGS.debug.traceLlm },
       voice: { enabled: s?.voice?.enabled ?? DEFAULT_SETTINGS.voice.enabled },
+      supervisorApproval: { enabled: s?.supervisorApproval?.enabled ?? DEFAULT_SETTINGS.supervisorApproval.enabled },
+      supervisorAsk: { enabled: s?.supervisorAsk?.enabled ?? DEFAULT_SETTINGS.supervisorAsk.enabled },
     }
   } catch {
     return {
@@ -612,6 +632,8 @@ async function readSettings(): Promise<AppSettings> {
       messageSubmit: { ...DEFAULT_SETTINGS.messageSubmit },
       debug: { ...DEFAULT_SETTINGS.debug },
       voice: { ...DEFAULT_SETTINGS.voice },
+      supervisorApproval: { ...DEFAULT_SETTINGS.supervisorApproval },
+      supervisorAsk: { ...DEFAULT_SETTINGS.supervisorAsk },
     }
   }
 }
@@ -626,6 +648,8 @@ async function writeSettings(patch: Partial<AppSettings>): Promise<void> {
         messageSubmit: { ...DEFAULT_SETTINGS.messageSubmit, ...(cur.messageSubmit ?? {}), ...(patch.messageSubmit ?? {}) },
         debug: { ...DEFAULT_SETTINGS.debug, ...(cur.debug ?? {}), ...(patch.debug ?? {}) },
         voice: { ...DEFAULT_SETTINGS.voice, ...(cur.voice ?? {}), ...(patch.voice ?? {}) },
+        supervisorApproval: { ...DEFAULT_SETTINGS.supervisorApproval, ...(cur.supervisorApproval ?? {}), ...(patch.supervisorApproval ?? {}) },
+        supervisorAsk: { ...DEFAULT_SETTINGS.supervisorAsk, ...(cur.supervisorAsk ?? {}), ...(patch.supervisorAsk ?? {}) },
       }
       cfg.settings = merged
     })
@@ -1117,18 +1141,36 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   // 多专家编排时工具在专家独立 Session 里执行、主会话缺工具事件，需补持久化到主会话」。
   const runningLoops = new Map<string, AgentLoop>()
   const multiExpertLoops = new Map<string, Map<string, AgentLoop>>()
+  // 会话当前任务的发起方（run 开始 set、结束 delete）：审批分流时据此判断「管家下发 or 用户下发」。
+  // 用 Map 而非会话级静态标记，因为同一会话这一轮可能用户发、下一轮可能管家发。
+  const sessionOrigin = new Map<string, 'user' | 'supervisor'>()
 
   // —— 工具过程 + 审批桥（审批按 requestId 独立 resolve，支持并行会话）——
   const toolTraceCallbacks = new Set<(trace: ToolTrace) => void>()
   const approvalCallbacks = new Set<(req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }) => void>()
   const pendingApprovals = new Map<string, { resolve: (outcome: ApprovalOutcome) => void; sessionId?: string }>()
+  // 审批被「管家决策」resolve 后的回调（UI 据此关闭对应弹窗；用户手动/手机端走各自通道，不经过这里）
+  const approvalResolvedCallbacks = new Set<(requestId: string) => void>()
+  // 提问被「管家代答」resolve 后的回调（UI 据此关闭对应弹窗；用户手动/手机端走各自通道，不经过这里）
+  const askResolvedCallbacks = new Set<(requestId: string) => void>()
 
   const approval = new ApprovalService(async (req) => {
     approvalCallbacks.forEach((cb) => cb({ id: req.id, sessionId: req.sessionId, toolName: req.toolName, args: req.args, riskLevel: req.riskLevel }))
-    return new Promise<ApprovalOutcome>((resolve) => {
+    // 发起方判定：审批请求产生的会话即发起审批的会话，查其当前任务的发起方（管家下发 or 用户侧）
+    const origin = req.sessionId ? (sessionOrigin.get(req.sessionId) ?? 'user') : 'user'
+    console.log('[supervisor-wake] 审批请求产生：', req.id, req.toolName, 'sessionId=', req.sessionId, 'origin=', origin, '开关=', currentSettings.supervisorApproval.enabled)
+    const promise = new Promise<ApprovalOutcome>((resolve) => {
       // 记录发起审批的会话 id：删除会话时按会话拒绝其待审批请求，避免 agent 永久卡在 await
       pendingApprovals.set(req.id, { resolve, sessionId: req.sessionId })
     })
+    // 管家接管：仅当「管家下发 + 开关开启」时唤醒管家决策（非阻塞，弹窗仍显示、用户仍可手动点）；
+    // 用户侧（含手机远程）始终只走弹窗手动审批，不唤醒管家。
+    if (origin === 'supervisor' && currentSettings.supervisorApproval.enabled) {
+      void wakeSupervisorForApproval(req)
+    } else {
+      console.log('[supervisor-wake] 审批请求不唤醒管家（origin!=supervisor 或开关关闭）')
+    }
+    return promise
   })
 
   // 审批策略（安全模式）改为「会话级」：每个会话独立的安全模式，通过 approval/policy 事件持久化到会话 JSON。
@@ -1167,6 +1209,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     messageSubmit: { mode: DEFAULT_SETTINGS.messageSubmit.mode },
     debug: { traceLlm: DEFAULT_SETTINGS.debug.traceLlm },
     voice: { enabled: DEFAULT_SETTINGS.voice.enabled },
+    supervisorApproval: { enabled: DEFAULT_SETTINGS.supervisorApproval.enabled },
+    supervisorAsk: { enabled: DEFAULT_SETTINGS.supervisorAsk.enabled },
   }
   // 立即恢复为 config.json 持久化的值（含 debug.traceLlm）：必须在 onHttpTrace 等回调定义之前恢复，
   // 否则回调被模型调用触发时读到的仍是默认 false（traceLlm 开关不生效、日志不落盘）
@@ -1384,6 +1428,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       '5. 执行有风险的操作（写文件、运行命令）前会请求用户确认，请把要做的改动讲清楚再调用工具。',
       '6. 内置可执行技能（见下方【内置能力】）用 skill_read 读手册、skill_run 执行脚本；不在内置清单里的第三方技能，在需要时用 skill_list 查询。',
       '7. 需要用户协助做选择、确认或补充信息时，用 ask_user 工具向用户提问：可提供 options 让用户单选/多选，或让用户自由输入；调用后必须等待用户回答，再基于回答继续执行。',
+      '8. 输出「目录树 / 文件树 / 框线图 / 表格 / 缩进层级」等需要等宽对齐的结构化内容时，必须用 Markdown 代码块（``` 包裹）输出，不要作为普通段落输出，否则换行会被折叠、对齐错乱甚至溢出。',
       '',
       '【合规与安全（必须严格遵守）】',
       '1. 你生成的所有内容必须符合中华人民共和国法律法规，践行社会主义核心价值观。',
@@ -1724,9 +1769,13 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   }
 
   const snapshot = (sid?: string): TokenSnapshot => {
-    const s = sessionStats(sid ?? currentSessionId ?? '')
-    // contextLength 兜底当前模型（切模型/登录后写入当前会话，未写入时用模型属性兜底）
-    const ctxLen = s.contextLength > 0 ? s.contextLength : allModels().find((m) => m.id === currentModelId)?.contextLength ?? 0
+    const target = sid ?? currentSessionId ?? ''
+    const s = sessionStats(target)
+    // contextLength 兜底：supervisor 会话用管家模型（会话日志回放），其余用全局当前模型（切模型/登录后写入当前会话，未写入时用模型属性兜底）
+    const fallbackModelId = target === SUPERVISOR_ID
+      ? ((sessions.get(SUPERVISOR_ID) ? effectiveModelId(sessions.get(SUPERVISOR_ID)!.session.list()) : undefined) ?? defaultModelId)
+      : currentModelId
+    const ctxLen = s.contextLength > 0 ? s.contextLength : allModels().find((m) => m.id === fallbackModelId)?.contextLength ?? 0
     return {
       totalPrompt: s.totalPrompt,
       totalCompletion: s.totalCompletion,
@@ -1740,7 +1789,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       turnCachedPromptTokens: s.turnCachedPromptTokens,
       totalCachedPromptTokens: s.totalCachedPromptTokens,
       cacheHitRatio: s.lastPrompt > 0 ? s.lastCachedPromptTokens / s.lastPrompt : 0,
-      turnCount: countCompletedTurns(sid),
+      turnCount: countCompletedTurns(target),
     }
   }
 
@@ -1977,6 +2026,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   /** 管家会话专用工具集（已在 tools 声明处占位声明，见上方）。此处装配赋值，runInSession 据此走管家分支。 */
   /** 管家转发队列：会话 id → 待执行消息列表（queue 模式，目标会话 busy 时排队，任务结束后由 drainSupervisorQueue 自动执行） */
   const supervisorQueue = new Map<string, string[]>()
+  /** 待管家决策队列（审批/提问接管）：管家忙时不再 injectUserMessage（注入到即将结束的 loop 会悬空，导致会话永久挂起），
+   *  改为串行队列，每个决策 prompt 由独立的 runSupervisorInternal 处理，处理完再取下一条。 */
+  const supervisorWakeQueue: string[] = []
+  let supervisorWaking = false
 
   // —— 会话活动 / 激活会话 / 管家结果回传事件（主进程 ui-store 订阅，同步 UI 状态）——
   /** 会话开始/结束执行（runningLoops / multiExpertLoops 挂载与清理时广播），主进程据此刷新「处理中」与消息流 */
@@ -2007,6 +2060,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     message: string,
     opts?: { maxSteps?: number; attachments?: ContentPart[] },
     modelIdOverride?: string,
+    origin: 'user' | 'supervisor' = 'user',
   ): Promise<string> => {
     const meta = sessions.get(sid)
     if (!meta) throw new Error(`会话不存在: ${sid}`)
@@ -2017,8 +2071,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     const effModelId = modelIdOverride ?? currentModelId
     const effModel = modelIdOverride ? resolveProvider(modelIdOverride) : model
     stoppedSessions.delete(sid)
+    // 记录本轮任务发起方（审批分流用）：管家会话自身不标记（管家工具免审批，不会触发审批）
+    if (!isSupervisorRun) sessionOrigin.set(sid, origin)
     // 发消息即视为活跃，刷新活跃时间（列表排序用）
     touchSession(sid)
+    // 发消息立即 busy：start 广播提前到 triage 拆解/图片降级之前，避免「管家下发→triage LLM 往返」期间发送按钮状态延迟、耗时起点不准
+    sessionActivityCallbacks.forEach((cb) => cb(sid, 'start'))
     // 本轮任务开始时清零 turn 统计（会话级），模型每次返回 usage 时重新累计
     const statAcc = sessionStats(sid)
     statAcc.turnPrompt = 0
@@ -2053,11 +2111,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       if (plan.steps.length > 1) {
         // 多步编排：先落盘用户消息（专家用独立 Session，主会话手动记录用户消息 + 最终回复）
         targetSession.append('user/message', { content: message, attachments: (opts?.attachments ?? []) as unknown[] })
-        targetSession.append('turn/start', { turn: 1 })
+        targetSession.append('turn/start', { turn: 1, mode: 'multi' })
+        // 持久化拆解计划：断点续跑（继续执行）时据此恢复依赖图，跳过已完成步骤、只重跑未完成步骤
+        targetSession.append('orchestrator/plan', { plan })
         const expertAgents = buildExpertAgents(sid, visionCapable, effModelId, targetSession)
         // 注册多专家 loop，供插入模式向所有专家注入消息（各专家在下一步模型调用前消费注入消息）
         multiExpertLoops.set(sid, expertAgents)
-        sessionActivityCallbacks.forEach((cb) => cb(sid, 'start'))
         // 累积多专家编排的思考内容，落盘到 assistant/message（否则多专家思考只存在于实时流、重启/重建后丢失）
         let expertReasoning = ''
         try {
@@ -2068,6 +2127,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
             onStep: (trace) => {
               // 轮次序号 = 会话内 user 消息序号（本轮 user/message 已 append，其数量即本轮序号）
               const turnSeq = targetSession.list().filter((e) => e.type === 'user/message').length
+              // 持久化每步状态：断点续跑时据此恢复已完成步骤的结果（作为后续步骤依赖上下文）
+              targetSession.append('orchestrator/step', { stepId: trace.stepId, expertId: trace.expertId, title: trace.title, status: trace.status, result: trace.result, error: trace.error })
               expertTraceCallbacks.forEach((cb) => cb({ ...trace, turnSeq }))
             },
             onDelta: (text) => {
@@ -2078,6 +2139,39 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
               expertReasoning += text
               reasoningCallbacks.forEach((cb) => cb(sid, text))
             },
+            summarize: async (task, steps, onDelta) => {
+              // 用主模型（triage 同款旗舰模型）把各专家结果汇总成一段直接回答用户问题的最终结果
+              const parts = steps.map((s, i) => `${i + 1}. [${s.expert}] ${s.title}\n${s.result}`).join('\n\n')
+              const systemPrompt =
+                '你是「山海」的结果汇总器。下面是一次多专家协作任务中各位专家的执行结果，以及用户最初的问题。请把它们汇总成一段连贯、简洁、直接回答用户问题的最终结果：只输出最终答案本身，不要罗列专家名、不要复述执行过程、不要加分节标题（除非用户明确要求）。'
+              const userPrompt = `【用户的问题】\n${task}\n\n【各专家执行结果】\n${parts}`
+              const messages = [
+                { role: 'system' as const, content: systemPrompt },
+                { role: 'user' as const, content: userPrompt },
+              ]
+              let full = ''
+              try {
+                if (model.stream) {
+                  for await (const chunk of model.stream(messages, [])) {
+                    if (stoppedSessions.has(sid)) throw new Error('__stopped__')
+                    if (chunk.text) {
+                      full += chunk.text
+                      onDelta(chunk.text)
+                    }
+                  }
+                } else {
+                  const res = await model.complete(messages, [])
+                  full = res.text ?? ''
+                  if (full) onDelta(full)
+                }
+              } catch (err) {
+                // 用户停止 / 重试耗尽：向上抛，由外层按中断/重试处理；其余汇总失败回退拼接（不阻断任务）
+                if (err instanceof Error && (err.message === '__stopped__' || err.message.startsWith('__retry_exhausted__'))) throw err
+                console.error('[orchestrator] 汇总失败，回退拼接:', err instanceof Error ? err.message : err)
+                return ''
+              }
+              return full
+            },
           })
           const result = await sessionContext.run(sid, () => orchestrator.run(message))
           targetSession.append('assistant/message', { content: result.text, reasoningContent: expertReasoning || undefined })
@@ -2085,6 +2179,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
           return result.text
         } finally {
           multiExpertLoops.delete(sid)
+          sessionOrigin.delete(sid)
           sessionActivityCallbacks.forEach((cb) => cb(sid, 'end'))
           // 多专家任务结束（成功/中断/重试耗尽）更新活跃时间为结束时间，并落盘主会话消息
           meta.lastActiveAt = Date.now()
@@ -2105,7 +2200,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     }
     const loop = new AgentLoop(effModel, isSupervisorRun ? supervisorLoopTools : tools, targetSession, approval, sid, currentContextBudget(effModelId), visionCapable, currentApiKey(effModelId))
     runningLoops.set(sid, loop)
-    sessionActivityCallbacks.forEach((cb) => cb(sid, 'start'))
     let suspended = false
     try {
       return await sessionContext.run(sid, () =>
@@ -2128,9 +2222,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       if (err instanceof Error && err.message === '__stopped__') {
         return '（已中断，历史已保留，可点击「继续执行」续跑）'
       }
-      // 重试耗尽：任务挂起，保留 loop 引用（供 retrySession 用相同 body 重试），不要 delete
+      // 重试耗尽：任务挂起，保留 loop 引用（供 retrySession 用相同 body 重试），不要 delete。
+      // 管家会话例外：审批/提问决策是短任务，失败时挂起无意义（用户不会 retry 一个审批决策），
+      // 且 suspended 会让 runningLoops 残留 SUPERVISOR_ID、又因 !suspended 不触发 drainSupervisorWake，
+      // 使串行队列断裂、后续审批/提问永远不被处理（目标会话永久挂起）。故管家失败不挂起，清理 loop 让队列继续。
       if (err instanceof Error && err.message.startsWith('__retry_exhausted__')) {
-        suspended = true
+        suspended = !isSupervisorRun
       }
       throw err
     } finally {
@@ -2139,6 +2236,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         runningLoops.delete(sid)
         sessionActivityCallbacks.forEach((cb) => cb(sid, 'end'))
       }
+      sessionOrigin.delete(sid)
       // 任务结束（成功/失败/中断/重试耗尽）更新活跃时间为结束时间（列表排序用），随后立即落盘
       meta.lastActiveAt = Date.now()
       // 会话事件（用户消息/助手回复/工具过程）已追加到 session，立即落盘，重启不丢
@@ -2147,6 +2245,13 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       emitTokenStats()
       // 管家转发队列：目标会话任务结束后，自动执行排队的下一条消息（queue 模式）
       drainSupervisorQueue(sid)
+      // 管家 loop 结束后，串行消费待管家决策队列（审批/提问接管）下一条
+      if (sid === SUPERVISOR_ID && !suspended) {
+        console.log('[supervisor-wake] 管家 loop 结束（finally），触发 drain，suspended=', suspended)
+        void drainSupervisorWake()
+      } else if (sid === SUPERVISOR_ID) {
+        console.log('[supervisor-wake] 管家 loop 结束但 suspended=true，不触发 drain')
+      }
     }
   }
 
@@ -2155,9 +2260,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   /** 管家专用系统提示词：定位为「主 Agent」，可查看/转发/配置所有用户会话 */
   const buildSupervisorSystemPrompt = (): string =>
     [
-      '你是「会话管家」，山海多会话系统的主 Agent。你负责监控和管理用户的所有会话，而不是替某个会话执行具体的编码/文件任务。',
+      '你是「会话管家」，山海多会话系统的主 Agent。你负责准确理解用户意图、把任务精准调度给合适的会话，并监控各会话状态，而不是替某个会话执行具体的编码/文件任务。',
       '你的能力：',
-      '1. 用 list_sessions 查看所有会话及其执行状态（谁在忙、当前需求、已执行步数、上下文占用、是否激活）。',
+      '1. 用 list_sessions 查看所有会话及其状态（标题、工作目录、当前需求、最近需求 recentRequests、是否忙、已执行步数、上下文占用、是否激活）。',
       '2. 用 inspect_session 深入查看某个会话的详情。',
       '3. 用 list_models 查看可选模型。',
       '4. 用 switch_session 切换管家当前聚焦的会话（仅管家视角，不影响用户聊天窗口显示的会话）。',
@@ -2167,6 +2272,20 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       '8. 用 choose_session 弹出会话选择器让用户选目标会话、choose_model 弹出模型选择器让用户选模型（阻塞等待用户选择，选中后拿到 id 再继续）。',
       '9. 用 ask_user 向用户提问：需要用户单选/多选、确认或补充信息时，可提供 options 让用户点选（multiple 为 true 时多选），或让用户自由输入；调用后必须等待用户回答再继续。',
       '10. 用插件类工具沉淀与扩展管家自身能力：plugin_inspect 查看可挂载 UI 插槽/可用工具/已注册服务/已安装插件；plugin_define 定义新插件（host 半是进程内源码、client 半是界面 UI 源码）；plugin_run 临时运行、plugin_stop / plugin_undefine 撤回；要长期沉淀走 plugin_define → plugin_test 自测 → plugin_install 安装进内核（落盘 ~/.shanhai/plugins/，跨会话/跨重启留存）→ plugin_uninstall 卸载。已安装插件重启后自动加载。',
+      '【调度决策流程】收到用户消息后，必须严格按以下五步执行，一步都不能省：',
+      '第一步 解析需求：把用户这条消息拆解成 1..N 个独立需求。判据：每个需求是一个「可以独立交给某个会话完成的任务单元」。一条消息含多个相互独立需求时必须拆开逐个处理；只含一个需求则 N=1。',
+      '第二步 匹配会话：对每个需求，用 list_sessions 查看所有会话的 title（职责）、workDir（工作目录）、recentRequests（最近在做什么）、currentRequest（当前在做什么）、busy 状态，判断该需求应交由哪个会话。综合会话标题体现的职责、工作目录、历史与当前需求来判断：能唯一确定 → 记下目标会话 id；不能唯一确定（有多个候选 / 无匹配 / 拿不准）→ 标记为「待确认」。',
+      '第三步 求助确认（不明确时强制，禁止臆测）：',
+      '  - 需求本身表述不清（缺「做什么 / 对哪个项目或目录 / 要什么结果」等关键信息）→ 先用 ask_user 追问清楚，禁止猜测后直接下发。',
+      '  - 需求明确但目标会话不明确 → 先 list_sessions 拿候选，再用 choose_session 弹选择器让用户选；候选为空则 ask_user 询问用户想用哪个会话或是否新建。',
+      '  - 一条消息含多个需求，部分明确部分不明确 → 明确的部分可先下发，不明确的部分单独求助，不能因一条不明确就整体卡住或整体瞎猜。',
+      '第四步 执行下发：对每个已明确的需求，用 send_message 把需求内容原样、完整地转发给目标会话（不要删减、不要替它做、不要把不同需求合并成一条），并逐一汇报「需求 X → 会话「标题」」的映射，让用户可核对。',
+      '第五步 汇报：用简洁清单向用户汇报：哪些需求已下发到哪个会话、哪些需求已求助待确认，做到每个需求都有明确去向，不留任何「我以为」。',
+      '【求助用户的形式】（务必遵守）：',
+      '- 需要用户做「选择」（选目标会话 / 选模型）→ 用 choose_session / choose_model 弹选择器，禁止用纯文本反问。',
+      '- 需要用户「补充信息 / 确认 / 回答开放问题」→ 用 ask_user 弹提问卡片（能枚举选项就给 options，multiple 按需多选；开放问题让用户自由输入）。',
+      '- 情况复杂、需要用户理解多步背景或给出详细说明 → 用回复正文详细说明情况并明确列出需要用户回答的问题，可同时配合 ask_user 收集关键确认项。',
+      '- 拿不准时宁可多问一次，绝不擅自替用户做决定（尤其涉及「把需求交给哪个会话、删除会话、切换模型」这类有歧义或不可逆的操作）。',
       '工作原则：',
       '- 用户问「有哪些会话在干活」「某个会话做到哪了」时，先 list_sessions / inspect_session 查询，如实汇报，不要编造。',
       '- 用户说「给会话X新增需求Y」时，用 send_message 转发，并说明转发结果。',
@@ -2182,9 +2301,19 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     const meta = sessions.get(sid)
     if (!meta || meta.isSupervisor) return null
     const events = meta.session.list()
-    // 当前需求 = 最后一条非注入用户消息
+    // 当前需求 = 最后一条非注入用户消息；同时收集最近若干条非注入用户消息（供管家判断会话职责）
     let currentRequest = ''
     let lastUserIdx = -1
+    const userRequests: string[] = []
+    for (const e of events) {
+      if (e?.type === 'user/message') {
+        const d = e.data as { content?: string; injected?: boolean }
+        if (!d.injected) {
+          const text = (d.content ?? '').trim()
+          if (text) userRequests.push(text)
+        }
+      }
+    }
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i]
       if (e?.type === 'user/message') {
@@ -2196,6 +2325,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         }
       }
     }
+    // 最近 3 条非注入用户消息（从旧到新），每条截断到 120 字，避免上下文膨胀
+    const recentRequests = userRequests.slice(-3).map((t) => (t.length > 120 ? t.slice(0, 120) + '…' : t))
     // 已执行步数 = 最后一个 turn/start 之后的 tool/call 数量
     let turnStartIdx = -1
     for (let i = 0; i < events.length; i++) {
@@ -2231,6 +2362,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       modelName: modelDef?.displayName ?? modelDef?.name ?? modelId,
       approvalPolicy: effectiveApprovalPolicy(events) ?? 'ask',
       currentRequest,
+      recentRequests,
       stepCount,
       contextLength: snap.contextLength,
       lastPrompt: snap.lastPrompt,
@@ -2422,6 +2554,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     message: string,
     mode: 'insert' | 'queue',
     onDone: (sid: string, title: string, result?: string, error?: string) => void,
+    origin: 'user' | 'supervisor' = 'user',
   ): Promise<{ ok: boolean; message: string; result?: string }> {
     const meta = sessions.get(sid)
     if (!meta || meta.isSupervisor) return Promise.resolve({ ok: false, message: `会话不存在: ${sid}` })
@@ -2459,7 +2592,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     userMessageCallbacks.forEach((cb) => cb(sid, content, turnSeq))
     void (async () => {
       try {
-        const result = await runInSession(sid, content, undefined, targetModelId)
+        const result = await runInSession(sid, content, undefined, targetModelId, origin)
         onDone(sid, title, result)
       } catch (err) {
         onDone(sid, title, undefined, err instanceof Error ? err.message : String(err))
@@ -2468,15 +2601,16 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     return Promise.resolve({ ok: true, message: `已向会话「${title}」(${sid}) 下发任务，将异步执行` })
   }
 
-  /** 向指定会话转发消息（管家工具用）：执行完成后通过 notifySupervisorResult 把正文结果回传管家窗口。 */
+  /** 向指定会话转发消息（管家工具用）：执行完成后通过 notifySupervisorResult 把正文结果回传管家窗口。
+   *  origin 固定为 'supervisor'：管家下发的任务触发的审批可被管家接管（受开关控制）。 */
   function sendMessageToSession(sid: string, message: string, mode: 'insert' | 'queue'): Promise<{ ok: boolean; message: string; result?: string }> {
-    return dispatchToSession(sid, message, mode, (sid, title, result, error) => notifySupervisorResult(sid, title, result, error))
+    return dispatchToSession(sid, message, mode, (sid, title, result, error) => notifySupervisorResult(sid, title, result, error), 'supervisor')
   }
 
   /** 向指定会话执行任务（手机远程控制用）：等同用户手动切到该会话发消息，但不回传管家结果（避免污染管家历史）。
-   *  手机端靠 onSessionActivity('end') + getSessionHistory 获取执行结果。 */
+   *  手机端靠 onSessionActivity('end') + getSessionHistory 获取执行结果。origin 默认 'user'（远程是用户侧操作，审批由用户在手机端点）。 */
   function runSession(sid: string, message: string, mode: 'insert' | 'queue' = 'insert'): Promise<{ ok: boolean; message: string; result?: string }> {
-    return dispatchToSession(sid, message, mode, () => {})
+    return dispatchToSession(sid, message, mode, () => {}, 'user')
   }
 
   /** 目标会话异步任务完成后，把正文结果回传管家：持久化到管家会话历史 + 广播事件通知管家窗口实时展示 */
@@ -2564,13 +2698,34 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
             sessionId: SUPERVISOR_ID,
           })
           .then((answer) => (answer === ASK_CANCELLED ? '' : answer)),
+      resolveApproval: (requestId, outcome) => {
+        const p = pendingApprovals.get(requestId)
+        if (!p) {
+          console.log('[supervisor-wake] resolve_approval 未命中：', requestId, 'pendingApprovals 现存=', [...pendingApprovals.keys()].join(','))
+          return { ok: false, message: `审批请求不存在或已处理: ${requestId}` }
+        }
+        p.resolve(outcome)
+        pendingApprovals.delete(requestId)
+        console.log('[supervisor-wake] resolve_approval 已决策：', requestId, outcome)
+        // 广播：UI 据此关闭对应弹窗（管家决策 = 替用户授权，决策后弹窗消失）
+        approvalResolvedCallbacks.forEach((cb) => cb(requestId))
+        return { ok: true, message: `已${outcome === 'rejected' ? '拒绝' : '批准'}审批请求 ${requestId}` }
+      },
+      answerAsk: (requestId, answer) => {
+        const resolved = askService.respond(requestId, answer)
+        if (!resolved) return { ok: false, message: `提问请求不存在或已处理: ${requestId}` }
+        // 广播：UI 据此关闭对应弹窗（管家代答 = 替用户回答，代答后弹窗消失）
+        askResolvedCallbacks.forEach((cb) => cb(requestId))
+        return { ok: true, message: `已代答提问 ${requestId}` }
+      },
     }).map(wrapTool),
   ]
 
   /** 管家执行入口：临时切管家会话模型/审批策略，单步 ReAct + 管家工具集，执行完还原 */
-  const runSupervisorInternal = async (message: string, attachments?: ContentPart[]): Promise<string> => {
+  const runSupervisorInternal = async (message: string, attachments?: ContentPart[], modelIdOverride?: string): Promise<string> => {
     const supMeta = sessions.get(SUPERVISOR_ID)
-    const supModel = supMeta ? effectiveModelId(supMeta.session.list()) : undefined
+    // modelIdOverride：resend/retry 等在截断后调用时，截断可能已删掉 model/select 事件，需显式传入截断前读到的持久化模型
+    const supModel = modelIdOverride ?? (supMeta ? effectiveModelId(supMeta.session.list()) : undefined)
     const targetModelId = supModel ?? defaultModelId
     const savedModelId = currentModelId
     if (targetModelId) applyModel(targetModelId)
@@ -2583,6 +2738,87 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       approval.setPolicy(sessionApprovalPolicy())
     }
   }
+
+  /** 串行消费待管家决策队列：管家空闲时逐条取出审批/提问 prompt，用独立 runSupervisorInternal 处理。
+   *  每个决策一个独立 loop，处理完（runInSession finally 会再次 drain）再取下一条，杜绝注入悬空导致的会话永久挂起。 */
+  async function drainSupervisorWake(): Promise<void> {
+    if (supervisorWaking) {
+      console.log('[supervisor-wake] drain 跳过：已有 drain 在跑（supervisorWaking=true），queue=', supervisorWakeQueue.length)
+      return
+    }
+    // 管家正忙（runningLoops 里有管家 loop）：不启动新 loop，避免 set 覆盖；等管家结束（runInSession finally）再 drain
+    if (runningLoops.has(SUPERVISOR_ID)) {
+      console.log('[supervisor-wake] drain 跳过：管家正忙（runningLoops 有 SUPERVISOR_ID），queue=', supervisorWakeQueue.length)
+      return
+    }
+    supervisorWaking = true
+    console.log('[supervisor-wake] drain 启动，queue=', supervisorWakeQueue.length)
+    try {
+      while (supervisorWakeQueue.length > 0 && !runningLoops.has(SUPERVISOR_ID)) {
+        const prompt = supervisorWakeQueue.shift()!
+        console.log('[supervisor-wake] 取出 prompt 开始处理，剩余 queue=', supervisorWakeQueue.length)
+        try {
+          await runSupervisorInternal(prompt)
+          console.log('[supervisor-wake] prompt 处理完成')
+        } catch (err) {
+          // 单个决策失败（如管家 LLM 调用失败）不中断整条队列，继续处理下一个审批/提问。
+          // 失败的那个审批/提问请求仍挂在 pendingApprovals / pending 里（弹窗照常显示），用户可手动决策兜底。
+          console.error('[supervisor-wake] 管家决策处理失败，继续处理队列下一条:', err instanceof Error ? err.message : err)
+        }
+      }
+      console.log('[supervisor-wake] while 退出：queue=', supervisorWakeQueue.length, 'runningLoops.has=', runningLoops.has(SUPERVISOR_ID))
+    } finally {
+      supervisorWaking = false
+      console.log('[supervisor-wake] drain 结束，supervisorWaking=false')
+    }
+  }
+
+  /** 唤醒管家决策审批：把审批请求注入管家会话，触发管家跑一轮，由管家调用 resolve_approval 工具决策。
+   *  管家空闲则异步执行；管家正忙则注入（在下一轮模型调用前生效，不打断当前管家动作）。 */
+  function wakeSupervisorForApproval(req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }): void {
+    const sid = req.sessionId ?? ''
+    const title = sid ? (sessions.get(sid)?.title ?? sid) : sid
+    const prompt =
+      `【审批请求】会话「${title}」请求执行工具 ${req.toolName}（风险等级 ${req.riskLevel}）。\n` +
+      `参数：${JSON.stringify(req.args)}\n\n` +
+      `请判断是否批准该操作，并调用 resolve_approval 工具决策：requestId="${req.id}"，outcome 取 allowed-once（批准）或 rejected（拒绝）。` +
+      `若风险过高或参数可疑请拒绝；不要替该会话执行具体操作。`
+    supervisorWakeQueue.push(prompt)
+    // 实时广播到管家窗口：审批请求 prompt 立即显示为管家窗口的 user 气泡（否则要等决策结束 onSessionActivity('end') 重建 items 才出现）
+    const supMeta = sessions.get(SUPERVISOR_ID)
+    const turnSeq = supMeta ? supMeta.session.list().filter((e) => e.type === 'user/message' && !(e.data as { injected?: boolean }).injected).length + 1 : 1
+    userMessageCallbacks.forEach((cb) => cb(SUPERVISOR_ID, prompt, turnSeq))
+    console.log('[supervisor-wake] 审批请求入队：', req.id, req.toolName, 'queue=', supervisorWakeQueue.length, 'supervisorWaking=', supervisorWaking, 'runningLoops.has=', runningLoops.has(SUPERVISOR_ID))
+    void drainSupervisorWake()
+  }
+
+  /** 唤醒管家代答提问：把提问注入管家会话，触发管家跑一轮，由管家调用 answer_ask 工具代答。
+   *  管家空闲则异步执行；管家正忙则注入（在下一轮模型调用前生效，不打断当前管家动作）。 */
+  function wakeSupervisorForAsk(req: AskRequest): void {
+    const sid = req.sessionId ?? ''
+    const title = sid ? (sessions.get(sid)?.title ?? sid) : sid
+    const optionsText = req.options && req.options.length > 0 ? `\n可选项：${req.options.map((o) => `「${o}」`).join(' / ')}` : ''
+    const prompt =
+      `【提问请求】会话「${title}」向你提问：${req.question}${optionsText}\n\n` +
+      `请以用户视角判断并回答该问题，调用 answer_ask 工具代答：requestId="${req.id}"，answer 填你的回答。` +
+      `有可选项时从可选项里选一个最合适的作为 answer；无选项时给出简短明确的文字回答。不要替该会话执行具体操作。`
+    supervisorWakeQueue.push(prompt)
+    // 实时广播到管家窗口：提问请求 prompt 立即显示为管家窗口的 user 气泡（否则要等决策结束 onSessionActivity('end') 重建 items 才出现）
+    const supMeta = sessions.get(SUPERVISOR_ID)
+    const turnSeq = supMeta ? supMeta.session.list().filter((e) => e.type === 'user/message' && !(e.data as { injected?: boolean }).injected).length + 1 : 1
+    userMessageCallbacks.forEach((cb) => cb(SUPERVISOR_ID, prompt, turnSeq))
+    console.log('[supervisor-wake] 提问请求入队：', req.id, 'queue=', supervisorWakeQueue.length, 'supervisorWaking=', supervisorWaking, 'runningLoops.has=', runningLoops.has(SUPERVISOR_ID))
+    void drainSupervisorWake()
+  }
+
+  // 提问接管：管家下发的任务里会话发起 ask_user 时，若「管家接管提问」开关开启，唤醒管家代答。
+  // 仅管家下发的任务触发（sessionOrigin==='supervisor'）；用户侧始终只走弹窗手动回答，弹窗照常显示、用户始终可手动点。
+  askService.onRequest((req) => {
+    const origin = req.sessionId ? (sessionOrigin.get(req.sessionId) ?? 'user') : 'user'
+    if (origin === 'supervisor' && currentSettings.supervisorAsk.enabled) {
+      void wakeSupervisorForAsk(req)
+    }
+  })
 
   return {
     kernel,
@@ -3014,6 +3250,14 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         pendingApprovals.delete(requestId)
       }
     },
+    onApprovalResolved(cb) {
+      approvalResolvedCallbacks.add(cb)
+      return () => approvalResolvedCallbacks.delete(cb)
+    },
+    onAskResolved(cb) {
+      askResolvedCallbacks.add(cb)
+      return () => askResolvedCallbacks.delete(cb)
+    },
     onAskRequest(cb) {
       return askService.onRequest(cb)
     },
@@ -3066,8 +3310,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       }
     },
 
-    getTokenStats() {
-      return snapshot()
+    getTokenStats(sessionId?: string) {
+      return snapshot(sessionId)
     },
     onTokenStats(cb) {
       tokenCallbacks.add(cb)
@@ -3110,6 +3354,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       const meta = sessions.get(sessionId)
       if (!meta) throw new Error(`会话不存在: ${sessionId}`)
       const events = meta.session.list()
+      // 截断前先取该会话持久化模型（model/select 可能位于被截断区，须先读取；管家会话模型同样持久化在其会话日志里）
+      const effModelId = effectiveModelId(events) ?? defaultModelId
       // 定位第 userMessageIndex 条用户消息（0 起），拿到原内容
       let userCount = 0
       let targetIdx = -1
@@ -3133,27 +3379,204 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       const content = newContent !== undefined ? newContent : originalContent
       // 截断到该用户消息之前（丢弃它及其后的回复/工具过程），重新生成
       meta.session.truncate(targetIdx)
-      return runInSession(sessionId, content)
+      // 管家会话：走管家入口（正确切换管家模型 + 管家审批策略 + 管家工具集），避免落到全局 currentModelId 错用普通会话模型
+      if (sessionId === SUPERVISOR_ID) {
+        return runSupervisorInternal(content, undefined, effModelId)
+      }
+      // 普通会话：显式用该会话持久化模型，避免依赖全局 currentModelId（后台/切走时可能不一致）
+      return runInSession(sessionId, content, undefined, effModelId)
     },
 
     resume: async (sessionId) => {
-      const meta = sessions.get(sessionId)
-      if (!meta) throw new Error(`会话不存在: ${sessionId}`)
+      const sid = sessionId
+      const meta = sessions.get(sid)
+      if (!meta) throw new Error(`会话不存在: ${sid}`)
       const events = meta.session.list()
+
+      // 判断最后一个未完成轮次是「单步 ReAct」还是「多专家编排」：多专家专家 Session 不持久化，无法恢复编排进度，降级重新拆解
+      let lastTurnMode: 'single' | 'multi' = 'single'
+      for (let i = events.length - 1; i >= 0; i--) {
+        if (events[i]?.type === 'turn/start') {
+          lastTurnMode = (events[i]!.data as { mode?: 'single' | 'multi' }).mode ?? 'single'
+          break
+        }
+      }
+      // 找最后一条非注入用户消息（多专家降级截断用 + 单步记忆检索用）
       let lastUserIdx = -1
+      let lastUserContent = ''
       for (let i = events.length - 1; i >= 0; i--) {
         if (events[i]?.type === 'user/message') {
-          const d = events[i]!.data as { injected?: boolean }
+          const d = events[i]!.data as { injected?: boolean; content: string }
           // 跳过注入消息（injected）：它们不产生独立轮次，不是可继续的「用户消息」
           if (d.injected) continue
           lastUserIdx = i
+          lastUserContent = d.content
           break
         }
       }
       if (lastUserIdx < 0) throw new Error('没有可继续的消息')
-      const content = (events[lastUserIdx]!.data as { content: string }).content
-      meta.session.truncate(lastUserIdx)
-      return runInSession(sessionId, content)
+
+      // 多专家编排：断点续跑——回放 plan + 已完成步骤结果，跳过已完成步骤、只重跑未完成步骤
+      if (lastTurnMode === 'multi') {
+        // 1. 从会话日志回放拆解计划 + 已完成步骤结果
+        let plan: TaskPlan | null = null
+        const completedResults = new Map<string, string>()
+        const completedSteps = new Set<string>()
+        let lastCompletedIdx = -1
+        for (let i = 0; i < events.length; i++) {
+          const e = events[i]
+          if (e?.type === 'orchestrator/plan') {
+            plan = (e.data as { plan: TaskPlan }).plan
+            lastCompletedIdx = i
+          } else if (e?.type === 'orchestrator/step') {
+            const d = e.data as { stepId: string; status: 'started' | 'completed' | 'failed'; result?: string }
+            if (d.status === 'completed') {
+              completedSteps.add(d.stepId)
+              if (d.result != null) completedResults.set(d.stepId, d.result)
+              lastCompletedIdx = i
+            }
+          }
+        }
+        // 无计划（异常，如旧版本日志）：降级为重新拆解执行
+        if (!plan || lastCompletedIdx < 0) {
+          meta.session.truncate(lastUserIdx)
+          return runInSession(sid, lastUserContent)
+        }
+        // 2. 截断主会话日志到最后一个 completed step 之后（清掉未完成 step 的 started + 部分工具事件）
+        meta.session.truncate(lastCompletedIdx + 1)
+
+        // 3. 重建专家 + Orchestrator，从 plan + 已完成结果继续（跳过已完成步骤）
+        stoppedSessions.delete(sid)
+        touchSession(sid)
+        const effModelId = effectiveModelId(events) ?? defaultModelId
+        const effModel = resolveProvider(effModelId)
+        const visionCapable = modelSupportsVision(allModels().find((m) => m.id === effModelId))
+        const expertAgents = buildExpertAgents(sid, visionCapable, effModelId, meta.session)
+        multiExpertLoops.set(sid, expertAgents)
+        sessionActivityCallbacks.forEach((cb) => cb(sid, 'start'))
+        let expertReasoning = ''
+        try {
+          const orchestrator = new Orchestrator(triage, expertAgents, {
+            sessionId: sid,
+            expertNames: roleNameById(),
+            expertSystemPrompts: buildExpertSystemPrompts(meta.workDir, lastUserContent),
+            onStep: (trace) => {
+              const turnSeq = meta.session.list().filter((e) => e.type === 'user/message').length
+              meta.session.append('orchestrator/step', { stepId: trace.stepId, expertId: trace.expertId, title: trace.title, status: trace.status, result: trace.result, error: trace.error })
+              expertTraceCallbacks.forEach((cb) => cb({ ...trace, turnSeq }))
+            },
+            onDelta: (text) => {
+              if (stoppedSessions.has(sid)) throw new Error('__stopped__')
+              deltaCallbacks.forEach((cb) => cb(sid, text))
+            },
+            onReasoning: (text) => {
+              expertReasoning += text
+              reasoningCallbacks.forEach((cb) => cb(sid, text))
+            },
+            summarize: async (task, steps, onDelta) => {
+              const parts = steps.map((s, i) => `${i + 1}. [${s.expert}] ${s.title}\n${s.result}`).join('\n\n')
+              const systemPrompt =
+                '你是「山海」的结果汇总器。下面是一次多专家协作任务中各位专家的执行结果，以及用户最初的问题。请把它们汇总成一段连贯、简洁、直接回答用户问题的最终结果：只输出最终答案本身，不要罗列专家名、不要复述执行过程、不要加分节标题（除非用户明确要求）。'
+              const userPrompt = `【用户的问题】\n${task}\n\n【各专家执行结果】\n${parts}`
+              const messages = [
+                { role: 'system' as const, content: systemPrompt },
+                { role: 'user' as const, content: userPrompt },
+              ]
+              let full = ''
+              try {
+                if (effModel.stream) {
+                  for await (const chunk of effModel.stream(messages, [])) {
+                    if (stoppedSessions.has(sid)) throw new Error('__stopped__')
+                    if (chunk.text) {
+                      full += chunk.text
+                      onDelta(chunk.text)
+                    }
+                  }
+                } else {
+                  const res = await effModel.complete(messages, [])
+                  full = res.text ?? ''
+                  if (full) onDelta(full)
+                }
+              } catch (err) {
+                if (err instanceof Error && (err.message === '__stopped__' || err.message.startsWith('__retry_exhausted__'))) throw err
+                console.error('[orchestrator] 汇总失败，回退拼接:', err instanceof Error ? err.message : err)
+                return ''
+              }
+              return full
+            },
+          })
+          const result = await sessionContext.run(sid, () => orchestrator.resume(lastUserContent, plan, completedResults, completedSteps))
+          meta.session.append('assistant/message', { content: result.text, reasoningContent: expertReasoning || undefined })
+          meta.session.append('turn/end', { turn: 1, text: result.text })
+          return result.text
+        } catch (err) {
+          // 用户再次停止：返回中断（历史仍保留，可再次续跑）
+          if (err instanceof Error && err.message === '__stopped__') {
+            return '（已中断，历史已保留，可点击「继续执行」续跑）'
+          }
+          // 重试耗尽：向上传播，前端弹窗让用户选择重试/取消
+          throw err
+        } finally {
+          multiExpertLoops.delete(sid)
+          sessionActivityCallbacks.forEach((cb) => cb(sid, 'end'))
+          meta.lastActiveAt = Date.now()
+          await persistSession(meta)
+          emitTokenStats()
+          drainSupervisorQueue(sid)
+        }
+      }
+
+      // 单步 ReAct：断点续跑——回放已执行历史（含完整工具回合），从断点继续，不清空已执行步骤
+      stoppedSessions.delete(sid)
+      touchSession(sid)
+      const isSupervisorRun = sid === SUPERVISOR_ID
+      const effModelId = effectiveModelId(events) ?? defaultModelId
+      const effModel = resolveProvider(effModelId)
+      const visionCapable = modelSupportsVision(allModels().find((m) => m.id === effModelId))
+      const loop = new AgentLoop(
+        effModel,
+        isSupervisorRun ? supervisorLoopTools : tools,
+        meta.session,
+        approval,
+        sid,
+        currentContextBudget(effModelId),
+        visionCapable,
+        currentApiKey(effModelId),
+      )
+      runningLoops.set(sid, loop)
+      sessionActivityCallbacks.forEach((cb) => cb(sid, 'start'))
+      let suspended = false
+      try {
+        return await sessionContext.run(sid, () =>
+          loop.resumeRun(
+            isSupervisorRun ? buildSupervisorSystemPrompt() : buildSystemPrompt(meta.workDir, buildMemoryContext(lastUserContent)),
+            (text) => {
+              if (stoppedSessions.has(sid)) throw new Error('__stopped__')
+              deltaCallbacks.forEach((cb) => cb(sid, text))
+            },
+            (text) => reasoningCallbacks.forEach((cb) => cb(sid, text)),
+          ),
+        )
+      } catch (err) {
+        // 用户再次停止：返回中断（历史仍保留，可再次续跑）
+        if (err instanceof Error && err.message === '__stopped__') {
+          return '（已中断，历史已保留，可点击「继续执行」续跑）'
+        }
+        // 重试耗尽：挂起，保留 loop 供重试弹窗 retry
+        if (err instanceof Error && err.message.startsWith('__retry_exhausted__')) {
+          suspended = true
+        }
+        throw err
+      } finally {
+        if (!suspended) {
+          runningLoops.delete(sid)
+          sessionActivityCallbacks.forEach((cb) => cb(sid, 'end'))
+        }
+        meta.lastActiveAt = Date.now()
+        await persistSession(meta)
+        emitTokenStats()
+        drainSupervisorQueue(sid)
+      }
     },
 
     retrySession: async (sessionId) => {
@@ -3178,8 +3601,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       // 无运行中 loop：优先从持久化快照恢复精确重试（重启后仍用失败节点相同的 body 重发），无快照才降级 resume
       const snapshot = readRetrySnapshot(meta)
       if (snapshot) {
-        const visionCapable = modelSupportsVision(allModels().find((m) => m.id === currentModelId))
-        const restoredLoop = new AgentLoop(model, tools, meta.session, approval, sid, currentContextBudget(), visionCapable, currentApiKey())
+        // 用该会话持久化模型 + 对应工具集（管家会话用 supervisorLoopTools），避免错用全局 currentModelId/tools
+        const isSupervisorRun = sid === SUPERVISOR_ID
+        const effModelId = effectiveModelId(meta.session.list()) ?? defaultModelId
+        const effModel = resolveProvider(effModelId)
+        const visionCapable = modelSupportsVision(allModels().find((m) => m.id === effModelId))
+        const restoredLoop = new AgentLoop(effModel, isSupervisorRun ? supervisorLoopTools : tools, meta.session, approval, sid, currentContextBudget(effModelId), visionCapable, currentApiKey(effModelId))
         restoredLoop.restoreSuspended(snapshot)
         runningLoops.set(sid, restoredLoop)
         try {
@@ -3214,8 +3641,13 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       }
       if (lastUserIdx < 0) throw new Error('没有可继续的消息')
       const content = (events[lastUserIdx]!.data as { content: string }).content
+      // 截断前取该会话持久化模型（model/select 可能位于被截断区）
+      const effModelId = effectiveModelId(events) ?? defaultModelId
       meta.session.truncate(lastUserIdx)
-      return runInSession(sid, content)
+      if (sid === SUPERVISOR_ID) {
+        return runSupervisorInternal(content, undefined, effModelId)
+      }
+      return runInSession(sid, content, undefined, effModelId)
     },
 
     abandonSession: async (sessionId) => {
@@ -3393,7 +3825,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
 
     getSettings() {
-      return { browser: { ...currentSettings.browser }, messageSubmit: { ...currentSettings.messageSubmit }, debug: { ...currentSettings.debug }, voice: { ...currentSettings.voice } }
+      return { browser: { ...currentSettings.browser }, messageSubmit: { ...currentSettings.messageSubmit }, debug: { ...currentSettings.debug }, voice: { ...currentSettings.voice }, supervisorApproval: { ...currentSettings.supervisorApproval }, supervisorAsk: { ...currentSettings.supervisorAsk } }
     },
 
     async getHttpTrace(id) {
@@ -3428,6 +3860,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         messageSubmit: { ...currentSettings.messageSubmit, ...(patch.messageSubmit ?? {}) },
         debug: { ...currentSettings.debug, ...(patch.debug ?? {}) },
         voice: { ...currentSettings.voice, ...(patch.voice ?? {}) },
+        supervisorApproval: { ...currentSettings.supervisorApproval, ...(patch.supervisorApproval ?? {}) },
+        supervisorAsk: { ...currentSettings.supervisorAsk, ...(patch.supervisorAsk ?? {}) },
       }
       // 实时同步到浏览器后端（影响后续新建窗口是否显示，已存在窗口不受影响）
       browserUse.setShowOnCreate?.(currentSettings.browser.showOnCreate)
@@ -3455,7 +3889,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         }
       }
       await writeSettings(currentSettings)
-      return { browser: { ...currentSettings.browser }, messageSubmit: { ...currentSettings.messageSubmit }, debug: { ...currentSettings.debug }, voice: { ...currentSettings.voice } }
+      return { browser: { ...currentSettings.browser }, messageSubmit: { ...currentSettings.messageSubmit }, debug: { ...currentSettings.debug }, voice: { ...currentSettings.voice }, supervisorApproval: { ...currentSettings.supervisorApproval }, supervisorAsk: { ...currentSettings.supervisorAsk } }
     },
   }
 }

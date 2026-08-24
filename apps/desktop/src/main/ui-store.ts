@@ -348,6 +348,12 @@ export function initUiStore(runtime: Runtime): void {
     mutate((s) => ({ ...s, askQueues: { ...s.askQueues, [sid]: [...(s.askQueues[sid] ?? []), req] } }))
   })
 
+  // 管家决策审批后，关闭对应弹窗（removeApprovalRequest 按 requestId 过滤所有会话队列）
+  runtime.onApprovalResolved((requestId) => removeApprovalRequest(requestId))
+
+  // 管家代答提问后，关闭对应弹窗（removeAskRequest 按 requestId 过滤所有会话队列）
+  runtime.onAskResolved((requestId) => removeAskRequest(requestId))
+
   // token 用量按会话隔离
   runtime.onTokenStats((sessionId, stats) => {
     mutate((s) => ({ ...s, tokenStatsBySession: { ...s.tokenStatsBySession, [sessionId]: stats } }))
@@ -375,7 +381,7 @@ export function initUiStore(runtime: Runtime): void {
     if (kind === 'start') {
       mutate((s) => ({
         ...s,
-        sessionMap: { ...s.sessionMap, [sessionId]: { ...(s.sessionMap[sessionId] ?? EMPTY_SESSION), busy: true } },
+        sessionMap: { ...s.sessionMap, [sessionId]: { ...(s.sessionMap[sessionId] ?? EMPTY_SESSION), busy: true, turnStartTs: Date.now() } },
         sessions: s.sessions.map((it) => (it.id === sessionId ? { ...it, busy: true } : it)),
       }))
       return
@@ -383,15 +389,19 @@ export function initUiStore(runtime: Runtime): void {
     try {
       const items = historyToChatItems(runtime.getSessionHistory(sessionId))
       const sessions = runtime.listSessions()
+      // 结束即同步「未完成轮次」状态：正常结束（已有 assistant/message + turn/end）时清除「继续执行」按钮，中断/挂起时保留。
+      // 统一用后端事件日志判定，覆盖用户手动、管家下发、远程控制等所有结束路径，避免依赖渲染进程 doRun 的 finally——
+      // 管家下发等后端异步路径不走 doRun，若不在此同步会残留上一次的 incompleteTurn，导致「正常结束后按钮仍显示」。
+      const incompleteTurn = runtime.hasIncompleteTurn(sessionId)
       mutate((s) => ({
         ...s,
         sessions,
-        sessionMap: { ...s.sessionMap, [sessionId]: { ...(s.sessionMap[sessionId] ?? EMPTY_SESSION), items, streaming: '', streamingReasoning: '', busy: false } },
+        sessionMap: { ...s.sessionMap, [sessionId]: { ...(s.sessionMap[sessionId] ?? EMPTY_SESSION), items, streaming: '', streamingReasoning: '', busy: false, incompleteTurn } },
       }))
       // 任务结束系统通知：仅「用户会话正常完成」时提醒。
       // 排除管家会话自身（短任务、常驻窗口可见）；中断/失败/重试耗尽等未完成场景（hasIncompleteTurn=true）不通知，
       // 它们分别由用户主动停止、错误弹窗 / 重试弹窗承接，无需系统提醒。
-      if (sessionId !== SUPERVISOR_ID && !runtime.hasIncompleteTurn(sessionId)) {
+      if (sessionId !== SUPERVISOR_ID && !incompleteTurn) {
         const meta = sessions.find((it) => it.id === sessionId)
         const lastAssistant = [...items].reverse().find((it) => it.kind === 'assistant')
         const summary = lastAssistant && lastAssistant.kind === 'assistant' ? lastAssistant.content : ''

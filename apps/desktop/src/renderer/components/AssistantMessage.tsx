@@ -6,7 +6,7 @@ import { MessageActions, copyAssistantAsImage } from './MessageActions'
 import { ReasoningBlock } from './ReasoningBlock'
 import { StepStats, ToolStep } from './ToolStep'
 import { ExpertTraces } from './ExpertTraces'
-import { makeMarkdownComponents } from './Markdown'
+import { makeMarkdownComponents, normalizeTreeBlocks } from './Markdown'
 import { copyText, formatDuration } from './ui'
 import type { ExpertTrace, ToolTrace } from '../types'
 
@@ -23,7 +23,7 @@ export function AssistantMessage({ content, reasoningContent, toolSteps, expertT
     <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
       <div
         ref={bubbleRef}
-        style={{ maxWidth: '85%', padding: '10px 14px', borderRadius: 16, borderTopLeftRadius: 4, background: 'var(--bg-panel)', boxShadow: '0 1px 2px rgba(0,0,0,0.06)', fontSize: 14, lineHeight: 1.65, color: 'var(--text)', overflowWrap: 'break-word', wordBreak: 'break-word', userSelect: 'text', WebkitUserSelect: 'text' }}
+        style={{ maxWidth: '85%', minWidth: 0, padding: '10px 14px', borderRadius: 16, borderTopLeftRadius: 4, background: 'var(--bg-panel)', boxShadow: '0 1px 2px rgba(0,0,0,0.06)', fontSize: 14, lineHeight: 1.65, color: 'var(--text)', overflowWrap: 'anywhere', wordBreak: 'break-word', userSelect: 'text', WebkitUserSelect: 'text' }}
       >
         {(turnDuration != null || hasTools) && (
           <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 6 }}>
@@ -41,9 +41,9 @@ export function AssistantMessage({ content, reasoningContent, toolSteps, expertT
         {hasExperts && <ExpertTraces traces={experts} />}
         {hasReasoning && <ReasoningBlock content={reasoningContent} />}
         {content && (
-          <div ref={contentRef} style={{ marginTop: hasTools || hasExperts ? 6 : 0 }}>
+          <div ref={contentRef} style={{ marginTop: hasTools || hasExperts ? 6 : 0, minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
             <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents(onPreviewImage)}>
-              {content}
+              {normalizeTreeBlocks(content)}
             </ReactMarkdown>
           </div>
         )}

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { IconActivity, IconWrench } from './icons'
-import { makeMarkdownComponents } from './Markdown'
+import { makeMarkdownComponents, normalizeTreeBlocks } from './Markdown'
 import { TOOL_META, toolSummary, renderToolResult } from './ToolStep'
 import { ThinkingDots } from './ui'
 import { WindowTitleBar } from './WindowTitleBar'
@@ -113,7 +113,7 @@ function TraceRow({ m, index, callMap }: { m: TraceEntry; index: number; callMap
           <div style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 320, overflowY: 'auto', fontFamily: 'system-ui, sans-serif' }}>
             {m.role === 'assistant' && !m.toolCalls ? (
               <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents(() => undefined)}>
-                {m.content}
+                {normalizeTreeBlocks(m.content)}
               </ReactMarkdown>
             ) : (
               m.content

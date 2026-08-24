@@ -24,7 +24,7 @@ export function CodeBlock({ children }: { children?: React.ReactNode }) {
       >
         {copied ? '✓ 已复制' : '复制'}
       </button>
-      <pre style={{ background: '#282c34', color: '#abb2bf', padding: '12px 12px 12px 12px', borderRadius: 8, overflowX: 'auto', fontSize: 13, lineHeight: 1.55, margin: 0 }}>
+      <pre style={{ background: '#282c34', color: '#abb2bf', padding: '12px 12px 12px 12px', borderRadius: 8, overflowX: 'auto', maxWidth: '100%', boxSizing: 'border-box', whiteSpace: 'pre', fontSize: 13, lineHeight: 1.55, margin: 0 }}>
         <code style={{ fontFamily: 'ui-monospace, monospace' }}>{children}</code>
       </pre>
     </div>
@@ -151,15 +151,144 @@ function MarkdownImage(props: { src?: string; alt?: string }): React.JSX.Element
   )
 }
 
+/** 表格外层：加横向滚动容器，宽表格不会被气泡 maxWidth 挤压换行 */
+function MarkdownTable(props: { children?: React.ReactNode }): React.JSX.Element {
+  return (
+    <div style={{ overflowX: 'auto', margin: '10px 0' }}>
+      <table style={{ borderCollapse: 'collapse', fontSize: 13, minWidth: '100%', width: '100%' }}>{props.children}</table>
+    </div>
+  )
+}
+
+/** 表头单元格：背景底色 + 边框 + 加粗左对齐，与普通单元格形成视觉区分 */
+function MarkdownTh(props: { children?: React.ReactNode }): React.JSX.Element {
+  return (
+    <th
+      style={{
+        border: '1px solid var(--border-strong)',
+        background: 'var(--bg-hover)',
+        padding: '6px 12px',
+        textAlign: 'left',
+        fontWeight: 600,
+        color: 'var(--text)',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {props.children}
+    </th>
+  )
+}
+
+/** 表格单元格：边框 + 内边距 + 顶部对齐 */
+function MarkdownTd(props: { children?: React.ReactNode }): React.JSX.Element {
+  return (
+    <td
+      style={{
+        border: '1px solid var(--border-strong)',
+        padding: '6px 12px',
+        color: 'var(--text)',
+        verticalAlign: 'top',
+      }}
+    >
+      {props.children}
+    </td>
+  )
+}
+
 /** 稳定引用的 components（模块级只创建一次），避免每次 render 新建组件导致代码块/Mermaid 图表子树重挂载（输入时闪屏的根因） */
 const MARKDOWN_COMPONENTS = {
   code: MarkdownCode,
   a: MarkdownLink,
   img: MarkdownImage,
+  table: MarkdownTable,
+  th: MarkdownTh,
+  td: MarkdownTd,
 }
 
 /** 生成 react-markdown 的 components 配置（代码块高亮 / mermaid 图表 / 行内代码 / 链接 / 图片宽度限制） */
 export function makeMarkdownComponents(onImageClick?: (url: string) => void) {
   latestImageClick = onImageClick
   return MARKDOWN_COMPONENTS
+}
+
+/** 树结构 / 目录树 / 框线图用到的 box-drawing 字符（U+2500 系列），用于识别「未用代码块包裹的等宽树形文本」 */
+const TREE_CHARS = new Set('─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬')
+
+function hasTreeChar(line: string): boolean {
+  for (const ch of line) {
+    if (TREE_CHARS.has(ch)) return true
+  }
+  return false
+}
+
+/**
+ * 把「未包裹在代码块里的树结构 / 框线图段落」自动转成围栏代码块。
+ * 根因：Markdown 会把段内的单个换行折叠成空格，导致树结构多行挤成一行、超长溢出气泡；
+ * 树结构需要等宽字体 + 保留换行（+ 必要时横向滚动）才能正确显示，因此转成代码块交给 CodeBlock。
+ * 规则：
+ * - 只处理围栏代码块（``` / ~~~）之外的行，围栏内的内容原样保留；
+ * - 连续 ≥2 个含 box-drawing 字符的行（允许中间夹空行）视为一个树块，包裹成 ``` 代码块；
+ * - 单个含 box-drawing 字符的行不作为树块处理（避免误伤 markdown 分隔线等）。
+ */
+export function normalizeTreeBlocks(markdown: string): string {
+  if (!markdown) return markdown
+  const lines = markdown.split('\n')
+  const out: string[] = []
+  let i = 0
+  let fenceOpen = false
+  let fenceChar = ''
+
+  // noUncheckedIndexedAccess 下 lines[idx] 为 string | undefined，统一兜底为 ''（i 恒 < length，实际不会命中）
+  const lineAt = (idx: number): string => lines[idx] ?? ''
+
+  while (i < lines.length) {
+    const line = lineAt(i)
+
+    if (fenceOpen) {
+      out.push(line)
+      const t = line.trimStart()
+      if (fenceChar === '`' ? t.startsWith('```') : t.startsWith('~~~')) fenceOpen = false
+      i++
+      continue
+    }
+
+    const openMatch = /^\s*(```+|~~~+)/.exec(line)
+    if (openMatch && openMatch[1]) {
+      fenceOpen = true
+      fenceChar = openMatch[1].charAt(0)
+      out.push(line)
+      i++
+      continue
+    }
+
+    if (hasTreeChar(line.trimStart())) {
+      const block: string[] = []
+      let j = i
+      while (j < lines.length) {
+        const l = lineAt(j)
+        if (hasTreeChar(l.trimStart())) {
+          block.push(l)
+          j++
+        } else if (l.trim() === '' && j + 1 < lines.length && hasTreeChar(lineAt(j + 1).trimStart())) {
+          block.push(l)
+          j++
+        } else {
+          break
+        }
+      }
+      const nonEmpty = block.filter((l) => l.trim() !== '')
+      if (nonEmpty.length >= 2) {
+        out.push('```')
+        out.push(...block)
+        out.push('```')
+        i = j
+        continue
+      }
+    }
+
+    out.push(line)
+    i++
+  }
+
+  return out.join('\n')
 }

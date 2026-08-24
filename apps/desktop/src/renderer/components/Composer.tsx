@@ -29,9 +29,11 @@ export interface ComposerProps {
   selectedModel: string
   loggedIn: boolean
   selectModel: (id: string) => void
-  workDir: string
-  workDirName: string
-  pickWorkdir: () => Promise<void>
+  workDir?: string
+  workDirName?: string
+  pickWorkdir?: () => Promise<void>
+  /** 是否显示「工作目录」按钮：管家窗口无工作目录概念，传 false 隐藏 */
+  showWorkdir?: boolean
   approvalMenuRef: React.RefObject<HTMLDivElement>
   approvalMenuOpen: boolean
   setApprovalMenuOpen: React.Dispatch<React.SetStateAction<boolean>>
@@ -127,10 +129,16 @@ export function Composer(p: ComposerProps): React.JSX.Element {
             p.isComposingRef.current = true
           }}
           onCompositionEnd={() => {
-            p.isComposingRef.current = false
+            // macOS 等平台的原生输入法在按回车确认候选词时，compositionend 会先于紧随的
+            // keydown(Enter) 触发；若立即置 false，那个「选词回车」会被误判成发送。
+            // 延迟到下一个宏任务再清除，确保选词回车被拦截、不触发发送。
+            setTimeout(() => {
+              p.isComposingRef.current = false
+            }, 0)
           }}
           onKeyDown={(e) => {
-            const composing = p.isComposingRef.current || e.nativeEvent.isComposing
+            // keyCode 229 = 该按键正在被 IME 处理（组合中），不应触发发送
+            const composing = p.isComposingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229
             if (e.key === 'Enter' && !e.shiftKey && !composing) {
               e.preventDefault()
               void p.send()
@@ -224,14 +232,16 @@ export function Composer(p: ComposerProps): React.JSX.Element {
                 </div>
               )}
             </div>
-            <button
-              onClick={() => void p.pickWorkdir()}
-              title={`工作目录：${p.workDir || '未设置'}（点击选择目录）`}
-              style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid var(--border-strong)', fontSize: 12, color: 'var(--text-secondary)', background: 'var(--bg-panel)', outline: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: 150 }}
-            >
-              <IconFolder />
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.workDirName}</span>
-            </button>
+            {p.showWorkdir !== false && (
+              <button
+                onClick={() => void p.pickWorkdir?.()}
+                title={`工作目录：${p.workDir || '未设置'}（点击选择目录）`}
+                style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid var(--border-strong)', fontSize: 12, color: 'var(--text-secondary)', background: 'var(--bg-panel)', outline: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: 150 }}
+              >
+                <IconFolder />
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.workDirName ?? '选择目录'}</span>
+              </button>
+            )}
             <div ref={p.approvalMenuRef} style={{ position: 'relative' }}>
               <button
                 onClick={() => p.setApprovalMenuOpen((v) => !v)}

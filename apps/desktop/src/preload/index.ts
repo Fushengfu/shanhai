@@ -283,7 +283,7 @@ export interface ShanhaiBridge {
   speak(text: string): Promise<void>
   transcribeAudio(audioBase64: string, format?: string): Promise<string>
   // token 用量（会话级）
-  getTokenStats(): Promise<TokenSnapshot>
+  getTokenStats(sessionId?: string): Promise<TokenSnapshot>
   onTokenStats(cb: (sessionId: string, stats: TokenSnapshot) => void): () => void
   // 自修改（K5）
   selfmodInspect(sessionId?: string): Promise<unknown>
@@ -502,7 +502,7 @@ const bridge: ShanhaiBridge = {
   stop: () => ipcRenderer.invoke('chat:stop'),
   speak: (text) => ipcRenderer.invoke('voice:speak', text),
   transcribeAudio: (audioBase64, format) => ipcRenderer.invoke('voice:transcribe', audioBase64, format),
-  getTokenStats: () => ipcRenderer.invoke('token:stats'),
+  getTokenStats: (sessionId) => ipcRenderer.invoke('token:stats', sessionId),
   onTokenStats: (cb) => {
     const listener = (_e: unknown, sessionId: string, stats: TokenSnapshot) => cb(sessionId, stats)
     ipcRenderer.on('token:stats', listener)

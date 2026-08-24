@@ -118,7 +118,7 @@ function RadioGroup({
 
 /** 设置面板：配置通用设置（浏览器窗口显示等），持久化到 config.json，跨会话、重启保留。侧滑铺满主区域 */
 export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?: number; top?: number; onClose?: () => void; variant?: 'panel' | 'window' }) {
-  const [settings, setSettings] = useState<AppSettings>({ browser: { showOnCreate: true, enableWebBridge: true }, messageSubmit: { mode: 'queue' }, debug: { traceLlm: false }, voice: { enabled: false } })
+  const [settings, setSettings] = useState<AppSettings>({ browser: { showOnCreate: true, enableWebBridge: true }, messageSubmit: { mode: 'queue' }, debug: { traceLlm: false }, voice: { enabled: false }, supervisorApproval: { enabled: false }, supervisorAsk: { enabled: false } })
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [httpTraces, setHttpTraces] = useState<HttpTraceRecord[]>([])
@@ -313,6 +313,21 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                 description="开启后，每次任务执行完、输出正文时会用系统语音（macOS say）朗读结果，同时聊天窗口显示 3D AI 特效（超长正文截断到约 500 字）。默认开启。"
                 checked={settings.voice.enabled}
                 onChange={(v) => void update({ voice: { enabled: v } })}
+              />
+              <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', margin: '18px 0 6px', textTransform: 'uppercase', letterSpacing: 0.5, borderLeft: '3px solid var(--accent)', paddingLeft: 8 }}>
+                管家
+              </div>
+              <ToggleRow
+                label="管家接管审批"
+                description="开启后，会话管家下发的任务触发的授权确认，由管家代替你决策（管家决策后弹窗自动关闭）；你自己发起的任务仍由你手动点击授权，弹窗始终显示、你始终可以手动点。默认关闭。"
+                checked={settings.supervisorApproval.enabled}
+                onChange={(v) => void update({ supervisorApproval: { enabled: v } })}
+              />
+              <ToggleRow
+                label="管家接管提问"
+                description="开启后，会话管家下发的任务里会话发起的提问（ask_user），由管家代替你回答（管家代答后弹窗自动关闭）；你自己发起的任务仍由你手动回答，弹窗始终显示、你始终可以手动点。默认关闭。"
+                checked={settings.supervisorAsk.enabled}
+                onChange={(v) => void update({ supervisorAsk: { enabled: v } })}
               />
               <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', margin: '18px 0 6px', textTransform: 'uppercase', letterSpacing: 0.5, borderLeft: '3px solid var(--accent)', paddingLeft: 8 }}>
                 DeepSeek 网页版

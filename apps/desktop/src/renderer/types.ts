@@ -223,6 +223,14 @@ export interface AppSettings {
     /** 任务执行完、输出正文时是否自动语音播报 */
     enabled: boolean
   }
+  supervisorApproval: {
+    /** 是否允许管家接管审批：true 时管家下发的任务触发的审批由管家决策（决策后弹窗关闭） */
+    enabled: boolean
+  }
+  supervisorAsk: {
+    /** 是否允许管家接管提问：true 时管家下发的任务里会话发起的 ask_user 提问由管家代答（代答后弹窗关闭） */
+    enabled: boolean
+  }
 }
 
 /** 设置补丁：允许只传某个分组的某个字段（嵌套 Partial） */
@@ -231,6 +239,8 @@ export type AppSettingsPatch = {
   messageSubmit?: Partial<AppSettings['messageSubmit']>
   debug?: Partial<AppSettings['debug']>
   voice?: Partial<AppSettings['voice']>
+  supervisorApproval?: Partial<AppSettings['supervisorApproval']>
+  supervisorAsk?: Partial<AppSettings['supervisorAsk']>
 }
 
 /** 一条 HTTP 原始请求/响应记录（排查问题用：请求一条、响应一条，含接口地址与完整 body） */
@@ -375,7 +385,7 @@ declare global {
       stop(): Promise<void>
       speak(text: string): Promise<void>
       transcribeAudio(audioBase64: string, format?: string): Promise<string>
-      getTokenStats(): Promise<TokenSnapshot>
+      getTokenStats(sessionId?: string): Promise<TokenSnapshot>
       onTokenStats(cb: (sessionId: string, stats: TokenSnapshot) => void): () => void
       selfmodInspect(sessionId?: string): Promise<unknown>
       onClientRunRequest(cb: (req: ClientRunRequest) => void): () => void

@@ -811,23 +811,12 @@ export function App() {
     })
   }
 
-  /** 继续执行：把最后一条未完成的用户消息重新生成（断点恢复） */
+  /** 继续执行：断点续跑——保留已执行步骤，从断点继续（后端从会话日志回放恢复，不清空历史） */
   function resumeMessage(): void {
     const sid = currentSessionId
     if (!sid) return
-    // 立即截断：保留到最后一条用户消息（含），移除其后的中断残留（半截工具步骤/流式），重新生成
-    patchSession(sid, (s) => {
-      let lastUserAt = -1
-      for (let i = s.items.length - 1; i >= 0; i--) {
-        const it = s.items[i]
-        if (it?.kind === 'user') {
-          lastUserAt = i
-          break
-        }
-      }
-      const items = lastUserAt >= 0 ? s.items.slice(0, lastUserAt + 1) : s.items
-      return { items, busy: true, streaming: '', streamingReasoning: '', turnStartTs: Date.now() }
-    })
+    // 不截断 items：已执行的工具步骤/回复保持不变，仅置 busy 等待断点续跑
+    patchSession(sid, (s) => ({ busy: true, streaming: '', streamingReasoning: '', turnStartTs: Date.now() }))
     void window.shanhai?.resume(sid).then((result) => {
       void reloadSessionItems(sid, result)
     }).catch((err) => {

@@ -197,6 +197,8 @@ function showWindow(win: BrowserWindow | undefined): void {
   if (win.isMinimized()) win.restore()
   win.show()
   win.focus()
+  // 任意窗口 show 后，macOS 可能把全屏桌面壳 raise 到最前并盖住其它窗口，立即把桌面压回背景层
+  keepDesktopAtBottom()
 }
 
 /** 显示聊天窗口（聊天窗口是常驻主窗口，销毁则重建） */
@@ -269,25 +271,26 @@ export function hideChatWindow(): void {
 }
 
 /**
- * 把聊天窗口与所有「非桌面」窗口带回桌面之上（桌面壳被点击提升 z-order 后兜底恢复）。
- * macOS 点击任何窗口都会把它提升到最前（z-order），focusable:false 也拦不住；桌面是全屏窗口，
- * 一旦被点击就会盖住聊天窗口。这里在桌面被点击（渲染进程 mousedown）时调用，把 dock/app/chat 移回桌面之上。
- * - dock / app 窗口只 moveTop()（回到桌面之上，但不抢焦点，避免打断用户）
- * - 聊天窗口 show + focus（聊天是主交互窗口，点壁纸后理应回到可输入状态）
+ * 把桌面壳窗口压回最底：将所有可见的「非桌面」窗口 moveTop()（提升 z-order），但不抢焦点。
+ * macOS 上任意窗口 show()/focus() 都可能把全屏桌面壳 raise 到最前并盖住其它窗口，
+ * 因此在所有「窗口出现」路径（showWindow）统一调用，确保桌面壳始终待在背景层。
  */
-export function restoreAboveDesktop(): void {
+export function keepDesktopAtBottom(): void {
   for (const meta of windows.values()) {
     if (meta.type === 'desktop') continue
     if (meta.win.isDestroyed() || !meta.win.isVisible()) continue
     meta.win.moveTop()
   }
-  const chat = findWindow('chat')
-  if (chat && !chat.win.isDestroyed()) {
-    if (chat.win.isMinimized()) chat.win.restore()
-    chat.win.show()
-    chat.win.moveTop()
-    chat.win.focus()
-  }
+}
+
+/**
+ * 把桌面壳窗口压回最底（点击壁纸 / Dock 空隙 / 关闭 app 后兜底恢复）。
+ * macOS 点击任何窗口都会把它提升到最前（z-order），focusable:false 也拦不住；桌面是全屏窗口，
+ * 一旦被点击就会盖住其它窗口。这里把所有「非桌面」可见窗口 moveTop() 移回桌面之上，
+ * 但不抢焦点、也不强制唤起聊天窗口（聊天窗口是否显示由用户通过 Dock 入口 / 快捷键决定）。
+ */
+export function restoreAboveDesktop(): void {
+  keepDesktopAtBottom()
 }
 
 /**
@@ -308,9 +311,14 @@ export function resizeDockWindow(width: number, height: number): void {
   })
 }
 
-/** 最小化窗口（自定义标题栏按钮用，按发起窗口定位） */
+/** 最小化窗口（自定义标题栏按钮用，按发起窗口定位）。聊天窗口的最小化 = 隐藏（与关闭一致，常驻窗口不缩到系统 Dock），app 类窗口走系统最小化。 */
 export function minimizeWindow(win: BrowserWindow | null | undefined): void {
-  if (win && !win.isDestroyed()) win.minimize()
+  if (!win || win.isDestroyed()) return
+  if (getWindowType(win) === 'chat') {
+    win.hide()
+    return
+  }
+  win.minimize()
 }
 
 /** 切换窗口最大化/还原（自定义标题栏按钮用，按发起窗口定位），返回操作后的最大化状态 */
@@ -339,6 +347,11 @@ export async function openApp(appId: string): Promise<boolean> {
   // 会话管家是独立常驻窗口（非 app 类型），Dock 图标点击转发到 supervisor 窗口
   if (appId === 'supervisor') {
     showSupervisorWindow()
+    return true
+  }
+  // 聊天窗口是常驻主窗口（非 app 类型），Dock 图标点击转发到聊天窗口
+  if (appId === 'chat') {
+    showChatWindow()
     return true
   }
   const existing = findWindow('app', appId)

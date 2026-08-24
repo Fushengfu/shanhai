@@ -13,6 +13,7 @@ import { AskCard } from '../components/AskCard'
 import { SessionPicker } from '../components/SessionPicker'
 import { ModelPicker } from '../components/ModelPicker'
 import { Composer } from '../components/Composer'
+import { TokenStatusBar } from '../components/TokenStatusBar'
 import { IconMonitor, IconWarn } from '../components/icons'
 import { btn, formatBytes, prettyValue, readFileAsDataUrl, LiveDuration, ThinkingDots } from '../components/ui'
 import { useThemeSync } from '../theme'
@@ -158,7 +159,6 @@ export function SupervisorApp(): React.JSX.Element {
   const [voiceNotice, setVoiceNotice] = useState('')
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
   const [approvalMenuOpen, setApprovalMenuOpen] = useState(false)
-  const [workDir, setWorkDir] = useState('')
   const [isSpeaking, setIsSpeaking] = useState(false)
   /** 管家自己的模型 / 安全模式（supervisor 会话级，独立于其他会话与全局） */
   const [supervisorModel, setSupervisorModel] = useState('')
@@ -172,8 +172,6 @@ export function SupervisorApp(): React.JSX.Element {
   const listRef = useRef<HTMLDivElement>(null)
   const atBottomRef = useRef(true)
 
-  const workDirName = workDir ? (workDir.split(/[\\/]/).filter(Boolean).pop() ?? '工作目录') : '选择目录'
-
   // 主题：订阅主进程广播，跟随聊天窗口切换（亮/暗实时同步）
   useThemeSync()
 
@@ -184,9 +182,10 @@ export function SupervisorApp(): React.JSX.Element {
     void api.getSupervisorHistory().then((history) => {
       patchSession({ items: historyToItems(history) })
     })
-    void api.getSessionWorkdir(SUPERVISOR_SID).then((wd) => setWorkDir(wd)).catch(() => undefined)
     void api.supervisorGetModel().then((m) => setSupervisorModel(m)).catch(() => undefined)
     void api.supervisorGetApproval().then((p) => setSupervisorApproval(p)).catch(() => undefined)
+    // 管家会话 token 用量：主动拉取初始累计值（累计值从 supervisor 会话事件日志恢复），后续由 onTokenStats 广播实时更新
+    void api.getTokenStats(SUPERVISOR_SID).then((s) => patchUiStore({ tokenStatsBySession: { [SUPERVISOR_SID]: s } })).catch(() => undefined)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -405,14 +404,6 @@ export function SupervisorApp(): React.JSX.Element {
       console.error('麦克风不可用或录音失败', err)
       setRecording(false)
     }
-  }
-
-  async function pickWorkdir(): Promise<void> {
-    const current = workDir || undefined
-    const picked = await window.shanhai?.selectDirectory(current)
-    if (!picked) return
-    await window.shanhai?.setSessionWorkdir(SUPERVISOR_SID, picked)
-    setWorkDir(picked)
   }
 
   /** 切换管家自己的模型：只影响 supervisor 会话，不碰全局默认模型、不碰其他会话 */
@@ -762,9 +753,7 @@ export function SupervisorApp(): React.JSX.Element {
         selectedModel={supervisorModel || ui.selectedModel}
         loggedIn={ui.loggedIn}
         selectModel={selectModel}
-        workDir={workDir}
-        workDirName={workDirName}
-        pickWorkdir={pickWorkdir}
+        showWorkdir={false}
         approvalMenuRef={approvalMenuRef}
         approvalMenuOpen={approvalMenuOpen}
         setApprovalMenuOpen={setApprovalMenuOpen}
@@ -776,6 +765,9 @@ export function SupervisorApp(): React.JSX.Element {
         send={send}
         stopSend={stopSend}
       />
+
+      {/* token 用量状态栏：与聊天窗口一致（累计 / 本轮 / 缓存命中 / 轮次 / 上下文占比），数据源为管家会话（supervisor） */}
+      <TokenStatusBar stats={ui.tokenStatsBySession[SUPERVISOR_SID] ?? null} />
 
       {/* 审批弹窗（管家会话的工具审批） */}
       {curApproval && (

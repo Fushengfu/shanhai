@@ -97,13 +97,15 @@ export class AskService {
     return () => this.listeners.delete(cb)
   }
 
-  /** 用户提交回答（resolve 对应提问） */
-  respond(id: string, answer: string): void {
+  /** 用户提交回答（resolve 对应提问），返回是否找到并 resolve 了该提问（供管家代答判断提问是否存在） */
+  respond(id: string, answer: string): boolean {
     const p = this.pending.get(id)
     if (p) {
       p.resolve(answer)
       this.pending.delete(id)
+      return true
     }
+    return false
   }
 
   /** 用户取消回答/选择（resolve 为 ASK_CANCELLED 标记，工具据此返回「用户取消」） */

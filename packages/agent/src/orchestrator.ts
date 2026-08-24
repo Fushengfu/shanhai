@@ -53,12 +53,25 @@ export interface OrchestratorOptions {
   onDelta?: (text: string) => void
   /** 专家流式思考增量回调 */
   onReasoning?: (text: string) => void
+  /**
+   * 汇总器：多步骤（>1）全部执行完后，把各步骤结果汇总成「针对用户任务的最终回答」。
+   * 提供时最终正文 = 汇总结果（onDelta 回调接收汇总流式增量）；不提供时最终正文 = 各步骤结果拼接（现状）。
+   */
+  summarize?: (task: string, steps: SummarizedStep[], onDelta: (text: string) => void) => Promise<string>
+}
+
+/** 汇总器入参：单个专家步骤的产出（专家名 + 步骤标题 + 步骤结果） */
+export interface SummarizedStep {
+  expert: string
+  title: string
+  result: string
 }
 
 /**
  * 多专家编排：按依赖图调度（无依赖并行、有依赖串行）。
  *
  * 拓扑调度：每轮找出依赖已满足的步骤并行执行，直到全部完成。
+ * 断点续跑：resume 从已持久化的 plan + 已完成步骤结果继续，跳过已完成步骤、只跑未完成步骤。
  */
 export class Orchestrator {
   constructor(
@@ -69,9 +82,24 @@ export class Orchestrator {
 
   async run(task: string): Promise<RunResult> {
     const plan = await this.triage.route(task)
-    const results = new Map<string, string>()
-    const completed = new Set<string>()
-    const pending = [...plan.steps]
+    return this.runFromPlan(task, plan, new Map(), new Set())
+  }
+
+  /**
+   * 断点续跑：从已持久化的拆解计划 + 已完成步骤结果继续，跳过已完成步骤、只跑未完成步骤。
+   * 运行时层从会话事件日志回放 plan（orchestrator/plan）+ 已完成步骤结果（orchestrator/step completed）后传入。
+   */
+  async resume(task: string, plan: TaskPlan, results: Map<string, string>, completed: Set<string>): Promise<RunResult> {
+    return this.runFromPlan(task, plan, results, completed)
+  }
+
+  private async runFromPlan(
+    task: string,
+    plan: TaskPlan,
+    results: Map<string, string>,
+    completed: Set<string>,
+  ): Promise<RunResult> {
+    const pending = plan.steps.filter((s) => !completed.has(s.id))
     const expertName = (id: string): string => this.options.expertNames?.get(id) ?? id
     const emit = (step: TaskStep, status: StepTrace['status'], extra?: Partial<StepTrace>): void => {
       this.options.onStep?.({ sessionId: this.options.sessionId, stepId: step.id, expertId: step.expertId, expertName: expertName(step.expertId), title: step.title, status, ...extra })
@@ -102,10 +130,21 @@ export class Orchestrator {
       )
     }
 
-    const text = plan.steps
-      .map((s) => `【${expertName(s.expertId)}】${s.title}\n${results.get(s.id) ?? ''}`)
-      .filter((line) => line.trim() !== '')
-      .join('\n\n')
+    const stepOutputs: SummarizedStep[] = plan.steps
+      .map((s) => ({ expert: expertName(s.expertId), title: s.title, result: results.get(s.id) ?? '' }))
+      .filter((o) => o.result.trim() !== '')
+
+    // 多步骤且提供汇总器：正文 = 汇总后的最终回答（专家过程仅保留在轨迹回调，不进正文）；
+    // 否则（单步 / 未提供汇总器 / 汇总失败兜底）正文 = 各步骤结果拼接。
+    let text: string
+    if (this.options.summarize && stepOutputs.length > 1) {
+      text = await this.options.summarize(task, stepOutputs, (t) => this.options.onDelta?.(t))
+      if (!text.trim()) {
+        text = stepOutputs.map((o) => `【${o.expert}】${o.title}\n${o.result}`).join('\n\n')
+      }
+    } else {
+      text = stepOutputs.map((o) => `【${o.expert}】${o.title}\n${o.result}`).join('\n\n')
+    }
     return { sessionId: this.options.sessionId, text, status: 'completed' }
   }
 
@@ -126,7 +165,7 @@ export class Orchestrator {
       const systemPrompt = this.options.expertSystemPrompts?.get(step.expertId)
       const result = await agent.run(step.title + context, {
         ...(systemPrompt ? { systemPrompt } : {}),
-        onDelta: this.options.onDelta,
+        // 专家执行阶段的流式正文不进最终正文（正文只在汇总阶段生成，见 run() 的 summarize 兜底）
         onReasoning: this.options.onReasoning,
       })
       completed.add(step.id)
@@ -142,11 +181,5 @@ export class Orchestrator {
       completed.add(step.id)
       return `（步骤失败：${error}）`
     }
-  }
-
-  /** 断点续跑：从会话事件日志回放，继续未完成的步骤（运行时层基于 Session 日志实现，这里返回占位） */
-  async resume(sessionId: string): Promise<RunResult> {
-    void sessionId
-    return { sessionId: this.options.sessionId, text: '', status: 'interrupted' }
   }
 }

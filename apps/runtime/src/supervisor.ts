@@ -32,6 +32,8 @@ export interface SessionStateSummary {
   approvalPolicy: ApprovalPolicy
   /** 当前需求（最后一条非注入的用户消息，空串 = 无） */
   currentRequest: string
+  /** 最近若干条非注入的用户消息（按时间从旧到新，用于管家判断会话职责/擅长方向；空数组 = 无历史） */
+  recentRequests: string[]
   /** 当前轮已执行的工具步数（最后一个 turn/start 之后的 tool/call 数量） */
   stepCount: number
   /** 当前模型上下文窗口长度（0 = 未知） */
@@ -80,6 +82,10 @@ export interface SupervisorContext {
   askSessionPicker(question: string): Promise<string>
   /** 弹出模型选择器让用户选择模型（阻塞等待），resolve 选中的 modelId；用户取消返回空串 */
   askModelPicker(question: string): Promise<string>
+  /** 审批请求到达时，管家决策是否批准目标会话的工具执行（outcome=allowed-once 批准 / rejected 拒绝），决策后对应弹窗关闭 */
+  resolveApproval(requestId: string, outcome: 'allowed-once' | 'rejected'): { ok: boolean; message: string }
+  /** 提问请求到达时，管家代答目标会话的提问（answer 为代答内容，有选项时填选中项、无选项时填文字），代答后对应弹窗关闭 */
+  answerAsk(requestId: string, answer: string): { ok: boolean; message: string }
 }
 
 const MODE_DESC =
@@ -97,6 +103,7 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
     modelName: s.modelName,
     approvalPolicy: s.approvalPolicy,
     currentRequest: s.currentRequest,
+    recentRequests: s.recentRequests,
     stepCount: s.stepCount,
     contextUsageRatio: Number(s.contextUsageRatio.toFixed(3)),
     contextLength: s.contextLength,
@@ -349,6 +356,52 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
       },
       riskLevel: 'irreversible',
       execute: async (args) => ctx.deleteSession(String(args.sessionId ?? '')),
+    },
+    {
+      name: 'resolve_approval',
+      description:
+        '审批请求到达时（管家接管的审批），决定是否批准目标会话的工具执行。' +
+        'requestId 来自审批请求通知里的 id；outcome 取 allowed-once（批准）或 rejected（拒绝）。' +
+        '决策后对应会话的授权弹窗会自动关闭，目标会话按决策继续或跳过该工具。' +
+        '仅在收到【审批请求】通知、且需要替用户把关时调用；只读决策，不执行任何实际文件/命令操作。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          requestId: { type: 'string', description: '审批请求 id（来自【审批请求】通知）' },
+          outcome: { type: 'string', enum: ['allowed-once', 'rejected'], description: 'allowed-once=批准执行一次，rejected=拒绝' },
+        },
+        required: ['requestId', 'outcome'],
+      },
+      riskLevel: 'readonly',
+      execute: async (args) => {
+        const requestId = String(args.requestId ?? '')
+        const outcome = args.outcome === 'rejected' ? 'rejected' : 'allowed-once'
+        if (!requestId) return { ok: false, message: 'requestId 不能为空' }
+        return ctx.resolveApproval(requestId, outcome)
+      },
+    },
+    {
+      name: 'answer_ask',
+      description:
+        '提问请求到达时（管家接管的提问），代答目标会话的提问。' +
+        'requestId 来自【提问请求】通知里的 id；answer 填代答内容（有可选项时填选中的那一个的原文，无选项时填简短文字）。' +
+        '代答后对应会话的提问弹窗会自动关闭，目标会话按你的回答继续执行。' +
+        '仅在收到【提问请求】通知、且需要替用户回答时调用；只读决策，不执行任何实际文件/命令操作。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          requestId: { type: 'string', description: '提问请求 id（来自【提问请求】通知）' },
+          answer: { type: 'string', description: '代答内容（有选项时填选中项原文，无选项时填简短文字）' },
+        },
+        required: ['requestId', 'answer'],
+      },
+      riskLevel: 'readonly',
+      execute: async (args) => {
+        const requestId = String(args.requestId ?? '')
+        const answer = String(args.answer ?? '')
+        if (!requestId) return { ok: false, message: 'requestId 不能为空' }
+        return ctx.answerAsk(requestId, answer)
+      },
     },
   ]
 }

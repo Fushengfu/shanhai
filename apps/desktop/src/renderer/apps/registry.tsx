@@ -1,5 +1,5 @@
 import type { ComponentType } from 'react'
-import { IconMonitor, IconTerminal, IconActivity, IconClock, IconSettings, IconUsers, IconWrench, IconImage } from '../components/icons'
+import { IconChat, IconMonitor, IconTerminal, IconActivity, IconClock, IconSettings, IconUsers, IconWrench, IconImage } from '../components/icons'
 
 /**
  * 插件应用清单（多窗口桌面系统的「应用」注册表）。
@@ -14,6 +14,7 @@ export interface AppManifest {
 }
 
 export const APP_REGISTRY: AppManifest[] = [
+  { id: 'chat', name: '聊天', description: '聊天窗口', Icon: IconChat },
   { id: 'supervisor', name: '管家', description: '会话管家', Icon: IconMonitor },
   { id: 'terminal', name: '终端', description: '命令终端', Icon: IconTerminal },
   { id: 'trace', name: '轨迹', description: '执行轨迹', Icon: IconActivity },

@@ -26,8 +26,9 @@ const AI_BUBBLE_STYLE: React.CSSProperties = {
   fontSize: 14,
   lineHeight: 1.65,
   color: 'var(--text)',
-  overflowWrap: 'break-word',
+  overflowWrap: 'anywhere',
   wordBreak: 'break-word',
+  minWidth: 0,
   userSelect: 'text',
   WebkitUserSelect: 'text',
 }
@@ -178,7 +179,7 @@ function ChatSlot(): React.JSX.Element {
                       {streaming.reasoning && <ReasoningBlock content={streaming.reasoning} streaming />}
                       {/* 正式回答：只显示最终正文 */}
                       {streaming.text && (
-                        <span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+                        <span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
                           {streaming.text}
                           <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
                         </span>

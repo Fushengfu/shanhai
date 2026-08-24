@@ -145,7 +145,7 @@ export function registerIpc(): void {
   ipcMain.handle('model:removeCustom', async (_e, id: string) => runtime.removeCustomModel(id))
 
   // —— token 用量 ——
-  ipcMain.handle('token:stats', async () => runtime.getTokenStats())
+  ipcMain.handle('token:stats', async (_e, sessionId?: string) => runtime.getTokenStats(sessionId))
 
   // —— 语音 ——
   ipcMain.handle('voice:speak', async (_e, text: string) => {

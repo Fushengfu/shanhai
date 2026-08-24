@@ -19,6 +19,8 @@ export type AgentEventType =
   | 'approval/request'
   | 'approval/outcome'
   | 'retry/snapshot'
+  | 'orchestrator/plan'
+  | 'orchestrator/step'
 
 /**
  * 审批策略（安全模式，会话级）：
@@ -31,7 +33,8 @@ export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unava
 
 /** 事件 → 载荷的类型映射（类型化事件，编译期约束载荷） */
 export interface EventData {
-  'turn/start': { turn: number }
+  /** mode 标记本轮是「单步 ReAct」（single，缺省）还是「多专家编排」（multi）：断点续跑（继续执行）据此判断走 resumeRun 续跑还是降级重新拆解 */
+  'turn/start': { turn: number; mode?: 'single' | 'multi' }
   'turn/end': { turn: number; text: string }
   /** content 为文本；attachments 为多模态附件（图片/音频/视频），会话回放时一并还原。injected 标记「插入模式」任务执行中注入的消息（UI 不显示为独立用户气泡） */
   'user/message': { content: string; attachments?: unknown[]; injected?: boolean }
@@ -48,6 +51,10 @@ export interface EventData {
   'approval/outcome': { id: string; outcome: ApprovalOutcome }
   /** 失败重试挂起快照：重试耗尽后保存「失败节点发给模型的完整 messages 快照 + 重入位置」，供重启后精确重试（body 与失败完全一致） */
   'retry/snapshot': { messages: unknown[]; step: number; maxSteps: number; atLimit: boolean; reason?: string }
+  /** 多专家编排：拆解计划（断点续跑时恢复依赖图，跳过已完成步骤、只重跑未完成步骤） */
+  'orchestrator/plan': { plan: { steps: Array<{ id: string; expertId: string; title: string; deps: string[] }> } }
+  /** 多专家编排：单个步骤执行状态（断点续跑时恢复已完成步骤的 result 作为后续依赖上下文） */
+  'orchestrator/step': { stepId: string; expertId: string; title: string; status: 'started' | 'completed' | 'failed'; result?: string; error?: string }
 }
 
 export interface SessionEvent<T extends AgentEventType = AgentEventType> {

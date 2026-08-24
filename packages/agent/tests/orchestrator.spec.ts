@@ -181,4 +181,58 @@ describe('Orchestrator（多专家调度）', () => {
     expect(result.text).toContain('环A')
     expect(result.text).toContain('环B')
   })
+
+  it('提供 summarize 时，多步正文 = 汇总结果而非各步骤拼接', async () => {
+    const triage = new ModelTriage(
+      createMockModel([
+        {
+          text: '{"steps":[{"id":"s1","expertId":"general","title":"分析","deps":[]},{"id":"s2","expertId":"code","title":"编码","deps":["s1"]}]}',
+        },
+      ]),
+      ROLES,
+    )
+    const agents = new Map<string, AgentLoop>()
+    agents.set('general', textAgent('分析结果'))
+    agents.set('code', textAgent('编码结果'))
+    const deltas: string[] = []
+    const orch = new Orchestrator(triage, agents, {
+      sessionId: 's1',
+      expertNames: new Map([
+        ['general', '通用助手'],
+        ['code', '代码专家'],
+      ]),
+      onDelta: (t) => deltas.push(t),
+      summarize: async (_task, _steps, onDelta) => {
+        onDelta('最终汇总')
+        return '最终汇总结果'
+      },
+    })
+    const result = await orch.run('任务')
+    expect(result.text).toBe('最终汇总结果')
+    expect(result.text).not.toContain('分析结果')
+    expect(result.text).not.toContain('编码结果')
+    expect(deltas).toContain('最终汇总')
+  })
+
+  it('汇总返回空时回退为各步骤拼接', async () => {
+    const triage = new ModelTriage(
+      createMockModel([
+        {
+          text: '{"steps":[{"id":"s1","expertId":"general","title":"分析","deps":[]},{"id":"s2","expertId":"general","title":"编码","deps":["s1"]}]}',
+        },
+      ]),
+      ROLES,
+    )
+    const agents = new Map<string, AgentLoop>()
+    agents.set('general', textAgent('分析结果'))
+    const orch = new Orchestrator(triage, agents, {
+      sessionId: 's1',
+      expertNames: new Map([['general', '通用助手']]),
+      summarize: async () => '',
+    })
+    const result = await orch.run('任务')
+    expect(result.status).toBe('completed')
+    expect(result.text).toContain('分析')
+    expect(result.text).toContain('编码')
+  })
 })

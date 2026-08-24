@@ -23,6 +23,8 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
   /** 选项列表中的「其他（自定义填写）」是否被选中（选中后显示自由文本输入框） */
   const [customMode, setCustomMode] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  /** 输入法组合中标记：中文等 IME 用回车选词时不应触发提交 */
+  const isComposingRef = useRef(false)
 
   // 自由输入时自动聚焦（无选项，或切换到「自定义填写」）
   useEffect(() => {
@@ -156,8 +158,17 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
           ref={inputRef}
           value={text}
           onChange={(e) => setText(e.target.value)}
+          onCompositionStart={() => {
+            isComposingRef.current = true
+          }}
+          onCompositionEnd={() => {
+            // macOS 原生输入法选词时 compositionend 先于 keydown 触发，延迟清除避免选词回车误提交
+            setTimeout(() => {
+              isComposingRef.current = false
+            }, 0)
+          }}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+            if (e.key === 'Enter' && !isComposingRef.current && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229) {
               e.preventDefault()
               submit()
             }

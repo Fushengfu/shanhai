@@ -102,10 +102,17 @@ export class AgentLoop {
    * 多条注入消息按顺序全部追加，不覆盖、不丢失。
    */
   injectUserMessage(message: string): void {
+    // 只入队，不立即落盘：立即 session.append 会赶在「工具执行中」（tool/call 已落盘、tool/result 未落盘）
+    // 把消息插进二者之间，违背「追加在最后面」的语义，且回放时产生孤立 tool 消息 → 网关 400。
+    // 落盘延迟到 runLoop 下一轮开头（当前工具回合已完整结束），保证追加到事件日志末尾。
     this.pendingInjections.push(message)
-    // 落盘 user/message（带 injected 标记）：保证注入消息在历史/上下文里完整保留（重启后可回放），
-    // 但 UI 按 injected 标记不把它渲染成独立用户气泡——追加需求由最终回答正文体现。
-    this.session.append('user/message', { content: message, injected: true })
+  }
+
+  /** 把未消费的注入消息落盘到会话日志末尾（供中止时调用，避免追加需求丢失） */
+  private flushPendingInjections(): void {
+    for (const m of this.pendingInjections.splice(0, this.pendingInjections.length)) {
+      this.session.append('user/message', { content: m, injected: true })
+    }
   }
 
   /** 中止当前任务循环（用户点「停止」）：设置标志，run 循环 / 流式 chunk / 工具执行前检查后抛 __stopped__ 尽快退出。
@@ -120,22 +127,7 @@ export class AgentLoop {
     if (options?.systemPrompt) messages.push({ role: 'system', content: options.systemPrompt })
 
     // 从 session 事件日志回放历史（多轮对话 + 断点续跑：中断后历史仍在 session）
-    for (const e of this.session.list()) {
-      if (e.type === 'user/message') {
-        const d = e.data as { content: string; attachments?: ContentPart[] }
-        // 历史附件只回放占位符，不重新发送 base64（避免请求体巨大 / 非视觉模型 400 / 重复计费）
-        messages.push({ role: 'user', content: replayUserContent(d.content, d.attachments) })
-      } else if (e.type === 'assistant/message') {
-        const d = e.data as { content: string; reasoningContent?: string }
-        messages.push({ role: 'assistant', content: d.content, reasoningContent: d.reasoningContent })
-      } else if (e.type === 'tool/call') {
-        const d = e.data as { callId: string; name: string; args: Record<string, unknown>; reasoningContent?: string }
-        messages.push({ role: 'assistant', content: '', toolCall: { id: d.callId, name: d.name, args: d.args }, reasoningContent: d.reasoningContent })
-      } else if (e.type === 'tool/result') {
-        const d = e.data as { callId: string; result?: unknown; error?: string }
-        messages.push({ role: 'tool', content: JSON.stringify(d.result ?? d.error ?? ''), toolCallId: d.callId })
-      }
-    }
+    this.replayHistory(messages)
 
     // 追加当前消息（含多模态附件，附件一并写入事件日志，回放时还原）。
     // 落盘永远保留原始 message + attachments；发给模型的内容在有 modelContent 时用降级后的文字（如图片降级）
@@ -156,6 +148,46 @@ export class AgentLoop {
     return this.runLoop(messages, 0, maxSteps, onDelta, onReasoning)
   }
 
+  /** 回放会话事件日志到 messages（user/assistant/tool 三类；delta/turn/usage/retry-snapshot 等中间态或元数据事件忽略）。 */
+  private replayHistory(messages: ChatMessage[]): void {
+    for (const e of this.session.list()) {
+      if (e.type === 'user/message') {
+        const d = e.data as { content: string; attachments?: ContentPart[] }
+        // 历史附件只回放占位符，不重新发送 base64（避免请求体巨大 / 非视觉模型 400 / 重复计费）
+        messages.push({ role: 'user', content: replayUserContent(d.content, d.attachments) })
+      } else if (e.type === 'assistant/message') {
+        const d = e.data as { content: string; reasoningContent?: string }
+        messages.push({ role: 'assistant', content: d.content, reasoningContent: d.reasoningContent })
+      } else if (e.type === 'tool/call') {
+        const d = e.data as { callId: string; name: string; args: Record<string, unknown>; reasoningContent?: string }
+        messages.push({ role: 'assistant', content: '', toolCall: { id: d.callId, name: d.name, args: d.args }, reasoningContent: d.reasoningContent })
+      } else if (e.type === 'tool/result') {
+        const d = e.data as { callId: string; result?: unknown; error?: string }
+        messages.push({ role: 'tool', content: JSON.stringify(d.result ?? d.error ?? ''), toolCallId: d.callId })
+      }
+    }
+  }
+
+  /** 断点续跑（「继续执行」用）：从会话事件日志回放已执行的历史（含完整工具回合），不追加新 user 消息、不新建 turn，
+   * 直接继续 ReAct 循环。用户停止后 session 日志已完整记录已执行步骤，回放即恢复进度，从断点继续而非重新生成。 */
+  async resumeRun(
+    systemPrompt: string | undefined,
+    onDelta?: (text: string) => void,
+    onReasoning?: (text: string) => void,
+  ): Promise<string> {
+    // 清理上次中断残留的流式增量（半截 assistant/delta）：回放时虽忽略，但残留会污染持久化文件与后续重建
+    const events = this.session.list()
+    let cut = events.length
+    while (cut > 0 && events[cut - 1]?.type === 'assistant/delta') cut--
+    if (cut < events.length) this.session.truncate(cut)
+
+    const maxSteps = 1000
+    const messages: ChatMessage[] = []
+    if (systemPrompt) messages.push({ role: 'system', content: systemPrompt })
+    this.replayHistory(messages)
+    return this.runLoop(messages, 0, maxSteps, onDelta, onReasoning)
+  }
+
   /**
    * ReAct 循环主体（可重入）：挂起后 retry() 从失败的那一步用「相同 messages 快照」重新进入，
    * 即向 LLM 重新提交与上次失败完全一致的请求 body（上下文数据不变），而非重新回放历史/重新构建。
@@ -169,11 +201,17 @@ export class AgentLoop {
   ): Promise<string> {
     for (let step = startStep; step < maxSteps; step++) {
       // 用户点「停止」：每轮开始即检查，尽快中断（覆盖工具执行完回到循环、以及 reasoning/正文流式之前）
-      if (this.aborted) throw new Error('__stopped__')
+      if (this.aborted) {
+        // 中止时 flush 未消费的注入消息落盘（此时工具回合已完整结束，位置在末尾），避免追加需求丢失
+        this.flushPendingInjections()
+        throw new Error('__stopped__')
+      }
       // 插入模式：任务执行中用户追加的消息，在下一个模型调用前一次性追加到上下文（多条全部追加，不覆盖丢失）。
       // 用「追加需求」标记 + 编号列表注入，并指示模型在最终回答正文里单独回应，让追加的需求/问题在输出中显式体现。
       if (this.pendingInjections.length > 0) {
         const injected = this.pendingInjections.splice(0, this.pendingInjections.length)
+        // 落盘：此处上一轮工具回合（tool/call + tool/result）已完整落盘，追加到事件日志末尾才是「最后面」
+        for (const m of injected) this.session.append('user/message', { content: m, injected: true })
         const list = injected.map((m, i) => `${i + 1}. ${m}`).join('\n')
         messages.push({
           role: 'user',
@@ -448,7 +486,10 @@ export class AgentLoop {
 
   private async handleToolCall(messages: ChatMessage[], call: ToolCall, reasoningContent?: string): Promise<void> {
     // 用户点「停止」：工具执行前检查，已中止则不落盘 tool/call、不执行工具，直接中断
-    if (this.aborted) throw new Error('__stopped__')
+    if (this.aborted) {
+      this.flushPendingInjections()
+      throw new Error('__stopped__')
+    }
     const callId = call.id ?? `${call.name}-${Date.now()}`
     // tool/call 事件落盘 reasoningContent：thinking 模式多轮回放时需回传
     this.session.append('tool/call', { callId, name: call.name, args: call.args, reasoningContent })

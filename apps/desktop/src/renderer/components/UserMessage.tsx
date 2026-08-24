@@ -61,7 +61,7 @@ export function UserMessage({ content, images, userIndex, busy, pending, onResen
         </div>
       ) : content ? (
         <>
-          <div style={{ maxWidth: '70%', padding: '8px 14px', borderRadius: 16, borderBottomRightRadius: 4, background: 'var(--accent)', color: '#fff', fontSize: 14, lineHeight: 1.6, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word', opacity: pending ? 0.65 : 1, userSelect: 'text', WebkitUserSelect: 'text' }}>
+          <div style={{ maxWidth: '70%', minWidth: 0, padding: '8px 14px', borderRadius: 16, borderBottomRightRadius: 4, background: 'var(--accent)', color: '#fff', fontSize: 14, lineHeight: 1.6, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word', opacity: pending ? 0.65 : 1, userSelect: 'text', WebkitUserSelect: 'text' }}>
             {content}
           </div>
           {pending ? (
