@@ -134,7 +134,14 @@ export class AgentLoop {
     const attachments = options?.attachments
     this.session.append('user/message', { content: message, attachments: (attachments ?? []) as unknown[] })
     if (options?.modelContent !== undefined) {
+      // 非视觉模型降级路径：发给模型的是降级后的文字（字符串）
       messages.push({ role: 'user', content: options.modelContent })
+    } else if (this.supportsVision) {
+      // 多模态模型：所有用户消息统一用数组结构（标准多模态格式），无附件时也保持数组，
+      // 避免 content 一会儿字符串一会儿数组，保证网关/模型对结构一致性不敏感。
+      const parts: ContentPart[] = [{ type: 'text', text: message }]
+      if (attachments && attachments.length > 0) parts.push(...attachments)
+      messages.push({ role: 'user', content: parts })
     } else if (attachments && attachments.length > 0) {
       messages.push({ role: 'user', content: [{ type: 'text', text: message }, ...attachments] })
     } else {
@@ -153,8 +160,17 @@ export class AgentLoop {
     for (const e of this.session.list()) {
       if (e.type === 'user/message') {
         const d = e.data as { content: string; attachments?: ContentPart[] }
-        // 历史附件只回放占位符，不重新发送 base64（避免请求体巨大 / 非视觉模型 400 / 重复计费）
-        messages.push({ role: 'user', content: replayUserContent(d.content, d.attachments) })
+        if (this.supportsVision) {
+          // 多模态模型：历史用户消息统一用数组结构（重发 https 附件），与当前消息结构保持一致；
+          // 非视觉模型仍走 replayUserContent 的占位符（避免 400 / 重复计费）。
+          const parts: ContentPart[] = []
+          if (d.content) parts.push({ type: 'text', text: d.content })
+          if (d.attachments && d.attachments.length > 0) parts.push(...d.attachments)
+          messages.push({ role: 'user', content: parts.length > 0 ? parts : [{ type: 'text', text: '' }] })
+        } else {
+          // 历史附件只回放占位符，不重新发送 base64（避免请求体巨大 / 非视觉模型 400 / 重复计费）
+          messages.push({ role: 'user', content: replayUserContent(d.content, d.attachments) })
+        }
       } else if (e.type === 'assistant/message') {
         const d = e.data as { content: string; reasoningContent?: string }
         messages.push({ role: 'assistant', content: d.content, reasoningContent: d.reasoningContent })

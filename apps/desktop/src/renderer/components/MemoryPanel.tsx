@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { MemoryEntry } from '../types'
+import { useUiStore } from '../store-client'
 import { IconClock, IconTrash } from './icons'
 import { formatRelativeTime, smallIconBtn } from './ui'
 import { WindowTitleBar } from './WindowTitleBar'
@@ -23,13 +24,14 @@ const SCOPE_COLOR: Record<string, { dot: string; tint: string }> = {
   session: { dot: 'var(--text-muted)', tint: 'var(--bg-subtle)' },
 }
 
-/** 长期记忆面板：展示跨会话记忆（配置型全量 + 经验型召回），支持删除。侧滑铺满主区域（从侧边栏右缘到窗口右缘、状态栏下方到底部） */
+/** 长期记忆面板：展示当前会话记忆（按会话隔离），支持删除。侧滑铺满主区域（从侧边栏右缘到窗口右缘、状态栏下方到底部） */
 export function MemoryPanel({ left, top, onClose, variant = 'panel' }: { left?: number; top?: number; onClose?: () => void; variant?: 'panel' | 'window' }) {
+  const currentSessionId = useUiStore().currentSessionId
   const [memories, setMemories] = useState<MemoryEntry[]>([])
   const [hoverId, setHoverId] = useState<number | null>(null)
   const load = useCallback(() => {
-    void window.shanhai?.listMemory().then((m) => setMemories(m ?? [])).catch(() => undefined)
-  }, [])
+    void window.shanhai?.listMemory(currentSessionId ?? '').then((m) => setMemories(m ?? [])).catch(() => undefined)
+  }, [currentSessionId])
   useEffect(() => {
     load()
   }, [load])
@@ -64,7 +66,7 @@ export function MemoryPanel({ left, top, onClose, variant = 'panel' }: { left?: 
         icon={<IconClock />}
         tone="purple"
         title="长期记忆"
-        subtitle="跨会话沉淀的偏好与经验"
+        subtitle="当前会话沉淀的偏好与经验"
         extra={
           <span style={{ marginLeft: 4, fontSize: 11, fontWeight: 600, color: 'var(--purple)', background: 'var(--tint-purple)', padding: '2px 9px', borderRadius: 10, flexShrink: 0 }}>
             {memories.length} 条

@@ -136,6 +136,8 @@ export interface RetryPrompt {
 export interface UiStoreState {
   loggedIn: boolean
   username: string | null
+  /** 登录弹窗是否打开（跨窗口共享：Dock 点击「登录」后聊天窗口据此弹出登录框） */
+  loginOpen: boolean
   currentSessionId: string
   sessions: SessionListItem[]
   sessionMap: Record<string, SessionUIState>
@@ -164,6 +166,7 @@ export const EMPTY_SESSION: SessionUIState = {
 const INITIAL_STATE: UiStoreState = {
   loggedIn: false,
   username: null,
+  loginOpen: false,
   currentSessionId: '',
   sessions: [],
   sessionMap: {},
@@ -225,6 +228,8 @@ export function filterUiStateForWindow(type: WindowType | undefined, s: UiStoreS
     case 'desktop':
       return { ...INITIAL_STATE, loggedIn: s.loggedIn, username: s.username, wallpaper: s.wallpaper }
     case 'dock':
+      // Dock 需要登录态（显示登录状态 + 登录入口）与 loginOpen，但不消费消息流等重数据
+      return { ...INITIAL_STATE, loggedIn: s.loggedIn, username: s.username, loginOpen: s.loginOpen }
     case 'supervisor-bubble':
       return { ...INITIAL_STATE }
     case 'chat':
@@ -235,9 +240,9 @@ export function filterUiStateForWindow(type: WindowType | undefined, s: UiStoreS
   }
 }
 
-/** 判断窗口类型是否消费共享状态（dock/supervisor-bubble 不消费，广播时直接跳过，连空快照都不发） */
+/** 判断窗口类型是否消费共享状态（仅 supervisor-bubble 纯静态悬浮图标不消费，广播时跳过；dock 需消费登录态） */
 export function windowConsumesUiState(type: WindowType | undefined): boolean {
-  return type !== 'dock' && type !== 'supervisor-bubble'
+  return type !== 'supervisor-bubble'
 }
 
 export function subscribeUiState(cb: () => void): () => void {
@@ -417,9 +422,24 @@ export function initUiStore(runtime: Runtime): void {
     }
   })
 
-  // 激活会话切换：同步 currentSessionId（管家 switch_session 工具切换后，聊天窗口侧边栏也能高亮到目标会话）
+  // 激活会话切换：同步 currentSessionId + 加载目标会话历史消息。
+  // 管家 switch_session 工具直接走后端 switchSessionInternal 广播，不经过渲染进程 switchToSession，
+  // 若不在此填充 sessionMap[目标会话].items，聊天窗口会因 items 为空而显示「欢迎界面」。
   runtime.onCurrentSessionChanged((sessionId) => {
-    mutate((s) => ({ ...s, currentSessionId: sessionId }))
+    try {
+      const items = historyToChatItems(runtime.getSessionHistory(sessionId))
+      const incompleteTurn = runtime.hasIncompleteTurn(sessionId)
+      mutate((s) => ({
+        ...s,
+        currentSessionId: sessionId,
+        sessionMap: {
+          ...s.sessionMap,
+          [sessionId]: { ...(s.sessionMap[sessionId] ?? EMPTY_SESSION), items, incompleteTurn },
+        },
+      }))
+    } catch {
+      mutate((s) => ({ ...s, currentSessionId: sessionId }))
+    }
   })
 
   // 管家异步下发的目标会话任务完成：重新拉取管家会话历史，把回传的正文结果显示在管家窗口

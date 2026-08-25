@@ -151,6 +151,8 @@ export interface GlobalUiState {
 export interface ShanhaiBridge {
   /** 当前窗口类型（desktop/chat/app/supervisor），由主进程 additionalArguments 注入、preload 读 process.argv 得到 */
   windowType: 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble'
+  /** 运行平台（process.platform：darwin/win32/linux），渲染层据此做平台差异化（如 Windows 窗口圆角） */
+  platform: string
   /** app 类型窗口的应用 id（terminal/trace/memory/settings/experts/models），非 app 窗口为 undefined */
   windowAppId?: string
   /** 打开（或聚焦）一个插件应用窗口 */
@@ -175,6 +177,8 @@ export interface ShanhaiBridge {
   toggleMaximizeWindow(): Promise<boolean>
   /** Dock 窗口根据图标栏内容自适应尺寸（渲染进程测量后回调，fire-and-forget） */
   resizeDock(width: number, height: number): void
+  /** 退出到桌面：隐藏所有山海窗口回到系统界面，应用后台运行（托盘/快捷键恢复） */
+  exitToDesktop(): Promise<void>
   /** 切换主题（亮/暗）：通知主进程广播给所有窗口（聊天窗口是唯一写者） */
   setTheme(theme: 'light' | 'dark'): void
   /** 订阅主题变更（主进程广播 ui:theme），返回取消订阅函数 */
@@ -295,7 +299,7 @@ export interface ShanhaiBridge {
   listExperts(): Promise<Expert[]>
   addExpert(role: { id: string; name: string; description: string; systemPrompt: string }): Promise<Expert>
   removeExpert(id: string): Promise<void>
-  listMemory(): Promise<MemoryEntry[]>
+  listMemory(sessionId: string): Promise<MemoryEntry[]>
   removeMemory(id: number): Promise<void>
   // 通用设置
   getSettings(): Promise<AppSettings>
@@ -404,6 +408,7 @@ const windowAppId: string | undefined = readArg('--shanhai-app-id=')
 
 const bridge: ShanhaiBridge = {
   windowType,
+  platform: process.platform,
   windowAppId,
   openApp: (appId) => ipcRenderer.invoke('window:openApp', appId),
   closeApp: (appId) => ipcRenderer.invoke('window:closeApp', appId),
@@ -416,6 +421,7 @@ const bridge: ShanhaiBridge = {
   minimizeWindow: () => ipcRenderer.send('window:minimize'),
   toggleMaximizeWindow: () => ipcRenderer.invoke('window:toggleMaximize'),
   resizeDock: (width, height) => ipcRenderer.send('window:resizeDock', width, height),
+  exitToDesktop: () => ipcRenderer.invoke('window:hideToDesktop'),
   setTheme: (theme) => ipcRenderer.send('theme:set', theme),
   onThemeChange: (cb) => {
     const listener = (_e: unknown, theme: 'light' | 'dark') => cb(theme)
@@ -560,7 +566,7 @@ const bridge: ShanhaiBridge = {
   listExperts: () => ipcRenderer.invoke('experts:list'),
   addExpert: (role) => ipcRenderer.invoke('experts:add', role),
   removeExpert: (id) => ipcRenderer.invoke('experts:remove', id),
-  listMemory: () => ipcRenderer.invoke('memory:list'),
+  listMemory: (sessionId) => ipcRenderer.invoke('memory:list', sessionId),
   removeMemory: (id) => ipcRenderer.invoke('memory:remove', id),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   setSettings: (patch) => ipcRenderer.invoke('settings:set', patch),

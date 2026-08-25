@@ -14,6 +14,10 @@ async function bootstrap(): Promise<void> {
   const windowType = window.shanhai?.windowType ?? 'chat'
   if (!container) return
 
+  // 平台 + 圆角标记：供 theme.css 做 Windows 窗口圆角裁剪（chat/app/supervisor 需要圆角，desktop/dock/supervisor-bubble 不需要）
+  document.documentElement.dataset.platform = window.shanhai?.platform ?? ''
+  document.documentElement.dataset.rounded = windowType === 'chat' || windowType === 'app' || windowType === 'supervisor' ? 'true' : 'false'
+
   if (windowType === 'desktop') {
     const { DesktopApp } = await import('./desktop/DesktopApp')
     createRoot(container).render(<DesktopApp />)

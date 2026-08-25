@@ -46,4 +46,52 @@ describe('Session 类型化事件日志', () => {
     // 再移除一次返回 false
     expect(session.removeLast('retry/snapshot')).toBe(false)
   })
+
+  it('增量持久化游标：restore 后视为已持久化，追加新事件可切片获取', () => {
+    const session = new Session()
+    session.restore([{ type: 'user/message', data: { content: 'a' }, timestamp: 1 }])
+    expect(session.size).toBe(1)
+    expect(session.persistedCount).toBe(1)
+    expect(session.requireRewrite()).toBe(false)
+
+    session.append('assistant/message', { content: 'b' })
+    session.append('assistant/delta', { text: 'c' }) // delta 会在持久化层被过滤
+    // 从已持久化游标切片：拿到新增的 2 条
+    const delta = session.slice(session.persistedCount)
+    expect(delta.map((e) => e.type)).toEqual(['assistant/message', 'assistant/delta'])
+  })
+
+  it('truncate 命中已持久化区段时标记需要重写', () => {
+    const session = new Session()
+    session.restore([
+      { type: 'user/message', data: { content: 'a' }, timestamp: 1 },
+      { type: 'assistant/message', data: { content: 'b' }, timestamp: 2 },
+    ])
+    expect(session.persistedCount).toBe(2)
+
+    // 截断到 1 条（裁掉了已持久化的第 2 条）
+    session.truncate(1)
+    expect(session.requireRewrite()).toBe(true)
+    expect(session.persistedCount).toBe(1)
+
+    // markPersisted 清除重写标记并推进游标
+    session.markPersisted()
+    expect(session.requireRewrite()).toBe(false)
+    expect(session.persistedCount).toBe(1)
+  })
+
+  it('removeLast 命中已持久化区段时标记需要重写', () => {
+    const session = new Session()
+    session.restore([
+      { type: 'turn/start', data: { turn: 1 }, timestamp: 1 },
+      { type: 'retry/snapshot', data: { messages: [], step: 2, maxSteps: 10, atLimit: false }, timestamp: 2 },
+      { type: 'user/message', data: { content: 'hi' }, timestamp: 3 },
+    ])
+    expect(session.persistedCount).toBe(3)
+
+    // 删除已持久化区段的 retry/snapshot（第 2 条，位于已持久化部分）
+    expect(session.removeLast('retry/snapshot')).toBe(true)
+    expect(session.requireRewrite()).toBe(true)
+    expect(session.persistedCount).toBe(2)
+  })
 })

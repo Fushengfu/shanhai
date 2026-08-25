@@ -64,7 +64,7 @@ export interface SupervisorContext {
   listModels(): Array<{ id: string; name: string }>
   /** 向指定会话发消息（等同手动切过去发），mode=insert 追加 / queue 排队 */
   sendMessage(sessionId: string, message: string, mode: 'insert' | 'queue'): Promise<{ ok: boolean; message: string; result?: string }>
-  /** 切换管家聚焦会话（仅管家视角，不改变用户聊天窗口当前显示的会话） */
+  /** 切换激活会话（等同用户在侧边栏点击切换，同步更新聊天窗口当前显示的会话） */
   switchSession(sessionId: string): { ok: boolean; message: string }
   /** 切换指定会话使用的模型（写会话事件日志，不影响正在运行的任务） */
   setSessionModel(sessionId: string, modelId: string): { ok: boolean; message: string }
@@ -152,8 +152,8 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
     {
       name: 'switch_session',
       description:
-        '切换管家聚焦会话（仅管家视角，不影响用户聊天窗口当前显示的会话）。' +
-        'sessionId 来自 list_sessions。切换后汇报管家已聚焦该会话。',
+        '切换激活会话（等同用户在侧边栏点击切换，聊天窗口会同步切换到该会话）。' +
+        'sessionId 来自 list_sessions。切换后汇报管家已激活该会话。',
       inputSchema: {
         type: 'object',
         properties: {

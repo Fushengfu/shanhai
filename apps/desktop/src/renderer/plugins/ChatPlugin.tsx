@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ToolTrace } from '../types'
 import { AskCard } from '../components/AskCard'
 import { SessionPicker } from '../components/SessionPicker'
@@ -9,7 +9,7 @@ import { ExpertTraces } from '../components/ExpertTraces'
 import { ReasoningBlock } from '../components/ReasoningBlock'
 import { StepStats, ToolStep, toolDisplayName, riskLevelLabel } from '../components/ToolStep'
 import { UserMessage } from '../components/UserMessage'
-import { IconCode, IconRefresh, IconWarn } from '../components/icons'
+import { IconChevronDown, IconCode, IconRefresh, IconWarn } from '../components/icons'
 import { btn, formatArgs, LiveDuration, ThinkingDots } from '../components/ui'
 import { registerSlot, SlotView, AppendSlotView } from '../slots'
 import { useUIContext } from '../ui-context'
@@ -41,6 +41,12 @@ function ChatSlot(): React.JSX.Element {
   // 用户是否在底部：仅由滚动事件维护，不参与「内容增长」的计算。
   // 之前的实现每次内容更新都重算 nearBottom，流式内容一次性增长超过阈值时会被误判为「用户已上翻」而停止跟随。
   const atBottomRef = useRef(true)
+
+  // 审批弹窗 / 提问卡片的折叠状态（默认展开；新请求到来时自动展开）
+  const [approvalCollapsed, setApprovalCollapsed] = useState(false)
+  useEffect(() => {
+    setApprovalCollapsed(false)
+  }, [ctx.curApproval?.id])
 
   // 用户滚动（滚轮/拖条/键盘）时更新「是否在底部」状态
   const handleScroll = (): void => {
@@ -235,22 +241,48 @@ function ChatSlot(): React.JSX.Element {
             boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
           }}
         >
-          <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text)' }}>
-            <IconWarn />
-            需要确认操作
-          </div>
-          <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>工具：{toolDisplayName(ctx.curApproval.toolName, ctx.curApproval.args)}（{riskLevelLabel(ctx.curApproval.riskLevel)}）</div>
-          <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-            {formatArgs(ctx.curApproval.args)}
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button onClick={() => void ctx.respondApproval('allowed-once')} style={btn('var(--accent)', '#fff')}>
-              允许一次
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: approvalCollapsed ? 0 : 6 }}>
+            <div style={{ fontWeight: 600, color: 'var(--text)', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <IconWarn />
+              需要确认操作
+            </div>
+            <button
+              onClick={() => setApprovalCollapsed((c) => !c)}
+              title={approvalCollapsed ? '展开' : '折叠'}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: 22,
+                height: 22,
+                borderRadius: 6,
+                border: 'none',
+                background: 'transparent',
+                color: 'var(--text-secondary)',
+                cursor: 'pointer',
+                transform: approvalCollapsed ? 'none' : 'rotate(180deg)',
+                transition: 'transform 0.15s ease',
+              }}
+            >
+              <IconChevronDown />
             </button>
-            <button onClick={() => void ctx.respondApproval('rejected')} style={btn('var(--bg-panel)', 'var(--text)', '1px solid var(--border-strong)')}>
-              拒绝
-            </button>
           </div>
+          {!approvalCollapsed && (
+            <>
+              <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>工具：{toolDisplayName(ctx.curApproval.toolName, ctx.curApproval.args)}（{riskLevelLabel(ctx.curApproval.riskLevel)}）</div>
+              <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+                {formatArgs(ctx.curApproval.args)}
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button onClick={() => void ctx.respondApproval('allowed-once')} style={btn('var(--accent)', '#fff')}>
+                  允许一次
+                </button>
+                <button onClick={() => void ctx.respondApproval('rejected')} style={btn('var(--bg-panel)', 'var(--text)', '1px solid var(--border-strong)')}>
+                  拒绝
+                </button>
+              </div>
+            </>
+          )}
         </div>
       )}
 

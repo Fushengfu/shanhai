@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { SUPERVISOR_ID } from '@shanhai/runtime'
 import { getRuntime } from './runtime'
-import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow, toggleMaximizeWindow, resizeDockWindow, hideSupervisorToBubble, showSupervisorFromBubble, moveSupervisorBubble, getWindowType } from './window-manager'
+import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow, toggleMaximizeWindow, resizeDockWindow, hideSupervisorToBubble, showSupervisorFromBubble, moveSupervisorBubble, hideToSystemDesktop, getWindowType } from './window-manager'
 import { getUiState, patchUiState, getWallpaper, setWallpaper, filterUiStateForWindow, type UiStoreState } from './ui-store'
 import { listSystemWallpapers, applySystemWallpaper } from './system-wallpaper'
 import { startRemoteServer, stopRemoteServer, getRemoteStatus } from './remote-server'
@@ -72,7 +72,7 @@ export function registerIpc(): void {
   ipcMain.handle('experts:remove', async (_e, id: string) => runtime.removeExpert(id))
 
   // —— 长期记忆 ——
-  ipcMain.handle('memory:list', async () => runtime.listMemory())
+  ipcMain.handle('memory:list', async (_e, sessionId: string) => runtime.listMemory(sessionId))
   ipcMain.handle('memory:remove', async (_e, id: number) => runtime.removeMemory(id))
 
   // —— 通用设置 ——
@@ -184,6 +184,8 @@ export function registerIpc(): void {
   ipcMain.handle('window:toggleMaximize', (e) => toggleMaximizeWindow(BrowserWindow.fromWebContents(e.sender)))
   // Dock 窗口根据图标栏内容自适应尺寸（渲染进程测量后回调，fire-and-forget）
   ipcMain.on('window:resizeDock', (_e, width: number, height: number) => resizeDockWindow(width, height))
+  // 退出到桌面：隐藏所有山海窗口回到系统界面，应用后台运行（托盘/快捷键恢复）
+  ipcMain.handle('window:hideToDesktop', async () => hideToSystemDesktop())
 
   // —— 主题切换（亮/暗）：聊天窗口切换后广播给所有窗口，让各独立窗口（会话管家/Dock/桌面壳/应用窗口）实时跟随 ——
   ipcMain.on('theme:set', (_e, theme: 'light' | 'dark') => {

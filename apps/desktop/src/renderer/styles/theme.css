@@ -92,6 +92,15 @@ body {
   transition: background-color 0.2s ease, color 0.2s ease;
 }
 
+/* Windows 窗口圆角：Electron 的 roundedCorners 选项仅 macOS 有效，Windows frameless 窗口是直角。
+   对需要圆角的窗口（chat/app/supervisor，主进程已设 transparent），用透明 body + 圆角裁剪实现四角透明。
+   desktop（全屏壁纸）/ dock / supervisor-bubble 不走此规则（它们的圆角由自身 CSS 或无需圆角承担）。 */
+html[data-platform='win32'][data-rounded='true'] body {
+  background: transparent;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
 /* 全局动画 keyframes：所有窗口（聊天 / 会话管家 / 应用等）共享。
    原先定义在 App.tsx 内联 <style> 里，导致独立窗口（如会话管家 SupervisorApp）
    拿不到这些 keyframes，出现「思考中三点不动」「光标不闪烁」等动画失效。 */

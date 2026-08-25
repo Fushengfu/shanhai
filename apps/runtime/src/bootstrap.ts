@@ -1,7 +1,7 @@
 import { Kernel, FileSnapshotStore, PluginStore, type DynamicPackage } from '@shanhai/kernel'
 import { CORE_SLOTS } from '@shanhai/kernel-modules/client'
 import { SelfModifyRuntime } from '@shanhai/selfmod'
-import { Session, effectiveApprovalPolicy, effectiveModelId, type ApprovalPolicy, type SessionEvent } from '@shanhai/session'
+import { Session, type ApprovalPolicy, type SessionEvent } from '@shanhai/session'
 import { ApprovalService } from '@shanhai/approval'
 import { AgentLoop, ModelTriage, Orchestrator, type RoleDefinition, type StepTrace, type SuspendedSnapshot, type TaskPlan } from '@shanhai/agent'
 import type { Model, ContentPart, TokenUsage, HttpTrace, HttpTraceCallback, ChatMessage } from '@shanhai/llm'
@@ -20,6 +20,18 @@ import { createTerminalSkill, createMockTerminalService, type TerminalService, t
 import { createDeepSeekModel, buildBridgeScript, BRIDGE_READY_CHECK } from '@shanhai/deepseek-bridge'
 import { uploadImageToCloud } from '@shanhai/storage'
 import { createSupervisorTools, SUPERVISOR_ID, type SessionStateSummary } from './supervisor'
+import { createSupervisorLedgerTools, ensureSupervisorWorkspace, removeSessionLedger, SUPERVISOR_WORKSPACE } from './supervisor-workspace'
+import {
+  sessionDirPath,
+  writeSessionMetaFile,
+  readSessionMetaFile,
+  appendSessionEventsFile,
+  rewriteSessionEventsFile,
+  loadSessionEventsFile,
+  rotateSessionEventsFile,
+  deleteSessionDir,
+  migrateLegacySessionFile,
+} from './session-store'
 import { promises as fs } from 'node:fs'
 import { homedir, hostname as osHostname } from 'node:os'
 import { randomUUID } from 'node:crypto'
@@ -358,8 +370,8 @@ export interface Runtime {
   registerExpert(role: { id: string; name: string; description: string; systemPrompt: string }): Promise<RoleDefinition & { builtin: boolean }>
   /** 删除一个自定义专家（内置专家不可删除） */
   removeExpert(id: string): Promise<void>
-  /** 列出长期记忆（跨会话，配置型 + 经验型） */
-  listMemory(): Array<{ id: number; scope: string; key: string; value: unknown; source: string; confidence: number; timestamp: number }>
+  /** 列出长期记忆（按会话隔离，仅返回当前会话的记忆） */
+  listMemory(sessionId: string): Array<{ id: number; scope: string; key: string; value: unknown; source: string; confidence: number; timestamp: number; sessionId?: string }>
   /** 删除一条长期记忆（按 id） */
   removeMemory(id: number): void
   /** 语音转文字（STT）：音频 base64 → 文本（优先 LLM 网关 AI 识别，失败降级 macOS Speech） */
@@ -661,9 +673,9 @@ async function writeSettings(patch: Partial<AppSettings>): Promise<void> {
 /** 当前正在播放的 say 子进程：新播报来了先打断旧的，避免多条语音叠加播放 */
 let activeSay: ChildProcess | null = null
 
-/** 用系统语音引擎播报文本（可被打断 + 超时兜底）。
+/** 用系统语音引擎播报文本（可被打断，不设固定超时，按实际文本长度自然朗读完整）。
  *  macOS 走 /usr/bin/say，Windows 走 PowerShell System.Speech SAPI（无外部依赖）。 */
-function spawnSay(text: string, voice: string, timeoutMs: number): Promise<void> {
+function spawnSay(text: string, voice: string): Promise<void> {
   const isWin = process.platform === 'win32'
   const file = isWin ? 'powershell.exe' : '/usr/bin/say'
   const args = isWin
@@ -673,21 +685,11 @@ function spawnSay(text: string, voice: string, timeoutMs: number): Promise<void>
   return new Promise((resolve) => {
     const child = spawn(file, args, { stdio: 'ignore' })
     activeSay = child
-    const timer = setTimeout(() => {
-      try {
-        child.kill('SIGTERM')
-      } catch {
-        /* 已退出 */
-      }
-      resolve()
-    }, timeoutMs)
     child.on('error', () => {
-      clearTimeout(timer)
       if (activeSay === child) activeSay = null
       resolve()
     })
     child.on('exit', () => {
-      clearTimeout(timer)
       if (activeSay === child) activeSay = null
       resolve()
     })
@@ -754,8 +756,8 @@ function createSystemVoiceService(): VoiceService {
           }
           activeSay = null
         }
-        // 设 30s 超时：避免语音引擎因音频设备异常卡住导致 speak 永不返回、特效不消失
-        await spawnSay(text, voice, 30000)
+        // 不设固定超时：让 say 按实际文本长度自然朗读完整，避免长文本被 30s 硬超时截断
+        await spawnSay(text, voice)
       } catch (err) {
         // 明确记录失败原因（之前 .catch 静默吞掉，无法定位「没声音」）
         console.error('[voice] say 播报失败:', err instanceof Error ? err.message : String(err))
@@ -918,7 +920,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   /** DeepSeek 网页版桥接模型来源（本地免费 LLM 网关，非工具/技能；服务启动成功后才非空） */
   let deepseekBridgeModel: GatewayModel | null = null
   let currentModelId = ''
-  /** 全局默认模型 id（新会话 / 无 model/select 记录的会话回退用），随 switchModel 更新并持久化到 config.json */
+  /** 全局默认模型 id（新会话 / 未设置会话模型的会话回退用），随 switchModel 更新并持久化到 config.json */
   let defaultModelId = ''
 
   /** 全部模型 = 系统内置 + 用户自定义 + DeepSeek 网页版（自定义标记 custom: true，UI 分组展示） */
@@ -934,6 +936,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     lastActiveAt: number
     /** 是否为「会话管家」超级会话（固定 id，不显示在用户侧边栏、不可改名/删除） */
     isSupervisor: boolean
+    /** 会话级模型 id（持久化到 meta.json；undefined 表示未选择，回退全局默认模型） */
+    modelId?: string
+    /** 会话级审批策略（安全模式，持久化到 meta.json；undefined 回退 'ask'） */
+    approvalPolicy?: ApprovalPolicy
   }
   const sessionsDir = join(homedir(), '.shanhai', 'sessions')
   /** LLM 请求/响应原始记录目录（排查问题用，独立于会话 JSON，避免污染会话回放与体积膨胀） */
@@ -1008,18 +1014,44 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     }
   }
 
-  async function persistSession(meta: SessionMeta): Promise<void> {
+  // 每会话持久化串行队列：persistSession 被 fire-and-forget 并发调用，若不串行化，并发「增量追加」会乱序/重复/丢失。
+  // 用链式 Promise 串行化（与 config.json 互斥锁同理），保证每个会话的事件按 append 顺序落盘。
+  const sessionWriteChains = new Map<string, Promise<unknown>>()
+
+  function persistSession(meta: SessionMeta): Promise<void> {
+    const prev = sessionWriteChains.get(meta.id) ?? Promise.resolve()
+    const next = prev.then(() => persistSessionInner(meta)).catch(() => undefined)
+    sessionWriteChains.set(meta.id, next)
+    return next
+  }
+
+  async function persistSessionInner(meta: SessionMeta): Promise<void> {
     try {
-      await fs.mkdir(sessionsDir, { recursive: true })
-      // 只丢弃 assistant/delta（流式增量中间态，最终 assistant/message 已含完整内容，属去冗余而非丢数据）；
-      // tool/result、附件 base64 等原始数据一律完整保留，不截断、不降级。
-      const events = meta.session.list().filter((e) => e.type !== 'assistant/delta')
-      const data = { id: meta.id, title: meta.title, workDir: meta.workDir, lastActiveAt: meta.lastActiveAt, events }
-      // 原子写：先写临时文件再 rename 覆盖，避免应用崩溃/强杀时留下 0 字节或截断的会话文件（启动时 JSON.parse 失败被跳过 → 会话「凭空消失」）
-      const path = join(sessionsDir, `${meta.id}.json`)
-      const tmp = `${path}.tmp`
-      await fs.writeFile(tmp, JSON.stringify(data, null, 2), { mode: 0o600 })
-      await fs.rename(tmp, path)
+      const dir = sessionDirPath(sessionsDir, meta.id)
+      // 1. meta 小文件覆盖写（原子：临时文件 + rename）
+      await writeSessionMetaFile(dir, {
+        id: meta.id,
+        title: meta.title,
+        workDir: meta.workDir,
+        lastActiveAt: meta.lastActiveAt,
+        modelId: meta.modelId,
+        approvalPolicy: meta.approvalPolicy,
+      })
+      // 2. events 增量追加（或截断/删除历史后全量重写）
+      const session = meta.session
+      if (session.requireRewrite()) {
+        // 只丢弃 assistant/delta（流式增量中间态，最终 assistant/message 已含完整内容，属去冗余而非丢数据）；
+        // tool/result、附件 base64 等原始数据一律完整保留，不截断、不降级。
+        const durable = session.list().filter((e) => e.type !== 'assistant/delta')
+        await rewriteSessionEventsFile(dir, durable)
+        session.markPersisted()
+      } else {
+        const newEvents = session.slice(session.persistedCount).filter((e) => e.type !== 'assistant/delta')
+        if (newEvents.length > 0) {
+          await appendSessionEventsFile(dir, newEvents)
+        }
+        session.persistedCount = session.size
+      }
     } catch {
       // 忽略持久化失败
     }
@@ -1046,6 +1078,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   }
 
   /** 创建新会话（仅创建 + 持久化，不切换 currentSessionId、不写 lastActiveSessionId、不改全局模型），供管家 create_session 工具后台新建 */
+  // 注意：普通会话默认工作目录为 ~/shanhai/workspace（不带点，历史遗留路径，保持不变）；与配置/数据目录 ~/.shanhai/（带点）不同
   const createSessionInternal = (title?: string, workDir?: string): string => {
     const id = `s-${Date.now()}-${Math.random().toString(36).slice(2)}`
     const meta: SessionMeta = { id, title: title?.trim() || '新会话', session: new Session(), workDir: workDir ?? join(homedir(), 'shanhai', 'workspace'), lastActiveAt: Date.now(), isSupervisor: false }
@@ -1066,12 +1099,13 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
    * 不抢占 currentSessionId、不写 lastActiveSessionId（管家不是「最近激活的用户会话」）。
    */
   const ensureSupervisorSession = (): void => {
+    void ensureSupervisorWorkspace()
     if (sessions.has(SUPERVISOR_ID)) return
     const meta: SessionMeta = {
       id: SUPERVISOR_ID,
       title: '会话管家',
       session: new Session(),
-      workDir: join(homedir(), 'shanhai', 'workspace'),
+      workDir: SUPERVISOR_WORKSPACE,
       lastActiveAt: Date.now(),
       isSupervisor: true,
     }
@@ -1096,25 +1130,56 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   // 启动时加载历史会话（聊天记录持久化：重启后历史消息不丢）
   try {
     await fs.mkdir(sessionsDir, { recursive: true })
-    const files = await fs.readdir(sessionsDir)
-    for (const f of files) {
-      if (!f.endsWith('.json')) continue
-      try {
-        const raw = await fs.readFile(join(sessionsDir, f), 'utf8')
-        const data = JSON.parse(raw) as { id: string; title: string; workDir?: string; lastActiveAt?: number; events?: SessionEvent[] }
-        const meta: SessionMeta = {
-          id: data.id,
-          title: data.title,
-          session: new Session(),
-          workDir: data.workDir ?? join(homedir(), 'shanhai', 'workspace'),
-          lastActiveAt: typeof data.lastActiveAt === 'number' ? data.lastActiveAt : 0,
-          // 管家超级会话按固定 id 识别（持久化文件不含 isSupervisor，id 即身份）
-          isSupervisor: data.id === SUPERVISOR_ID,
+    const entries = await fs.readdir(sessionsDir, { withFileTypes: true })
+    const defaultWorkDir = join(homedir(), 'shanhai', 'workspace')
+    for (const entry of entries) {
+      // 新格式：<会话id>/ 目录（含 meta.json + events.jsonl）
+      if (entry.isDirectory()) {
+        try {
+          const dir = join(sessionsDir, entry.name)
+          const metaFile = await readSessionMetaFile(dir)
+          if (!metaFile) continue
+          const meta: SessionMeta = {
+            id: metaFile.id,
+            title: metaFile.title,
+            session: new Session(),
+            workDir: metaFile.workDir || defaultWorkDir,
+            lastActiveAt: typeof metaFile.lastActiveAt === 'number' ? metaFile.lastActiveAt : 0,
+            // 管家超级会话按固定 id 识别（持久化文件不含 isSupervisor，id 即身份）
+            isSupervisor: metaFile.id === SUPERVISOR_ID,
+            modelId: metaFile.modelId,
+            approvalPolicy: metaFile.approvalPolicy,
+          }
+          // 启动即压缩归档超阈值活跃段（日志轮转：历史段 gzip，控制活跃段体积与读放大）
+          await rotateSessionEventsFile(dir)
+          const events = await loadSessionEventsFile(dir)
+          meta.session.restore(events)
+          sessions.set(meta.id, meta)
+        } catch {
+          // 跳过损坏的会话目录
         }
-        if (Array.isArray(data.events)) meta.session.restore(data.events)
-        sessions.set(meta.id, meta)
-      } catch {
-        // 跳过损坏的会话文件
+      } else if (entry.isFile() && entry.name.endsWith('.json')) {
+        // 旧格式：<会话id>.json 单文件 → 迁移到新格式后删除旧文件（数据逐字节等价）
+        const sessionId = entry.name.slice(0, -'.json'.length)
+        try {
+          const legacy = await migrateLegacySessionFile(sessionsDir, sessionId, defaultWorkDir)
+          if (legacy) {
+            const meta: SessionMeta = {
+              id: sessionId,
+              title: legacy.title,
+              session: new Session(),
+              workDir: legacy.workDir,
+              lastActiveAt: legacy.lastActiveAt,
+              isSupervisor: sessionId === SUPERVISOR_ID,
+              modelId: legacy.modelId,
+              approvalPolicy: legacy.approvalPolicy,
+            }
+            meta.session.restore(legacy.events)
+            sessions.set(meta.id, meta)
+          }
+        } catch {
+          // 迁移失败跳过
+        }
       }
     }
   } catch {
@@ -1173,13 +1238,13 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     return promise
   })
 
-  // 审批策略（安全模式）改为「会话级」：每个会话独立的安全模式，通过 approval/policy 事件持久化到会话 JSON。
-  // 这里不再维护全局 policy 变量；会话级 policy 由 ApprovalService 从会话事件日志回放（effectiveApprovalPolicy）。
-  /** 读取指定会话（缺省当前会话）的审批策略：从事件日志回放，缺省 'ask' */
+  // 审批策略（安全模式）为「会话级」：每个会话独立的安全模式，持久化到会话 meta.json 的 approvalPolicy 字段。
+  // 这里不再维护全局 policy 变量；会话级 policy 直接从 meta.approvalPolicy 读取。
+  /** 读取指定会话（缺省当前会话）的审批策略：从 meta 读取，缺省 'ask' */
   const sessionApprovalPolicy = (sid?: string): ApprovalPolicy => {
     const meta = sessions.get(sid ?? currentSessionId ?? '')
     if (!meta) return 'ask'
-    return effectiveApprovalPolicy(meta.session.list()) ?? 'ask'
+    return meta.approvalPolicy ?? 'ask'
   }
 
   // —— 能力实例（提前创建，供工具使用）——
@@ -1306,9 +1371,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   const memoryFile = join(homedir(), '.shanhai', 'memory.json')
   try {
     const raw = await fs.readFile(memoryFile, 'utf8')
-    const entries = JSON.parse(raw) as Array<{ scope: never; key: string; value: unknown; source?: never; confidence?: number }>
+    const entries = JSON.parse(raw) as Array<{ scope: never; key: string; value: unknown; source?: never; confidence?: number; sessionId?: string }>
     for (const e of entries) {
-      if (e && typeof e.key === 'string') memory.save(e.scope, e.key, e.value, { source: e.source, confidence: e.confidence })
+      if (e && typeof e.key === 'string') memory.save(e.scope, e.key, e.value, { source: e.source, confidence: e.confidence, sessionId: e.sessionId })
     }
   } catch {
     // 无记忆文件或损坏，忽略
@@ -1425,10 +1490,13 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       '2. 文件路径既可以是绝对路径，也可以是相对于当前工作目录的相对路径；优先使用相对路径，把操作范围限制在工作目录内。',
       '3. 需要了解项目结构时，用 list_dir 以树形列出目录。',
       `4. 执行命令时注意当前是 ${env.osName} 系统，使用对应的命令语法（如 macOS/Linux 用 ls、cat，Windows 用 dir、type）。`,
-      '5. 执行有风险的操作（写文件、运行命令）前会请求用户确认，请把要做的改动讲清楚再调用工具。',
+      '5. 区分「分析」与「执行」：只读分析类问题（看看/检查/分析/排查/为什么/能不能/在哪/怎么回事等）直接给结论，不提问、不申请审批；只有真正要「执行修改」（改代码/写文件/删文件/运行有风险命令）时，才在动手前请求用户确认，并把要做的改动讲清楚。',
       '6. 内置可执行技能（见下方【内置能力】）用 skill_read 读手册、skill_run 执行脚本；不在内置清单里的第三方技能，在需要时用 skill_list 查询。',
-      '7. 需要用户协助做选择、确认或补充信息时，用 ask_user 工具向用户提问：可提供 options 让用户单选/多选，或让用户自由输入；调用后必须等待用户回答，再基于回答继续执行。',
+      '7. 只在「执行任务过程中」确实需要用户做关键决策时才用 ask_user 提问（如多个方案需要用户选定、缺关键参数/凭证/路径无法继续、需要用户确认是否继续）；纯分析/排查/问答类问题一律直接给结论，不弹窗提问。ask_user 可提供 options 让用户单选/多选，或让用户自由输入；调用后必须等待用户回答，再基于回答继续执行。',
       '8. 输出「目录树 / 文件树 / 框线图 / 表格 / 缩进层级」等需要等宽对齐的结构化内容时，必须用 Markdown 代码块（``` 包裹）输出，不要作为普通段落输出，否则换行会被折叠、对齐错乱甚至溢出。',
+      '',
+      '【任务完成规范】',
+      '每次执行完任务（成功或失败）结束前：先对照需求逐条自检 → 构建/测试验证（附命令+真实输出，不要只说"完成"）→ 结构化总结（目标/改动清单/问题/验证结果/注意事项）。',
       '',
       '【合规与安全（必须严格遵守）】',
       '1. 你生成的所有内容必须符合中华人民共和国法律法规，践行社会主义核心价值观。',
@@ -1451,10 +1519,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       .join('\n')
   }
 
-  /** 构建长期记忆上下文：配置型全量注入 + 经验型按当前消息关键词召回（注入系统提示词） */
-  const buildMemoryContext = (message: string): string | undefined => {
-    const config = memory.list().filter((e) => e.scope !== 'task_experience' && e.scope !== 'session')
-    const experience = memory.recall('task_experience', message).slice(0, 5)
+  /** 构建长期记忆上下文：配置型全量注入 + 经验型按当前消息关键词召回（注入系统提示词）。全隔离：仅召回当前会话的记忆 */
+  const buildMemoryContext = (message: string, sessionId: string): string | undefined => {
+    const config = memory.listBySession(sessionId).filter((e) => e.scope !== 'task_experience' && e.scope !== 'session')
+    const experience = memory.recall('task_experience', message, sessionId).slice(0, 5)
     const all = [...config, ...experience]
     if (all.length === 0) return undefined
     const lines = all.map((e) => `- [${e.scope}] ${e.key}: ${typeof e.value === 'string' ? e.value : JSON.stringify(e.value)}`)
@@ -1596,12 +1664,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
     memory: {
       save: (scope, key, value) => {
-        const entry = memory.save(scope as never, key, value)
+        const entry = memory.save(scope as never, key, value, { sessionId: sessionContext.getStore() ?? currentSessionId ?? '' })
         void persistMemory()
         return entry
       },
-      recall: (scope, keyword) => memory.recall(scope as never, keyword),
-      list: () => memory.list(),
+      recall: (scope, keyword) => memory.recall(scope as never, keyword, sessionContext.getStore() ?? currentSessionId ?? ''),
+      list: () => memory.listBySession(sessionContext.getStore() ?? currentSessionId ?? ''),
     },
   })
   const askTools: ToolContract[] = createAskTools(askService, () => sessionContext.getStore() ?? currentSessionId ?? '')
@@ -1771,9 +1839,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   const snapshot = (sid?: string): TokenSnapshot => {
     const target = sid ?? currentSessionId ?? ''
     const s = sessionStats(target)
-    // contextLength 兜底：supervisor 会话用管家模型（会话日志回放），其余用全局当前模型（切模型/登录后写入当前会话，未写入时用模型属性兜底）
+    // contextLength 兜底：supervisor 会话用管家模型（meta.modelId），其余用全局当前模型（切模型/登录后写入当前会话，未写入时用模型属性兜底）
     const fallbackModelId = target === SUPERVISOR_ID
-      ? ((sessions.get(SUPERVISOR_ID) ? effectiveModelId(sessions.get(SUPERVISOR_ID)!.session.list()) : undefined) ?? defaultModelId)
+      ? (sessions.get(SUPERVISOR_ID)?.modelId ?? defaultModelId)
       : currentModelId
     const ctxLen = s.contextLength > 0 ? s.contextLength : allModels().find((m) => m.id === fallbackModelId)?.contextLength ?? 0
     return {
@@ -1905,7 +1973,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     if (Array.isArray(g?.customModels)) {
       customModels = g.customModels.map((m) => ({ ...m, custom: true }))
     }
-    // 审批策略（安全模式）已是会话级：从各会话事件日志回放（approval/policy 事件），无需从 config.json 全局恢复
+    // 审批策略（安全模式）已是会话级：持久化到各会话 meta.json 的 approvalPolicy 字段，无需从 config.json 全局恢复
     // 通用设置已在上面（能力实例创建后）用 readSettings() 恢复，这里无需重复
   } catch {
     // 无凭证，未登录
@@ -2042,8 +2110,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   const userMessageCallbacks = new Set<(sessionId: string, message: string, turnSeq: number) => void>()
 
   /** 专家专属 systemPrompt（含环境信息 + 长期记忆 + 角色人设），由 Orchestrator 在每步注入 */
-  const buildExpertSystemPrompts = (workDir: string, message: string): Map<string, string> => {
-    const base = buildSystemPrompt(workDir, buildMemoryContext(message))
+  const buildExpertSystemPrompts = (workDir: string, message: string, sessionId: string): Map<string, string> => {
+    const base = buildSystemPrompt(workDir, buildMemoryContext(message, sessionId))
     const map = new Map<string, string>()
     for (const role of roleRegistry.values()) {
       map.set(role.id, role.systemPrompt ? `${base}\n\n${role.systemPrompt}` : base)
@@ -2103,11 +2171,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     }
     // —— 多专家编排入口：Triage 拆解（复杂任务拆多步路由专家，简单任务单步走现有 ReAct）——
     // 拆解失败（模型/网络/解析异常）自动退化为单步，绝不阻断主流程
-    // 每次路由前同步最新专家列表（内置 + 自定义），让新增的专家能被拆解指派到
-    triage.setRoles([...roleRegistry.values()])
+    // 用会话自己的模型创建局部 triage（不共享全局 triage），保证拆解/汇总与执行用同一模型，
+    // 避免管家异步下发给目标会话时错用全局 currentModelId 的模型。
+    const sessionTriage = new ModelTriage(effModel, [...roleRegistry.values()])
     if (!isSupervisorRun)
     try {
-      const plan = await sessionContext.run(sid, () => triage.route(message))
+      const plan = await sessionContext.run(sid, () => sessionTriage.route(message))
       if (plan.steps.length > 1) {
         // 多步编排：先落盘用户消息（专家用独立 Session，主会话手动记录用户消息 + 最终回复）
         targetSession.append('user/message', { content: message, attachments: (opts?.attachments ?? []) as unknown[] })
@@ -2120,10 +2189,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         // 累积多专家编排的思考内容，落盘到 assistant/message（否则多专家思考只存在于实时流、重启/重建后丢失）
         let expertReasoning = ''
         try {
-          const orchestrator = new Orchestrator(triage, expertAgents, {
+          const orchestrator = new Orchestrator(sessionTriage, expertAgents, {
             sessionId: sid,
             expertNames: roleNameById(),
-            expertSystemPrompts: buildExpertSystemPrompts(meta.workDir, message),
+            expertSystemPrompts: buildExpertSystemPrompts(meta.workDir, message, meta.id),
             onStep: (trace) => {
               // 轮次序号 = 会话内 user 消息序号（本轮 user/message 已 append，其数量即本轮序号）
               const turnSeq = targetSession.list().filter((e) => e.type === 'user/message').length
@@ -2140,7 +2209,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
               reasoningCallbacks.forEach((cb) => cb(sid, text))
             },
             summarize: async (task, steps, onDelta) => {
-              // 用主模型（triage 同款旗舰模型）把各专家结果汇总成一段直接回答用户问题的最终结果
+              // 用会话模型（与 triage 拆解同一模型）把各专家结果汇总成一段直接回答用户问题的最终结果
               const parts = steps.map((s, i) => `${i + 1}. [${s.expert}] ${s.title}\n${s.result}`).join('\n\n')
               const systemPrompt =
                 '你是「山海」的结果汇总器。下面是一次多专家协作任务中各位专家的执行结果，以及用户最初的问题。请把它们汇总成一段连贯、简洁、直接回答用户问题的最终结果：只输出最终答案本身，不要罗列专家名、不要复述执行过程、不要加分节标题（除非用户明确要求）。'
@@ -2151,8 +2220,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
               ]
               let full = ''
               try {
-                if (model.stream) {
-                  for await (const chunk of model.stream(messages, [])) {
+                if (effModel.stream) {
+                  for await (const chunk of effModel.stream(messages, [])) {
                     if (stoppedSessions.has(sid)) throw new Error('__stopped__')
                     if (chunk.text) {
                       full += chunk.text
@@ -2160,7 +2229,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
                     }
                   }
                 } else {
-                  const res = await model.complete(messages, [])
+                  const res = await effModel.complete(messages, [])
                   full = res.text ?? ''
                   if (full) onDelta(full)
                 }
@@ -2206,7 +2275,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         loop.run(message, {
           ...opts,
           // 系统提示词告知当前工作目录：让模型知道文件/命令操作的锚点，并约束工具调用围绕工作目录
-          systemPrompt: isSupervisorRun ? buildSupervisorSystemPrompt() : buildSystemPrompt(meta.workDir, buildMemoryContext(message)),
+          systemPrompt: isSupervisorRun ? buildSupervisorSystemPrompt(message) : buildSystemPrompt(meta.workDir, buildMemoryContext(message, meta.id)),
           attachments: opts?.attachments,
           modelContent,
           onDelta: (text) => {
@@ -2258,29 +2327,34 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   // —— 会话管家（主 Agent）：状态查询 + 消息转发 + 会话配置 ——
 
   /** 管家专用系统提示词：定位为「主 Agent」，可查看/转发/配置所有用户会话 */
-  const buildSupervisorSystemPrompt = (): string =>
-    [
+  const buildSupervisorSystemPrompt = (message: string): string => {
+    const mem = buildMemoryContext(message, SUPERVISOR_ID)
+    const base = [
       '你是「会话管家」，山海多会话系统的主 Agent。你负责准确理解用户意图、把任务精准调度给合适的会话，并监控各会话状态，而不是替某个会话执行具体的编码/文件任务。',
       '你的能力：',
       '1. 用 list_sessions 查看所有会话及其状态（标题、工作目录、当前需求、最近需求 recentRequests、是否忙、已执行步数、上下文占用、是否激活）。',
       '2. 用 inspect_session 深入查看某个会话的详情。',
       '3. 用 list_models 查看可选模型。',
-      '4. 用 switch_session 切换管家当前聚焦的会话（仅管家视角，不影响用户聊天窗口显示的会话）。',
+      '4. 用 switch_session 切换激活会话（等同用户在侧边栏点击切换，聊天窗口会同步切换到该会话）。',
       '5. 用 send_message / inject_message 把需求转发给指定会话执行（等同用户手动切过去发消息）。',
       '6. 用 set_session_model 切换某个会话使用的模型，用 set_session_approval 配置其安全模式。',
       '7. 用 create_session 新建会话、rename_session 重命名会话、set_session_workdir 设置会话工作目录、delete_session 删除会话。',
       '8. 用 choose_session 弹出会话选择器让用户选目标会话、choose_model 弹出模型选择器让用户选模型（阻塞等待用户选择，选中后拿到 id 再继续）。',
       '9. 用 ask_user 向用户提问：需要用户单选/多选、确认或补充信息时，可提供 options 让用户点选（multiple 为 true 时多选），或让用户自由输入；调用后必须等待用户回答再继续。',
       '10. 用插件类工具沉淀与扩展管家自身能力：plugin_inspect 查看可挂载 UI 插槽/可用工具/已注册服务/已安装插件；plugin_define 定义新插件（host 半是进程内源码、client 半是界面 UI 源码）；plugin_run 临时运行、plugin_stop / plugin_undefine 撤回；要长期沉淀走 plugin_define → plugin_test 自测 → plugin_install 安装进内核（落盘 ~/.shanhai/plugins/，跨会话/跨重启留存）→ plugin_uninstall 卸载。已安装插件重启后自动加载。',
-      '【调度决策流程】收到用户消息后，必须严格按以下五步执行，一步都不能省：',
-      '第一步 解析需求：把用户这条消息拆解成 1..N 个独立需求。判据：每个需求是一个「可以独立交给某个会话完成的任务单元」。一条消息含多个相互独立需求时必须拆开逐个处理；只含一个需求则 N=1。',
-      '第二步 匹配会话：对每个需求，用 list_sessions 查看所有会话的 title（职责）、workDir（工作目录）、recentRequests（最近在做什么）、currentRequest（当前在做什么）、busy 状态，判断该需求应交由哪个会话。综合会话标题体现的职责、工作目录、历史与当前需求来判断：能唯一确定 → 记下目标会话 id；不能唯一确定（有多个候选 / 无匹配 / 拿不准）→ 标记为「待确认」。',
-      '第三步 求助确认（不明确时强制，禁止臆测）：',
-      '  - 需求本身表述不清（缺「做什么 / 对哪个项目或目录 / 要什么结果」等关键信息）→ 先用 ask_user 追问清楚，禁止猜测后直接下发。',
-      '  - 需求明确但目标会话不明确 → 先 list_sessions 拿候选，再用 choose_session 弹选择器让用户选；候选为空则 ask_user 询问用户想用哪个会话或是否新建。',
-      '  - 一条消息含多个需求，部分明确部分不明确 → 明确的部分可先下发，不明确的部分单独求助，不能因一条不明确就整体卡住或整体瞎猜。',
-      '第四步 执行下发：对每个已明确的需求，用 send_message 把需求内容原样、完整地转发给目标会话（不要删减、不要替它做、不要把不同需求合并成一条），并逐一汇报「需求 X → 会话「标题」」的映射，让用户可核对。',
-      '第五步 汇报：用简洁清单向用户汇报：哪些需求已下发到哪个会话、哪些需求已求助待确认，做到每个需求都有明确去向，不留任何「我以为」。',
+      '11. 用台账工具维护持久化跨会话状态速查记录（承载各会话的「任务计划/进度」，跨重启可恢复，按需读写即可，详见下方【台账】）：list_ledger 列出台账目录、read_ledger 读台账文件、write_ledger 写台账文件（覆盖）、edit_ledger 局部编辑台账文件。台账位于管家私有工作目录 ~/.shanhai/supervisor-workspace/，只作用于你自己的速查记录，与各会话的事件日志、长期记忆互不冲突。',
+      '【调度流程】收到用户消息后按「拆 → 配 → 问 → 发 → 报」处理，能一步到位就别多绕：',
+      '1 拆分：把消息拆成 1..N 个可独立交给会话的任务单元，多需求逐个处理。',
+      '2 匹配：list_sessions 按 title/workDir/recentRequests/currentRequest/busy 判断归属；唯一确定→记下会话 id，不确定（多候选/无匹配）→标记待确认。',
+      '3 不明确就求助（禁止臆测）：需求缺关键信息→ask_user 追问；目标会话不确定→choose_session 让用户选（无候选则 ask_user 问是否新建）；多需求中明确的先下发、不明确的单独求助，不整体卡住。',
+      '4 下发：对明确需求用 send_message 原样完整转发（不删减、不代办、不合并），并汇报「需求→会话」映射。',
+      '5 汇报：简洁清单说明每个需求去向（已下发/待确认），不留「我以为」。',
+      '【任务编排（项目经理模式）】当需求是「多步骤的完整项目/系统」（如"开发商城系统"）时，不要一次性把所有需求灌给会话，要像项目经理一样拆解、排期、逐个监督执行：',
+      '1 分析拆解：先产出需求分析与方案，拆成 3..10 个有先后依赖的具体任务（todo 清单）；可自己分析，也可先 send_message 让目标会话产出方案再据此拆解。',
+      '2 落账：用 write_ledger 把任务清单写进该会话的 state.json（按【台账结构约定】的 schema：goal/plan/tasks，初始全 status=todo）。',
+      '3 逐个下发：按顺序用 send_message 把「下一个 todo 任务」下发给会话，一次只发一个（该任务 mark doing）；执行期间不重复下发、不打断。',
+      '4 回传更新：收到该会话执行完成回传后，用 edit_ledger 把该任务 status 改为 done、result 回填结果摘要；失败则 status=blocked 并记录原因。',
+      '5 接力收工：更新后若清单还有 todo，继续第 3 步下发下一个；清单全部 done 后向用户汇报整体完成并收工。清单有限、逐个勾销，禁止空转或无限下发。',
       '【求助用户的形式】（务必遵守）：',
       '- 需要用户做「选择」（选目标会话 / 选模型）→ 用 choose_session / choose_model 弹选择器，禁止用纯文本反问。',
       '- 需要用户「补充信息 / 确认 / 回答开放问题」→ 用 ask_user 弹提问卡片（能枚举选项就给 options，multiple 按需多选；开放问题让用户自由输入）。',
@@ -2294,7 +2368,17 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       '- 配置类操作（切模型/改安全模式/改工作目录/重命名）先说明再执行，执行完汇报。',
       '- delete_session 是危险且不可恢复的操作：执行前必须向用户复述目标会话 id 与标题，得到明确确认后才能删除。',
       '- 你只做会话调度与监控，不替目标会话执行具体任务（具体任务由目标会话的 Agent 完成）。',
+      '【台账（可选辅助记忆，勿机械执行）】：',
+      '- 台账只在你需要回忆「跨会话的历史决策/待跟进/注意事项」时才 read_ledger；日常查询直接 list_sessions（已含实时状态），不必读台账。',
+      '- 首次发现台账目录为空或缺 _index.json 时，用 write_ledger 初始化：_index.json 写「会话id→标题」，每会话建 state.json（currentTask/status）与 notes.md 占位。',
+      '- 仅当会话发生实质状态变化（下发任务、结果回传、会话增删改/完成/失败）后，才用 write_ledger/edit_ledger 更新对应 state.json/notes.md 并同步 _index.json；纯查询、纯转发无需写台账。',
+      '【台账结构约定】：',
+      '- 管家工作目录是 ~/.shanhai/supervisor-workspace/（独立于普通会话工作目录）。顶层 _index.json 记录「会话 id → 标题」索引；每个会话一个子目录（目录名 = 会话 id），内含 notes.md（自然语言备注：当前任务、关键决策、待跟进、注意事项）与 state.json（结构化状态）。',
+      '- state.json 统一用以下结构承载「任务计划与进度」（这是台账的核心，务必按此 schema 写）：{"goal":"该会话总体目标","plan":"需求分析与方案设计摘要","tasks":[{"id":1,"title":"任务标题","status":"todo","result":""}],"updatedAt":<时间戳>}。status 取值 todo(待办)/doing(进行中)/done(已完成)/blocked(阻塞)。',
+      '- 台账与权威来源的分工：事件日志（sessions/<会话id>/events.jsonl）是权威完整历史，台账是你的速查摘要；两者不冲突，台账用于「快速回忆」，需要精确细节时用 list_sessions / inspect_session 查实时状态。',
     ].join('\n')
+    return mem ? base + mem : base
+  }
 
   /** 描述单个会话的完整状态（管家 list_sessions / inspect_session 用） */
   const describeSession = (sid: string): SessionStateSummary | null => {
@@ -2349,7 +2433,17 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       }
       hasIncompleteTurn = !done
     }
-    const modelId = effectiveModelId(events) ?? defaultModelId
+    // 失败重试快照：从后往前找 retry/snapshot（遇到 turn/end 说明已完成、快照失效）
+    let hasRetrySnapshot = false
+    for (let i = events.length - 1; i >= 0; i--) {
+      const t = events[i]?.type
+      if (t === 'turn/end') break
+      if (t === 'retry/snapshot') {
+        hasRetrySnapshot = true
+        break
+      }
+    }
+    const modelId = meta.modelId ?? defaultModelId
     const modelDef = allModels().find((m) => m.id === modelId)
     const snap = snapshot(sid)
     return {
@@ -2360,7 +2454,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       active: currentSessionId === sid,
       modelId,
       modelName: modelDef?.displayName ?? modelDef?.name ?? modelId,
-      approvalPolicy: effectiveApprovalPolicy(events) ?? 'ask',
+      approvalPolicy: meta.approvalPolicy ?? 'ask',
       currentRequest,
       recentRequests,
       stepCount,
@@ -2369,28 +2463,28 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       contextUsageRatio: snap.contextUsageRatio,
       turnCount: snap.turnCount,
       hasIncompleteTurn,
-      hasRetrySnapshot: readRetrySnapshot(meta) !== null,
+      hasRetrySnapshot,
       expertCount: multiExpertLoops.get(sid)?.size ?? 0,
       lastActiveAt: meta.lastActiveAt,
     }
   }
 
-  /** 切换指定会话使用的模型（写事件日志持久化；目标会话是当前全局会话时立即生效） */
+  /** 切换指定会话使用的模型（写 meta.json 持久化；目标会话是当前全局会话时立即生效） */
   const setSessionModelInternal = (sid: string, modelId: string): { ok: boolean; message: string } => {
     const meta = sessions.get(sid)
     if (!meta || meta.isSupervisor) return { ok: false, message: `会话不存在: ${sid}` }
     if (!allModels().some((m) => m.id === modelId)) return { ok: false, message: `模型不存在: ${modelId}（用 list_models 查看可用模型）` }
-    meta.session.append('model/select', { modelId })
+    meta.modelId = modelId
     void persistSession(meta)
     if (currentSessionId === sid) applyModel(modelId)
     return { ok: true, message: `已将会话「${meta.title}」(${sid}) 的模型切换为 ${modelId}` }
   }
 
-  /** 配置指定会话的安全模式（写事件日志持久化；目标会话是当前全局会话时立即生效） */
+  /** 配置指定会话的安全模式（写 meta.json 持久化；目标会话是当前全局会话时立即生效） */
   const setSessionApprovalInternal = (sid: string, policy: ApprovalPolicy): { ok: boolean; message: string } => {
     const meta = sessions.get(sid)
     if (!meta || meta.isSupervisor) return { ok: false, message: `会话不存在: ${sid}` }
-    meta.session.append('approval/policy', { policy })
+    meta.approvalPolicy = policy
     void persistSession(meta)
     if (currentSessionId === sid) approval.setPolicy(policy)
     return { ok: true, message: `已将会话「${meta.title}」(${sid}) 的安全模式设为 ${policy}` }
@@ -2440,9 +2534,15 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     // 取消该会话待回答的提问（避免 agent 永久卡在等待用户回答）
     askService.cancelSession(sid)
     sessions.delete(sid)
+    // 删除整个会话目录（新格式 <sid>/meta.json + <sid>/events.jsonl）；旧格式 <sid>.json 一并兜底删除
+    await deleteSessionDir(sessionDirPath(sessionsDir, sid))
     await fs.rm(join(sessionsDir, `${sid}.json`), { force: true }).catch(() => undefined)
+    // 释放该会话的持久化写入队列（避免 Map 随删除会话泄漏）
+    sessionWriteChains.delete(sid)
     // 清理该会话的 HTTP trace 日志（LLM 原始请求/响应，可能很大），避免删除会话后残留大文件
     await fs.rm(httpTracePath(sid), { force: true }).catch(() => undefined)
+    // 清理该会话的管家台账子目录（supervisor-workspace/<sid>/），避免删除会话后台账残留
+    await removeSessionLedger(sid)
     // 当前会话被删：切到剩余第一个「用户会话」（跳过管家）；无剩余则新建一个空会话
     if (currentSessionId === sid) {
       const next = [...sessions.values()].find((s) => !s.isSupervisor)
@@ -2458,30 +2558,30 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     return { ok: true, message: `已删除会话「${title}」(${sid})` }
   }
 
-  /** 管家自己的模型 id：优先 supervisor 会话的 model/select 记录，缺省回退全局默认模型 */
+  /** 管家自己的模型 id：读 supervisor 会话 meta.modelId，缺省回退全局默认模型 */
   const getSupervisorModelInternal = (): string => {
     const meta = sessions.get(SUPERVISOR_ID)
-    return (meta ? effectiveModelId(meta.session.list()) : undefined) ?? defaultModelId
+    return meta?.modelId ?? defaultModelId
   }
 
-  /** 管家自己的安全模式：从 supervisor 会话事件日志回放，缺省 'ask' */
+  /** 管家自己的安全模式：从 supervisor 会话 meta 读取，缺省 'ask' */
   const getSupervisorApprovalInternal = (): ApprovalPolicy => sessionApprovalPolicy(SUPERVISOR_ID)
 
-  /** 切换管家自己的模型：只向 supervisor 会话写 model/select 事件，不碰全局默认模型、不碰其他会话 */
+  /** 切换管家自己的模型：只写 supervisor 会话 meta.modelId，不碰全局默认模型、不碰其他会话 */
   const setSupervisorModelInternal = (modelId: string): { ok: boolean; message: string } => {
     const meta = sessions.get(SUPERVISOR_ID)
     if (!meta) return { ok: false, message: '管家会话不存在' }
     if (!allModels().some((m) => m.id === modelId)) return { ok: false, message: `模型不存在: ${modelId}（用 list_models 查看可用模型）` }
-    meta.session.append('model/select', { modelId })
+    meta.modelId = modelId
     void persistSession(meta)
     return { ok: true, message: `管家模型已切换为 ${modelId}` }
   }
 
-  /** 配置管家自己的安全模式：只向 supervisor 会话写 approval/policy 事件，不碰全局、不碰其他会话 */
+  /** 配置管家自己的安全模式：只写 supervisor 会话 meta.approvalPolicy，不碰全局、不碰其他会话 */
   const setSupervisorApprovalInternal = (policy: ApprovalPolicy): { ok: boolean; message: string } => {
     const meta = sessions.get(SUPERVISOR_ID)
     if (!meta) return { ok: false, message: '管家会话不存在' }
-    meta.session.append('approval/policy', { policy })
+    meta.approvalPolicy = policy
     void persistSession(meta)
     return { ok: true, message: `管家安全模式已设为 ${policy}` }
   }
@@ -2490,11 +2590,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   const switchSessionInternal = (id: string): { ok: boolean; message: string } => {
     const target = sessions.get(id)
     if (!target || target.isSupervisor) return { ok: false, message: `会话不存在: ${id}` }
+    const prevId = currentSessionId
     currentSessionId = id
     sessionRef = target.session
     void persistLastActiveSessionId(id)
-    approval.setPolicy(effectiveApprovalPolicy(target.session.list()) ?? 'ask')
-    const sidModel = effectiveModelId(target.session.list())
+    approval.setPolicy(target.approvalPolicy ?? 'ask')
+    const sidModel = target.modelId
     if (sidModel) {
       applyModel(sidModel)
     } else if (defaultModelId) {
@@ -2504,14 +2605,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     ensureDefaultBrowserWindow(id)
     currentSessionChangedCallbacks.forEach((cb) => cb(id))
     return { ok: true, message: `已激活会话「${target.title}」(${id})` }
-  }
-
-  /** 管家聚焦会话（switch_session 工具的目标）：管家是独立主 Agent，切换聚焦会话不抢占用户正在查看的聊天窗口，
-   * 故不碰 currentSessionId、不广播、不 applyModel。当前 send_message 等工具显式传 sessionId，聚焦仅作语义确认。 */
-  const switchSupervisorFocus = (id: string): { ok: boolean; message: string } => {
-    const target = sessions.get(id)
-    if (!target || target.isSupervisor) return { ok: false, message: `会话不存在: ${id}` }
-    return { ok: true, message: `管家已聚焦会话「${target.title}」(${id})（不影响用户聊天窗口当前会话）` }
   }
 
   /** 中断指定会话的进行中任务（按 sessionId 精确停止，不改变 currentSessionId）。
@@ -2549,7 +2642,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
    */
   /** 向指定会话分发消息的公共实现：空闲→异步执行（长任务不阻塞调用方），busy+insert→注入不打断，busy+queue→排队。
    *  onDone 在空闲异步执行结束后回调（管家用它回传结果到管家窗口；手机远程控制传空操作，靠 onSessionActivity('end') 获取结果）。 */
-  function dispatchToSession(
+  async function dispatchToSession(
     sid: string,
     message: string,
     mode: 'insert' | 'queue',
@@ -2557,9 +2650,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     origin: 'user' | 'supervisor' = 'user',
   ): Promise<{ ok: boolean; message: string; result?: string }> {
     const meta = sessions.get(sid)
-    if (!meta || meta.isSupervisor) return Promise.resolve({ ok: false, message: `会话不存在: ${sid}` })
+    if (!meta || meta.isSupervisor) return { ok: false, message: `会话不存在: ${sid}` }
     const content = message.trim()
-    if (!content) return Promise.resolve({ ok: false, message: '消息内容不能为空' })
+    if (!content) return { ok: false, message: '消息内容不能为空' }
 
     const busy = runningLoops.has(sid) || (multiExpertLoops.get(sid)?.size ?? 0) > 0
     if (busy && mode === 'insert') {
@@ -2585,7 +2678,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
 
     // 空闲：长任务异步执行（不阻塞调用方），用目标会话自己的 provider 隔离模型，完成后回调 onDone
     const title = meta.title
-    const targetModelId = effectiveModelId(meta.session.list()) ?? defaultModelId
+    const targetModelId = meta.modelId ?? defaultModelId
     // 实时同步 user 消息到目标会话 UI：外部下发不经过渲染进程本地 push（区别于用户手动输入），
     // 需由事件驱动立即显示用户气泡，否则要等执行结束 onSessionActivity('end') 重建 items 才出现。
     const turnSeq = meta.session.list().filter((e) => e.type === 'user/message' && !(e.data as { injected?: boolean }).injected).length + 1
@@ -2623,6 +2716,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     supMeta?.session.append('assistant/message', { content: text })
     if (supMeta) void persistSession(supMeta)
     supervisorResultCallbacks.forEach((cb) => cb(sid, title, result, error))
+    // 唤醒管家接力：更新台账进度并按任务清单下发下一个任务（复用 supervisorWakeQueue/drainSupervisorWake，忙时排队）
+    wakeSupervisorForResult(sid, title, result, error)
   }
 
   /** 目标会话任务结束后，自动执行其排队中的下一条消息（queue 模式）。function 声明提升，供 runInSession finally 调用。 */
@@ -2638,6 +2733,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   // 避免管家越界直接执行文件/命令/浏览器/插件等操作（管家职责是「监控+调度」，具体执行由目标会话 Agent 完成）。
   const SUPERVISOR_ALLOWED_BASE_TOOL_NAMES = new Set([
     'ask_user',
+    'remember',
+    'recall_memory',
     'plugin_inspect',
     'plugin_define',
     'plugin_run',
@@ -2658,7 +2755,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       inspectSession: (sid) => describeSession(sid),
       listModels: () => allModels().map((m) => ({ id: m.id, name: m.displayName ?? m.name ?? m.id })),
       sendMessage: (sid, message, mode) => sendMessageToSession(sid, message, mode),
-      switchSession: (sid) => switchSupervisorFocus(sid),
+      switchSession: (sid) => switchSessionInternal(sid),
       setSessionModel: (sid, modelId) => setSessionModelInternal(sid, modelId),
       setSessionApproval: (sid, policy) => setSessionApprovalInternal(sid, policy),
       createSession: (title, workdir) => {
@@ -2719,13 +2816,15 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         return { ok: true, message: `已代答提问 ${requestId}` }
       },
     }).map(wrapTool),
+    // 管家台账工具：锚定并强限制在管家私有台账目录内、免审批，供管家维护每会话状态记录
+    ...createSupervisorLedgerTools().map(wrapTool),
   ]
 
   /** 管家执行入口：临时切管家会话模型/审批策略，单步 ReAct + 管家工具集，执行完还原 */
   const runSupervisorInternal = async (message: string, attachments?: ContentPart[], modelIdOverride?: string): Promise<string> => {
     const supMeta = sessions.get(SUPERVISOR_ID)
-    // modelIdOverride：resend/retry 等在截断后调用时，截断可能已删掉 model/select 事件，需显式传入截断前读到的持久化模型
-    const supModel = modelIdOverride ?? (supMeta ? effectiveModelId(supMeta.session.list()) : undefined)
+    // modelIdOverride：resend/retry 等在截断后调用时显式传入截断前读到的持久化模型；否则读 meta.modelId
+    const supModel = modelIdOverride ?? supMeta?.modelId
     const targetModelId = supModel ?? defaultModelId
     const savedModelId = currentModelId
     if (targetModelId) applyModel(targetModelId)
@@ -2808,6 +2907,26 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     const turnSeq = supMeta ? supMeta.session.list().filter((e) => e.type === 'user/message' && !(e.data as { injected?: boolean }).injected).length + 1 : 1
     userMessageCallbacks.forEach((cb) => cb(SUPERVISOR_ID, prompt, turnSeq))
     console.log('[supervisor-wake] 提问请求入队：', req.id, 'queue=', supervisorWakeQueue.length, 'supervisorWaking=', supervisorWaking, 'runningLoops.has=', runningLoops.has(SUPERVISOR_ID))
+    void drainSupervisorWake()
+  }
+
+  /** 唤醒管家处理会话任务完成回传：让管家按【任务编排】流程更新台账进度、接力下发下一个任务。
+   *  复用 supervisorWakeQueue / drainSupervisorWake；管家空闲则异步执行、正忙则排队，不打断管家当前动作。 */
+  function wakeSupervisorForResult(sid: string, title: string, result?: string, error?: string): void {
+    const body = error ? `执行失败：${error}` : (result ?? '（无正文输出）')
+    const prompt =
+      `【任务回传】会话「${title}」(${sid}) 的任务执行${error ? '失败' : '完成'}。\n` +
+      `结果：${body}\n\n` +
+      `请按【任务编排】流程接力处理：\n` +
+      `1. 若该会话在台账里有任务清单（state.json 的 tasks），read_ledger 读取后，把刚完成的任务 status 改为 done（失败改 blocked）并回填 result，同步 _index.json。\n` +
+      `2. 若清单里还有 status=todo 的后续任务，用 send_message 把下一个任务下发给该会话（继续推进流水线）。\n` +
+      `3. 若清单已全部 done、或该会话本就没有任务清单（只是简单转发），更新必要状态后结束本轮，不要重复下发、不要空转。`
+    supervisorWakeQueue.push(prompt)
+    // 实时广播到管家窗口：任务回传 prompt 立即显示为管家窗口的 user 气泡（否则要等管家跑完一轮 onSessionActivity('end') 才出现）
+    const supMeta = sessions.get(SUPERVISOR_ID)
+    const turnSeq = supMeta ? supMeta.session.list().filter((e) => e.type === 'user/message' && !(e.data as { injected?: boolean }).injected).length + 1 : 1
+    userMessageCallbacks.forEach((cb) => cb(SUPERVISOR_ID, prompt, turnSeq))
+    console.log('[supervisor-wake] 任务回传入队：', sid, 'queue=', supervisorWakeQueue.length, 'supervisorWaking=', supervisorWaking, 'runningLoops.has=', runningLoops.has(SUPERVISOR_ID))
     void drainSupervisorWake()
   }
 
@@ -3210,7 +3329,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
     createSession(title, workdir) {
       const id = newSession(title ?? '新会话', workdir)
-      // 新会话无 model/select 记录：回退全局默认模型（defaultModelId 为空则保持现状，未登录时无模型可切）
+      // 新会话未设置会话模型：回退全局默认模型（defaultModelId 为空则保持现状，未登录时无模型可切）
       if (defaultModelId) applyModel(defaultModelId)
       // 新会话默认预创建一个浏览器窗口
       ensureDefaultBrowserWindow(id)
@@ -3325,10 +3444,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       // 全局默认模型随选择更新（新会话 / 无记录会话回退用），持久化到 config.json
       defaultModelId = modelId
       void persistSelectedModel(modelId)
-      // 会话级：向当前会话事件日志追加 model/select 事件，切回该会话时回放恢复（对齐 approval/policy 模式）
+      // 会话级：写入当前会话 meta.modelId，切回该会话时直接读 meta 恢复
       const meta = currentSessionId ? sessions.get(currentSessionId) : undefined
       if (meta) {
-        meta.session.append('model/select', { modelId })
+        meta.modelId = modelId
         void persistSession(meta)
       }
     },
@@ -3354,8 +3473,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       const meta = sessions.get(sessionId)
       if (!meta) throw new Error(`会话不存在: ${sessionId}`)
       const events = meta.session.list()
-      // 截断前先取该会话持久化模型（model/select 可能位于被截断区，须先读取；管家会话模型同样持久化在其会话日志里）
-      const effModelId = effectiveModelId(events) ?? defaultModelId
+      // 会话级模型已在 meta.modelId（截断不影响，无需截断前先读）
+      const effModelId = meta.modelId ?? defaultModelId
       // 定位第 userMessageIndex 条用户消息（0 起），拿到原内容
       let userCount = 0
       let targetIdx = -1
@@ -3448,7 +3567,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         // 3. 重建专家 + Orchestrator，从 plan + 已完成结果继续（跳过已完成步骤）
         stoppedSessions.delete(sid)
         touchSession(sid)
-        const effModelId = effectiveModelId(events) ?? defaultModelId
+        const effModelId = meta.modelId ?? defaultModelId
         const effModel = resolveProvider(effModelId)
         const visionCapable = modelSupportsVision(allModels().find((m) => m.id === effModelId))
         const expertAgents = buildExpertAgents(sid, visionCapable, effModelId, meta.session)
@@ -3459,7 +3578,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
           const orchestrator = new Orchestrator(triage, expertAgents, {
             sessionId: sid,
             expertNames: roleNameById(),
-            expertSystemPrompts: buildExpertSystemPrompts(meta.workDir, lastUserContent),
+            expertSystemPrompts: buildExpertSystemPrompts(meta.workDir, lastUserContent, meta.id),
             onStep: (trace) => {
               const turnSeq = meta.session.list().filter((e) => e.type === 'user/message').length
               meta.session.append('orchestrator/step', { stepId: trace.stepId, expertId: trace.expertId, title: trace.title, status: trace.status, result: trace.result, error: trace.error })
@@ -3530,7 +3649,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       stoppedSessions.delete(sid)
       touchSession(sid)
       const isSupervisorRun = sid === SUPERVISOR_ID
-      const effModelId = effectiveModelId(events) ?? defaultModelId
+      const effModelId = meta.modelId ?? defaultModelId
       const effModel = resolveProvider(effModelId)
       const visionCapable = modelSupportsVision(allModels().find((m) => m.id === effModelId))
       const loop = new AgentLoop(
@@ -3549,7 +3668,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       try {
         return await sessionContext.run(sid, () =>
           loop.resumeRun(
-            isSupervisorRun ? buildSupervisorSystemPrompt() : buildSystemPrompt(meta.workDir, buildMemoryContext(lastUserContent)),
+            isSupervisorRun ? buildSupervisorSystemPrompt(lastUserContent) : buildSystemPrompt(meta.workDir, buildMemoryContext(lastUserContent, meta.id)),
             (text) => {
               if (stoppedSessions.has(sid)) throw new Error('__stopped__')
               deltaCallbacks.forEach((cb) => cb(sid, text))
@@ -3603,7 +3722,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       if (snapshot) {
         // 用该会话持久化模型 + 对应工具集（管家会话用 supervisorLoopTools），避免错用全局 currentModelId/tools
         const isSupervisorRun = sid === SUPERVISOR_ID
-        const effModelId = effectiveModelId(meta.session.list()) ?? defaultModelId
+        const effModelId = meta.modelId ?? defaultModelId
         const effModel = resolveProvider(effModelId)
         const visionCapable = modelSupportsVision(allModels().find((m) => m.id === effModelId))
         const restoredLoop = new AgentLoop(effModel, isSupervisorRun ? supervisorLoopTools : tools, meta.session, approval, sid, currentContextBudget(effModelId), visionCapable, currentApiKey(effModelId))
@@ -3641,8 +3760,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       }
       if (lastUserIdx < 0) throw new Error('没有可继续的消息')
       const content = (events[lastUserIdx]!.data as { content: string }).content
-      // 截断前取该会话持久化模型（model/select 可能位于被截断区）
-      const effModelId = effectiveModelId(events) ?? defaultModelId
+      // 会话级模型已在 meta.modelId（截断不影响）
+      const effModelId = meta.modelId ?? defaultModelId
       meta.session.truncate(lastUserIdx)
       if (sid === SUPERVISOR_ID) {
         return runSupervisorInternal(content, undefined, effModelId)
@@ -3715,8 +3834,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     setApprovalPolicy(policy) {
       const meta = currentSessionId ? sessions.get(currentSessionId) : undefined
       if (!meta) return
-      // 会话级：向当前会话事件日志追加 approval/policy 事件（持久化到会话 JSON，重启后回放恢复）
-      meta.session.append('approval/policy', { policy })
+      // 会话级：写入当前会话 meta.approvalPolicy（持久化到 meta.json，重启后直接读）
+      meta.approvalPolicy = policy
       approval.setPolicy(policy)
       void persistSession(meta)
     },
@@ -3791,8 +3910,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       triage.setRoles([...roleRegistry.values()])
     },
 
-    listMemory() {
-      return memory.list()
+    listMemory(sessionId) {
+      return memory.listBySession(sessionId)
     },
 
     removeMemory(id) {

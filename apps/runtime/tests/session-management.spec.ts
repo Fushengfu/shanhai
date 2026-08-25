@@ -24,13 +24,15 @@ describe('会话管理（持久化 / 重命名 / 删除 / 工作目录）', () =
     const result = await runtime.run('你好')
     expect(result.length).toBeGreaterThan(0)
 
-    const file = join(homedir(), '.shanhai', 'sessions', `${id}.json`)
-    const raw = await fs.readFile(file, 'utf8')
-    const data = JSON.parse(raw) as { title: string; workDir: string; events: unknown[] }
-    expect(data.title).toBe('改名后的会话')
-    expect(data.workDir).toBe('/tmp/shanhai-test-workspace')
-    expect(Array.isArray(data.events)).toBe(true)
-    expect(data.events.length).toBeGreaterThan(0)
+    // 新格式：<id>/meta.json + <id>/events.jsonl（旧 <id>.json 已废弃）
+    const dir = join(homedir(), '.shanhai', 'sessions', id)
+    const metaRaw = await fs.readFile(join(dir, 'meta.json'), 'utf8')
+    const meta = JSON.parse(metaRaw) as { title: string; workDir: string }
+    expect(meta.title).toBe('改名后的会话')
+    expect(meta.workDir).toBe('/tmp/shanhai-test-workspace')
+    const eventsRaw = await fs.readFile(join(dir, 'events.jsonl'), 'utf8')
+    const events = eventsRaw.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l) as unknown)
+    expect(events.length).toBeGreaterThan(0)
 
     // 5. 历史回放：getSessionHistory 能读出 user + assistant 消息
     const history = runtime.getSessionHistory(id)
@@ -40,7 +42,7 @@ describe('会话管理（持久化 / 重命名 / 删除 / 工作目录）', () =
     // 6. 删除：列表不再包含，磁盘文件被清理
     await runtime.deleteSession(id)
     expect(runtime.listSessions().some((s) => s.id === id)).toBe(false)
-    await expect(fs.readFile(file, 'utf8')).rejects.toThrow()
+    await expect(fs.readFile(join(dir, 'meta.json'), 'utf8')).rejects.toThrow()
 
     await runtime.kernel.dispose()
   })

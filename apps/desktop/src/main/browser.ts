@@ -1,4 +1,5 @@
 import { app, BrowserWindow } from 'electron'
+import { registerExternalWindow, unregisterExternalWindow } from './window-manager'
 import type {
   BrowserConsoleLog,
   BrowserCookie,
@@ -168,6 +169,9 @@ export function createElectronBrowserService(opts?: { show?: boolean }): Browser
       allowClose: false,
     }
     windows.set(id, st)
+    // 注册进桌面层级纠正：浏览器窗口独立管理，若不注册，点标签 show/focus 触发 ensureDesktopLayer
+    // 时会被全屏桌面壳盖住（表现为「点一下没反应、要双击才显示」）
+    registerExternalWindow(win)
     // 用户点窗口关闭按钮 → 隐藏而非销毁，标签与窗口状态保持同步（点标签可恢复显示）
     win.on('close', (e) => {
       if (!st.allowClose) {
@@ -175,7 +179,10 @@ export function createElectronBrowserService(opts?: { show?: boolean }): Browser
         win.hide()
       }
     })
-    win.on('closed', () => windows.delete(id))
+    win.on('closed', () => {
+      windows.delete(id)
+      unregisterExternalWindow(win)
+    })
     // 导航后 CDP 执行上下文重置，标记需重新 attach；由后续操作的 enableDebugger 统一重新挂载。
     // 不在这里 fire-and-forget 调 enableDebugger，避免与 navigate/create 里的显式调用并发，导致 sendCommand 竞争挂起。
     win.webContents.on('did-navigate', () => {

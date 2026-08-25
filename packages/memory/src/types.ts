@@ -16,6 +16,8 @@ export interface MemoryEntry {
   source: MemorySource
   confidence: number
   timestamp: number
+  /** 所属会话 id；空/缺省视为全局（旧数据），不参与任何会话的召回 */
+  sessionId?: string
 }
 
 /** 配置型 scope：全量注入、写前归档、可回滚 */

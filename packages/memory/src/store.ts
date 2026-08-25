@@ -3,6 +3,7 @@ import { CONFIG_SCOPES, type MemoryEntry, type MemoryScope, type MemorySource } 
 export interface SaveMeta {
   source?: MemorySource
   confidence?: number
+  sessionId?: string
 }
 
 /**
@@ -25,6 +26,7 @@ export class MemoryStore {
       source: meta?.source ?? 'explicit',
       confidence: meta?.confidence ?? 1,
       timestamp: Date.now(),
+      sessionId: meta?.sessionId,
     }
     if (CONFIG_SCOPES.includes(scope)) {
       const hk = `${scope}:${key}`
@@ -46,6 +48,13 @@ export class MemoryStore {
     return this.entries.filter((e) => e.scope === scope)
   }
 
+  /** 按会话隔离：只返回归属于指定会话的记忆（全局/旧数据不在此列） */
+  listBySession(sessionId: string, scope?: MemoryScope): MemoryEntry[] {
+    let list = this.entries.filter((e) => e.sessionId === sessionId)
+    if (scope) list = list.filter((e) => e.scope === scope)
+    return [...list]
+  }
+
   /** 删除一条记忆（按 id） */
   remove(id: number): boolean {
     const idx = this.entries.findIndex((e) => e.id === id)
@@ -54,9 +63,10 @@ export class MemoryStore {
     return true
   }
 
-  /** 召回：按 key / 内容关键词匹配，返回最新的在前 */
-  recall(scope: MemoryScope, keyword?: string): MemoryEntry[] {
+  /** 召回：按 key / 内容关键词匹配，返回最新的在前；传 sessionId 时仅召回该会话记忆（全隔离） */
+  recall(scope: MemoryScope, keyword?: string, sessionId?: string): MemoryEntry[] {
     let list = this.entries.filter((e) => e.scope === scope)
+    if (sessionId !== undefined) list = list.filter((e) => e.sessionId === sessionId)
     if (keyword) {
       list = list.filter(
         (e) => e.key.includes(keyword) || JSON.stringify(e.value).includes(keyword),

@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { useEffect, useRef, useState } from 'react'
 import type { AskRequest } from '../types'
-import { IconHelp } from './icons'
+import { IconChevronDown, IconHelp } from './icons'
 import { btn } from './ui'
 
 interface AskCardProps {
@@ -22,6 +22,8 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
   const [text, setText] = useState('')
   /** 选项列表中的「其他（自定义填写）」是否被选中（选中后显示自由文本输入框） */
   const [customMode, setCustomMode] = useState(false)
+  /** 卡片折叠状态（默认展开，折叠后仅显示标题行） */
+  const [collapsed, setCollapsed] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   /** 输入法组合中标记：中文等 IME 用回车选词时不应触发提交 */
   const isComposingRef = useRef(false)
@@ -67,13 +69,38 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
         zIndex: 10,
       }}
     >
-      <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text)', display: 'flex', alignItems: 'center' }}>
-        <IconHelp />
-        AI 需要你的确认
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: collapsed ? 0 : 6 }}>
+        <div style={{ fontWeight: 600, color: 'var(--text)', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <IconHelp />
+          AI 需要你的确认
+        </div>
+        <button
+          onClick={() => setCollapsed((c) => !c)}
+          title={collapsed ? '展开' : '折叠'}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: 22,
+            height: 22,
+            borderRadius: 6,
+            border: 'none',
+            background: 'transparent',
+            color: 'var(--text-secondary)',
+            cursor: 'pointer',
+            transform: collapsed ? 'none' : 'rotate(180deg)',
+            transition: 'transform 0.15s ease',
+          }}
+        >
+          <IconChevronDown />
+        </button>
       </div>
-      <div style={{ color: 'var(--text)', marginBottom: 10, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-        {req.question}
-      </div>
+
+      {!collapsed && (
+        <>
+          <div style={{ color: 'var(--text)', marginBottom: 10, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+            {req.question}
+          </div>
 
       {hasOptions && !customMode ? (
         <div style={{ maxHeight: 200, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -207,6 +234,8 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
           取消
         </button>
       </div>
+        </>
+      )}
     </div>
   )
 }

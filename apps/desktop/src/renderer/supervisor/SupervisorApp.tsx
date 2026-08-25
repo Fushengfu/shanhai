@@ -6,6 +6,7 @@ import { EMPTY_SESSION, type AttachmentItem, type ChatItem, type ContentPart, ty
 import { WindowTitleBar } from '../components/WindowTitleBar'
 import { AiOrb } from '../components/AiOrb'
 import { AssistantMessage } from '../components/AssistantMessage'
+import { ImagePreview } from '../components/ImagePreview'
 import { UserMessage } from '../components/UserMessage'
 import { ToolStep, StepStats, toolDisplayName, riskLevelLabel } from '../components/ToolStep'
 import { ReasoningBlock } from '../components/ReasoningBlock'
@@ -855,6 +856,9 @@ export function SupervisorApp(): React.JSX.Element {
           </div>,
           document.body,
         )}
+
+      {/* 图片预览遮罩层：与聊天窗口一致，点击消息内图片放大预览，点背景或 Esc 关闭 */}
+      {previewImage && <ImagePreview src={previewImage} onClose={() => setPreviewImage(null)} />}
     </div>
   )
 }

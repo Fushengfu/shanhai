@@ -66,6 +66,14 @@ export interface SessionEvent<T extends AgentEventType = AgentEventType> {
 export class Session {
   private readonly events: SessionEvent[] = []
 
+  /**
+   * 已持久化的事件数（前 persistedCount 条已落盘）。由持久化层读写，用于增量追加：
+   * 每次 persist 只把 [persistedCount, length) 区间的新事件追加写盘，避免 O(n) 全量重写。
+   */
+  persistedCount = 0
+  /** 自上次持久化以来是否发生过截断/删除（truncate/removeLast），命中时需全量重写磁盘，而非增量追加 */
+  private needsRewrite = false
+
   append<T extends AgentEventType>(type: T, data: EventData[T]): SessionEvent<T> {
     const event = { type, data, timestamp: Date.now() } as SessionEvent<T>
     this.events.push(event as SessionEvent)
@@ -76,11 +84,23 @@ export class Session {
     return [...this.events]
   }
 
+  /** 当前事件总数（供持久化层判断是否有新增事件，避免 list() 全量复制） */
+  get size(): number {
+    return this.events.length
+  }
+
+  /** 返回 [start, end) 区间的浅拷贝（增量持久化用，避免 list() 全量复制） */
+  slice(start: number, end?: number): SessionEvent[] {
+    return this.events.slice(start, end)
+  }
+
   /** 从历史事件恢复（会话持久化加载用），返回恢复的事件数 */
   restore(events: SessionEvent[]): number {
     for (const e of events) {
       this.events.push(e as SessionEvent)
     }
+    this.persistedCount = this.events.length
+    this.needsRewrite = false
     return events.length
   }
 
@@ -94,6 +114,8 @@ export class Session {
     if (count >= this.events.length) return 0
     const removed = this.events.length - count
     this.events.length = count
+    if (this.persistedCount > count) this.persistedCount = count
+    this.needsRewrite = true
     return removed
   }
 
@@ -105,10 +127,23 @@ export class Session {
     for (let i = this.events.length - 1; i >= 0; i--) {
       if (this.events[i]!.type === type) {
         this.events.splice(i, 1)
+        if (i < this.persistedCount) this.persistedCount -= 1
+        this.needsRewrite = true
         return true
       }
     }
     return false
+  }
+
+  /** 是否发生过需要全量重写磁盘的修改（truncate/removeLast） */
+  requireRewrite(): boolean {
+    return this.needsRewrite
+  }
+
+  /** 持久化完成后调用：清除重写标记，并把已持久化游标推进到当前长度 */
+  markPersisted(): void {
+    this.needsRewrite = false
+    this.persistedCount = this.events.length
   }
 }
 

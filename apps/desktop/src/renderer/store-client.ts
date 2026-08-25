@@ -23,6 +23,7 @@ import type {
 export interface SharedState {
   loggedIn: boolean
   username: string | null
+  loginOpen: boolean
   currentSessionId: string
   sessions: SessionListItem[]
   sessionMap: Record<string, SessionUIState>
@@ -41,6 +42,7 @@ export interface SharedState {
 const EMPTY_STATE: SharedState = {
   loggedIn: false,
   username: null,
+  loginOpen: false,
   currentSessionId: '',
   sessions: [],
   sessionMap: {},

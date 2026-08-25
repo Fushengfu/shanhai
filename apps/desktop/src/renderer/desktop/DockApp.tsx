@@ -1,6 +1,8 @@
 import { useEffect, useRef } from 'react'
 import { APP_REGISTRY } from '../apps/registry'
 import { useThemeSync } from '../theme'
+import { useUiStore, patchUiStore } from '../store-client'
+import { IconAvatar, IconMonitor } from '../components/icons'
 
 /**
  * Dock 窗口（多窗口桌面系统的底部应用图标栏）。
@@ -10,8 +12,27 @@ import { useThemeSync } from '../theme'
 export function DockApp(): React.JSX.Element {
   const dockRef = useRef<HTMLDivElement>(null)
 
+  // 登录态（共享 store：主进程广播，跨窗口一致）
+  const ui = useUiStore()
+  const loggedIn = ui.loggedIn
+  const username = ui.username
+
   // 主题：订阅主进程广播，跟随聊天窗口切换（亮/暗实时同步）
   useThemeSync()
+
+  // 登录状态项点击：未登录 → 打开聊天窗口并弹出登录框；已登录 → 打开聊天窗口（进入主界面）。
+  // 已登录时【不再】在此退出登录：登录状态项是「状态展示 + 入口」，点击即退出会误触；退出登录入口保留在聊天窗口侧边栏。
+  const handleAuthClick = (): void => {
+    if (!loggedIn) {
+      patchUiStore({ loginOpen: true })
+    }
+    void window.shanhai?.openApp('chat')
+  }
+
+  // 退出到桌面：隐藏所有山海窗口回到系统界面，应用后台运行（托盘/快捷键恢复）
+  const handleExitToDesktop = (): void => {
+    void window.shanhai?.exitToDesktop()
+  }
 
   // 自适应：测量图标栏实际内容尺寸，通知主进程调整 Dock 窗口宽高（随应用数量增减自动伸缩）
   useEffect(() => {
@@ -93,6 +114,97 @@ export function DockApp(): React.JSX.Element {
             <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{app.name}</span>
           </button>
         ))}
+
+        {/* 登录状态 + 登录/登出入口（一目了然是否已登录） */}
+        <div style={{ width: 1, alignSelf: 'stretch', margin: '8px 2px', background: 'var(--border-soft)' }} />
+        <button
+          data-dock-icon
+          onClick={() => void handleAuthClick()}
+          title={loggedIn ? `已登录：${username ?? ''}（点击打开聊天窗口）` : '点击登录'}
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 6,
+            width: 72,
+            padding: '10px 4px 8px',
+            borderRadius: 14,
+            border: '1px solid var(--border-soft)',
+            background: 'var(--bg-sidebar)',
+            color: 'var(--text)',
+            cursor: 'pointer',
+            transition: 'transform 0.12s ease',
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.transform = 'translateY(-4px)'
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.transform = 'translateY(0)'
+          }}
+        >
+          <span style={{ position: 'relative', display: 'inline-flex', transform: 'scale(1.6)' }}>
+            <IconAvatar />
+            <span
+              style={{
+                position: 'absolute',
+                right: -2,
+                bottom: -2,
+                width: 8,
+                height: 8,
+                borderRadius: '50%',
+                background: loggedIn ? 'var(--success-text)' : 'var(--text-faint)',
+                border: '1.5px solid var(--bg-sidebar)',
+              }}
+            />
+          </span>
+          <span
+            style={{
+              fontSize: 11,
+              color: 'var(--text-secondary)',
+              maxWidth: 64,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {loggedIn ? (username ?? '已登录') : '登录'}
+          </span>
+        </button>
+
+        {/* 退出到桌面：隐藏所有山海窗口回到系统界面，应用后台运行 */}
+        <div style={{ width: 1, alignSelf: 'stretch', margin: '8px 2px', background: 'var(--border-soft)' }} />
+        <button
+          data-dock-icon
+          onClick={handleExitToDesktop}
+          title="退出到桌面（隐藏山海所有窗口，回到系统界面，后台运行）"
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 6,
+            width: 72,
+            padding: '10px 4px 8px',
+            borderRadius: 14,
+            border: '1px solid var(--border-soft)',
+            background: 'var(--bg-sidebar)',
+            color: 'var(--text)',
+            cursor: 'pointer',
+            transition: 'transform 0.12s ease',
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.transform = 'translateY(-4px)'
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.transform = 'translateY(0)'
+          }}
+        >
+          <span style={{ transform: 'scale(1.6)', display: 'inline-flex' }}>
+            <IconMonitor />
+          </span>
+          <span style={{ fontSize: 11, color: 'var(--text-secondary)', maxWidth: 64, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            回桌面
+          </span>
+        </button>
       </div>
     </div>
   )

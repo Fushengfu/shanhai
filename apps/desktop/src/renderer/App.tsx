@@ -73,6 +73,7 @@ export function App() {
   const browserWindows = ui.browserWindows
   const approvalPolicy = ui.approvalPolicy
   const retryPrompt = ui.retryPrompt
+  const loginOpen = ui.loginOpen
 
   // 共享状态 store setter（值更新，内部 patchUiStore 深合并 + 广播，跨窗口一致）
   const setLoggedIn = (v: boolean): void => patchUiStore({ loggedIn: v })
@@ -89,7 +90,8 @@ export function App() {
   const setApprovalPolicyState = (p: 'ask' | 'workdir' | 'never'): void => patchUiStore({ approvalPolicy: p })
   const setRetryPrompt = (v: RetryPrompt | null): void => patchUiStore({ retryPrompt: v })
 
-  const [loginOpen, setLoginOpen] = useState(false)
+  // 登录弹窗开关已上移到共享 store（跨窗口：Dock 点击「登录」→ patchUiStore({loginOpen:true}) → 聊天窗口据此弹出）
+  const setLoginOpen = (v: boolean): void => patchUiStore({ loginOpen: v })
   // 主题：亮/暗模式（localStorage 持久化，data-theme 驱动 CSS 变量）
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     try {
@@ -1174,7 +1176,7 @@ export function App() {
 
   return (
     <UIContext.Provider value={uiContextValue}>
-    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', fontFamily: 'system-ui, sans-serif' }}>
+    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', fontFamily: 'system-ui, sans-serif', background: 'var(--bg-app)' }}>
       {/* 侧边栏：会话列表（可折叠） */}
       <aside
         style={

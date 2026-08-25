@@ -4,7 +4,7 @@ import { getRuntime, setRuntime } from './runtime'
 import { initUiStore } from './ui-store'
 import { registerPush } from './push'
 import { registerIpc } from './ipc-handlers'
-import { createWindow, loadWindowContent, showChatWindow, toggleChatWindow, ICON_PATH } from './window-manager'
+import { createWindow, loadWindowContent, showChatWindow, toggleChatWindow, ensureDesktopLayer, ICON_PATH } from './window-manager'
 
 /** 全局唤起/隐藏主窗口的快捷键（macOS 上 CommandOrControl 即 ⌘，避开 Spotlight 的 ⌘+Space） */
 const TOGGLE_SHORTCUT = 'CommandOrControl+Shift+Space'
@@ -58,8 +58,9 @@ app.whenReady().then(async () => {
   // Dock 窗口（底部应用图标栏，独立于桌面壳以保持可点击）
   const dockWin = createWindow({ type: 'dock' })
   await loadWindowContent(dockWin)
-  // 聊天窗口（浮动在桌面之上，承载对话主界面）
-  const chatWin = createWindow({ type: 'chat' })
+  // 聊天窗口（浮动在桌面之上，承载对话主界面）：默认隐藏，启动时仅显示桌面壳 + Dock + 会话管家窗口，
+  // 用户通过 Dock「聊天」图标 / 托盘 / 全局快捷键打开聊天窗口
+  const chatWin = createWindow({ type: 'chat', show: false })
   await loadWindowContent(chatWin)
   // 会话管家窗口（独立常驻，右侧停靠，承载主 Agent 单会话聊天界面）
   const supervisorWin = createWindow({ type: 'supervisor' })
@@ -85,6 +86,10 @@ app.whenReady().then(async () => {
   }
 
   registerToggleShortcut()
+
+  // 任意山海窗口获得焦点时纠正桌面层级：把桌面壳抬到所有非山海窗口之上、
+  // 山海其它窗口保持在桌面壳之上（否则失焦再聚焦后会出现「聊天/管家窗口显示但桌面背景缺失」）
+  app.on('browser-window-focus', () => ensureDesktopLayer())
 
   app.on('activate', () => {
     if (app.isReady()) showChatWindow()

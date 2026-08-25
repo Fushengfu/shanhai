@@ -7,6 +7,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 /** 应用图标路径（dist/main → ../../assets；打包后由构建流程保证资源就位） */
 export const ICON_PATH = join(__dirname, '../../assets/icon-256.png')
 
+/** 是否为 Windows 平台（Windows 下 roundedCorners 选项无效，frameless 窗口是直角，需透明窗口 + CSS 圆角弥补） */
+const isWin = process.platform === 'win32'
+
 /**
  * 窗口类型（山海多窗口桌面系统的三类窗口）：
  * - desktop：桌面壳窗口（全屏壁纸 + 应用图标 Dock，作为「桌面」背景层）
@@ -27,6 +30,8 @@ export interface WindowMeta {
 }
 
 const windows = new Map<string, WindowMeta>()
+/** 外部窗口（浏览器窗口等由其它模块自建的窗口）：纳入桌面层级纠正，但不进主窗口注册表 */
+const externalWindows = new Set<BrowserWindow>()
 let seq = 0
 
 /** 应用退出标志：置 true 后放行所有窗口的 close（否则 chat/desktop 的 close 会 preventDefault 只隐藏、卡住退出） */
@@ -122,7 +127,9 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
     // desktop/dock 额外 focusable:false（不接受键盘焦点，点击不抢焦点，但仍可接收鼠标事件）。
     // supervisor 保持可聚焦（它是可交互的聊天窗口）。
     ...(shellBounds ? { frame: false, focusable: false } : { frame: false }),
-    ...(type === 'dock' || type === 'supervisor-bubble' ? { transparent: true, backgroundColor: '#00000000', hasShadow: false } : {}),
+    ...(type === 'dock' || type === 'supervisor-bubble' || (isWin && (type === 'chat' || type === 'supervisor' || type === 'app'))
+      ? { transparent: true, backgroundColor: '#00000000', hasShadow: false }
+      : {}),
     ...(type === 'supervisor-bubble' ? { alwaysOnTop: true, resizable: false, minimizable: false, maximizable: false, skipTaskbar: true } : {}),
     fullscreen: shellBounds ? false : (opts.fullscreen ?? false),
     show: opts.show ?? true,
@@ -197,8 +204,9 @@ function showWindow(win: BrowserWindow | undefined): void {
   if (win.isMinimized()) win.restore()
   win.show()
   win.focus()
-  // 任意窗口 show 后，macOS 可能把全屏桌面壳 raise 到最前并盖住其它窗口，立即把桌面压回背景层
-  keepDesktopAtBottom()
+  // 任意窗口 show 后，macOS 可能把全屏桌面壳 raise 到最前并盖住其它窗口，立即把桌面压回背景层。
+  // 同时把桌面壳抬到所有非山海窗口之上（见 ensureDesktopLayer），避免「聊天/管家窗口显示但桌面背景缺失」。
+  ensureDesktopLayer()
 }
 
 /** 显示聊天窗口（聊天窗口是常驻主窗口，销毁则重建） */
@@ -281,6 +289,53 @@ export function keepDesktopAtBottom(): void {
     if (meta.win.isDestroyed() || !meta.win.isVisible()) continue
     meta.win.moveTop()
   }
+  // 外部窗口（浏览器窗口等）：同样抬回桌面壳之上，避免点标签显示后又被全屏桌面壳盖住
+  for (const win of externalWindows) {
+    if (win.isDestroyed() || !win.isVisible()) continue
+    win.moveTop()
+  }
+}
+
+/** 注册外部窗口（如浏览器窗口），使其参与桌面层级纠正（被桌面壳盖住时能被抬回） */
+export function registerExternalWindow(win: BrowserWindow): void {
+  externalWindows.add(win)
+}
+
+/** 注销外部窗口（窗口销毁时调用） */
+export function unregisterExternalWindow(win: BrowserWindow): void {
+  externalWindows.delete(win)
+}
+
+/**
+ * 桌面层级纠正：把桌面壳抬到所有非山海进程窗口之上，再让山海其它窗口保持在桌面壳之上。
+ * 这是跨应用层级的唯一纠正点——keepDesktopAtBottom 只处理山海内部（非桌面窗口在桌面壳之上），
+ * 无法把桌面壳从 Chrome/Finder 等外部窗口下方抬回来。山海应用失焦时外部窗口会盖住桌面壳，
+ * 重新聚焦山海窗口后必须显式 moveTop 桌面壳，否则会出现「聊天/管家窗口浮在外部窗口之上，但桌面背景缺失」。
+ */
+export function ensureDesktopLayer(): void {
+  const desktop = findWindow('desktop')
+  if (desktop && !desktop.win.isDestroyed()) {
+    if (!desktop.win.isVisible()) desktop.win.show()
+    desktop.win.moveTop() // 桌面壳抬到前台，排在所有非山海窗口之上
+  }
+  // 桌面壳恢复时同步恢复 Dock：「退出到桌面」会隐藏全部窗口，恢复时必须把 Dock 一并带回，否则只剩聊天窗口没有桌面背景和图标栏
+  const dock = findWindow('dock')
+  if (dock && !dock.win.isDestroyed() && !dock.win.isVisible()) {
+    dock.win.show()
+  }
+  keepDesktopAtBottom() // 再把山海其它可见窗口抬回桌面壳之上
+}
+
+/**
+ * 退出到桌面：隐藏所有山海窗口（桌面壳 / Dock / 聊天 / 管家 / 悬浮图标 / 应用窗口），回到系统原始界面。
+ * 应用不退出（托盘常驻），通过托盘「显示主窗口」或全局快捷键恢复；恢复时 ensureDesktopLayer 会把桌面壳 + Dock 一并带回。
+ */
+export function hideToSystemDesktop(): void {
+  for (const meta of windows.values()) {
+    if (!meta.win.isDestroyed() && meta.win.isVisible()) {
+      meta.win.hide()
+    }
+  }
 }
 
 /**
@@ -290,7 +345,7 @@ export function keepDesktopAtBottom(): void {
  * 但不抢焦点、也不强制唤起聊天窗口（聊天窗口是否显示由用户通过 Dock 入口 / 快捷键决定）。
  */
 export function restoreAboveDesktop(): void {
-  keepDesktopAtBottom()
+  ensureDesktopLayer()
 }
 
 /**
@@ -321,9 +376,27 @@ export function minimizeWindow(win: BrowserWindow | null | undefined): void {
   win.minimize()
 }
 
+/** Windows 透明窗口最大化前 bounds 快照（key 为 BrowserWindow.id），用于 toggleMaximizeWindow 还原 */
+const preMaximizeBounds = new Map<number, Electron.Rectangle>()
+
 /** 切换窗口最大化/还原（自定义标题栏按钮用，按发起窗口定位），返回操作后的最大化状态 */
 export function toggleMaximizeWindow(win: BrowserWindow | null | undefined): boolean {
   if (!win || win.isDestroyed()) return false
+  // Windows 透明窗口（chat/supervisor/app）无法用原生 maximize()（DWM 限制），改用手动 setBounds 到 workArea 模拟。
+  // 记录最大化前 bounds 用于还原；窗口一旦被拖动/缩放（非本函数），保存的 bounds 可能过期，属模拟方案的已知边界。
+  const wtype = getWindowType(win)
+  if (isWin && (wtype === 'chat' || wtype === 'supervisor' || wtype === 'app')) {
+    const saved = preMaximizeBounds.get(win.id)
+    if (saved) {
+      preMaximizeBounds.delete(win.id)
+      win.setBounds(saved)
+      return false
+    }
+    preMaximizeBounds.set(win.id, win.getBounds())
+    const wa = screen.getPrimaryDisplay().workArea
+    win.setBounds({ x: wa.x, y: wa.y, width: wa.width, height: wa.height })
+    return true
+  }
   if (win.isMaximized()) {
     win.unmaximize()
     return false
