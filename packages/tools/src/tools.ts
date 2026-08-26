@@ -6,6 +6,9 @@ import { resolve, isAbsolute, join, relative } from 'node:path'
 const exec = promisify(execCallback)
 const execFile = promisify(execFileCallback)
 
+/** run_command 命令执行超时（毫秒）：超时后 kill 子进程并返回错误，防止命令永久卡死堵塞任务循环（等机器类的兜底，区别于 ask_user 等「等用户」工具的不超时） */
+const RUN_COMMAND_TIMEOUT_MS = 5 * 60 * 1000
+
 /** 工具风险等级（安全属性内嵌于契约） */
 export type RiskLevel = 'readonly' | 'reversible' | 'irreversible' | 'high'
 
@@ -21,6 +24,8 @@ export interface ToolContract {
   inputSchema: Record<string, unknown>
   riskLevel: RiskLevel
   approvalRequired?: boolean
+  /** 单工具执行超时（毫秒）。Infinity = 不设超时（等用户交互的工具，如 ask_user / choose_session / choose_model——用户思考/离开多久由用户决定）。
+   *  未设置时 agent 用默认兜底（5 分钟），防止网络/进程/IO 类工具永久挂起卡死整个任务循环。 */
   timeoutMs?: number
   /** 动态风险解析：统一入口工具（如 skill_run）按 args 决定审批粒度（action 级）。
    *  返回 undefined 则回退到静态 riskLevel / approvalRequired。
@@ -241,19 +246,23 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
     return undefined
   }
 
-  /** read_file：读取文件内容（相对路径解析到工作目录，支持 startLine/endLine 分段读取） */
+  /** read_file 默认分段读取行数：未指定 endLine 时每次默认读取 200 行，避免大文件一次返回全文撑爆上下文 */
+  const READ_FILE_DEFAULT_LINES = 200
+
+  /** read_file：读取文件内容（相对路径解析到工作目录，默认分段读取，每段至少 200 行，避免大文件一次返回全文） */
   const readFileTool: ToolContract = {
     name: 'read_file',
     description:
       '读取指定路径的文本文件内容。当需要查看文件内容时使用。' +
       'path 可以是绝对路径，也可以是相对于当前工作目录的相对路径（优先使用相对路径，保持操作范围在工作目录内）。' +
-      '大文件可用 startLine / endLine 按行范围分段读取（1-based、包含两端），避免一次读取全文导致上下文过长。',
+      '默认分段读取：未指定行号时只读取前 200 行（文件不足 200 行则读全文），截断时会提示总行数与继续读取的 startLine。' +
+      '可用 startLine / endLine 按行范围分段读取（1-based、包含两端），避免一次读取全文导致上下文过长。',
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: '文件路径（绝对路径，或相对当前工作目录的相对路径）' },
-        startLine: { type: 'number', description: '起始行号（1-based，包含，可选）' },
-        endLine: { type: 'number', description: '结束行号（1-based，包含，可选）' },
+        startLine: { type: 'number', description: '起始行号（1-based，包含，可选；不传默认从第 1 行开始）' },
+        endLine: { type: 'number', description: '结束行号（1-based，包含，可选；不传默认读取 200 行）' },
       },
       required: ['path'],
     },
@@ -265,17 +274,31 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
       }
       const path = resolvePath(args.path)
       const text = await fs.readFile(path, 'utf8')
+      const lines = text.split('\n')
+      const total = lines.length
       const startLine = toLineNumber(args.startLine)
       const endLine = toLineNumber(args.endLine)
-      // 未指定任何行号 → 返回全文（兼容原有行为）
-      if (startLine === undefined && endLine === undefined) return text
-      const lines = text.split('\n')
+      // 明确指定 endLine → 按精确范围读取（用户明确知道要读哪些行，不加截断提示）
+      if (endLine !== undefined) {
+        const start = Math.max(1, Math.floor(startLine ?? 1))
+        const end = Math.floor(endLine)
+        if (start > end) {
+          throw new Error(`read_file 行范围非法：startLine=${start} 大于 endLine=${end}`)
+        }
+        return lines.slice(start - 1, end).join('\n')
+      }
+      // 未指定 endLine → 默认分段读取 200 行（不足则到文件末尾），截断时提示继续读取
       const start = Math.max(1, Math.floor(startLine ?? 1))
-      const end = Math.floor(endLine ?? lines.length)
+      const end = Math.min(start + READ_FILE_DEFAULT_LINES - 1, total)
       if (start > end) {
         throw new Error(`read_file 行范围非法：startLine=${start} 大于 endLine=${end}`)
       }
-      return lines.slice(start - 1, end).join('\n')
+      const content = lines.slice(start - 1, end).join('\n')
+      // 截断提示：未读完整时，告知总行数与继续读取的起始行，引导模型分段读取后续内容
+      if (end < total) {
+        return `${content}\n\n（文件共 ${total} 行，本次读取 ${start}-${end} 行，剩余 ${total - end} 行未读。请用 startLine=${end + 1} 继续分段读取。）`
+      }
+      return content
     },
   }
 
@@ -420,7 +443,7 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
       // 显式指定 shell（等价于 Node 默认，但明确平台分支，便于后续扩展 Git Bash 兼容）：
       //   win32 用 ComSpec/cmd.exe（支持 &&、|、> 等），POSIX 用 /bin/sh。agent 在 Windows 上应写 cmd 兼容命令。
       const shell = process.platform === 'win32' ? (process.env.ComSpec ?? 'cmd.exe') : '/bin/sh'
-      const { stdout, stderr } = await exec(args.command, { cwd: getCwd(), env, shell })
+      const { stdout, stderr } = await exec(args.command, { cwd: getCwd(), env, shell, timeout: RUN_COMMAND_TIMEOUT_MS })
       return { stdout, stderr }
     },
   }

@@ -101,7 +101,7 @@ export interface HttpTrace {
   url: string
   method: string
   /** request 阶段 = 最终提交给模型接口的完整 body（序列化前对象，含 model/messages/tools 等全部字段，与 JSON.stringify 后发出内容一致）；
-   *  response 阶段 = 接口返回内容，按 JSON 结构记录：非流式 = 解析后的 JSON 对象；流式 = 解析后的 SSE 事件数组（{ stream, events }）；无法解析时回退为原始字符串 */
+   *  response 阶段 = 接口返回内容，按 JSON 结构记录：非流式 = 解析后的 JSON 对象；流式 = 合并后的完整响应 JSON（等价非流式，不记录逐条 SSE 事件）；无法解析时回退为原始字符串 */
   body?: unknown
   /** 仅 response 阶段有意义：HTTP 状态码 */
   responseStatus?: number
@@ -189,8 +189,12 @@ function serializeMessages(messages: ChatMessage[]): Array<Record<string, unknow
       return msg
     }
     if (m.role === 'tool') {
-      // tool 消息必须带 tool_call_id 关联上一条 assistant 的 tool_calls
-      return { role: 'tool', content: m.content, tool_call_id: m.toolCallId ?? '' }
+      // tool 消息必须带 tool_call_id 关联上一条 assistant 的 tool_calls；
+      // id 必须严格来自事件日志里记录的 callId（回放时由 replayHistory 忠实读出），缺失直接报错，绝不编造
+      if (!m.toolCallId) {
+        throw new Error('序列化失败：tool 消息缺少 tool_call_id（事件回放的 callId 缺失）')
+      }
+      return { role: 'tool', content: m.content, tool_call_id: m.toolCallId }
     }
     const msg: Record<string, unknown> = { role: m.role, content: m.content }
     // thinking 模式：assistant 文本消息回传 reasoning_content
@@ -254,7 +258,7 @@ export class DeepSeekProvider implements Model {
     // 先读原始文本：既用于 trace 记录完整原始响应，也用于后续 JSON 解析与错误提示
     const rawText = await res.text()
     if (!res.ok) {
-      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText, false), responseStatus: res.status, error: `DeepSeek API ${res.status}` })
+      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText), responseStatus: res.status, error: `DeepSeek API ${res.status}` })
       throw new Error(`DeepSeek API ${res.status}: ${rawText}`)
     }
     // 网关响应：{ code, data: { choices: [...] } } 包装（兼容裸 OpenAI 格式）
@@ -271,7 +275,7 @@ export class DeepSeekProvider implements Model {
     try {
       raw = JSON.parse(rawText) as typeof raw
     } catch {
-      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText, false), responseStatus: res.status, error: '响应非合法 JSON' })
+      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText), responseStatus: res.status, error: '响应非合法 JSON' })
       throw new Error(`DeepSeek API ${res.status}: 响应非合法 JSON`)
     }
     this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: raw, responseStatus: res.status })
@@ -340,7 +344,7 @@ export class DeepSeekProvider implements Model {
     }
     if (!res.ok || !res.body) {
       const errText = await res.text()
-      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(errText, false), responseStatus: res.status, error: `DeepSeek API ${res.status}` })
+      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(errText), responseStatus: res.status, error: `DeepSeek API ${res.status}` })
       throw new Error(`DeepSeek API ${res.status}: ${errText}`)
     }
     const reader = res.body.getReader()
@@ -350,8 +354,20 @@ export class DeepSeekProvider implements Model {
     const toolCallAccs = new Map<number, { id?: string; name?: string; argsText: string }>()
     /** 本次响应已完成的工具调用（按完成顺序累积，text/usage/流结束 时统一产出） */
     const completedToolCalls: ToolCall[] = []
-    /** 累积接口返回的原始 SSE 文本（原始响应：不解析、不聚合，流结束后作为响应记录） */
-    let rawBody = ''
+    /** 合并后的完整响应内容（流结束后用于 trace 落盘，替代逐条 SSE 事件） */
+    let fullText = ''
+    let fullReasoning = ''
+    const allToolCalls: ToolCall[] = []
+    let finalUsage: Usage | undefined
+
+    /** 累积每个产出 chunk 的完整内容，供流结束后合并成完整 JSON */
+    const accumulate = (c: StreamChunk): void => {
+      if (c.text) fullText += c.text
+      if (c.reasoningContent) fullReasoning += c.reasoningContent
+      if (c.toolCalls) allToolCalls.push(...c.toolCalls)
+      else if (c.toolCall) allToolCalls.push(c.toolCall)
+      if (c.usage) finalUsage = c.usage
+    }
 
     /** 结算所有累积中的工具调用（不产出，仅把完成的 toolCall 推进 completedToolCalls） */
     const flushAll = (): ToolCall[] => {
@@ -415,26 +431,38 @@ export class DeepSeekProvider implements Model {
       const { done, value } = await reader.read()
       if (done) break
       const text = decoder.decode(value, { stream: true })
-      rawBody += text
       buffer += text
       const lines = buffer.split('\n')
       buffer = lines.pop() ?? ''
       for (const line of lines) {
-        for (const chunk of handleLine(line)) yield chunk
+        for (const chunk of handleLine(line)) {
+          accumulate(chunk)
+          yield chunk
+        }
       }
     }
-    rawBody += decoder.decode()
-    for (const chunk of handleLine(buffer)) yield chunk
+    for (const chunk of handleLine(buffer)) {
+      accumulate(chunk)
+      yield chunk
+    }
     // 流结束：结算残留的工具调用并产出（usage 未返回时的兜底）
     completedToolCalls.push(...flushAll())
     if (completedToolCalls.length > 0) {
-      yield { toolCalls: [...completedToolCalls], toolCall: completedToolCalls[0] }
+      const chunk = { toolCalls: [...completedToolCalls], toolCall: completedToolCalls[0] }
+      accumulate(chunk)
+      yield chunk
     }
     this.opts.onTrace?.({
       phase: 'response',
       url,
       method: 'POST',
-      body: normalizeResponseBody(rawBody, true),
+      body: buildMergedStreamBody({
+        model: this.opts.model,
+        text: fullText,
+        reasoningContent: fullReasoning,
+        toolCalls: allToolCalls,
+        usage: finalUsage,
+      }),
       responseStatus: res.status,
     })
   }
@@ -506,34 +534,52 @@ function safeParse(json: string): Record<string, unknown> {
 
 /**
  * 将接口响应原始文本按 JSON 结构归一化（供 trace 落盘，避免 response 记录成转义字符串）：
- * - 非流式：JSON.parse 成对象，失败回退为原始字符串（错误页 / 非 JSON 响应）
- * - 流式：逐行解析 SSE `data:` 行，聚合成 { stream: true, events: [...] }（保留事件序列便于排查）
+ * JSON.parse 成对象，失败回退为原始字符串（错误页 / 非 JSON 响应）。
+ * 流式响应的合并逻辑见 buildMergedStreamBody（trace 不记录逐条 SSE 事件，只记合并后的完整 JSON）。
  */
-function normalizeResponseBody(rawText: string, stream: boolean): unknown {
-  if (!stream) {
-    try {
-      return JSON.parse(rawText) as unknown
-    } catch {
-      return rawText
+function normalizeResponseBody(rawText: string): unknown {
+  try {
+    return JSON.parse(rawText) as unknown
+  } catch {
+    return rawText
+  }
+}
+
+/** 将流式响应累积结果合并成等价于非流式的完整响应 JSON（trace 落盘用，替代逐条 SSE 事件） */
+function buildMergedStreamBody(opts: {
+  model: string
+  text: string
+  reasoningContent: string
+  toolCalls: ToolCall[]
+  usage?: Usage
+}): unknown {
+  const message: Record<string, unknown> = { role: 'assistant' }
+  if (opts.text) message.content = opts.text
+  if (opts.reasoningContent) message.reasoning_content = opts.reasoningContent
+  if (opts.toolCalls.length > 0) {
+    message.tool_calls = opts.toolCalls.map((tc, i) => ({
+      index: i,
+      id: tc.id,
+      type: 'function',
+      function: { name: tc.name, arguments: JSON.stringify(tc.args ?? {}) },
+    }))
+  }
+  const body: Record<string, unknown> = {
+    model: opts.model,
+    stream: false,
+    choices: [{ index: 0, message, finish_reason: 'stop' }],
+  }
+  if (opts.usage) {
+    body.usage = {
+      prompt_tokens: opts.usage.promptTokens,
+      completion_tokens: opts.usage.completionTokens,
+      total_tokens: opts.usage.totalTokens,
+      ...(opts.usage.cachedPromptTokens != null
+        ? { prompt_tokens_details: { cached_tokens: opts.usage.cachedPromptTokens } }
+        : {}),
     }
   }
-  const events: unknown[] = []
-  for (const line of rawText.split('\n')) {
-    const trimmed = line.trim()
-    if (!trimmed.startsWith('data:')) continue
-    const data = trimmed.slice(5).trim()
-    if (!data) continue
-    if (data === '[DONE]') {
-      events.push({ done: true })
-      continue
-    }
-    try {
-      events.push(JSON.parse(data) as unknown)
-    } catch {
-      events.push({ raw: data })
-    }
-  }
-  return { stream: true, events }
+  return body
 }
 
 /** 构造图片内容片段（data: URL 或 https 链接） */
@@ -696,8 +742,6 @@ interface AnthropicMessage {
 function serializeAnthropicMessages(messages: ChatMessage[]): { system?: string; messages: AnthropicMessage[] } {
   const systemParts: string[] = []
   const out: AnthropicMessage[] = []
-  let fallbackCallId = 0
-  let lastGeneratedId = ''
 
   for (const m of messages) {
     if (m.role === 'system') {
@@ -706,7 +750,11 @@ function serializeAnthropicMessages(messages: ChatMessage[]): { system?: string;
       continue
     }
     if (m.role === 'tool') {
-      const id = m.toolCallId || lastGeneratedId || `call_${fallbackCallId++}`
+      // tool_use_id 必须严格来自事件日志里记录的 callId，缺失直接报错，绝不编造
+      if (!m.toolCallId) {
+        throw new Error('序列化失败：tool 消息缺少 tool_use_id（事件回放的 callId 缺失）')
+      }
+      const id = m.toolCallId
       const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
       out.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content }] })
       continue
@@ -717,9 +765,11 @@ function serializeAnthropicMessages(messages: ChatMessage[]): { system?: string;
       const text = extractText(m.content)
       if (text) blocks.push({ type: 'text', text })
       for (const c of calls) {
-        const id = c.id || `call_${fallbackCallId++}`
-        lastGeneratedId = id
-        blocks.push({ type: 'tool_use', id, name: c.name, input: c.args ?? {} })
+        // tool_use id 必须严格来自事件日志里记录的 callId，缺失直接报错，绝不编造
+        if (!c.id) {
+          throw new Error(`序列化失败：assistant 工具调用 ${c.name} 缺少 id（事件回放的 callId 缺失）`)
+        }
+        blocks.push({ type: 'tool_use', id: c.id, name: c.name, input: c.args ?? {} })
       }
       out.push({ role: 'assistant', content: blocks })
       continue
@@ -811,14 +861,14 @@ export class AnthropicProvider implements Model {
     }
     const rawText = await res.text()
     if (!res.ok) {
-      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText, false), responseStatus: res.status, error: `Anthropic API ${res.status}` })
+      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText), responseStatus: res.status, error: `Anthropic API ${res.status}` })
       throw new Error(`Anthropic API ${res.status}: ${rawText}`)
     }
     let raw: AnthropicResponse
     try {
       raw = JSON.parse(rawText) as AnthropicResponse
     } catch {
-      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText, false), responseStatus: res.status, error: '响应非合法 JSON' })
+      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText), responseStatus: res.status, error: '响应非合法 JSON' })
       throw new Error(`Anthropic API ${res.status}: 响应非合法 JSON`)
     }
     this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: raw, responseStatus: res.status })
@@ -859,7 +909,7 @@ export class AnthropicProvider implements Model {
     }
     if (!res.ok || !res.body) {
       const errText = await res.text()
-      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(errText, false), responseStatus: res.status, error: `Anthropic API ${res.status}` })
+      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(errText), responseStatus: res.status, error: `Anthropic API ${res.status}` })
       throw new Error(`Anthropic API ${res.status}: ${errText}`)
     }
     const reader = res.body.getReader()
@@ -867,8 +917,19 @@ export class AnthropicProvider implements Model {
     let buffer = ''
     let toolUseAcc: { id?: string; name?: string; jsonText: string } | null = null
     let inputTokens = 0
-    /** 累积接口返回的原始 SSE 文本（原始响应：不解析、不聚合，流结束后作为响应记录） */
-    let rawBody = ''
+    /** 合并后的完整响应内容（流结束后用于 trace 落盘，替代逐条 SSE 事件） */
+    let fullText = ''
+    const allToolCalls: ToolCall[] = []
+    let finalUsage: Usage | undefined
+
+    /** 累积每个产出 chunk 的完整内容，供流结束后合并成完整 JSON */
+    const accumulate = (c: StreamChunk): void => {
+      if (c.text) fullText += c.text
+      if (c.reasoningContent) fullText += c.reasoningContent
+      if (c.toolCalls) allToolCalls.push(...c.toolCalls)
+      else if (c.toolCall) allToolCalls.push(c.toolCall)
+      if (c.usage) finalUsage = c.usage
+    }
 
     const handleEvent = (event: Record<string, unknown>): StreamChunk[] => {
       const out: StreamChunk[] = []
@@ -925,21 +986,31 @@ export class AnthropicProvider implements Model {
       const { done, value } = await reader.read()
       if (done) break
       const text = decoder.decode(value, { stream: true })
-      rawBody += text
       buffer += text
       const lines = buffer.split('\n')
       buffer = lines.pop() ?? ''
       for (const line of lines) {
-        for (const chunk of parseLine(line)) yield chunk
+        for (const chunk of parseLine(line)) {
+          accumulate(chunk)
+          yield chunk
+        }
       }
     }
-    rawBody += decoder.decode()
-    for (const chunk of parseLine(buffer)) yield chunk
+    for (const chunk of parseLine(buffer)) {
+      accumulate(chunk)
+      yield chunk
+    }
     this.opts.onTrace?.({
       phase: 'response',
       url,
       method: 'POST',
-      body: normalizeResponseBody(rawBody, true),
+      body: buildMergedStreamBody({
+        model: this.opts.model,
+        text: fullText,
+        reasoningContent: '',
+        toolCalls: allToolCalls,
+        usage: finalUsage,
+      }),
       responseStatus: res.status,
     })
   }

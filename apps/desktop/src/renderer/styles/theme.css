@@ -93,11 +93,14 @@ body {
 }
 
 /* Windows 窗口圆角：Electron 的 roundedCorners 选项仅 macOS 有效，Windows frameless 窗口是直角。
-   对需要圆角的窗口（chat/app/supervisor，主进程已设 transparent），用透明 body + 圆角裁剪实现四角透明。
-   desktop（全屏壁纸）/ dock / supervisor-bubble 不走此规则（它们的圆角由自身 CSS 或无需圆角承担）。 */
-html[data-platform='win32'][data-rounded='true'] body {
+   对需要圆角的窗口（主进程已设 transparent），用透明 body + 圆角裁剪实现四角透明。
+   html/body/#root 三级都做透明 + 圆角 + 溢出裁剪，确保内容层（App 根 div 的不透明背景）也被裁剪到圆角内，
+   避免「body 有圆角但内容直角」导致四角仍然露出直角。 */
+html[data-platform='win32'][data-rounded='true'],
+html[data-platform='win32'][data-rounded='true'] body,
+html[data-platform='win32'][data-rounded='true'] #root {
   background: transparent;
-  border-radius: 12px;
+  border-radius: 16px;
   overflow: hidden;
 }
 

@@ -39,8 +39,6 @@ export interface SuspendedSnapshot {
  * 流式：模型有 stream 时优先流式，逐步落 assistant/delta（UI 实时逐字渲染）。
  */
 export class AgentLoop {
-  /** 最近一次模型调用返回的真实总 token 数（usage.total_tokens，接口返回，非本地估算） */
-  private lastUsageTotalTokens = 0
   /** 待注入的用户消息（插入模式）：任务执行中用户追加的消息，在下一个模型调用前以 user 形式追加到上下文 */
   private pendingInjections: string[] = []
   /** 同一会话同一 agent 稳定不变的 user_id：网关前缀缓存隔离 + 命中用（确定性派生，跨请求/跨重启不变） */
@@ -49,6 +47,9 @@ export class AgentLoop {
   private readonly approvalSession: Session
   /** 是否已被用户中止（点「停止」）：在每轮循环 / 流式每个 chunk / 工具执行前检查，尽快中断 */
   private aborted = false
+  /** 最后一次 LLM 返回的真实 usage.total_tokens（网关真实返回，非本地估算）：循环中判断上下文是否超窗口用。
+   * 从会话 usage/record 事件恢复；之后每次模型调用后由 recordUsage 更新。 */
+  private lastUsageTotalTokens = 0
   /** 挂起状态（任务失败重试耗尽后保存）：messages 快照 + 重入位置，retry() 用相同 body 重新提交 */
   private suspended:
     | (SuspendedSnapshot & {
@@ -69,25 +70,25 @@ export class AgentLoop {
     private readonly supportsVision = false,
     /** 当前模型服务的 apiKey：user_id 确定性派生用（区分不同账号/服务商的前缀缓存） */
     private readonly apiKey?: string,
+    /** 统一压缩模型：配置了则用该模型做上下文摘要（LLM 压缩），否则回退会话模型（this.model） */
+    private readonly compactModel?: Model,
   ) {
     this.approvalSession = this.session
-    // 断点续跑（resume）时新建 AgentLoop，从会话历史恢复「最近一次真实 usage」，避免首轮因无 usage 而跳过压缩、把超长历史直发网关打 400
-    this.lastUsageTotalTokens = this.restoreLastUsageTotalTokens()
     // 同一会话同一 agent 的 user_id 永远不变（确定性派生，不含时间戳/随机数，跨请求/跨重启稳定）：
     // user_id = sessionId:apiKey，同一账号同会话所有请求共享，前缀缓存稳定累积命中
     this.userId = [sessionId ?? 'agent', apiKey].filter((x): x is string => !!x).join(':')
+    this.restoreLastUsageTotalTokens()
   }
 
-  /** 从会话事件日志倒序找最近一条 usage/record，恢复真实总 token 数（无则 0） */
-  private restoreLastUsageTotalTokens(): number {
-    const events = this.session.list()
-    for (let i = events.length - 1; i >= 0; i--) {
-      const e = events[i]
-      if (e?.type === 'usage/record') {
-        return (e.data as { totalTokens: number }).totalTokens
+  /** 从会话事件日志恢复最近一次真实 usage（循环中 maybeCompact 判断上下文是否超窗口用）。
+   * 遍历 usage/record 事件取最后一条 totalTokens，是网关真实返回，不是本地估算。 */
+  private restoreLastUsageTotalTokens(): void {
+    for (const e of this.session.list()) {
+      if (e.type === 'usage/record') {
+        const d = e.data as { totalTokens?: number }
+        if (typeof d.totalTokens === 'number') this.lastUsageTotalTokens = d.totalTokens
       }
     }
-    return 0
   }
 
   /**
@@ -116,12 +117,15 @@ export class AgentLoop {
   }
 
   async run(message: string, options?: AgentLoopOptions): Promise<string> {
-    const maxSteps = options?.maxSteps ?? 1000
+    const maxSteps = options?.maxSteps ?? 2000
     let messages: ChatMessage[] = []
     if (options?.systemPrompt) messages.push({ role: 'system', content: options.systemPrompt })
 
     // 从 session 事件日志回放历史（多轮对话 + 断点续跑：中断后历史仍在 session）
     this.replayHistory(messages)
+
+    // 发起新任务（非断点续跑）：默认全量回放；若回放历史事件的消息条数超过 1000，则裁剪保留最近 20 个对话回合（避免上下文超限）
+    this.trimHistoryIfTooLong(messages)
 
     // 追加当前消息（含多模态附件，附件一并写入事件日志，回放时还原）。
     // 落盘永远保留原始 message + attachments；发给模型的内容在有 modelContent 时用降级后的文字（如图片降级）
@@ -178,6 +182,56 @@ export class AgentLoop {
     }
   }
 
+  /** 发起时上下文裁剪（仅用户发起新任务 run() 时调用，断点续跑 resumeRun() 不调用）：
+   * 回放历史事件后，若满足「回放消息条数超过 MAX_HISTORY_MESSAGES（1000 条）」或「token 达到窗口 80% 临界值」任一条件，
+   * 则裁剪保留最近 MAX_HISTORY_TURNS 个对话回合（20 对 user/assistant 正文），每个回合只留「用户原始消息 + 最终 assistant 回复正文」，
+   * 丢弃中间的 tool/call、tool/result、assistant(tool_calls) 工具执行过程，最大程度压缩体积同时保留对话主线。
+   * 按 user 消息为回合边界，不切断「assistant(tool_calls) ↔ tool」配对（这些过程整体丢弃，不会产生孤立 tool 消息）。
+   * token 判断依据 lastUsageTotalTokens（最后一次 LLM 返回的真实 usage.total_tokens，非本地估算）。
+   * 说明：此裁剪是发起时的兜底，不做 LLM 摘要（摘要交给循环中的 maybeCompact，见下）。 */
+  private trimHistoryIfTooLong(messages: ChatMessage[]): void {
+    // 回放的历史消息条数（排除 system prompt）
+    const historyCount = messages.filter((m) => m.role !== 'system').length
+    const overLength = historyCount > MAX_HISTORY_MESSAGES
+    // token 达到窗口 80% 临界值（真实 usage）
+    const overBudget = this.budget ? this.lastUsageTotalTokens > Math.floor(this.budget * COMPACTION_THRESHOLD) : false
+    // 满足「超过 1000 条」或「token 达 80%」任一条件即裁剪到 20 对
+    if (!overLength && !overBudget) return
+    const trimmed = this.buildTrimmedMessages(messages)
+    messages.length = 0
+    messages.push(...trimmed)
+  }
+
+  /** 裁剪 messages 到最近 MAX_HISTORY_TURNS 个对话回合，返回新数组：每回合只保留「用户原始消息 + 最终 assistant 回复正文」，
+   * 丢弃中间的 tool/call、tool/result、assistant(tool_calls) 工具执行过程（20 对 user/assistant 正文）。
+   * 调用方已确认需要裁剪，此处不再判断回合数是否超上限，始终只保留 user/assistant 正文。 */
+  private buildTrimmedMessages(messages: ChatMessage[]): ChatMessage[] {
+    const systemMsgs = messages.filter((m) => m.role === 'system')
+    const rest = messages.filter((m) => m.role !== 'system')
+    const userIndices: number[] = []
+    rest.forEach((m, i) => {
+      if (m.role === 'user') userIndices.push(i)
+    })
+    // 保留最近 MAX_HISTORY_TURNS 个回合：每回合 = 用户原始消息 + 该回合最终 assistant 正文（无工具调用的最终回复）
+    const kept: ChatMessage[] = []
+    const keptUserIndices = userIndices.slice(-MAX_HISTORY_TURNS) // 最近 20 个 user 消息在 rest 中的索引
+    keptUserIndices.forEach((userIdx, t) => {
+      const userMsg = rest[userIdx]
+      if (!userMsg) return
+      kept.push(userMsg) // 用户发的原始消息
+      const nextUserIdx = keptUserIndices[t + 1] ?? rest.length // 下一个 user 消息的位置（最后一个回合取 rest 末尾）
+      // 在该回合内倒序找最后一条 assistant 正文（最终回复，无工具调用）；任务中止无正文时该回合只留 user 消息
+      for (let i = nextUserIdx - 1; i > userIdx; i--) {
+        const m = rest[i]
+        if (m && m.role === 'assistant' && !isToolCallMessage(m)) {
+          kept.push(m)
+          break
+        }
+      }
+    })
+    return [...systemMsgs, ...kept]
+  }
+
   /** 断点续跑（「继续执行」用）：从会话事件日志回放已执行的历史（含完整工具回合），不追加新 user 消息、不新建 turn，
    * 直接继续 ReAct 循环。用户停止后 session 日志已完整记录已执行步骤，回放即恢复进度，从断点继续而非重新生成。 */
   async resumeRun(
@@ -191,10 +245,11 @@ export class AgentLoop {
     while (cut > 0 && events[cut - 1]?.type === 'assistant/delta') cut--
     if (cut < events.length) this.session.truncate(cut)
 
-    const maxSteps = 1000
+    const maxSteps = 2000
     const messages: ChatMessage[] = []
     if (systemPrompt) messages.push({ role: 'system', content: systemPrompt })
     this.replayHistory(messages)
+    // 断点续跑不裁剪：保留全量已执行历史，确保从断点继续时上下文完整（按长度裁剪只对用户发起新任务生效，见 run()）
     return this.runLoop(messages, 0, maxSteps, onDelta, onReasoning)
   }
 
@@ -348,43 +403,66 @@ export class AgentLoop {
     return this.suspended !== undefined
   }
 
-  /** 超预算压缩：保留 system 消息，把早期对话历史用模型压成摘要，保留最近 4 条原文。
-   * 判断依据：接口返回的真实 usage.total_tokens（lastUsageTotalTokens），不是本地估算——
-   * 本地估算在中文/代码/多模态混合时误差大，容易漏触发（打网关 400）或误触发。
-   * @param force true 时跳过阈值判断直接压缩（网关已返回 400 超限时的兜底强制压缩） */
+  /** 循环中压缩：最近一次真实 usage 达到窗口 80% 临界值（COMPACTION_THRESHOLD）时，仅针对「当前轮」（最后一条 user 消息之后已执行的工具调用与结果）
+   * 做 LLM 摘要，生成一段本轮进度摘要，保证本轮任务连贯性后继续执行。历史回合保持原文不动——超过上下文窗口临界值的
+   * 历史也保留、不裁剪、不丢弃（发起时按消息条数超 1000 才裁剪 20 轮，见 trimHistoryIfTooLong）。
+   * 判断依据：lastUsageTotalTokens（最后一次 LLM 返回的真实 usage.total_tokens），不是本地估算。
+   * @param force true 时跳过判断直接压缩（网关已返回 400 超限时的兜底强制压缩）；若当前轮尚无可压缩步骤，则保留原样返回（不裁剪历史）。 */
   private async maybeCompact(messages: ChatMessage[], force = false): Promise<ChatMessage[]> {
     if (!this.budget) return messages
-    // 上下文窗口的 60% 作为触发阈值（留 40% 余量给回复 + 工具结果），对齐 Taco 的压缩触发比例
-    const threshold = Math.floor(this.budget * 0.6)
-    // 首次调用前还没有真实 usage（lastUsageTotalTokens=0），不压缩；之后用接口真实返回判断
+    // 触发条件：force（网关已返回 400 超限的兜底）或 最近一次真实 usage 达到窗口 80% 临界值（COMPACTION_THRESHOLD，用户设定）。
+    const threshold = Math.floor(this.budget * COMPACTION_THRESHOLD)
     if (!force && this.lastUsageTotalTokens <= threshold) return messages
-    const systemMsgs = messages.filter((m) => m.role === 'system')
-    const rest = messages.filter((m) => m.role !== 'system')
-    if (rest.length <= 6) return messages
-    // 安全切分：tail 起点不能落在 tool 消息上——否则其前面对应的 assistant(tool_calls) 会被切进 head 压成摘要，
-    // 压缩后的 messages 出现「孤立 tool 消息」，网关报 400（tool must be a response to a preceding tool_calls）。
-    // 前移切分点直到起点不是 tool 消息，保证「assistant(tool_calls) ↔ tool」配对不被切断。
-    let cut = rest.length - 4
-    if (cut < 0) cut = 0
-    while (cut > 0 && rest[cut]?.role === 'tool') cut--
-    const head = rest.slice(0, cut)
-    const tail = rest.slice(cut)
-    // 摘要输入只保留纯文本对话（user / assistant 文本），剥离 tool 消息与带 toolCalls 的 assistant 消息：
-    // 否则 head 边界切断工具配对，摘要请求本身也会被网关判非法（400/502，insufficient tool messages / tool must be a response）。
-    const summarizable = head.filter(
-      (m) => m.role !== 'tool' && !(m.role === 'assistant' && ((m.toolCalls?.length ?? 0) > 0 || m.toolCall)),
+
+    // 定位「当前轮」：最后一条 user 消息（即当前这条新消息）之后的所有消息 = 本轮已执行的工具步骤
+    let lastUserIdx = -1
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]?.role === 'user') {
+        lastUserIdx = i
+        break
+      }
+    }
+    if (lastUserIdx < 0) return messages
+    const prefix = messages.slice(0, lastUserIdx + 1) // system + 历史回合 + 当前 user 消息
+    const currentTurn = messages.slice(lastUserIdx + 1) // 本轮已执行的步骤
+    // 当前轮没有实质工具步骤（空轮，或已被压成摘要只剩 assistant 文本）：说明超限来自历史本身，
+    // 压缩当前轮救不了（压完历史仍超会反复压缩），回退裁剪历史到 20 轮。
+    const hasToolSteps = currentTurn.some(
+      (m) => m.role === 'tool' || (m.role === 'assistant' && isToolCallMessage(m)),
     )
-    if (summarizable.length === 0) return messages
-    // 摘要输入裁剪：只取最近 SUMMARY_WINDOW 条 + 单条内容截断，避免把超长 head 整体塞给模型导致摘要请求本身也超限
-    const summaryInput = summarizable.slice(-SUMMARY_WINDOW).map(truncateMessageForSummary)
-    const droppedCount = summarizable.length - summaryInput.length
+    if (!hasToolSteps) {
+      // 超过上下文窗口临界值的历史也保留：当前轮无实质工具步骤（空轮/已压成摘要），说明超限来自历史本身，
+      // 但按需求「超窗口临界值的历史也保留」，不裁剪历史，直接原样返回（宁可超限报错也不偷偷丢弃历史）。
+      return messages
+    }
+
+    // 把当前轮步骤转成可读文本喂给摘要器（保留工具调用名+参数、工具结果，才能保证本轮连贯性）。
+    // 摘要器走 model.complete 纯文本路径，无工具配对约束，统一压平成 user 文本消息最安全。
+    const summaryInput: ChatMessage[] = currentTurn.map((m) => {
+      let text = ''
+      if (m.role === 'tool') {
+        text = `[工具结果] ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '')}`
+      } else if (m.role === 'assistant' && ((m.toolCalls?.length ?? 0) > 0 || m.toolCall)) {
+        const calls = (m.toolCalls ?? (m.toolCall ? [m.toolCall] : [])).map(
+          (c) => `调用工具 ${c.name}(${JSON.stringify(c.args ?? {})})`,
+        )
+        text = calls.join('\n')
+      } else {
+        text = typeof m.content === 'string' ? m.content : ''
+      }
+      return { role: 'user', content: truncateTextForSummary(text, MAX_SUMMARY_MSG_CHARS) }
+    })
+
     let summary = ''
+    // 摘要模型：默认会话模型，配置了统一压缩模型则用配置的（this.compactModel ?? this.model）
+    const summaryModel = this.compactModel ?? this.model
     try {
-      const res = await this.model.complete(
+      const res = await summaryModel.complete(
         [
           {
             role: 'system',
-            content: '你是对话摘要器。把以下对话历史压缩成简洁的续跑摘要，保留关键信息：用户需求、已完成的操作与结论、待办事项、下一步行动。',
+            content:
+              '你是任务进度摘要器。把「当前这一轮」已执行的工具调用与结果压缩成一段简洁的进度摘要，让模型能据此继续执行：保留已完成的操作、关键结果与结论、尚未完成的部分、下一步该做什么。',
           },
           ...summaryInput,
         ],
@@ -396,8 +474,8 @@ export class AgentLoop {
       // 摘要失败不阻断主流程：跳过压缩，继续用原文（可能超预算，但至少不崩）
       return messages
     }
-    const droppedNote = droppedCount > 0 ? `\n（另有 ${droppedCount} 条更早历史因篇幅省略）` : ''
-    return [...systemMsgs, { role: 'system', content: `【历史摘要】${summary}${droppedNote}` }, ...tail]
+    if (!summary) return messages
+    return [...prefix, { role: 'assistant', content: `【本轮执行摘要】${summary}` }]
   }
 
   /** 带自动重试的模型决策：可重试错误（网络/超时/5xx/429/余额不足/网关错误）自动重试最多 MAX_AUTO_RETRY 次（指数退避）。
@@ -482,8 +560,8 @@ export class AgentLoop {
     return res
   }
 
-  /** 记录最近一次模型调用返回的真实总 token 数（usage.total_tokens），供压缩判断使用。
-   * 同时持久化到会话事件日志，断点续跑（resume）新建 AgentLoop 时据此恢复，避免首轮无 usage 跳过压缩。 */
+  /** 记录每次模型调用返回的 usage，持久化到会话事件日志（usage/record），
+   * 供 token 统计模块（累计用量 / 上下文占比）恢复使用，同时更新 lastUsageTotalTokens 供压缩判断用真实值。 */
   private recordUsage(usage: Usage): void {
     this.lastUsageTotalTokens = usage.totalTokens
     this.session.append('usage/record', {
@@ -548,10 +626,12 @@ export class AgentLoop {
     // 用 toolReasoningContext 把「这一轮调用工具的思考」注入执行上下文，runtime 工具包装层据此把
     // reasoning 关联到本次工具调用的 trace 上（前端工具步骤卡片折叠展示）。
     try {
-      const result = await withTimeout(
-        toolReasoningContext.run(reasoningContent, () => Promise.resolve(tool.execute(call.args))),
-        TOOL_TIMEOUT_MS,
-      )
+      const executed = toolReasoningContext.run(reasoningContent, () => Promise.resolve(tool.execute(call.args)))
+      // 超时区分：等用户交互的工具（ask_user / choose_session / choose_model，timeoutMs=Infinity）不设超时——
+      // 用户思考/离开多久由用户决定，不该被固定时限打断；其余「等机器/网络/进程」的工具用 timeoutMs（未设则默认兜底），
+      // 防止单个工具永久挂起（如浏览器 loadURL 白屏、命令执行卡死）导致整个任务循环被堵塞。
+      const result =
+        tool.timeoutMs === Infinity ? await executed : await withTimeout(executed, tool.timeoutMs ?? TOOL_TIMEOUT_MS)
       this.session.append('tool/result', { callId, name: call.name, result })
       messages.push(assistantCallMsg())
       messages.push({ role: 'tool', content: JSON.stringify(result), toolCallId: callId })
@@ -580,11 +660,22 @@ const MAX_AUTO_RETRY = 5
 /** 自动重试初始退避时间（毫秒），指数增长（500ms → 1s → 2s → 4s） */
 const AUTO_RETRY_BACKOFF_MS = 500
 
-/** 压缩时摘要输入最多取最近 N 条历史消息（更早的直接丢弃，避免摘要请求本身超限） */
-const SUMMARY_WINDOW = 16
+/** 发起新任务时，若上下文超窗口，则裁剪保留的对话回合数（20 轮任务：用户原始消息 + 最终 assistant 回复正文） */
+const MAX_HISTORY_TURNS = 20
+
+/** 发起新任务时，回放历史事件后，若消息条数超过该阈值，则裁剪保留最近 20 轮（避免上下文超限） */
+const MAX_HISTORY_MESSAGES = 1000
+
+/** 循环中上下文压缩触发临界值：最近一次真实 usage 达到窗口 80% 即触发（预留 20% 余量，用户设定） */
+const COMPACTION_THRESHOLD = 0.8
 
 /** 压缩时单条消息内容最多参与摘要的字符数（超过截断，控制摘要请求体积） */
-const MAX_SUMMARY_MSG_CHARS = 4000
+const MAX_SUMMARY_MSG_CHARS = 10000
+
+/** 判断一条 assistant 消息是否为「工具调用」消息（带 toolCall/toolCalls），用于区分「最终回复正文」与「工具调用过程」。 */
+function isToolCallMessage(m: ChatMessage): boolean {
+  return !!m.toolCall || (m.toolCalls?.length ?? 0) > 0
+}
 
 /** 从工具结果中提取 https 图片链接（截图工具返回的 imageUrl），供视觉模型直接「看」。
  * 只接受 http(s) 开头的公网链接，不接受 data: URL / 本地路径，避免误注入。 */
@@ -634,11 +725,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-/** 摘要输入的单条消息裁剪：纯文本超过 MAX_SUMMARY_MSG_CHARS 截断，避免巨型工具结果撑爆摘要请求 */
-function truncateMessageForSummary(m: ChatMessage): ChatMessage {
-  if (typeof m.content !== 'string') return m
-  if (m.content.length <= MAX_SUMMARY_MSG_CHARS) return m
-  return { ...m, content: `${m.content.slice(0, MAX_SUMMARY_MSG_CHARS)}\n…（内容过长，摘要时已截断）` }
+/** 摘要输入的单条文本裁剪：超过 MAX_SUMMARY_MSG_CHARS 截断，避免巨型工具结果撑爆摘要请求 */
+function truncateTextForSummary(text: string, max: number): string {
+  if (text.length <= max) return text
+  return `${text.slice(0, max)}\n…（内容过长，摘要时已截断）`
 }
 
 /** 给 Promise 加超时：超时 reject，正常 resolve/reject 则透传。finally 清理定时器避免泄漏。 */

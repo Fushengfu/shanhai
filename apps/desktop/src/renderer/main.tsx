@@ -14,9 +14,11 @@ async function bootstrap(): Promise<void> {
   const windowType = window.shanhai?.windowType ?? 'chat'
   if (!container) return
 
-  // 平台 + 圆角标记：供 theme.css 做 Windows 窗口圆角裁剪（chat/app/supervisor 需要圆角，desktop/dock/supervisor-bubble 不需要）
+  // 平台 + 圆角标记：供 theme.css 做 Windows 窗口圆角裁剪。
+  // 所有窗口类型在 Windows 上都圆角（desktop/dock/supervisor-bubble 在 Windows 下也已设 transparent，统一走 CSS 圆角）。
+  // 圆角规则只在 data-platform='win32' 时生效；macOS 的 frameless 窗口有系统原生圆角，不受影响。
   document.documentElement.dataset.platform = window.shanhai?.platform ?? ''
-  document.documentElement.dataset.rounded = windowType === 'chat' || windowType === 'app' || windowType === 'supervisor' ? 'true' : 'false'
+  document.documentElement.dataset.rounded = 'true'
 
   if (windowType === 'desktop') {
     const { DesktopApp } = await import('./desktop/DesktopApp')

@@ -32,6 +32,8 @@ function askUserTool(service: AskService, getSessionId: () => string): ToolContr
       required: ['question'],
     },
     riskLevel: 'readonly',
+    // 等用户回答：不设超时（用户思考/离开多久由用户决定，不该被 5 分钟统一兜底打断）
+    timeoutMs: Infinity,
     execute: async (args) => {
       const question = String(args.question ?? '').trim()
       if (!question) return { ok: false, error: 'question 不能为空' }

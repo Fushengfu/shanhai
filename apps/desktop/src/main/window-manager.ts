@@ -127,7 +127,7 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
     // desktop/dock 额外 focusable:false（不接受键盘焦点，点击不抢焦点，但仍可接收鼠标事件）。
     // supervisor 保持可聚焦（它是可交互的聊天窗口）。
     ...(shellBounds ? { frame: false, focusable: false } : { frame: false }),
-    ...(type === 'dock' || type === 'supervisor-bubble' || (isWin && (type === 'chat' || type === 'supervisor' || type === 'app'))
+    ...(type === 'dock' || type === 'supervisor-bubble' || (isWin && (type === 'chat' || type === 'supervisor' || type === 'app' || type === 'desktop'))
       ? { transparent: true, backgroundColor: '#00000000', hasShadow: false }
       : {}),
     ...(type === 'supervisor-bubble' ? { alwaysOnTop: true, resizable: false, minimizable: false, maximizable: false, skipTaskbar: true } : {}),

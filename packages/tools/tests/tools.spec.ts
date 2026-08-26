@@ -109,6 +109,27 @@ describe('原子工具', () => {
     await fs.rm(dir, { recursive: true, force: true })
   })
 
+  it('read_file 默认分段读取 200 行（大文件截断并提示）', async () => {
+    const dir = join('/tmp', `shanhai-tools-${Date.now()}`)
+    await fs.mkdir(dir, { recursive: true })
+    const bigLines = Array.from({ length: 300 }, (_, i) => `line${i + 1}`)
+    await fs.writeFile(join(dir, 'big.txt'), bigLines.join('\n'))
+    const readFileTool = createAtomicTools(() => dir).find((t) => t.name === 'read_file')!
+    // 未指定行号 → 默认读前 200 行 + 截断提示
+    const head = (await readFileTool.execute({ path: 'big.txt' })) as string
+    expect(head).toContain('line1')
+    expect(head).toContain('line200')
+    expect(head).not.toContain('line201')
+    expect(head).toContain('文件共 300 行')
+    expect(head).toContain('startLine=201')
+    // 指定 startLine=250（未指定 endLine）→ 读 250~300，已读完整不加提示
+    const tail = (await readFileTool.execute({ path: 'big.txt', startLine: 250 })) as string
+    expect(tail).toContain('line250')
+    expect(tail).toContain('line300')
+    expect(tail).not.toContain('文件共 300 行')
+    await fs.rm(dir, { recursive: true, force: true })
+  })
+
   it('edit_file 精确替换（唯一命中）', async () => {
     const dir = join('/tmp', `shanhai-tools-${Date.now()}`)
     await fs.mkdir(dir, { recursive: true })

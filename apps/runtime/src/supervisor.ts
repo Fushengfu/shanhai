@@ -175,6 +175,8 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
         required: ['question'],
       },
       riskLevel: 'readonly',
+      // 等用户选择：不设超时（用户思考/离开多久由用户决定，不该被 5 分钟统一兜底打断）
+      timeoutMs: Infinity,
       execute: async (args) => {
         const question = String(args.question ?? '').trim() || '请选择要操作的会话'
         const sessionId = await ctx.askSessionPicker(question)
@@ -195,6 +197,8 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
         required: ['question'],
       },
       riskLevel: 'readonly',
+      // 等用户选择：不设超时（用户思考/离开多久由用户决定，不该被 5 分钟统一兜底打断）
+      timeoutMs: Infinity,
       execute: async (args) => {
         const question = String(args.question ?? '').trim() || '请选择模型'
         const modelId = await ctx.askModelPicker(question)

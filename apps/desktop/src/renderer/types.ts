@@ -209,6 +209,10 @@ export interface AppSettings {
     /** 是否允许管家接管提问：true 时管家下发的任务里会话发起的 ask_user 提问由管家代答（代答后弹窗关闭） */
     enabled: boolean
   }
+  compaction: {
+    /** 统一压缩模型 id：上下文超限触发 LLM 摘要时用的模型。空串 = 未配置，回退当前会话模型。 */
+    modelId: string
+  }
 }
 
 /** 设置补丁：允许只传某个分组的某个字段（嵌套 Partial） */
@@ -219,13 +223,13 @@ export type AppSettingsPatch = {
   voice?: Partial<AppSettings['voice']>
   supervisorApproval?: Partial<AppSettings['supervisorApproval']>
   supervisorAsk?: Partial<AppSettings['supervisorAsk']>
+  compaction?: Partial<AppSettings['compaction']>
 }
 
 /** 一条 HTTP 原始请求/响应记录（排查问题用：请求一条、响应一条，含接口地址与完整 body） */
 export interface HttpTraceRecord {
   ts: number
   sessionId: string
-  model: string
   phase: 'request' | 'response'
   url: string
   method: string

@@ -362,7 +362,6 @@ export type AppSettingsPatch = {
 export interface HttpTraceRecord {
   ts: number
   sessionId: string
-  model: string
   phase: 'request' | 'response'
   url: string
   method: string

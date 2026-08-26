@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { AppSettings, AppSettingsPatch, HttpTraceRecord, RemoteStatus, RelayStatus } from '../types'
+import type { AppSettings, AppSettingsPatch, GatewayModel, HttpTraceRecord, RemoteStatus, RelayStatus } from '../types'
 import { IconSettings } from './icons'
 import { smallIconBtn } from './ui'
 import { WindowTitleBar } from './WindowTitleBar'
@@ -118,7 +118,8 @@ function RadioGroup({
 
 /** 设置面板：配置通用设置（浏览器窗口显示等），持久化到 config.json，跨会话、重启保留。侧滑铺满主区域 */
 export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?: number; top?: number; onClose?: () => void; variant?: 'panel' | 'window' }) {
-  const [settings, setSettings] = useState<AppSettings>({ browser: { showOnCreate: true, enableWebBridge: true }, messageSubmit: { mode: 'queue' }, debug: { traceLlm: false }, voice: { enabled: false }, supervisorApproval: { enabled: false }, supervisorAsk: { enabled: false } })
+  const [settings, setSettings] = useState<AppSettings>({ browser: { showOnCreate: true, enableWebBridge: true }, messageSubmit: { mode: 'queue' }, debug: { traceLlm: false }, voice: { enabled: false }, supervisorApproval: { enabled: false }, supervisorAsk: { enabled: false }, compaction: { modelId: '' } })
+  const [models, setModels] = useState<GatewayModel[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [httpTraces, setHttpTraces] = useState<HttpTraceRecord[]>([])
@@ -227,6 +228,7 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
       })
       .catch(() => undefined)
       .finally(() => setLoading(false))
+    void window.shanhai?.listModels().then((m) => setModels(m ?? [])).catch(() => setModels([]))
   }, [])
 
   useEffect(() => {
@@ -329,6 +331,27 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                 checked={settings.supervisorAsk.enabled}
                 onChange={(v) => void update({ supervisorAsk: { enabled: v } })}
               />
+              <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', margin: '18px 0 6px', textTransform: 'uppercase', letterSpacing: 0.5, borderLeft: '3px solid var(--accent)', paddingLeft: 8 }}>
+                上下文压缩
+              </div>
+              <div style={{ padding: '12px 0', borderBottom: '1px solid var(--border)' }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>统一压缩模型</div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.5 }}>
+                  上下文超限触发 LLM 摘要时使用的模型。默认「跟随会话模型」（即当前会话选中的模型）；也可指定一个固定模型统一处理所有会话的压缩。
+                </div>
+                <select
+                  value={settings.compaction?.modelId ?? ''}
+                  onChange={(e) => void update({ compaction: { modelId: e.target.value } })}
+                  style={{ marginTop: 8, width: '100%', padding: '6px 8px', fontSize: 13, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text)' }}
+                >
+                  <option value="">跟随会话模型（默认）</option>
+                  {models.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name}（{m.id}）
+                    </option>
+                  ))}
+                </select>
+              </div>
               <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', margin: '18px 0 6px', textTransform: 'uppercase', letterSpacing: 0.5, borderLeft: '3px solid var(--accent)', paddingLeft: 8 }}>
                 DeepSeek 网页版
               </div>
@@ -456,7 +479,6 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
                           <span style={{ color: 'var(--text-muted)' }}>#{i + 1}</span>
                           <span style={{ fontWeight: 600, color: t.phase === 'request' ? 'var(--accent)' : 'var(--success-text)' }}>{t.phase === 'request' ? '请求' : '响应'}</span>
-                          <span style={{ color: 'var(--text-muted)' }}>{t.model}</span>
                           <span style={{ color: 'var(--text-muted)' }}>{new Date(t.ts).toLocaleTimeString()}</span>
                           {t.responseStatus != null && <span style={{ color: 'var(--text-muted)' }}>HTTP {t.responseStatus}</span>}
                           {t.error ? <span style={{ color: 'var(--danger-text)' }}>错误</span> : null}
