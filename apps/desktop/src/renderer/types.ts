@@ -76,6 +76,21 @@ export interface RelayStatus {
   clientCount: number
 }
 
+/** 应用版本检查/更新结果（主进程 → 渲染层） */
+export interface AppUpdateCheckResult {
+  success: boolean
+  checkedAt: number
+  currentVersion: string
+  hasUpdate: boolean
+  latestVersion?: string
+  latestVersionCode?: string
+  releaseNotes?: string
+  downloadUrl?: string
+  forceUpdate?: boolean
+  downloadTriggered?: boolean
+  message?: string
+}
+
 /** 会话选择器中的单个会话选项（choose_session 工具专用） */
 export interface AskSessionOption {
   id: string
@@ -303,6 +318,14 @@ declare global {
       relayDisable(): Promise<RelayStatus>
       /** 查询网关中继状态 */
       relayStatus(): Promise<RelayStatus>
+      /** 获取当前应用版本号 */
+      getVersion(): Promise<string>
+      /** 手动检查更新（弹窗引导下载/安装） */
+      checkUpdate(): Promise<AppUpdateCheckResult>
+      /** 获取最近一次版本检查结果 */
+      getUpdateStatus(): Promise<AppUpdateCheckResult | null>
+      /** 订阅自动检查发现新版本时的推送 */
+      onUpdateAvailable(cb: (result: AppUpdateCheckResult) => void): () => void
       /** 读取全局 UI 共享状态快照 */
       getUiState(): Promise<GlobalUiState>
       /** 订阅全局 UI 共享状态变化 */

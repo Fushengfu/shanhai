@@ -6,6 +6,7 @@ import { getUiState, patchUiState, getWallpaper, setWallpaper, filterUiStateForW
 import { listSystemWallpapers, applySystemWallpaper } from './system-wallpaper'
 import { startRemoteServer, stopRemoteServer, getRemoteStatus } from './remote-server'
 import { startRemoteRelay, stopRemoteRelay, getRelayStatus, getRelayPreference } from './remote-relay'
+import { checkAndPromptForUpdate, getLastUpdateCheckResult } from './app-updater'
 
 /**
  * 渲染进程 → 主进程 调用（IPC handler）。
@@ -234,4 +235,11 @@ export function registerIpc(): void {
     return getRelayStatus()
   })
   ipcMain.handle('remote:relayStatus', async () => getRelayStatus())
+
+  // —— 应用版本更新（复用网关公开版本检查 API，手动检查 + 自动调度推送）——
+  ipcMain.handle('app:get-version', async () => app.getVersion())
+  ipcMain.handle('app:check-update', async (e) =>
+    checkAndPromptForUpdate({ manual: true, parentWindow: BrowserWindow.fromWebContents(e.sender) }),
+  )
+  ipcMain.handle('app:get-update-status', async () => getLastUpdateCheckResult())
 }

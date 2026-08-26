@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { AppSettings, AppSettingsPatch, GatewayModel, HttpTraceRecord, RemoteStatus, RelayStatus } from '../types'
+import type { AppSettings, AppSettingsPatch, AppUpdateCheckResult, GatewayModel, HttpTraceRecord, RemoteStatus, RelayStatus } from '../types'
 import { IconSettings } from './icons'
 import { smallIconBtn } from './ui'
 import { WindowTitleBar } from './WindowTitleBar'
@@ -132,6 +132,9 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
   const [remoteBusy, setRemoteBusy] = useState(false)
   const [relay, setRelay] = useState<RelayStatus | null>(null)
   const [relayBusy, setRelayBusy] = useState(false)
+  const [version, setVersion] = useState('')
+  const [updateStatus, setUpdateStatus] = useState<AppUpdateCheckResult | null>(null)
+  const [updateChecking, setUpdateChecking] = useState(false)
 
   const loadDsb = useCallback(() => {
     void window.shanhai
@@ -231,12 +234,46 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
     void window.shanhai?.listModels().then((m) => setModels(m ?? [])).catch(() => setModels([]))
   }, [])
 
+  const loadUpdate = useCallback(() => {
+    void window.shanhai
+      ?.getVersion()
+      .then((v) => {
+        if (v) setVersion(v)
+      })
+      .catch(() => undefined)
+    void window.shanhai
+      ?.getUpdateStatus()
+      .then((s) => setUpdateStatus(s ?? null))
+      .catch(() => undefined)
+  }, [])
+
+  const checkUpdate = useCallback(async () => {
+    if (updateChecking) return
+    setUpdateChecking(true)
+    try {
+      const r = await window.shanhai?.checkUpdate()
+      if (r) setUpdateStatus(r)
+    } catch (e) {
+      console.error('[update] 检查更新失败:', e)
+    } finally {
+      setUpdateChecking(false)
+    }
+  }, [updateChecking])
+
   useEffect(() => {
     load()
     loadDsb()
     loadRemote()
     loadRelay()
-  }, [load, loadDsb, loadRemote, loadRelay])
+    loadUpdate()
+  }, [load, loadDsb, loadRemote, loadRelay, loadUpdate])
+
+  useEffect(() => {
+    const unsub = window.shanhai?.onUpdateAvailable((result) => {
+      setUpdateStatus(result)
+    })
+    return () => unsub?.()
+  }, [])
 
   useEffect(() => {
     function onKey(e: KeyboardEvent): void {
@@ -499,6 +536,40 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                   )}
                 </div>
               )}
+              <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', margin: '18px 0 6px', textTransform: 'uppercase', letterSpacing: 0.5, borderLeft: '3px solid var(--accent)', paddingLeft: 8 }}>
+                关于山海
+              </div>
+              <div style={{ padding: '12px 0', borderBottom: '1px solid var(--border)' }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>
+                  当前版本 <span style={{ color: 'var(--purple)' }}>v{version || '—'}</span>
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4, lineHeight: 1.5 }}>
+                  {updateStatus?.hasUpdate
+                    ? `发现新版本 v${updateStatus.latestVersion}`
+                    : updateStatus
+                      ? (updateStatus.message ?? (updateStatus.success ? '当前已是最新版本' : '检查失败'))
+                      : '点击下方按钮检查最新版本'}
+                </div>
+                {updateStatus?.releaseNotes ? (
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6, lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                    {updateStatus.releaseNotes}
+                  </div>
+                ) : null}
+                <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <button
+                    onClick={() => void checkUpdate()}
+                    disabled={updateChecking}
+                    style={{ ...smallIconBtn, padding: '4px 12px', fontSize: 12, border: '1px solid var(--border-soft)', borderRadius: 6 }}
+                  >
+                    {updateChecking ? '检查中…' : '检查更新'}
+                  </button>
+                  {updateStatus?.checkedAt ? (
+                    <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+                      上次检查：{new Date(updateStatus.checkedAt).toLocaleString()}
+                    </span>
+                  ) : null}
+                </div>
+              </div>
             </>
           )}
         </div>

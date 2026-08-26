@@ -6,6 +6,7 @@ import { registerPush } from './push'
 import { registerIpc } from './ipc-handlers'
 import { startRemoteRelay, getRelayPreference } from './remote-relay'
 import { createWindow, loadWindowContent, showChatWindow, toggleChatWindow, ensureDesktopLayer, ICON_PATH } from './window-manager'
+import { scheduleStartupUpdateCheck } from './app-updater'
 
 /** 全局唤起/隐藏主窗口的快捷键（macOS 上 CommandOrControl 即 ⌘，避开 Spotlight 的 ⌘+Space） */
 const TOGGLE_SHORTCUT = 'CommandOrControl+Shift+Space'
@@ -71,6 +72,9 @@ app.whenReady().then(async () => {
   const supervisorWin = createWindow({ type: 'supervisor' })
   await loadWindowContent(supervisorWin)
   registerPush()
+
+  // 启动应用版本自动检查：1 秒后查一次，之后每 10 分钟查一次（发现新版本主动推送渲染层亮角标）
+  scheduleStartupUpdateCheck(chatWin)
 
   // 恢复已安装插件（AI 自研应用跨会话/跨重启留存）：在窗口就绪 + 广播注册后执行，
   // 确保 browser 半 UI 代码能正确投递到渲染进程（否则 restore 时窗口尚未创建，投递会丢失）。

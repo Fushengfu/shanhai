@@ -38,6 +38,21 @@ export interface RelayStatus {
   clientCount: number
 }
 
+/** 应用版本检查/更新结果（主进程 → 渲染层） */
+export interface AppUpdateCheckResult {
+  success: boolean
+  checkedAt: number
+  currentVersion: string
+  hasUpdate: boolean
+  latestVersion?: string
+  latestVersionCode?: string
+  releaseNotes?: string
+  downloadUrl?: string
+  forceUpdate?: boolean
+  downloadTriggered?: boolean
+  message?: string
+}
+
 export interface ApprovalRequest {
   id: string
   sessionId?: string
@@ -208,6 +223,14 @@ export interface ShanhaiBridge {
   relayDisable(): Promise<RelayStatus>
   /** 查询网关中继状态 */
   relayStatus(): Promise<RelayStatus>
+  /** 获取当前应用版本号（package.json version） */
+  getVersion(): Promise<string>
+  /** 手动检查更新（弹窗引导下载/安装），返回检查结果 */
+  checkUpdate(): Promise<AppUpdateCheckResult>
+  /** 获取最近一次版本检查结果（自动检查或手动检查） */
+  getUpdateStatus(): Promise<AppUpdateCheckResult | null>
+  /** 订阅主进程自动检查发现新版本时的推送，返回取消订阅函数 */
+  onUpdateAvailable(cb: (result: AppUpdateCheckResult) => void): () => void
   // 认证
   status(): Promise<{ loggedIn: boolean; username: string | null }>
   login(username: string, password: string): Promise<{ username: string; nickname?: string }>
@@ -417,6 +440,14 @@ const bridge: ShanhaiBridge = {
   relayEnable: (url) => ipcRenderer.invoke('remote:relayEnable', url),
   relayDisable: () => ipcRenderer.invoke('remote:relayDisable'),
   relayStatus: () => ipcRenderer.invoke('remote:relayStatus'),
+  getVersion: () => ipcRenderer.invoke('app:get-version'),
+  checkUpdate: () => ipcRenderer.invoke('app:check-update'),
+  getUpdateStatus: () => ipcRenderer.invoke('app:get-update-status'),
+  onUpdateAvailable: (cb) => {
+    const listener = (_e: unknown, result: AppUpdateCheckResult) => cb(result)
+    ipcRenderer.on('app:update-available', listener)
+    return () => ipcRenderer.removeListener('app:update-available', listener)
+  },
   status: () => ipcRenderer.invoke('auth:status'),
   login: (u, p) => ipcRenderer.invoke('auth:login', u, p),
   logout: () => ipcRenderer.invoke('auth:logout'),

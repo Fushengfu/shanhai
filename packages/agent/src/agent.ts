@@ -47,9 +47,10 @@ export class AgentLoop {
   private readonly approvalSession: Session
   /** 是否已被用户中止（点「停止」）：在每轮循环 / 流式每个 chunk / 工具执行前检查，尽快中断 */
   private aborted = false
-  /** 最后一次 LLM 返回的真实 usage.total_tokens（网关真实返回，非本地估算）：循环中判断上下文是否超窗口用。
+  /** 最后一次 LLM 返回的真实 usage.prompt_tokens（网关真实返回，非本地估算）：循环中判断上下文是否超窗口用。
+   * 用 promptTokens 而非 totalTokens：判断「messages 是否超窗口」只看 prompt 部分，不能把 completion 计入。
    * 从会话 usage/record 事件恢复；之后每次模型调用后由 recordUsage 更新。 */
-  private lastUsageTotalTokens = 0
+  private lastUsagePromptTokens = 0
   /** 挂起状态（任务失败重试耗尽后保存）：messages 快照 + 重入位置，retry() 用相同 body 重新提交 */
   private suspended:
     | (SuspendedSnapshot & {
@@ -77,16 +78,18 @@ export class AgentLoop {
     // 同一会话同一 agent 的 user_id 永远不变（确定性派生，不含时间戳/随机数，跨请求/跨重启稳定）：
     // user_id = sessionId:apiKey，同一账号同会话所有请求共享，前缀缓存稳定累积命中
     this.userId = [sessionId ?? 'agent', apiKey].filter((x): x is string => !!x).join(':')
-    this.restoreLastUsageTotalTokens()
+    this.restoreLastUsagePromptTokens()
   }
 
-  /** 从会话事件日志恢复最近一次真实 usage（循环中 maybeCompact 判断上下文是否超窗口用）。
-   * 遍历 usage/record 事件取最后一条 totalTokens，是网关真实返回，不是本地估算。 */
-  private restoreLastUsageTotalTokens(): void {
+  /** 从会话事件日志恢复最近一次真实 usage.promptTokens（循环中 maybeCompact 判断上下文是否超窗口用）。
+   * 遍历 usage/record 事件取最后一条 promptTokens，是网关真实返回，不是本地估算。
+   * 兼容旧记录：无 promptTokens 时回退 totalTokens。 */
+  private restoreLastUsagePromptTokens(): void {
     for (const e of this.session.list()) {
       if (e.type === 'usage/record') {
-        const d = e.data as { totalTokens?: number }
-        if (typeof d.totalTokens === 'number') this.lastUsageTotalTokens = d.totalTokens
+        const d = e.data as { totalTokens?: number; promptTokens?: number }
+        if (typeof d.promptTokens === 'number') this.lastUsagePromptTokens = d.promptTokens
+        else if (typeof d.totalTokens === 'number') this.lastUsagePromptTokens = d.totalTokens
       }
     }
   }
@@ -183,19 +186,19 @@ export class AgentLoop {
   }
 
   /** 发起时上下文裁剪（仅用户发起新任务 run() 时调用，断点续跑 resumeRun() 不调用）：
-   * 回放历史事件后，若满足「回放消息条数超过 MAX_HISTORY_MESSAGES（1000 条）」或「token 达到窗口 80% 临界值」任一条件，
+   * 回放历史事件后，若满足「回放消息条数超过 MAX_HISTORY_MESSAGES（1000 条）」或「token 达到窗口 70% 临界值」任一条件，
    * 则裁剪保留最近 MAX_HISTORY_TURNS 个对话回合（20 对 user/assistant 正文），每个回合只留「用户原始消息 + 最终 assistant 回复正文」，
    * 丢弃中间的 tool/call、tool/result、assistant(tool_calls) 工具执行过程，最大程度压缩体积同时保留对话主线。
    * 按 user 消息为回合边界，不切断「assistant(tool_calls) ↔ tool」配对（这些过程整体丢弃，不会产生孤立 tool 消息）。
-   * token 判断依据 lastUsageTotalTokens（最后一次 LLM 返回的真实 usage.total_tokens，非本地估算）。
+   * token 判断依据 lastUsagePromptTokens（最后一次 LLM 返回的真实 usage.prompt_tokens，非本地估算）。
    * 说明：此裁剪是发起时的兜底，不做 LLM 摘要（摘要交给循环中的 maybeCompact，见下）。 */
   private trimHistoryIfTooLong(messages: ChatMessage[]): void {
     // 回放的历史消息条数（排除 system prompt）
     const historyCount = messages.filter((m) => m.role !== 'system').length
     const overLength = historyCount > MAX_HISTORY_MESSAGES
-    // token 达到窗口 80% 临界值（真实 usage）
-    const overBudget = this.budget ? this.lastUsageTotalTokens > Math.floor(this.budget * COMPACTION_THRESHOLD) : false
-    // 满足「超过 1000 条」或「token 达 80%」任一条件即裁剪到 20 对
+    // token 达到窗口 70% 临界值（真实 usage.promptTokens）
+    const overBudget = this.budget ? this.lastUsagePromptTokens > Math.floor(this.budget * COMPACTION_THRESHOLD) : false
+    // 满足「超过 1000 条」或「token 达 70%」任一条件即裁剪到 20 对
     if (!overLength && !overBudget) return
     const trimmed = this.buildTrimmedMessages(messages)
     messages.length = 0
@@ -403,16 +406,16 @@ export class AgentLoop {
     return this.suspended !== undefined
   }
 
-  /** 循环中压缩：最近一次真实 usage 达到窗口 80% 临界值（COMPACTION_THRESHOLD）时，仅针对「当前轮」（最后一条 user 消息之后已执行的工具调用与结果）
+  /** 循环中压缩：最近一次真实 usage.promptTokens 达到窗口 70% 临界值（COMPACTION_THRESHOLD）时，仅针对「当前轮」（最后一条 user 消息之后已执行的工具调用与结果）
    * 做 LLM 摘要，生成一段本轮进度摘要，保证本轮任务连贯性后继续执行。历史回合保持原文不动——超过上下文窗口临界值的
    * 历史也保留、不裁剪、不丢弃（发起时按消息条数超 1000 才裁剪 20 轮，见 trimHistoryIfTooLong）。
-   * 判断依据：lastUsageTotalTokens（最后一次 LLM 返回的真实 usage.total_tokens），不是本地估算。
-   * @param force true 时跳过判断直接压缩（网关已返回 400 超限时的兜底强制压缩）；若当前轮尚无可压缩步骤，则保留原样返回（不裁剪历史）。 */
+   * 判断依据：lastUsagePromptTokens（最后一次 LLM 返回的真实 usage.prompt_tokens），不是本地估算。
+   * @param force true 时跳过判断直接压缩（网关已返回 400 超限时的兜底强制压缩）；若当前轮尚无可压缩步骤且非 force，则保留原样返回（不裁剪历史）。 */
   private async maybeCompact(messages: ChatMessage[], force = false): Promise<ChatMessage[]> {
     if (!this.budget) return messages
-    // 触发条件：force（网关已返回 400 超限的兜底）或 最近一次真实 usage 达到窗口 80% 临界值（COMPACTION_THRESHOLD，用户设定）。
+    // 触发条件：force（网关已返回 400 超限的兜底）或 最近一次真实 usage.promptTokens 达到窗口 70% 临界值（COMPACTION_THRESHOLD，用户设定）。
     const threshold = Math.floor(this.budget * COMPACTION_THRESHOLD)
-    if (!force && this.lastUsageTotalTokens <= threshold) return messages
+    if (!force && this.lastUsagePromptTokens <= threshold) return messages
 
     // 定位「当前轮」：最后一条 user 消息（即当前这条新消息）之后的所有消息 = 本轮已执行的工具步骤
     let lastUserIdx = -1
@@ -431,8 +434,15 @@ export class AgentLoop {
       (m) => m.role === 'tool' || (m.role === 'assistant' && isToolCallMessage(m)),
     )
     if (!hasToolSteps) {
-      // 超过上下文窗口临界值的历史也保留：当前轮无实质工具步骤（空轮/已压成摘要），说明超限来自历史本身，
-      // 但按需求「超窗口临界值的历史也保留」，不裁剪历史，直接原样返回（宁可超限报错也不偷偷丢弃历史）。
+      // 当前轮无实质工具步骤（空轮，或已被压成摘要只剩 assistant 文本）：说明超限来自历史本身，压缩当前轮救不了。
+      // 非 force（预防性压缩）：按需求「超窗口临界值的历史也保留」，不裁剪历史，直接原样返回（宁可超限报错也不偷偷丢弃历史）。
+      // force（网关已明确返回 400「发起即超」）：压缩当前轮救不了，此时必须裁剪历史 20 轮自救——否则注定 400 死循环。
+      if (force) {
+        const trimmed = this.buildTrimmedMessages(messages)
+        // 裁剪后消息数未减少（历史本身不超过 20 轮，无内容可裁）→ 返回原样，让外层抛错（裁剪也救不了）
+        if (trimmed.length >= messages.length) return messages
+        return trimmed
+      }
       return messages
     }
 
@@ -561,9 +571,9 @@ export class AgentLoop {
   }
 
   /** 记录每次模型调用返回的 usage，持久化到会话事件日志（usage/record），
-   * 供 token 统计模块（累计用量 / 上下文占比）恢复使用，同时更新 lastUsageTotalTokens 供压缩判断用真实值。 */
+   * 供 token 统计模块（累计用量 / 上下文占比）恢复使用，同时更新 lastUsagePromptTokens 供压缩判断用真实值。 */
   private recordUsage(usage: Usage): void {
-    this.lastUsageTotalTokens = usage.totalTokens
+    this.lastUsagePromptTokens = usage.promptTokens
     this.session.append('usage/record', {
       totalTokens: usage.totalTokens,
       promptTokens: usage.promptTokens,
@@ -666,8 +676,8 @@ const MAX_HISTORY_TURNS = 20
 /** 发起新任务时，回放历史事件后，若消息条数超过该阈值，则裁剪保留最近 20 轮（避免上下文超限） */
 const MAX_HISTORY_MESSAGES = 1000
 
-/** 循环中上下文压缩触发临界值：最近一次真实 usage 达到窗口 80% 即触发（预留 20% 余量，用户设定） */
-const COMPACTION_THRESHOLD = 0.8
+/** 循环中上下文压缩触发临界值：最近一次真实 usage.promptTokens 达到窗口 70% 即触发（预留 30% 余量，用户设定） */
+const COMPACTION_THRESHOLD = 0.7
 
 /** 压缩时单条消息内容最多参与摘要的字符数（超过截断，控制摘要请求体积） */
 const MAX_SUMMARY_MSG_CHARS = 10000
