@@ -5,9 +5,11 @@ import { SessionPicker } from '../components/SessionPicker'
 import { ModelPicker } from '../components/ModelPicker'
 import { RetryPromptCard } from '../components/RetryPrompt'
 import { AssistantMessage } from '../components/AssistantMessage'
-import { ExpertTraces } from '../components/ExpertTraces'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import { makeMarkdownComponents, normalizeTreeBlocks } from '../components/Markdown'
 import { ReasoningBlock } from '../components/ReasoningBlock'
-import { StepStats, ToolStep, toolDisplayName, riskLevelLabel } from '../components/ToolStep'
+import { DiffBlock, StepStats, ToolStep, toolDisplayName, riskLevelLabel } from '../components/ToolStep'
 import { UserMessage } from '../components/UserMessage'
 import { IconChevronDown, IconCode, IconRefresh, IconWarn } from '../components/icons'
 import { btn, formatArgs, LiveDuration, ThinkingDots } from '../components/ui'
@@ -33,6 +35,36 @@ const AI_BUBBLE_STYLE: React.CSSProperties = {
   WebkitUserSelect: 'text',
 }
 
+/** 审批弹窗参数展示：编辑/写入文件渲染 diff 前后对比，执行命令完整显示命令，其余回退友好键值对 */
+function renderApprovalDetail(toolName: string, args: Record<string, unknown>): React.ReactNode {
+  if (!args || Object.keys(args).length === 0) return <span style={{ color: 'var(--text-muted)' }}>（无参数）</span>
+  if (toolName === 'edit_file') {
+    const path = typeof args.path === 'string' ? args.path : ''
+    const before = typeof args.oldText === 'string' ? args.oldText : ''
+    const after = typeof args.newText === 'string' ? args.newText : ''
+    return <DiffBlock before={before} after={after} path={path} />
+  }
+  if (toolName === 'write_file') {
+    const path = typeof args.path === 'string' ? args.path : ''
+    const content = typeof args.content === 'string' ? args.content : ''
+    return <DiffBlock before="" after={content} path={path} isNew />
+  }
+  if (toolName === 'run_command') {
+    const command = typeof args.command === 'string' ? args.command : ''
+    return (
+      <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 12 }}>
+        {command && (
+          <div style={{ padding: '8px 12px', background: '#282c34', color: '#61afef', whiteSpace: 'pre-wrap', wordBreak: 'break-all', borderRadius: 8 }}>
+            <span style={{ color: '#7f848e' }}>$ </span>
+            {command}
+          </div>
+        )}
+      </div>
+    )
+  }
+  return formatArgs(args)
+}
+
 /** shell.chat 插件：消息流主体 + 浮动交互层（审批弹窗 / 提问卡片 / browser 半投递弹窗，可被 selfmod 替换） */
 function ChatSlot(): React.JSX.Element {
   const ctx = useUIContext()
@@ -55,12 +87,12 @@ function ChatSlot(): React.JSX.Element {
     atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
   }
 
-  // 消息更新 / 思考流 / 多专家轨迹 / 审批弹窗出现时：只要用户在底部就跟随滚到底。
+  // 消息更新 / 思考流 / 审批弹窗出现时：只要用户在底部就跟随滚到底。
   useEffect(() => {
     const el = listRef.current
     if (!el) return
     if (atBottomRef.current) el.scrollTop = el.scrollHeight
-  }, [ctx.cur.items, streaming.text, streaming.reasoning, ctx.curExpertTraces, ctx.curApproval])
+  }, [ctx.cur.items, streaming.text, streaming.reasoning, ctx.curApproval])
 
   // 切换会话：重置「在底部」并立即滚到底
   useEffect(() => {
@@ -69,14 +101,7 @@ function ChatSlot(): React.JSX.Element {
     if (el) el.scrollTop = el.scrollHeight
   }, [ctx.currentSessionId])
 
-  // 当前这一轮（最后一个 user 消息）的序号；用于任务执行中实时渲染多专家协作卡片（不等任务结束）
-  const lastUserTurnSeq = [...ctx.cur.items].reverse().find((it) => it.kind === 'user')?.turnSeq
-  // 当前轮是否已有 assistant 回复（任务完成）；已完成则交给历史分支（assistant 之后）渲染，实时区不再重复
-  const lastTurnHasAssistant = ctx.cur.items.some((it) => it.kind === 'assistant' && it.turnSeq === lastUserTurnSeq)
-  const liveTraces =
-    lastUserTurnSeq != null && !lastTurnHasAssistant ? ctx.curExpertTraces.filter((t) => t.turnSeq === lastUserTurnSeq) : []
-
-  // 历史消息节点缓存：streaming 变化时 items/expertTraces/busy 都不变，返回缓存的 nodes，
+  // 历史消息节点缓存：streaming 变化时 items/busy 都不变，返回缓存的 nodes，
   // 避免每个 token 都重建全部历史消息 VNode（React 对相同 element 引用做 bailout，跳过子树渲染）。
   const history = useMemo(() => {
     const nodes: React.ReactNode[] = []
@@ -116,7 +141,6 @@ function ChatSlot(): React.JSX.Element {
           />
         )
       } else if (it.kind === 'assistant') {
-        const turnTraces = it.turnSeq != null ? ctx.curExpertTraces.filter((t) => t.turnSeq === it.turnSeq) : []
         const tools = toolBuffer
         toolBuffer = []
         nodes.push(
@@ -125,7 +149,6 @@ function ChatSlot(): React.JSX.Element {
             content={it.content}
             reasoningContent={it.reasoningContent}
             toolSteps={tools}
-            expertTraces={turnTraces}
             turnDuration={it.turnDuration}
             onPreviewImage={(url) => ctx.setPreviewImage(url)}
           />
@@ -137,7 +160,7 @@ function ChatSlot(): React.JSX.Element {
     // 非 busy 时残留的 tool（如任务中断）直接渲染；busy 时残留 tool 归入「正在生成」气泡
     if (!ctx.cur.busy) flushTools('tail')
     return { nodes, pendingTools: toolBuffer }
-  }, [ctx.cur.items, ctx.curExpertTraces, ctx.cur.busy, ctx.resendMessage, ctx.editResend, ctx.setPreviewImage])
+  }, [ctx.cur.items, ctx.cur.busy, ctx.resendMessage, ctx.editResend, ctx.setPreviewImage])
 
   return (
     <>
@@ -179,16 +202,16 @@ function ChatSlot(): React.JSX.Element {
                           ))}
                         </div>
                       )}
-                      {/* 多专家协作卡片：显示在正文之前 */}
-                      <ExpertTraces traces={liveTraces} />
                       {/* 思考过程折叠块：显示在正文之前，流式展开显示完整思考 */}
                       {streaming.reasoning && <ReasoningBlock content={streaming.reasoning} streaming />}
-                      {/* 正式回答：只显示最终正文 */}
+                      {/* 正式回答：只显示最终正文（流式实时按 Markdown 渲染，与历史气泡一致） */}
                       {streaming.text && (
-                        <span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
-                          {streaming.text}
+                        <div style={{ minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
+                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents((url) => ctx.setPreviewImage(url))}>
+                            {normalizeTreeBlocks(streaming.text)}
+                          </ReactMarkdown>
                           <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
-                        </span>
+                        </div>
                       )}
                       {/* 思考中三点动画：气泡底部（块级换行），任务结束才消失 */}
                       <div style={{ display: 'block', color: 'var(--text-muted)', fontSize: 12, marginTop: 4 }}>
@@ -271,7 +294,7 @@ function ChatSlot(): React.JSX.Element {
             <>
               <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>工具：{toolDisplayName(ctx.curApproval.toolName, ctx.curApproval.args)}（{riskLevelLabel(ctx.curApproval.riskLevel)}）</div>
               <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-                {formatArgs(ctx.curApproval.args)}
+                {renderApprovalDetail(ctx.curApproval.toolName, ctx.curApproval.args)}
               </div>
               <div style={{ display: 'flex', gap: 8 }}>
                 <button onClick={() => void ctx.respondApproval('allowed-once')} style={btn('var(--accent)', '#fff')}>

@@ -102,6 +102,8 @@ export interface AskRequest {
   options?: string[]
   multiple?: boolean
   placeholder?: string
+  /** AI 调用本次提问时的思考过程（为什么问你），供 UI 折叠展示背景 */
+  reasoning?: string
   /** 交互类型：text=普通提问/填空（默认）、session-picker=会话选择器、model-picker=模型选择器 */
   kind?: 'text' | 'session-picker' | 'model-picker'
   /** 会话选择器数据（kind=session-picker 时提供） */
@@ -165,31 +167,6 @@ export interface ClientRunRequest {
   pkgId: string
   name: string
   purpose: string
-}
-
-/** 多专家编排轨迹（Triage 拆解 → 专家执行过程） */
-export interface ExpertTrace {
-  sessionId?: string
-  /** 所属轮次序号（会话内 user 消息序号，从 1 开始）；用于把「多专家协作」卡片插到对应那一轮消息之后 */
-  turnSeq?: number
-  stepId: string
-  expertId: string
-  expertName: string
-  title: string
-  status: 'started' | 'completed' | 'failed'
-  result?: string
-  error?: string
-}
-
-/** 专家角色（多专家编排：内置 + 自定义；builtin 标记内置不可删，自定义可删） */
-export interface Expert {
-  id: string
-  name: string
-  description: string
-  systemPrompt: string
-  toolSet: string[]
-  skillSet: string[]
-  builtin: boolean
 }
 
 /** 长期记忆条目 */
@@ -397,10 +374,6 @@ declare global {
       respondClientRun(requestId: string, approved: boolean): Promise<void>
       onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
       onClientRemove(cb: (pkgId: string) => void): () => void
-      onExpertTrace(cb: (trace: ExpertTrace) => void): () => void
-      listExperts(): Promise<Expert[]>
-      addExpert(role: { id: string; name: string; description: string; systemPrompt: string }): Promise<Expert>
-      removeExpert(id: string): Promise<void>
       listMemory(sessionId: string): Promise<MemoryEntry[]>
       removeMemory(id: number): Promise<void>
       getSettings(): Promise<AppSettings>

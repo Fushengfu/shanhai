@@ -11,7 +11,7 @@ export function WelcomeHero({ onSuggestion }: { onSuggestion: (text: string) => 
       <div style={{ fontSize: 44, fontWeight: 700, color: 'var(--accent)', letterSpacing: 2, marginBottom: 10 }}>山海</div>
       <div style={{ fontSize: 18, fontWeight: 600, color: 'var(--text)', marginBottom: 8 }}>欢迎使用山海 AI 助手</div>
       <div style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.7, marginBottom: 22 }}>
-        一个可自我升级的桌面智能体：多专家编排、真实工具执行、会话级隔离。
+        一个可自我升级的桌面智能体：真实工具执行、会话级隔离。
         <br />
         登录后解锁全部模型，也支持接入你自己的模型服务商。
       </div>

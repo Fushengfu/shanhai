@@ -38,6 +38,8 @@ dependencies:
   flutter_markdown: ^0.7.4
   crypto: ^3.0.5
   http: ^1.2.2
+  # 登录态本地安全存储（Keychain / Keystore）：跨重启缓存会员 JWT，避免每次打开都要重新登录
+  flutter_secure_storage: ^9.2.2
 
 dev_dependencies:
   flutter_test:

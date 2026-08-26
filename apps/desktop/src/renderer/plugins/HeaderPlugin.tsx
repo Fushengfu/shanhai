@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { IconActivity, IconClock, IconClose, IconMaximize, IconMinimize, IconMonitor, IconMoon, IconRestore, IconSettings, IconSidebar, IconSun, IconTerminal, IconUsers } from '../components/icons'
+import { IconActivity, IconClock, IconClose, IconMaximize, IconMinimize, IconMonitor, IconMoon, IconRestore, IconSettings, IconSidebar, IconSun, IconTerminal } from '../components/icons'
 import { smallIconBtn } from '../components/ui'
 import { registerSlot, AppendSlotView } from '../slots'
 import { useUIContext } from '../ui-context'
@@ -40,14 +40,6 @@ function HeaderSlot(): React.JSX.Element {
         >
           <IconClock />
           记忆
-        </button>
-        <button
-          onClick={() => void window.shanhai?.openApp('experts')}
-          title="查看专家"
-          style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer', ...({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) }}
-        >
-          <IconUsers />
-          专家
         </button>
         <button
           onClick={() => void window.shanhai?.openApp('trace')}

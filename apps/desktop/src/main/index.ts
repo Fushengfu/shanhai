@@ -4,6 +4,7 @@ import { getRuntime, setRuntime } from './runtime'
 import { initUiStore } from './ui-store'
 import { registerPush } from './push'
 import { registerIpc } from './ipc-handlers'
+import { startRemoteRelay, getRelayPreference } from './remote-relay'
 import { createWindow, loadWindowContent, showChatWindow, toggleChatWindow, ensureDesktopLayer, ICON_PATH } from './window-manager'
 
 /** 全局唤起/隐藏主窗口的快捷键（macOS 上 CommandOrControl 即 ⌘，避开 Spotlight 的 ⌘+Space） */
@@ -51,6 +52,10 @@ app.whenReady().then(async () => {
   setRuntime(await bootHost())
   initUiStore(getRuntime())
   registerIpc()
+
+  // 恢复上次的网关中继开关：偏好为开启则自动连接。
+  // 未登录时 startRemoteRelay 会保持 enabled=true 但暂不建连（getMemberToken 为空），登录后由 auth:login 补连。
+  if (getRelayPreference()) startRemoteRelay()
 
   // 桌面壳窗口（全屏壁纸，忽略鼠标作为背景层；先创建，后续窗口浮在其上）
   const desktopWin = createWindow({ type: 'desktop' })

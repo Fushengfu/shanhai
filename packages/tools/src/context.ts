@@ -7,7 +7,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
  * runtime 层（工具包装器 wrapTool）在执行时 getStore 读出，把它关联到
  * 该次工具调用的 trace 上，前端工具步骤卡片据此折叠展示「这一步在想什么」。
  *
- * 用 AsyncLocalStorage 而非全局变量/Map：并行会话、多专家并行调度下，
+ * 用 AsyncLocalStorage 而非全局变量/Map：并行会话下，
  * 每个异步执行上下文天然隔离，不会把某一步的思考错配到另一步。
  */
 export const toolReasoningContext = new AsyncLocalStorage<string | undefined>()

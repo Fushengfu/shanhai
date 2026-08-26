@@ -98,9 +98,19 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
 
       {!collapsed && (
         <>
-          <div style={{ color: 'var(--text)', marginBottom: 10, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-            {req.question}
+          <div style={{ color: 'var(--text)', marginBottom: 6, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+            {req.question?.trim() ? req.question : '（AI 未提供说明，请结合下方选项判断）'}
           </div>
+          {req.reasoning && (
+            <details style={{ marginBottom: 10 }}>
+              <summary style={{ cursor: 'pointer', color: 'var(--text-muted)', fontSize: 12, userSelect: 'none' }}>
+                AI 为什么问你（点开看背景）
+              </summary>
+              <div style={{ marginTop: 6, padding: '8px 10px', borderRadius: 8, background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word', maxHeight: 200, overflowY: 'auto' }}>
+                {req.reasoning}
+              </div>
+            </details>
+          )}
 
       {hasOptions && !customMode ? (
         <div style={{ maxHeight: 200, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>

@@ -36,6 +36,8 @@ export interface AskRequest {
   multiple?: boolean
   /** 自由文本输入时的占位提示 */
   placeholder?: string
+  /** AI 调用本次提问时的思考过程（为什么问你、判断依据），供 UI 折叠展示背景 */
+  reasoning?: string
   /** 交互类型：text=普通提问/填空（默认）、session-picker=会话选择器、model-picker=模型选择器 */
   kind?: 'text' | 'session-picker' | 'model-picker'
   /** 会话选择器数据（kind=session-picker 时提供） */
@@ -67,6 +69,7 @@ export class AskService {
       options?: string[]
       multiple?: boolean
       placeholder?: string
+      reasoning?: string
       sessionId?: string
       kind?: 'text' | 'session-picker' | 'model-picker'
       sessionOptions?: AskSessionOption[]
@@ -81,6 +84,7 @@ export class AskService {
       options: opts?.options,
       multiple: opts?.multiple,
       placeholder: opts?.placeholder,
+      reasoning: opts?.reasoning,
       kind: opts?.kind,
       sessionOptions: opts?.sessionOptions,
       modelOptions: opts?.modelOptions,

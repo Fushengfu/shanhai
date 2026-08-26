@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'pages/login_page.dart';
+import 'pages/startup_page.dart';
 
 void main() {
   runApp(const ShanhaiMobileApp());
@@ -23,7 +23,7 @@ class ShanhaiMobileApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: const LoginPage(),
+      home: const StartupPage(),
     );
   }
 }

@@ -6,6 +6,9 @@ import { EMPTY_SESSION, type AttachmentItem, type ChatItem, type ContentPart, ty
 import { WindowTitleBar } from '../components/WindowTitleBar'
 import { AiOrb } from '../components/AiOrb'
 import { AssistantMessage } from '../components/AssistantMessage'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import { makeMarkdownComponents, normalizeTreeBlocks } from '../components/Markdown'
 import { ImagePreview } from '../components/ImagePreview'
 import { UserMessage } from '../components/UserMessage'
 import { ToolStep, StepStats, toolDisplayName, riskLevelLabel } from '../components/ToolStep'
@@ -634,7 +637,6 @@ export function SupervisorApp(): React.JSX.Element {
             content={it.content}
             reasoningContent={it.reasoningContent}
             toolSteps={tools}
-            expertTraces={[]}
             turnDuration={it.turnDuration}
             onPreviewImage={(url) => setPreviewImage(url)}
           />,
@@ -716,10 +718,12 @@ export function SupervisorApp(): React.JSX.Element {
                   )}
                   {streaming.reasoning && <ReasoningBlock content={streaming.reasoning} streaming />}
                   {streaming.text && (
-                    <span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-                      {streaming.text}
+                    <div style={{ minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents((url) => setPreviewImage(url))}>
+                        {normalizeTreeBlocks(streaming.text)}
+                      </ReactMarkdown>
                       <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
-                    </span>
+                    </div>
                   )}
                   <div style={{ display: 'block', color: 'var(--text-muted)', fontSize: 12, marginTop: 4 }}>
                     思考中

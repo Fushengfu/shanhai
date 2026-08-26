@@ -5,7 +5,7 @@ import './styles/theme.css'
  * 渲染进程入口（多窗口桌面系统）：按窗口类型分发不同的 React 根。
  * - desktop：桌面壳窗口（壁纸 + 应用图标 Dock）
  * - chat：聊天窗口（对话主界面，加载 App 及其 UI 插件）
- * - app：应用窗口（终端/轨迹/记忆/设置/专家/模型管理等独立插件应用）
+ * - app：应用窗口（终端/轨迹/记忆/设置/模型管理等独立插件应用）
  * 用动态 import 隔离各入口的副作用（如 App 的 UI 插件注册），避免窗口之间重复注册 slot。
  */
 const container = document.getElementById('root')

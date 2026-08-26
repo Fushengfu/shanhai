@@ -5,7 +5,7 @@ import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow,
 import { getUiState, patchUiState, getWallpaper, setWallpaper, filterUiStateForWindow, type UiStoreState } from './ui-store'
 import { listSystemWallpapers, applySystemWallpaper } from './system-wallpaper'
 import { startRemoteServer, stopRemoteServer, getRemoteStatus } from './remote-server'
-import { startRemoteRelay, stopRemoteRelay, getRelayStatus } from './remote-relay'
+import { startRemoteRelay, stopRemoteRelay, getRelayStatus, getRelayPreference } from './remote-relay'
 
 /**
  * 渲染进程 → 主进程 调用（IPC handler）。
@@ -17,7 +17,12 @@ export function registerIpc(): void {
 
   // —— 认证 ——
   ipcMain.handle('auth:status', async () => ({ loggedIn: runtime.loggedIn, username: runtime.username }))
-  ipcMain.handle('auth:login', async (_e, u: string, p: string) => runtime.login(u, p))
+  ipcMain.handle('auth:login', async (_e, u: string, p: string) => {
+    const result = await runtime.login(u, p)
+    // 登录成功后，若用户之前开启过中继，自动恢复连接（覆盖「启动时未登录、登录后补连」的场景）
+    if (getRelayPreference()) startRemoteRelay()
+    return result
+  })
   ipcMain.handle('auth:logout', async () => runtime.logout())
   ipcMain.handle('auth:listModels', async () => runtime.listModels())
   ipcMain.handle('auth:refreshModels', async () => runtime.refreshModels())
@@ -65,11 +70,6 @@ export function registerIpc(): void {
   // —— 自修改（K5）——
   ipcMain.handle('selfmod:inspect', async (_e, sessionId?: string) => runtime.selfmodInspect(sessionId))
   ipcMain.handle('selfmod:respond', async (_e, requestId: string, approved: boolean) => runtime.respondClientRun(requestId, approved))
-
-  // —— 专家（多专家编排：查看 / 新增 / 删除）——
-  ipcMain.handle('experts:list', async () => runtime.listExperts())
-  ipcMain.handle('experts:add', async (_e, role: { id: string; name: string; description: string; systemPrompt: string }) => runtime.registerExpert(role))
-  ipcMain.handle('experts:remove', async (_e, id: string) => runtime.removeExpert(id))
 
   // —— 长期记忆 ——
   ipcMain.handle('memory:list', async (_e, sessionId: string) => runtime.listMemory(sessionId))

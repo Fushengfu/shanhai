@@ -6,7 +6,6 @@ import type {
   AttachmentItem,
   BrowserWindowItem,
   ClientRunRequest,
-  ExpertTrace,
   GatewayModel,
   RetryPrompt,
   SessionListItem,
@@ -53,13 +52,11 @@ export interface UIContextValue {
   setMemoryPanelOpen: (v: boolean) => void
   setTracePanelOpen: (v: boolean) => void
   setSettingsPanelOpen: (v: boolean) => void
-  setExpertsPanelOpen: (v: boolean) => void
   browserWindows: BrowserWindowItem[]
   showBrowserWindow: (appId: string) => Promise<void>
   closeBrowserWindow: (appId: string) => Promise<void>
 
   // —— shell.chat ——
-  curExpertTraces: ExpertTrace[]
   incompleteTurn: boolean
   dynamicExtensions: SlotComponent[]
   curApproval: ApprovalRequest | null
@@ -128,7 +125,6 @@ export interface UIContextValue {
   tracePanelOpen: boolean
   memoryPanelOpen: boolean
   settingsPanelOpen: boolean
-  expertsPanelOpen: boolean
 
   // —— shell.terminal ——
   terminalPanelOpen: boolean

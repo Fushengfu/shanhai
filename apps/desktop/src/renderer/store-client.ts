@@ -3,7 +3,6 @@ import type {
   ApprovalRequest,
   AskRequest,
   BrowserWindowItem,
-  ExpertTrace,
   GatewayModel,
   RetryPrompt,
   SessionListItem,
@@ -33,7 +32,6 @@ export interface SharedState {
   tokenStatsBySession: Record<string, TokenSnapshot>
   approvalQueues: Record<string, ApprovalRequest[]>
   askQueues: Record<string, AskRequest[]>
-  expertTraces: Record<string, ExpertTrace[]>
   browserWindows: BrowserWindowItem[]
   retryPrompt: RetryPrompt | null
   wallpaper: string | null
@@ -52,7 +50,6 @@ const EMPTY_STATE: SharedState = {
   tokenStatsBySession: {},
   approvalQueues: {},
   askQueues: {},
-  expertTraces: {},
   browserWindows: [],
   retryPrompt: null,
   wallpaper: null,

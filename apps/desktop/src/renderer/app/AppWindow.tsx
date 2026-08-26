@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react'
 import { getUiStoreSnapshot, patchUiStore, useUiStore } from '../store-client'
 import { getAppManifest } from '../apps/registry'
 import { MemoryPanel } from '../components/MemoryPanel'
-import { ExpertsPanel } from '../components/ExpertsPanel'
 import { SettingsPanel } from '../components/SettingsPanel'
 import { TracePanel } from '../components/TracePanel'
 import { CustomModelDrawer } from '../components/CustomModelDrawer'
@@ -70,8 +69,6 @@ export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
   switch (appId) {
     case 'memory':
       return <MemoryPanel variant="window" onClose={close} />
-    case 'experts':
-      return <ExpertsPanel variant="window" onClose={close} />
     case 'settings':
       return <SettingsPanel variant="window" onClose={close} />
     case 'trace':

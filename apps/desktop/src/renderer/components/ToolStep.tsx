@@ -262,7 +262,7 @@ function computeDiff(before: string, after: string): DiffLine[] {
 }
 
 /** 文件变更卡片：git diff 风格（- 红 / + 绿 / 上下文灰），新建与修改文件都适用 */
-function DiffBlock({ before, after, path, isNew }: { before: string; after: string; path?: string; isNew?: boolean }) {
+export function DiffBlock({ before, after, path, isNew }: { before: string; after: string; path?: string; isNew?: boolean }) {
   const treatAsNew = isNew || before === ''
   const diffLines: DiffLine[] = treatAsNew
     ? after.split('\n').map((t, i): DiffLine => ({ type: 'add', text: t, newLine: i + 1 }))

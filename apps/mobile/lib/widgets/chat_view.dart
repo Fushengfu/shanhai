@@ -75,10 +75,12 @@ class _ChatViewState extends State<ChatView> {
     }
   }
 
+  /// 滚回最新消息。列表采用 reverse 布局，offset 0 即最新消息（视觉底部），
+  /// 用 jumpTo 瞬时定位，避开 animateTo 目标值在懒加载列表下被低估的问题。
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollCtrl.hasClients) {
-        _scrollCtrl.animateTo(_scrollCtrl.position.maxScrollExtent, duration: const Duration(milliseconds: 200), curve: Curves.easeOut);
+        _scrollCtrl.jumpTo(0);
       }
     });
   }
@@ -415,13 +417,15 @@ class _ChatViewState extends State<ChatView> {
                 ? const Center(child: CircularProgressIndicator())
                 : ListView.builder(
                     controller: _scrollCtrl,
+                    reverse: true,
                     padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
                     itemCount: _items.length + (_busy ? 1 : 0),
                     itemBuilder: (ctx, i) {
-                      if (i < _items.length) {
-                        return _buildItem(_items[i]);
-                      }
-                      return _buildStreamingBubble();
+                      // reverse 列表：i=0 是视觉底部（最新）。流式气泡固定在最底部，
+                      // 历史消息按「新→旧」向上排列，进页天然停在最新位置，无需手动滚底。
+                      if (_busy && i == 0) return _buildStreamingBubble();
+                      final offset = _busy ? i - 1 : i;
+                      return _buildItem(_items[_items.length - 1 - offset]);
                     },
                   ),
           ),

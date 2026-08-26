@@ -14,7 +14,7 @@ const isWin = process.platform === 'win32'
  * 窗口类型（山海多窗口桌面系统的三类窗口）：
  * - desktop：桌面壳窗口（全屏壁纸 + 应用图标 Dock，作为「桌面」背景层）
  * - chat：聊天窗口（浮动在桌面之上，承载对话主界面）
- * - app：应用窗口（终端/轨迹/记忆/设置/专家/模型管理等独立插件应用，按 appId 区分，可多开）
+ * - app：应用窗口（终端/轨迹/记忆/设置/模型管理等独立插件应用，按 appId 区分，可多开）
  */
 export type WindowType = 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble'
 
@@ -68,7 +68,7 @@ export async function loadWindowContent(win: BrowserWindow): Promise<void> {
 
 export interface CreateWindowOptions {
   type: WindowType
-  /** app 类型窗口的应用 id（terminal/trace/memory/settings/experts/models 等），用于多开区分 */
+  /** app 类型窗口的应用 id（terminal/trace/memory/settings/models 等），用于多开区分 */
   appId?: string
   width?: number
   height?: number

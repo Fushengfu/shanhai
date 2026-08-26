@@ -10,13 +10,3 @@ export interface SkillContract {
   /** 技能专用提示词 */
   prompt?: string
 }
-
-/** 角色定义（专家即配置）：一个专家 = 通用运行时 + 一份角色 JSON */
-export interface RoleDefinition {
-  id: string
-  name: string
-  description: string
-  systemPrompt: string
-  toolSet: string[]
-  skillSet: string[]
-}

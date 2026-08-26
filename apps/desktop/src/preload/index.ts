@@ -142,7 +142,6 @@ export interface GlobalUiState {
   tokenStatsBySession: Record<string, TokenSnapshot>
   approvalQueues: Record<string, ApprovalRequest[]>
   askQueues: Record<string, AskRequest[]>
-  expertTraces: Record<string, ExpertTrace[]>
   browserWindows: BrowserWindowItemPreload[]
   retryPrompt: RetryPromptPreload | null
   wallpaper: string | null
@@ -153,7 +152,7 @@ export interface ShanhaiBridge {
   windowType: 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble'
   /** 运行平台（process.platform：darwin/win32/linux），渲染层据此做平台差异化（如 Windows 窗口圆角） */
   platform: string
-  /** app 类型窗口的应用 id（terminal/trace/memory/settings/experts/models），非 app 窗口为 undefined */
+  /** app 类型窗口的应用 id（terminal/trace/memory/settings/models），非 app 窗口为 undefined */
   windowAppId?: string
   /** 打开（或聚焦）一个插件应用窗口 */
   openApp(appId: string): Promise<boolean>
@@ -295,10 +294,6 @@ export interface ShanhaiBridge {
   respondClientRun(requestId: string, approved: boolean): Promise<void>
   onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
   onClientRemove(cb: (pkgId: string) => void): () => void
-  onExpertTrace(cb: (trace: ExpertTrace) => void): () => void
-  listExperts(): Promise<Expert[]>
-  addExpert(role: { id: string; name: string; description: string; systemPrompt: string }): Promise<Expert>
-  removeExpert(id: string): Promise<void>
   listMemory(sessionId: string): Promise<MemoryEntry[]>
   removeMemory(id: number): Promise<void>
   // 通用设置
@@ -324,28 +319,6 @@ export interface MemoryEntry {
   source: string
   confidence: number
   timestamp: number
-}
-
-/** 多专家编排轨迹 */
-export interface ExpertTrace {
-  stepId: string
-  expertId: string
-  expertName: string
-  title: string
-  status: 'started' | 'completed' | 'failed'
-  result?: string
-  error?: string
-}
-
-/** 专家角色（多专家编排：内置 + 自定义；builtin 标记内置不可删，自定义可删） */
-export interface Expert {
-  id: string
-  name: string
-  description: string
-  systemPrompt: string
-  toolSet: string[]
-  skillSet: string[]
-  builtin: boolean
 }
 
 /** 用户手动终端简要信息（会话级隔离） */
@@ -558,14 +531,6 @@ const bridge: ShanhaiBridge = {
     ipcRenderer.on('selfmod:client-remove', listener)
     return () => ipcRenderer.removeListener('selfmod:client-remove', listener)
   },
-  onExpertTrace: (cb) => {
-    const listener = (_e: unknown, trace: ExpertTrace) => cb(trace)
-    ipcRenderer.on('expert:trace', listener)
-    return () => ipcRenderer.removeListener('expert:trace', listener)
-  },
-  listExperts: () => ipcRenderer.invoke('experts:list'),
-  addExpert: (role) => ipcRenderer.invoke('experts:add', role),
-  removeExpert: (id) => ipcRenderer.invoke('experts:remove', id),
   listMemory: (sessionId) => ipcRenderer.invoke('memory:list', sessionId),
   removeMemory: (id) => ipcRenderer.invoke('memory:remove', id),
   getSettings: () => ipcRenderer.invoke('settings:get'),

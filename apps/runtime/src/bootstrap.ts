@@ -3,7 +3,7 @@ import { CORE_SLOTS } from '@shanhai/kernel-modules/client'
 import { SelfModifyRuntime } from '@shanhai/selfmod'
 import { Session, type ApprovalPolicy, type SessionEvent } from '@shanhai/session'
 import { ApprovalService } from '@shanhai/approval'
-import { AgentLoop, ModelTriage, Orchestrator, type RoleDefinition, type StepTrace, type SuspendedSnapshot, type TaskPlan } from '@shanhai/agent'
+import { AgentLoop, type SuspendedSnapshot } from '@shanhai/agent'
 import type { Model, ContentPart, TokenUsage, HttpTrace, HttpTraceCallback, ChatMessage } from '@shanhai/llm'
 import { createMockModel, createModelProvider } from '@shanhai/llm'
 import { createAtomicTools, createUtilityTools, toolReasoningContext, type ToolContract } from '@shanhai/tools'
@@ -362,14 +362,6 @@ export interface Runtime {
   onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
   /** browser 半卸载回调（UI 移除组件） */
   onClientRemove(cb: (pkgId: string) => void): () => void
-  /** 多专家编排轨迹回调（UI 展示 Triage 拆解 → 专家执行过程） */
-  onExpertTrace(cb: (trace: StepTrace) => void): () => void
-  /** 列出所有专家（内置 + 自定义），builtin 标记内置（不可删）与自定义（可删） */
-  listExperts(): Array<RoleDefinition & { builtin: boolean }>
-  /** 新增/更新一个自定义专家（校验 id/name 非空，持久化到 config.json 并刷新 triage 角色列表） */
-  registerExpert(role: { id: string; name: string; description: string; systemPrompt: string }): Promise<RoleDefinition & { builtin: boolean }>
-  /** 删除一个自定义专家（内置专家不可删除） */
-  removeExpert(id: string): Promise<void>
   /** 列出长期记忆（按会话隔离，仅返回当前会话的记忆） */
   listMemory(sessionId: string): Array<{ id: number; scope: string; key: string; value: unknown; source: string; confidence: number; timestamp: number; sessionId?: string }>
   /** 删除一条长期记忆（按 id） */
@@ -567,30 +559,6 @@ async function persistCustomModels(models: GatewayModel[]): Promise<void> {
       const g = (cfg.gateway as Record<string, unknown> | undefined) ?? {}
       g.customModels = models
       cfg.gateway = g
-    })
-  } catch {
-    // 忽略持久化失败
-  }
-}
-
-/** 读取用户自定义专家角色（config.json 顶层 customRoles，重启恢复；内置角色不在此列） */
-async function readCustomRoles(): Promise<RoleDefinition[]> {
-  try {
-    const path = join(homedir(), '.shanhai', 'config.json')
-    const raw = await fs.readFile(path, 'utf8')
-    const cfg = JSON.parse(raw) as { customRoles?: RoleDefinition[] }
-    if (!Array.isArray(cfg.customRoles)) return []
-    return cfg.customRoles.filter((r) => typeof r?.id === 'string' && r.id.trim() !== '')
-  } catch {
-    return []
-  }
-}
-
-/** 持久化用户自定义专家角色到 config.json 顶层 customRoles（权限 600） */
-async function persistCustomRoles(roles: RoleDefinition[]): Promise<void> {
-  try {
-    await withConfigFile((cfg) => {
-      cfg.customRoles = roles
     })
   } catch {
     // 忽略持久化失败
@@ -1202,10 +1170,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   }
 
   // —— 运行中的循环（会话 id → loop）——
-  // 提前声明（早于下方 wrapTool）：wrapTool 需据此判断「单步执行时 AgentLoop 已用 LLM callId 持久化工具事件，
-  // 多专家编排时工具在专家独立 Session 里执行、主会话缺工具事件，需补持久化到主会话」。
   const runningLoops = new Map<string, AgentLoop>()
-  const multiExpertLoops = new Map<string, Map<string, AgentLoop>>()
   // 会话当前任务的发起方（run 开始 set、结束 delete）：审批分流时据此判断「管家下发 or 用户下发」。
   // 用 Map 而非会话级静态标记，因为同一会话这一轮可能用户发、下一轮可能管家发。
   const sessionOrigin = new Map<string, 'user' | 'supervisor'>()
@@ -1492,11 +1457,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       `4. 执行命令时注意当前是 ${env.osName} 系统，使用对应的命令语法（如 macOS/Linux 用 ls、cat，Windows 用 dir、type）。`,
       '5. 区分「分析」与「执行」：只读分析类问题（看看/检查/分析/排查/为什么/能不能/在哪/怎么回事等）直接给结论，不提问、不申请审批；只有真正要「执行修改」（改代码/写文件/删文件/运行有风险命令）时，才在动手前请求用户确认，并把要做的改动讲清楚。',
       '6. 内置可执行技能（见下方【内置能力】）用 skill_read 读手册、skill_run 执行脚本；不在内置清单里的第三方技能，在需要时用 skill_list 查询。',
-      '7. 只在「执行任务过程中」确实需要用户做关键决策时才用 ask_user 提问（如多个方案需要用户选定、缺关键参数/凭证/路径无法继续、需要用户确认是否继续）；纯分析/排查/问答类问题一律直接给结论，不弹窗提问。ask_user 可提供 options 让用户单选/多选，或让用户自由输入；调用后必须等待用户回答，再基于回答继续执行。',
+      '7. 只在「执行任务过程中」确实需要用户做关键决策时才用 ask_user 提问（如多个方案需要用户选定、缺关键参数/凭证/路径无法继续、需要用户确认是否继续）；纯分析/排查/问答类问题一律直接给结论，不弹窗提问。ask_user 可提供 options 让用户单选/多选，或让用户自由输入；提问必须自包含地写清楚「当前在做什么/背景 + 为什么需要用户决定 + 具体要选什么」，每个选项写清楚「是什么 + 选它的后果」，禁止只给一句空问句配几个孤零零的名词选项；调用后必须等待用户回答，再基于回答继续执行。',
       '8. 输出「目录树 / 文件树 / 框线图 / 表格 / 缩进层级」等需要等宽对齐的结构化内容时，必须用 Markdown 代码块（``` 包裹）输出，不要作为普通段落输出，否则换行会被折叠、对齐错乱甚至溢出。',
-      '',
-      '【任务完成规范】',
-      '每次执行完任务（成功或失败）结束前：先对照需求逐条自检 → 构建/测试验证（附命令+真实输出，不要只说"完成"）→ 结构化总结（目标/改动清单/问题/验证结果/注意事项）。',
       '',
       '【合规与安全（必须严格遵守）】',
       '1. 你生成的所有内容必须符合中华人民共和国法律法规，践行社会主义核心价值观。',
@@ -1511,9 +1473,17 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       '要「沉淀一个可长期使用的新能力」走完整闭环：plugin_define 定义 → plugin_test 自测（临时运行并撤回，验证无误）→ plugin_install 安装进内核（落盘 ~/.shanhai/plugins/，跨会话/跨重启留存，之后 AI 和用户都能持续使用）→ plugin_uninstall 卸载。已安装插件重启后自动加载，无需重复安装。',
       'UI 插槽分两类：覆盖型（shell.sidebar / shell.header / shell.chat / shell.composer / shell.statusbar / shell.welcome / shell.panels / shell.overlays / dynamic-extension，后注册整体替换该区块）；追加型（composer.below 输入框下方 / composer.actions 输入框工具栏 / header.actions 顶栏右侧 / chat.below 消息流下方，追加显示互不覆盖）。想「加一个按钮/小组件」时优先用追加型插槽，client 代码必须用 React.createElement 写（不能写 JSX）。',
       '当用户要求「新增一个能力」「改造界面某个区块」「给自己加个工具」「在某处加个按钮」时，优先用这套 plugin_* 工具自我实现，而不是只写死代码或空谈。',
-      '多专家方面：用 role_list 查看可用专家，用 role_define 新增/更新自定义专家（id 用短英文、name 中文名、description 一句话职责、systemPrompt 专属人设），让复杂任务能被拆解并指派给更合适的专家。',
       ...(builtinSkillCatalog ? ['', '【内置能力】', builtinSkillCatalog] : []),
       memoryContext,
+      '',
+      '【任务完成规范】',
+      '每次执行完任务（成功或失败）结束前：先对照需求逐条自检 → 构建/测试验证（附命令+真实输出，不要只说"完成"）→ 用 Markdown 输出结构化总结，格式如下：',
+      '## 任务总结',
+      '- **目标**：本次解决什么',
+      '- **改动清单**：改了哪些文件、每处一句话',
+      '- **问题**：执行中遇到的/未解决的',
+      '- **验证结果**：构建/测试命令及关键输出',
+      '- **注意事项**：没做完的、需用户知悉的边界'
     ]
       .filter(Boolean)
       .join('\n')
@@ -1547,21 +1517,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       return undefined
     }
   }
-  // —— 专家角色注册表（多专家编排用）：内置 4 个 + 用户/智能体自定义 ——
-  // 在此提前初始化（tools 组装之前），使 role_list / role_define 工具与 triage 共用同一份可变角色数据。
-  const BUILTIN_ROLES: RoleDefinition[] = [
-    { id: 'general', name: '通用助手', description: '日常问答、对话、信息整理', systemPrompt: '', toolSet: [], skillSet: [] },
-    { id: 'code', name: '代码专家', description: '读写代码、执行命令、排查 bug', systemPrompt: '你是「代码专家」，专注于读写代码、执行 shell 命令、排查 bug，输出严谨并给出行号与根因。', toolSet: [], skillSet: [] },
-    { id: 'writer', name: '写作专家', description: '撰写文档、文案润色', systemPrompt: '你是「写作专家」，专注于撰写文档、润色文字、结构化表达。', toolSet: [], skillSet: [] },
-    { id: 'analyst', name: '分析专家', description: '数据分析、信息提取与总结', systemPrompt: '你是「分析专家」，专注于数据分析、信息提取与总结，结论条理清晰。', toolSet: [], skillSet: [] },
-  ]
-  const roleRegistry = new Map<string, RoleDefinition>()
-  for (const r of BUILTIN_ROLES) roleRegistry.set(r.id, r)
-  // 恢复用户自定义专家（config.json，重启不丢；仅补充不存在于内置的 id，内置同名 id 优先）
-  for (const r of await readCustomRoles()) {
-    if (!roleRegistry.has(r.id)) roleRegistry.set(r.id, r)
-  }
-
   // —— 工具包装：落 trace + sessionId 注入。动态注册的自修改工具也走同一包装，保证 trace 一致 ——
   const tools: ToolContract[] = []
   // 管家会话专用工具集（占位声明，稍后在管家工具装配处赋值；plugin_inspect 报告工具清单需按会话区分引用它）
@@ -1594,24 +1549,14 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       toolTraceCallbacks.forEach((cb) =>
         cb({ kind: 'tool-call', sessionId: sid, callId, name: t.name, args, approvalRequired: t.approvalRequired, approved: false, reasoning, startTs }),
       )
-      // 多专家编排下，工具在专家独立 Session 里执行（AgentLoop 只 append 到 expertSession，多专家结束后不持久化），
-      // 主会话 session 缺工具事件，任务结束后 UI 用 getSessionHistory 重建消息流时会丢失工具步骤。
-      // 因此：非单步执行（runningLoops 未挂载该会话，即多专家等场景）时，把工具事件补 append 到主会话，保证工具步骤可重建。
-      // 单步执行时 AgentLoop 已用「LLM 返回的 callId」append 到主会话，这里不重复 append（wrapTool 自造 callId 仅用于实时 trace）。
-      const persistMeta = runningLoops.has(sid) ? undefined : sessions.get(sid)
-      if (persistMeta && !persistMeta.isSupervisor) {
-        persistMeta.session.append('tool/call', { callId, name: t.name, args, reasoningContent: reasoning })
-      }
       try {
         const result = await t.execute(effectiveArgs)
         // 结果 trace 带上 args：前端按工具类型渲染摘要（路径/命令）时需要它；durationMs 供前端显示该步耗时
         toolTraceCallbacks.forEach((cb) => cb({ kind: 'tool-result', sessionId: sid, callId, name: t.name, args, result, durationMs: Date.now() - startTs }))
-        if (persistMeta && !persistMeta.isSupervisor) persistMeta.session.append('tool/result', { callId, name: t.name, result })
         return result
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err)
         toolTraceCallbacks.forEach((cb) => cb({ kind: 'tool-result', sessionId: sid, callId, name: t.name, args, error, durationMs: Date.now() - startTs }))
-        if (persistMeta && !persistMeta.isSupervisor) persistMeta.session.append('tool/result', { callId, name: t.name, error })
         throw err
       }
     },
@@ -1692,65 +1637,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   const mcpService = new McpService()
   const mcpTools: ToolContract[] = createMcpTools(mcpService)
 
-  // —— 专家角色工具（role_list / role_define）：让智能体在会话中查看 / 新增自定义专家 ——
-  const roleTools: ToolContract[] = [
-    {
-      name: 'role_list',
-      description:
-        '查看当前系统可用的所有专家角色（内置 + 自定义），含 id/名称/职责。多专家编排会把复杂任务拆解并指派给这些专家，用此工具了解可指派哪些专家。',
-      inputSchema: {
-        type: 'object',
-        properties: {},
-      },
-      riskLevel: 'readonly',
-      execute: async () => [...roleRegistry.values()].map((r) => ({ id: r.id, name: r.name, description: r.description })),
-    },
-    {
-      name: 'role_define',
-      description:
-        '新增或更新一个自定义专家角色，供多专家编排指派（复杂任务拆解后路由到最合适的专家）。' +
-        'id 用短英文标识（如 security、frontend、data）；name 中文名；description 一句话职责；systemPrompt 是该专家执行时的专属人设。' +
-        '内置专家（general/code/writer/analyst）不可覆盖。定义后立即生效，后续复杂任务即可被拆解指派到该专家。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          id: { type: 'string', description: '专家唯一 id（短英文，如 security）' },
-          name: { type: 'string', description: '专家中文名' },
-          description: { type: 'string', description: '一句话职责说明' },
-          systemPrompt: { type: 'string', description: '专家专属人设（可选，注入该专家执行时的 systemPrompt）' },
-        },
-        required: ['id', 'name', 'description'],
-      },
-      riskLevel: 'reversible',
-      execute: async (args) => {
-        const id = String(args.id ?? '').trim()
-        const name = String(args.name ?? '').trim()
-        if (!id) throw new Error('role_define 缺少 id')
-        if (!name) throw new Error('role_define 缺少 name')
-        if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error('专家 id 只能包含字母、数字、下划线、连字符')
-        if (BUILTIN_ROLES.some((b) => b.id === id)) throw new Error(`内置专家 "${id}" 不可覆盖，请换一个 id`)
-        const def: RoleDefinition = {
-          id,
-          name,
-          description: String(args.description ?? '').trim(),
-          systemPrompt: String(args.systemPrompt ?? '').trim(),
-          toolSet: [],
-          skillSet: [],
-        }
-        roleRegistry.set(id, def)
-        await persistCustomRoles([...roleRegistry.values()].filter((r) => !BUILTIN_ROLES.some((b) => b.id === r.id)))
-        return { id: def.id, name: def.name, description: def.description, defined: true }
-      },
-    },
-  ]
-
   const baseTools = [
     ...createAtomicTools(getSessionCwd, snapshotFn),
     ...utilityTools,
     ...askTools,
     ...skillTools,
     ...mcpTools,
-    ...roleTools,
     ...selfmod.createTools(() => sessionContext.getStore() ?? currentSessionId ?? ''),
   ]
   tools.push(...baseTools.map(wrapTool))
@@ -1956,12 +1848,14 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       settings?: Partial<AppSettings>
     }
     const g = cfg.gateway
+    // memberToken 与 apiKey 解耦：JWT 是远程连接(relay)鉴权凭证，apiKey 是模型调用凭证，二者相互独立。
+    // 即使某次登录因网关异常/网络抖动导致 apiKey 未写入(空串)，也应恢复 memberToken，否则 relay 会拿不到 token 连不上。
+    memberToken = g?.memberToken ?? ''
     if (g?.apiKey) {
       loggedIn = true
       username = g.account?.nickname ?? g.account?.username ?? null
       gatewayApiKey = g.apiKey
       gatewayBaseUrl = g.baseUrl ?? ''
-      memberToken = g.memberToken ?? ''
       // 网关内置模型列表不缓存到本地：内存 gatewayModels 保持空，登录态下由下方 refreshGatewayModels 实时从接口拉取并缓存到内存
     }
     // 无论登录态，恢复用户上次选中的模型（登录后优先沿用）；同时作为全局默认模型（新会话 / 无记录会话回退用）
@@ -2058,11 +1952,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     apply: (ctx) => ctx.provide('agent', () => new AgentLoop(model, tools, sessionRef, approval)),
   })
 
-  // —— 多专家编排（Triage 拆解 → 路由专家 → 依赖调度 → 汇总）——
-  // 专家角色来自 roleRegistry（内置 + 自定义，见上方初始化），triage 每次 route 前用 setRoles 同步最新角色。
-  const roleNameById = (): Map<string, string> => new Map([...roleRegistry.values()].map((r) => [r.id, r.name]))
-  const triage = new ModelTriage(model, [...roleRegistry.values()])
-
   /** 当前模型的上下文窗口大小（token 数）。压缩触发阈值在 AgentLoop 内按窗口的 60% 计算，参考 Taco 的做法：
    *  判断依据用接口返回的真实 usage.total_tokens（非本地估算），窗口大小用模型配置的 contextLength。 */
   const currentContextBudget = (modelId?: string): number | undefined => {
@@ -2073,23 +1962,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   }
   /** 当前模型的 apiKey：user_id 确定性派生用（区分不同账号/服务商的前缀缓存）。网关模型用网关 key，自定义模型用各自 key。 */
   const currentApiKey = (modelId?: string): string => allModels().find((x) => x.id === (modelId ?? currentModelId))?.apiKey ?? gatewayApiKey ?? ''
-  // 专家执行轨迹回调（UI 展示多专家协作过程）
-  const expertTraceCallbacks = new Set<(trace: StepTrace) => void>()
-
-  /** 构造专家池：每个角色一个 AgentLoop（独立 Session 记录执行过程，审批路由到主会话）。modelId 缺省用当前全局模型。 */
-  const buildExpertAgents = (sid: string, visionCapable: boolean, modelId?: string, approvalSession?: Session): Map<string, AgentLoop> => {
-    const effModelId = modelId ?? currentModelId
-    const effModel = modelId ? resolveProvider(modelId) : model
-    const map = new Map<string, AgentLoop>()
-    for (const role of roleRegistry.values()) {
-      const expertSession = new Session()
-      map.set(
-        role.id,
-        new AgentLoop(effModel, tools, expertSession, approval, sid, currentContextBudget(effModelId), visionCapable, currentApiKey(effModelId), role.id, approvalSession),
-      )
-    }
-    return map
-  }
 
   /** 管家会话专用工具集（已在 tools 声明处占位声明，见上方）。此处装配赋值，runInSession 据此走管家分支。 */
   /** 管家转发队列：会话 id → 待执行消息列表（queue 模式，目标会话 busy 时排队，任务结束后由 drainSupervisorQueue 自动执行） */
@@ -2100,7 +1972,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   let supervisorWaking = false
 
   // —— 会话活动 / 激活会话 / 管家结果回传事件（主进程 ui-store 订阅，同步 UI 状态）——
-  /** 会话开始/结束执行（runningLoops / multiExpertLoops 挂载与清理时广播），主进程据此刷新「处理中」与消息流 */
+  /** 会话开始/结束执行（runningLoops 挂载与清理时广播），主进程据此刷新「处理中」与消息流 */
   const sessionActivityCallbacks = new Set<(sessionId: string, kind: 'start' | 'end') => void>()
   /** 激活会话切换（switchSessionInternal 里 currentSessionId 变化时广播），主进程据此同步聊天窗口当前会话 */
   const currentSessionChangedCallbacks = new Set<(sessionId: string) => void>()
@@ -2108,16 +1980,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   const supervisorResultCallbacks = new Set<(sessionId: string, title: string, result?: string, error?: string) => void>()
   /** 管家向目标会话下发任务时实时广播 user 消息（供目标会话 UI 立即显示用户气泡，无需等执行结束重建 items） */
   const userMessageCallbacks = new Set<(sessionId: string, message: string, turnSeq: number) => void>()
-
-  /** 专家专属 systemPrompt（含环境信息 + 长期记忆 + 角色人设），由 Orchestrator 在每步注入 */
-  const buildExpertSystemPrompts = (workDir: string, message: string, sessionId: string): Map<string, string> => {
-    const base = buildSystemPrompt(workDir, buildMemoryContext(message, sessionId))
-    const map = new Map<string, string>()
-    for (const role of roleRegistry.values()) {
-      map.set(role.id, role.systemPrompt ? `${base}\n\n${role.systemPrompt}` : base)
-    }
-    return map
-  }
 
   /**
    * 在指定会话内跑一次任务（run / resend / resume 共用）。
@@ -2133,7 +1995,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     const meta = sessions.get(sid)
     if (!meta) throw new Error(`会话不存在: ${sid}`)
     const targetSession = meta.session
-    // 管家超级会话：跳过 Triage 多专家路由，单步 ReAct + 管家工具集（管家是「主 Agent」，不是被拆解的任务）
+    // 管家超级会话：单步 ReAct + 管家工具集（管家是「主 Agent」，不是被拆解的任务）
     const isSupervisorRun = sid === SUPERVISOR_ID
     // 模型隔离：异步转发（管家给别的会话下发任务）时传 modelIdOverride，用目标会话自己的 provider，不污染全局 currentModelId
     const effModelId = modelIdOverride ?? currentModelId
@@ -2143,7 +2005,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     if (!isSupervisorRun) sessionOrigin.set(sid, origin)
     // 发消息即视为活跃，刷新活跃时间（列表排序用）
     touchSession(sid)
-    // 发消息立即 busy：start 广播提前到 triage 拆解/图片降级之前，避免「管家下发→triage LLM 往返」期间发送按钮状态延迟、耗时起点不准
+    // 发消息立即 busy：start 广播提前到图片降级之前，避免「管家下发」期间发送按钮状态延迟、耗时起点不准
     sessionActivityCallbacks.forEach((cb) => cb(sid, 'start'))
     // 本轮任务开始时清零 turn 统计（会话级），模型每次返回 usage 时重新累计
     const statAcc = sessionStats(sid)
@@ -2168,104 +2030,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       }
       const desc = parts.filter(Boolean).join('\n')
       modelContent = message ? `${message}\n\n${desc}` : desc
-    }
-    // —— 多专家编排入口：Triage 拆解（复杂任务拆多步路由专家，简单任务单步走现有 ReAct）——
-    // 拆解失败（模型/网络/解析异常）自动退化为单步，绝不阻断主流程
-    // 用会话自己的模型创建局部 triage（不共享全局 triage），保证拆解/汇总与执行用同一模型，
-    // 避免管家异步下发给目标会话时错用全局 currentModelId 的模型。
-    const sessionTriage = new ModelTriage(effModel, [...roleRegistry.values()])
-    if (!isSupervisorRun)
-    try {
-      const plan = await sessionContext.run(sid, () => sessionTriage.route(message))
-      if (plan.steps.length > 1) {
-        // 多步编排：先落盘用户消息（专家用独立 Session，主会话手动记录用户消息 + 最终回复）
-        targetSession.append('user/message', { content: message, attachments: (opts?.attachments ?? []) as unknown[] })
-        targetSession.append('turn/start', { turn: 1, mode: 'multi' })
-        // 持久化拆解计划：断点续跑（继续执行）时据此恢复依赖图，跳过已完成步骤、只重跑未完成步骤
-        targetSession.append('orchestrator/plan', { plan })
-        const expertAgents = buildExpertAgents(sid, visionCapable, effModelId, targetSession)
-        // 注册多专家 loop，供插入模式向所有专家注入消息（各专家在下一步模型调用前消费注入消息）
-        multiExpertLoops.set(sid, expertAgents)
-        // 累积多专家编排的思考内容，落盘到 assistant/message（否则多专家思考只存在于实时流、重启/重建后丢失）
-        let expertReasoning = ''
-        try {
-          const orchestrator = new Orchestrator(sessionTriage, expertAgents, {
-            sessionId: sid,
-            expertNames: roleNameById(),
-            expertSystemPrompts: buildExpertSystemPrompts(meta.workDir, message, meta.id),
-            onStep: (trace) => {
-              // 轮次序号 = 会话内 user 消息序号（本轮 user/message 已 append，其数量即本轮序号）
-              const turnSeq = targetSession.list().filter((e) => e.type === 'user/message').length
-              // 持久化每步状态：断点续跑时据此恢复已完成步骤的结果（作为后续步骤依赖上下文）
-              targetSession.append('orchestrator/step', { stepId: trace.stepId, expertId: trace.expertId, title: trace.title, status: trace.status, result: trace.result, error: trace.error })
-              expertTraceCallbacks.forEach((cb) => cb({ ...trace, turnSeq }))
-            },
-            onDelta: (text) => {
-              if (stoppedSessions.has(sid)) throw new Error('__stopped__')
-              deltaCallbacks.forEach((cb) => cb(sid, text))
-            },
-            onReasoning: (text) => {
-              expertReasoning += text
-              reasoningCallbacks.forEach((cb) => cb(sid, text))
-            },
-            summarize: async (task, steps, onDelta) => {
-              // 用会话模型（与 triage 拆解同一模型）把各专家结果汇总成一段直接回答用户问题的最终结果
-              const parts = steps.map((s, i) => `${i + 1}. [${s.expert}] ${s.title}\n${s.result}`).join('\n\n')
-              const systemPrompt =
-                '你是「山海」的结果汇总器。下面是一次多专家协作任务中各位专家的执行结果，以及用户最初的问题。请把它们汇总成一段连贯、简洁、直接回答用户问题的最终结果：只输出最终答案本身，不要罗列专家名、不要复述执行过程、不要加分节标题（除非用户明确要求）。'
-              const userPrompt = `【用户的问题】\n${task}\n\n【各专家执行结果】\n${parts}`
-              const messages = [
-                { role: 'system' as const, content: systemPrompt },
-                { role: 'user' as const, content: userPrompt },
-              ]
-              let full = ''
-              try {
-                if (effModel.stream) {
-                  for await (const chunk of effModel.stream(messages, [])) {
-                    if (stoppedSessions.has(sid)) throw new Error('__stopped__')
-                    if (chunk.text) {
-                      full += chunk.text
-                      onDelta(chunk.text)
-                    }
-                  }
-                } else {
-                  const res = await effModel.complete(messages, [])
-                  full = res.text ?? ''
-                  if (full) onDelta(full)
-                }
-              } catch (err) {
-                // 用户停止 / 重试耗尽：向上抛，由外层按中断/重试处理；其余汇总失败回退拼接（不阻断任务）
-                if (err instanceof Error && (err.message === '__stopped__' || err.message.startsWith('__retry_exhausted__'))) throw err
-                console.error('[orchestrator] 汇总失败，回退拼接:', err instanceof Error ? err.message : err)
-                return ''
-              }
-              return full
-            },
-          })
-          const result = await sessionContext.run(sid, () => orchestrator.run(message))
-          targetSession.append('assistant/message', { content: result.text, reasoningContent: expertReasoning || undefined })
-          targetSession.append('turn/end', { turn: 1, text: result.text })
-          return result.text
-        } finally {
-          multiExpertLoops.delete(sid)
-          sessionOrigin.delete(sid)
-          sessionActivityCallbacks.forEach((cb) => cb(sid, 'end'))
-          // 多专家任务结束（成功/中断/重试耗尽）更新活跃时间为结束时间，并落盘主会话消息
-          meta.lastActiveAt = Date.now()
-          await persistSession(meta)
-        }
-      }
-    } catch (err) {
-      // 用户点「停止」：多专家编排中断，直接返回「已中断」（不退化单步继续跑）
-      if (err instanceof Error && err.message === '__stopped__') {
-        return '（已中断，历史已保留，可点击「继续执行」续跑）'
-      }
-      // 重试耗尽（网络/余额不足等基础设施故障）：向上传播，前端弹窗让用户选择重试/取消（不退化单步继续跑）
-      if (err instanceof Error && err.message.startsWith('__retry_exhausted__')) {
-        throw err
-      }
-      // Triage 拆解异常：退化单步
-      console.error('[orchestrator] Triage 拆解异常，退化单步:', err instanceof Error ? err.message : err)
     }
     const loop = new AgentLoop(effModel, isSupervisorRun ? supervisorLoopTools : tools, targetSession, approval, sid, currentContextBudget(effModelId), visionCapable, currentApiKey(effModelId))
     runningLoops.set(sid, loop)
@@ -2420,9 +2184,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     for (let i = turnStartIdx + 1; i < events.length; i++) {
       if (events[i]?.type === 'tool/call') stepCount++
     }
-    // 未完成轮次：最后一条非注入 user 之后无 assistant/message 或 turn/end
+    // 未完成轮次：最后一条非注入 user 之后无 assistant/message 或 turn/end；
+    // 运行中（runningLoops.has）的任务不是「未完成」，避免手机端把进行中误判为可继续执行
     let hasIncompleteTurn = false
-    if (lastUserIdx >= 0) {
+    if (!runningLoops.has(sid) && lastUserIdx >= 0) {
       let done = false
       for (let i = lastUserIdx + 1; i < events.length; i++) {
         const t = events[i]?.type
@@ -2450,7 +2215,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       id: meta.id,
       title: meta.title,
       workDir: meta.workDir,
-      busy: runningLoops.has(sid) || (multiExpertLoops.get(sid)?.size ?? 0) > 0,
+      busy: runningLoops.has(sid),
       active: currentSessionId === sid,
       modelId,
       modelName: modelDef?.displayName ?? modelDef?.name ?? modelId,
@@ -2464,7 +2229,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       turnCount: snap.turnCount,
       hasIncompleteTurn,
       hasRetrySnapshot,
-      expertCount: multiExpertLoops.get(sid)?.size ?? 0,
       lastActiveAt: meta.lastActiveAt,
     }
   }
@@ -2614,10 +2378,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     stoppedSessions.add(sid)
     // 主动中止运行中的 AgentLoop：让 loop 在下一轮循环 / 流式 chunk / 工具执行前检查 aborted 标志尽快退出。
     runningLoops.get(sid)?.abort()
-    const experts = multiExpertLoops.get(sid)
-    if (experts) {
-      for (const loop of experts.values()) loop.abort()
-    }
     // 中断审批挂起：reject 该会话所有待审批请求，避免工具永久卡在 await 审批
     for (const [requestId, p] of pendingApprovals) {
       if (p.sessionId === sid) {
@@ -2654,18 +2414,13 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     const content = message.trim()
     if (!content) return { ok: false, message: '消息内容不能为空' }
 
-    const busy = runningLoops.has(sid) || (multiExpertLoops.get(sid)?.size ?? 0) > 0
+    const busy = runningLoops.has(sid)
     if (busy && mode === 'insert') {
       // 插入模式：注入不打断（等同 injectMessage）
       const loop = runningLoops.get(sid)
       if (loop) {
         loop.injectUserMessage(content)
         return Promise.resolve({ ok: true, message: `已向会话「${meta.title}」(${sid}) 追加需求（不打断当前任务）` })
-      }
-      const experts = multiExpertLoops.get(sid)
-      if (experts && experts.size > 0) {
-        for (const expert of experts.values()) expert.injectUserMessage(content)
-        return Promise.resolve({ ok: true, message: `已向会话「${meta.title}」(${sid}) 追加需求（多专家，不打断当前任务）` })
       }
       return Promise.resolve({ ok: false, message: '注入失败：未找到运行中的任务' })
     }
@@ -2729,7 +2484,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   }
 
   // 装配管家工具集：只保留「管家专属工具 + ask_user + 插件类工具（plugin_*）」，
-  // 不注入 read_file/write_file/run_command/skill_run/mcp_call/role_define 等执行类工具，
+  // 不注入 read_file/write_file/run_command/skill_run/mcp_call 等执行类工具，
   // 避免管家越界直接执行文件/命令/浏览器/插件等操作（管家职责是「监控+调度」，具体执行由目标会话 Agent 完成）。
   const SUPERVISOR_ALLOWED_BASE_TOOL_NAMES = new Set([
     'ask_user',
@@ -3512,15 +3267,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       if (!meta) throw new Error(`会话不存在: ${sid}`)
       const events = meta.session.list()
 
-      // 判断最后一个未完成轮次是「单步 ReAct」还是「多专家编排」：多专家专家 Session 不持久化，无法恢复编排进度，降级重新拆解
-      let lastTurnMode: 'single' | 'multi' = 'single'
-      for (let i = events.length - 1; i >= 0; i--) {
-        if (events[i]?.type === 'turn/start') {
-          lastTurnMode = (events[i]!.data as { mode?: 'single' | 'multi' }).mode ?? 'single'
-          break
-        }
-      }
-      // 找最后一条非注入用户消息（多专家降级截断用 + 单步记忆检索用）
+      // 找最后一条非注入用户消息（单步记忆检索用）
       let lastUserIdx = -1
       let lastUserContent = ''
       for (let i = events.length - 1; i >= 0; i--) {
@@ -3534,116 +3281,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         }
       }
       if (lastUserIdx < 0) throw new Error('没有可继续的消息')
-
-      // 多专家编排：断点续跑——回放 plan + 已完成步骤结果，跳过已完成步骤、只重跑未完成步骤
-      if (lastTurnMode === 'multi') {
-        // 1. 从会话日志回放拆解计划 + 已完成步骤结果
-        let plan: TaskPlan | null = null
-        const completedResults = new Map<string, string>()
-        const completedSteps = new Set<string>()
-        let lastCompletedIdx = -1
-        for (let i = 0; i < events.length; i++) {
-          const e = events[i]
-          if (e?.type === 'orchestrator/plan') {
-            plan = (e.data as { plan: TaskPlan }).plan
-            lastCompletedIdx = i
-          } else if (e?.type === 'orchestrator/step') {
-            const d = e.data as { stepId: string; status: 'started' | 'completed' | 'failed'; result?: string }
-            if (d.status === 'completed') {
-              completedSteps.add(d.stepId)
-              if (d.result != null) completedResults.set(d.stepId, d.result)
-              lastCompletedIdx = i
-            }
-          }
-        }
-        // 无计划（异常，如旧版本日志）：降级为重新拆解执行
-        if (!plan || lastCompletedIdx < 0) {
-          meta.session.truncate(lastUserIdx)
-          return runInSession(sid, lastUserContent)
-        }
-        // 2. 截断主会话日志到最后一个 completed step 之后（清掉未完成 step 的 started + 部分工具事件）
-        meta.session.truncate(lastCompletedIdx + 1)
-
-        // 3. 重建专家 + Orchestrator，从 plan + 已完成结果继续（跳过已完成步骤）
-        stoppedSessions.delete(sid)
-        touchSession(sid)
-        const effModelId = meta.modelId ?? defaultModelId
-        const effModel = resolveProvider(effModelId)
-        const visionCapable = modelSupportsVision(allModels().find((m) => m.id === effModelId))
-        const expertAgents = buildExpertAgents(sid, visionCapable, effModelId, meta.session)
-        multiExpertLoops.set(sid, expertAgents)
-        sessionActivityCallbacks.forEach((cb) => cb(sid, 'start'))
-        let expertReasoning = ''
-        try {
-          const orchestrator = new Orchestrator(triage, expertAgents, {
-            sessionId: sid,
-            expertNames: roleNameById(),
-            expertSystemPrompts: buildExpertSystemPrompts(meta.workDir, lastUserContent, meta.id),
-            onStep: (trace) => {
-              const turnSeq = meta.session.list().filter((e) => e.type === 'user/message').length
-              meta.session.append('orchestrator/step', { stepId: trace.stepId, expertId: trace.expertId, title: trace.title, status: trace.status, result: trace.result, error: trace.error })
-              expertTraceCallbacks.forEach((cb) => cb({ ...trace, turnSeq }))
-            },
-            onDelta: (text) => {
-              if (stoppedSessions.has(sid)) throw new Error('__stopped__')
-              deltaCallbacks.forEach((cb) => cb(sid, text))
-            },
-            onReasoning: (text) => {
-              expertReasoning += text
-              reasoningCallbacks.forEach((cb) => cb(sid, text))
-            },
-            summarize: async (task, steps, onDelta) => {
-              const parts = steps.map((s, i) => `${i + 1}. [${s.expert}] ${s.title}\n${s.result}`).join('\n\n')
-              const systemPrompt =
-                '你是「山海」的结果汇总器。下面是一次多专家协作任务中各位专家的执行结果，以及用户最初的问题。请把它们汇总成一段连贯、简洁、直接回答用户问题的最终结果：只输出最终答案本身，不要罗列专家名、不要复述执行过程、不要加分节标题（除非用户明确要求）。'
-              const userPrompt = `【用户的问题】\n${task}\n\n【各专家执行结果】\n${parts}`
-              const messages = [
-                { role: 'system' as const, content: systemPrompt },
-                { role: 'user' as const, content: userPrompt },
-              ]
-              let full = ''
-              try {
-                if (effModel.stream) {
-                  for await (const chunk of effModel.stream(messages, [])) {
-                    if (stoppedSessions.has(sid)) throw new Error('__stopped__')
-                    if (chunk.text) {
-                      full += chunk.text
-                      onDelta(chunk.text)
-                    }
-                  }
-                } else {
-                  const res = await effModel.complete(messages, [])
-                  full = res.text ?? ''
-                  if (full) onDelta(full)
-                }
-              } catch (err) {
-                if (err instanceof Error && (err.message === '__stopped__' || err.message.startsWith('__retry_exhausted__'))) throw err
-                console.error('[orchestrator] 汇总失败，回退拼接:', err instanceof Error ? err.message : err)
-                return ''
-              }
-              return full
-            },
-          })
-          const result = await sessionContext.run(sid, () => orchestrator.resume(lastUserContent, plan, completedResults, completedSteps))
-          meta.session.append('assistant/message', { content: result.text, reasoningContent: expertReasoning || undefined })
-          meta.session.append('turn/end', { turn: 1, text: result.text })
-          return result.text
-        } catch (err) {
-          // 用户再次停止：返回中断（历史仍保留，可再次续跑）
-          if (err instanceof Error && err.message === '__stopped__') {
-            return '（已中断，历史已保留，可点击「继续执行」续跑）'
-          }
-          // 重试耗尽：向上传播，前端弹窗让用户选择重试/取消
-          throw err
-        } finally {
-          multiExpertLoops.delete(sid)
-          sessionActivityCallbacks.forEach((cb) => cb(sid, 'end'))
-          meta.lastActiveAt = Date.now()
-          await persistSession(meta)
-          emitTokenStats()
-          drainSupervisorQueue(sid)
-        }
-      }
 
       // 单步 ReAct：断点续跑——回放已执行历史（含完整工具回合），从断点继续，不清空已执行步骤
       stoppedSessions.delete(sid)
@@ -3747,7 +3384,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
           if (!restoredLoop.isSuspended()) runningLoops.delete(sid)
         }
       }
-      // 无快照：多专家/拆解阶段失败，降级 resume（从最后一条用户消息续跑，重新拆解执行）
+      // 无快照：降级 resume（从最后一条用户消息续跑）
       const events = meta.session.list()
       let lastUserIdx = -1
       for (let i = events.length - 1; i >= 0; i--) {
@@ -3774,7 +3411,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       // 取消重试：清理挂起 loop + 挂起快照（取消后不再走「重试」，改走「继续执行」resume）。
       // 保留 session 未完成状态（不 append turn/end），让「继续执行」入口可用。
       runningLoops.delete(sid)
-      multiExpertLoops.delete(sid)
       const meta = sessions.get(sid)
       if (meta) {
         meta.session.removeLast('retry/snapshot')
@@ -3795,16 +3431,16 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         loop.injectUserMessage(message)
         return true
       }
-      // 多专家编排：向所有专家注入（各自在下一步模型调用前消费），消息不丢失
-      const experts = multiExpertLoops.get(sessionId)
-      if (experts && experts.size > 0) {
-        for (const expert of experts.values()) expert.injectUserMessage(message)
-        return true
-      }
       return false
     },
 
     hasIncompleteTurn(sessionId) {
+      // 运行中的会话不是「未完成轮次」：任务正在执行，不应显示「继续执行」。
+      // 否则「手机端下发任务、后台执行」期间，事件日志里 user 消息已追加、assistant/message 尚未落盘，
+      // 会被误判为「未完成」，桌面端切到该会话时错误显示「继续执行」按钮。
+      // 重试耗尽挂起（suspended）时 loop 仍在 runningLoops 中，但此时 busy=true 已挡住「继续执行」，
+      // 且挂起由 hasRetrySnapshot 的重试弹窗承接，故统一返回 false 不影响挂起交互。
+      if (runningLoops.has(sessionId)) return false
       const meta = sessions.get(sessionId)
       if (!meta) return false
       const events = meta.session.list()
@@ -3870,44 +3506,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     onClientRemove(cb) {
       clientRemoveCallbacks.add(cb)
       return () => clientRemoveCallbacks.delete(cb)
-    },
-
-    onExpertTrace(cb) {
-      expertTraceCallbacks.add(cb)
-      return () => expertTraceCallbacks.delete(cb)
-    },
-
-    listExperts() {
-      return [...roleRegistry.values()].map((r) => ({ ...r, builtin: BUILTIN_ROLES.some((b) => b.id === r.id) }))
-    },
-
-    async registerExpert(role) {
-      const id = (role.id ?? '').trim()
-      const name = (role.name ?? '').trim()
-      if (!id) throw new Error('专家 id 不能为空')
-      if (!name) throw new Error('专家名称不能为空')
-      if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error('专家 id 只能包含字母、数字、下划线、连字符')
-      if (BUILTIN_ROLES.some((b) => b.id === id)) throw new Error(`内置专家 "${id}" 不可覆盖，请换一个 id`)
-      const def: RoleDefinition = {
-        id,
-        name,
-        description: (role.description ?? '').trim(),
-        systemPrompt: (role.systemPrompt ?? '').trim(),
-        toolSet: [],
-        skillSet: [],
-      }
-      roleRegistry.set(id, def)
-      await persistCustomRoles([...roleRegistry.values()].filter((r) => !BUILTIN_ROLES.some((b) => b.id === r.id)))
-      triage.setRoles([...roleRegistry.values()])
-      return { ...def, builtin: false }
-    },
-
-    async removeExpert(id) {
-      if (BUILTIN_ROLES.some((b) => b.id === id)) throw new Error(`内置专家 "${id}" 不可删除`)
-      if (!roleRegistry.has(id)) return
-      roleRegistry.delete(id)
-      await persistCustomRoles([...roleRegistry.values()].filter((r) => !BUILTIN_ROLES.some((b) => b.id === r.id)))
-      triage.setRoles([...roleRegistry.values()])
     },
 
     listMemory(sessionId) {

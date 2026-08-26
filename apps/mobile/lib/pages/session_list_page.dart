@@ -227,12 +227,13 @@ class _SessionCard extends StatelessWidget {
                       style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
                     ),
                     const SizedBox(height: 6),
-                    Row(
+                    Wrap(
+                      spacing: 12,
+                      runSpacing: 4,
+                      crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
                         _meta(Icons.memory, s.modelName.isEmpty ? '默认模型' : s.modelName),
-                        const SizedBox(width: 12),
                         _meta(Icons.tune, '${s.stepCount} 步'),
-                        const SizedBox(width: 12),
                         _meta(Icons.pie_chart_outline, '上下文 ${(s.contextUsageRatio * 100).toStringAsFixed(0)}%'),
                       ],
                     ),
@@ -249,10 +250,18 @@ class _SessionCard extends StatelessWidget {
 
   Widget _meta(IconData icon, String text) {
     return Row(
+      mainAxisSize: MainAxisSize.min,
       children: [
         Icon(icon, size: 13, color: Colors.grey.shade600),
         const SizedBox(width: 3),
-        Text(text, style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
+        Flexible(
+          child: Text(
+            text,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 11, color: Colors.grey.shade500),
+          ),
+        ),
       ],
     );
   }

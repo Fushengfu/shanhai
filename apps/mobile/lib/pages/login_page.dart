@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../services/auth_service.dart';
+import '../services/token_store.dart';
 import '../services/ws_client.dart';
 import '../widgets/device_picker.dart';
 import 'home_page.dart';
@@ -42,14 +43,34 @@ class _LoginPageState extends State<LoginPage> {
     });
     _eventSub = _ws.events.listen((e) {
       if (e.event == 'error' && mounted) {
+        final msg = e.payload['message']?.toString() ?? '出错';
+        // token 失效/过期：清本地登录态并提示重新登录（与普通网络错误区分开）
+        if (_isTokenInvalid(msg)) {
+          TokenStore.clear();
+          setState(() {
+            _status = '登录已过期，请重新登录';
+            _busy = false;
+          });
+          return;
+        }
         setState(() {
-          _status = e.payload['message']?.toString() ?? '出错';
+          _status = msg;
           _busy = false;
         });
       } else if (e.event == 'devices_list' && mounted) {
         _showDevicePicker(e.payload['devices'] as List? ?? const []);
       }
     });
+  }
+
+  /// 判断网关 error 消息是否为「登录态失效」：含 token 过期/无效/未授权/401 关键字。
+  static bool _isTokenInvalid(String msg) {
+    final m = msg.toLowerCase();
+    return m.contains('invalid token') ||
+        m.contains('expired') ||
+        m.contains('unauthorized') ||
+        m.contains('401') ||
+        m.contains('token') && (m.contains('无效') || m.contains('过期'));
   }
 
   /// 同账号多设备在线：弹设备选择器，选中的设备作为 targetDeviceId 重连。
@@ -85,6 +106,8 @@ class _LoginPageState extends State<LoginPage> {
     try {
       final token = await AuthService(baseUrl: kLoginBaseUrl).login(u, p);
       if (!mounted) return;
+      // 登录成功先持久化登录态（跨重启自动登录），再连网关
+      await TokenStore.save(token, u);
       setState(() => _status = '登录成功，连接中…');
       await _ws.connectRelay(kRelayUrl, token);
     } catch (e) {

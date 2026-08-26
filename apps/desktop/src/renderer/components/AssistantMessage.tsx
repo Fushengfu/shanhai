@@ -5,20 +5,17 @@ import { IconCopy, IconImage } from './icons'
 import { MessageActions, copyAssistantAsImage } from './MessageActions'
 import { ReasoningBlock } from './ReasoningBlock'
 import { StepStats, ToolStep } from './ToolStep'
-import { ExpertTraces } from './ExpertTraces'
 import { makeMarkdownComponents, normalizeTreeBlocks } from './Markdown'
 import { copyText, formatDuration } from './ui'
-import type { ExpertTrace, ToolTrace } from '../types'
+import type { ToolTrace } from '../types'
 
-/** AI 助手消息气泡：左对齐，耗时 + 工具执行步骤（紧凑）+ 多专家协作卡片 + 思考过程（可折叠）+ 正式回答聚合在一个气泡内，气泡下方固定显示「复制 / 复制为图片」操作 */
-export function AssistantMessage({ content, reasoningContent, toolSteps, expertTraces, turnDuration, onPreviewImage }: { content: string; reasoningContent?: string; toolSteps?: ToolTrace[]; expertTraces?: ExpertTrace[]; turnDuration?: number; onPreviewImage: (url: string) => void }) {
+/** AI 助手消息气泡：左对齐，耗时 + 工具执行步骤（紧凑）+ 思考过程（可折叠）+ 正式回答聚合在一个气泡内，气泡下方固定显示「复制 / 复制为图片」操作 */
+export function AssistantMessage({ content, reasoningContent, toolSteps, turnDuration, onPreviewImage }: { content: string; reasoningContent?: string; toolSteps?: ToolTrace[]; turnDuration?: number; onPreviewImage: (url: string) => void }) {
   const bubbleRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const tools = toolSteps ?? []
-  const experts = expertTraces ?? []
   const hasReasoning = !!reasoningContent
   const hasTools = tools.length > 0
-  const hasExperts = experts.length > 0
   return (
     <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
       <div
@@ -38,10 +35,9 @@ export function AssistantMessage({ content, reasoningContent, toolSteps, expertT
             ))}
           </div>
         )}
-        {hasExperts && <ExpertTraces traces={experts} />}
         {hasReasoning && <ReasoningBlock content={reasoningContent} />}
         {content && (
-          <div ref={contentRef} style={{ marginTop: hasTools || hasExperts ? 6 : 0, minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
+          <div ref={contentRef} style={{ marginTop: hasTools ? 6 : 0, minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
             <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents(onPreviewImage)}>
               {normalizeTreeBlocks(content)}
             </ReactMarkdown>

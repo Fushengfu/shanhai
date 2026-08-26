@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 /// 连接状态
@@ -34,6 +35,8 @@ class WsClient {
   String? _targetDeviceId;
   bool _autoReconnect = false;
   bool _reconnecting = false;
+  Timer? _pingTimer;
+  int _reconnectAttempts = 0;
 
   ConnState _state = ConnState.disconnected;
   ConnState get state => _state;
@@ -56,6 +59,7 @@ class WsClient {
     _channel = WebSocketChannel.connect(uri);
     await _channel!.ready;
     _setState(ConnState.connected);
+    _startPing();
     _sub = _channel!.stream.listen(
       _onMessage,
       onDone: _onDone,
@@ -90,6 +94,8 @@ class WsClient {
     _channel = WebSocketChannel.connect(uri);
     await _channel!.ready;
     _setState(ConnState.connected);
+    _reconnectAttempts = 0; // 连接成功，重置退避计数
+    _startPing();
     _sub = _channel!.stream.listen(
       _onMessage,
       onDone: _onDone,
@@ -149,6 +155,7 @@ class WsClient {
   }
 
   void _onDone() {
+    _stopPing();
     _setState(ConnState.disconnected);
     _scheduleReconnect();
   }
@@ -158,11 +165,28 @@ class WsClient {
     _scheduleReconnect();
   }
 
+  /// 启动心跳：定时发 ping 保活（发一条网关会透传、对端会忽略的轻量消息，让 TCP 保持数据流动）
+  void _startPing() {
+    _stopPing();
+    _pingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      _channel?.sink.add(jsonEncode({'type': 'ping'}));
+    });
+  }
+
+  void _stopPing() {
+    _pingTimer?.cancel();
+    _pingTimer = null;
+  }
+
   /// 连接断开后延迟自动重连（仅 relay 模式；局域网模式配对码需用户重新输入，不自动重连）
   void _scheduleReconnect() {
     if (!_autoReconnect || _reconnecting) return;
     _reconnecting = true;
-    Future<void>.delayed(const Duration(seconds: 2), () {
+    // 指数退避 + 随机抖动：避免多台电脑/设备同步惊群重连、反复触发网关踢连接
+    final exp = min(2 * pow(2, _reconnectAttempts), 30).toDouble();
+    final jitter = exp * (0.8 + Random().nextDouble() * 0.4); // ±20%
+    _reconnectAttempts += 1;
+    Future<void>.delayed(Duration(milliseconds: (jitter * 1000).round()), () {
       _reconnecting = false;
       if (_autoReconnect && _relayUrl != null && _relayToken != null) {
         // 忽略重连失败（_onError 会再次调度重连）
@@ -195,6 +219,7 @@ class WsClient {
 
   Future<void> dispose() async {
     _autoReconnect = false; // 主动销毁，停止自动重连
+    _stopPing();
     await _sub?.cancel();
     await _channel?.sink.close();
     await _events.close();

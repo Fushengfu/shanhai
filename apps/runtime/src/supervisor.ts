@@ -48,8 +48,6 @@ export interface SessionStateSummary {
   hasIncompleteTurn: boolean
   /** 是否有失败重试挂起快照 */
   hasRetrySnapshot: boolean
-  /** 多专家编排运行中的专家数（非多专家为 0） */
-  expertCount: number
   /** 最近活跃时间戳 */
   lastActiveAt: number
 }
@@ -110,7 +108,6 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
     turnCount: s.turnCount,
     hasIncompleteTurn: s.hasIncompleteTurn,
     hasRetrySnapshot: s.hasRetrySnapshot,
-    expertCount: s.expertCount,
   })
 
   return [

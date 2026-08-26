@@ -9,7 +9,6 @@ import type {
   ChatItem,
   ClientRunRequest,
   ContentPart,
-  ExpertTrace,
   GatewayModel,
   HistoryItem,
   RetryPrompt,
@@ -69,7 +68,6 @@ export function App() {
   const tokenStatsBySession = ui.tokenStatsBySession
   const approvalQueues = ui.approvalQueues
   const askQueues = ui.askQueues
-  const expertTraces = ui.expertTraces
   const browserWindows = ui.browserWindows
   const approvalPolicy = ui.approvalPolicy
   const retryPrompt = ui.retryPrompt
@@ -85,7 +83,6 @@ export function App() {
   const setTokenStatsBySession = (v: Record<string, TokenSnapshot>): void => patchUiStore({ tokenStatsBySession: v })
   const setApprovalQueues = (v: Record<string, ApprovalRequest[]>): void => patchUiStore({ approvalQueues: v })
   const setAskQueues = (v: Record<string, AskRequest[]>): void => patchUiStore({ askQueues: v })
-  const setExpertTraces = (v: Record<string, ExpertTrace[]>): void => patchUiStore({ expertTraces: v })
   const setBrowserWindows = (v: BrowserWindowItem[]): void => patchUiStore({ browserWindows: v })
   const setApprovalPolicyState = (p: 'ask' | 'workdir' | 'never'): void => patchUiStore({ approvalPolicy: p })
   const setRetryPrompt = (v: RetryPrompt | null): void => patchUiStore({ retryPrompt: v })
@@ -128,7 +125,6 @@ export function App() {
   const [tracePanelOpen, setTracePanelOpen] = useState(false)
   const [memoryPanelOpen, setMemoryPanelOpen] = useState(false)
   const [settingsPanelOpen, setSettingsPanelOpen] = useState(false)
-  const [expertsPanelOpen, setExpertsPanelOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null)
   const [editingTitle, setEditingTitle] = useState('')
@@ -171,7 +167,6 @@ export function App() {
   const clientDisposers = useRef<Map<string, () => void>>(new Map())
   // 每个动态包通过 slots.register 注册的组件注销函数（unmount 时逆序撤销）
   const clientSlotDisposers = useRef<Map<string, Array<() => void>>>(new Map())
-  // 多专家编排轨迹（按会话隔离：Triage 拆解 → 专家执行过程）—— 已上移主进程 store
 
   // 顶部状态栏（header + 浏览器标签条）实际高度：侧滑面板顶部从它下方开始，避免覆盖状态栏区域
   const headerWrapRef = useRef<HTMLDivElement>(null)
@@ -195,8 +190,6 @@ export function App() {
   const curAsk = (askQueues[currentSessionId] ?? [])[0] ?? null
   // 当前会话的 browser 半投递审批请求
   const curClientRunRequest = (clientRunRequests[currentSessionId] ?? [])[0] ?? null
-  // 当前会话的多专家编排轨迹
-  const curExpertTraces = expertTraces[currentSessionId] ?? []
   // 自修改（K5）动态扩展区：订阅 dynamic-extension slot 的组件（统一走 SlotRegistry）
   const dynamicExtensions = useSlotComponents('dynamic-extension')
 
@@ -310,7 +303,7 @@ export function App() {
       // 后端刷新完成（启动自动刷新 / 手动刷新）后重取下拉框
       void refreshModelsList()
     })
-    // 流式增量 / 工具过程 / 审批请求 / 提问 / token / 专家轨迹 已上移主进程 ui-store 监听维护，
+    // 流式增量 / 工具过程 / 审批请求 / 提问 / token 已上移主进程 ui-store 监听维护，
     // 渲染进程只订阅 store 快照（useUiStore），不再单独订阅这些 runtime 事件。
     // 自修改（K5）：browser 半投递审批 + 代码投递 + 卸载
     const offClientRun = api.onClientRunRequest((req) => {
@@ -457,9 +450,12 @@ export function App() {
     loadedSessions.current.add(id)
     const history = (await window.shanhai?.getSessionHistory(id)) ?? []
     const items = historyToItems(history)
-    // 首次加载：busy 是「运行态」，切换会话不代表正在执行任务，统一置 false；
+    // 首次加载：busy 必须取后端权威运行态（listSessions 的 busy = runningLoops.has），不能写死 false——
+    // 否则「手机端/管家下发任务、后台执行」时切到该会话会把 busy=true 错误清零，
+    // 发送按钮/会话列表不再显示「执行中」，并因 incompleteTurn 误判而误显示「继续执行」。
     // 「未完成轮次（可继续执行）」由 incompleteTurn state 单独承载，与 busy 无关。
-    patchSession(id, { items, streaming: '', streamingReasoning: '', busy: false })
+    const busy = (await window.shanhai?.listSessions().then((l) => l?.find((s) => s.id === id)?.busy ?? false)) ?? false
+    patchSession(id, { items, streaming: '', streamingReasoning: '', busy })
   }
 
   async function createSession(): Promise<void> {
@@ -577,7 +573,7 @@ export function App() {
         turnStartTs: startTs,
       }))
     } else {
-      // 轮次序号 = 会话内 user 消息序号（从 1 开始），用于多专家协作卡片插到对应轮次之后
+      // 轮次序号 = 会话内 user 消息序号（从 1 开始）
       patchSession(sid, (s) => ({ items: [...s.items, { kind: 'user', content: text, images, turnSeq: s.items.filter((it) => it.kind === 'user').length + 1 }], streaming: '', streamingReasoning: '', busy: true, turnStartTs: startTs }))
     }
     let interrupted = false
@@ -589,7 +585,7 @@ export function App() {
       // 任务完成自动语音播报：仅正常完成（非中断）且正文非空时，超长截断后走 TTS（受「语音播报」开关控制）
       if (!interrupted && result.trim()) void speakResult(result)
       // 正常完成：assistant 正文气泡由主进程 ui-store 的 onSessionActivity('end') 用 getSessionHistory 重建
-      // （单步/多专家均已把 assistant/message 连同思考、耗时落盘到 session），这里不再重复 push——
+      // （assistant/message 连同思考、耗时已落盘到 session），这里不再重复 push——
       // 否则会出现「带工具调用」+「纯正文」两个重复的 assistant 气泡。
       // 仅中断时（loop 未落盘 assistant/message）补一个「已中断」提示气泡。
       if (interrupted) {
@@ -1097,12 +1093,10 @@ export function App() {
     setMemoryPanelOpen,
     setTracePanelOpen,
     setSettingsPanelOpen,
-    setExpertsPanelOpen,
     browserWindows,
     showBrowserWindow,
     closeBrowserWindow,
     // chat
-    curExpertTraces,
     incompleteTurn,
     dynamicExtensions,
     curApproval,
@@ -1164,7 +1158,6 @@ export function App() {
     tracePanelOpen,
     memoryPanelOpen,
     settingsPanelOpen,
-    expertsPanelOpen,
     // terminal（会话级：cur.terminalPanelOpen 派生，切会话自动隔离）
     terminalPanelOpen: cur.terminalPanelOpen,
     setTerminalPanelOpen,

@@ -45,7 +45,7 @@ export class AgentLoop {
   private pendingInjections: string[] = []
   /** 同一会话同一 agent 稳定不变的 user_id：网关前缀缓存隔离 + 命中用（确定性派生，跨请求/跨重启不变） */
   private readonly userId: string
-  /** 审批策略会话：审批判断从该会话回放 approval/policy（多专家时传主会话，缺省用自身 session） */
+  /** 审批策略会话：审批判断从该会话回放 approval/policy */
   private readonly approvalSession: Session
   /** 是否已被用户中止（点「停止」）：在每轮循环 / 流式每个 chunk / 工具执行前检查，尽快中断 */
   private aborted = false
@@ -69,19 +69,13 @@ export class AgentLoop {
     private readonly supportsVision = false,
     /** 当前模型服务的 apiKey：user_id 确定性派生用（区分不同账号/服务商的前缀缓存） */
     private readonly apiKey?: string,
-    /** 同一会话内区分多个 agent 的稳定标识（多专家编排时传角色 id）：user_id 确定性派生用 */
-    private readonly agentKey?: string,
-    /** 审批策略会话：审批判断从该会话回放 approval/policy（多专家时传主会话，缺省用自身 session） */
-    approvalSession?: Session,
   ) {
-    // 审批策略会话：多专家编排时专家 Session 为空，需回放主会话的 approval/policy；单步任务用自身 session
-    this.approvalSession = approvalSession ?? this.session
+    this.approvalSession = this.session
     // 断点续跑（resume）时新建 AgentLoop，从会话历史恢复「最近一次真实 usage」，避免首轮因无 usage 而跳过压缩、把超长历史直发网关打 400
     this.lastUsageTotalTokens = this.restoreLastUsageTotalTokens()
     // 同一会话同一 agent 的 user_id 永远不变（确定性派生，不含时间戳/随机数，跨请求/跨重启稳定）：
-    // - 单专家：user_id = sessionId:apiKey，同一账号同会话所有请求共享，前缀缓存稳定累积命中
-    // - 多专家：user_id = sessionId:apiKey:roleId，同一角色跨任务也稳定，且并发专家间缓存互不覆盖
-    this.userId = [sessionId ?? 'agent', apiKey, agentKey].filter((x): x is string => !!x).join(':')
+    // user_id = sessionId:apiKey，同一账号同会话所有请求共享，前缀缓存稳定累积命中
+    this.userId = [sessionId ?? 'agent', apiKey].filter((x): x is string => !!x).join(':')
   }
 
   /** 从会话事件日志倒序找最近一条 usage/record，恢复真实总 token 数（无则 0） */

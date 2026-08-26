@@ -109,18 +109,6 @@ export interface ApprovalRequest {
   riskLevel: string
 }
 
-export interface ExpertTrace {
-  sessionId?: string
-  turnSeq?: number
-  stepId: string
-  expertId: string
-  expertName: string
-  title: string
-  status: 'started' | 'completed' | 'failed'
-  result?: string
-  error?: string
-}
-
 export interface BrowserWindowItem {
   appId: string
   url: string
@@ -147,7 +135,6 @@ export interface UiStoreState {
   tokenStatsBySession: Record<string, TokenSnapshot>
   approvalQueues: Record<string, ApprovalRequest[]>
   askQueues: Record<string, AskRequest[]>
-  expertTraces: Record<string, ExpertTrace[]>
   browserWindows: BrowserWindowItem[]
   retryPrompt: RetryPrompt | null
   /** 桌面壳壁纸：CSS backgroundImage 值（预设渐变字符串或 data:image base64）。null = 默认渐变 */
@@ -176,7 +163,6 @@ const INITIAL_STATE: UiStoreState = {
   tokenStatsBySession: {},
   approvalQueues: {},
   askQueues: {},
-  expertTraces: {},
   browserWindows: [],
   retryPrompt: null,
   wallpaper: null,
@@ -362,22 +348,6 @@ export function initUiStore(runtime: Runtime): void {
   // token 用量按会话隔离
   runtime.onTokenStats((sessionId, stats) => {
     mutate((s) => ({ ...s, tokenStatsBySession: { ...s.tokenStatsBySession, [sessionId]: stats } }))
-  })
-
-  // 多专家编排轨迹
-  runtime.onExpertTrace((trace) => {
-    const sid = trace.sessionId ?? state.currentSessionId
-    if (!sid) return
-    mutate((s) => {
-      const list = s.expertTraces[sid] ?? []
-      const idx = list.findIndex((t) => t.stepId === trace.stepId)
-      if (idx >= 0) {
-        const next = [...list]
-        next[idx] = { ...next[idx], ...trace }
-        return { ...s, expertTraces: { ...s.expertTraces, [sid]: next } }
-      }
-      return { ...s, expertTraces: { ...s.expertTraces, [sid]: [...list, trace] } }
-    })
   })
 
   // 会话开始/结束执行：开始→busy=true；结束→重新拉取该会话历史刷新消息流 + 刷新会话列表（busy=false）。
