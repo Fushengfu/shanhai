@@ -1115,8 +1115,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     setApprovalPolicy(policy) {
       const meta = ctx.currentSessionId ? ctx.sessions.get(ctx.currentSessionId) : undefined
       if (!meta) return
-      // 会话级：写入当前会话 meta.approvalPolicy（持久化到 meta.json，重启后直接读）
+      // 会话级：写入当前会话 meta.approvalPolicy（持久化到 meta.json，重启后直接读），
+      // 同时写入事件日志 approval/policy，供审批判断 effectiveApprovalPolicy 回放（否则只改 meta 不生效）。
       meta.approvalPolicy = policy
+      meta.session.append('approval/policy', { policy })
       ctx.approval.setPolicy(policy)
       void sessionsModule.persistSession(meta)
     },

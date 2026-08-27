@@ -109,12 +109,12 @@ export type AppSettingsPatch = {
 
 /** 通用设置默认值 */
 export const DEFAULT_SETTINGS: AppSettings = {
-  browser: { showOnCreate: true, enableWebBridge: true },
+  browser: { showOnCreate: true, enableWebBridge: false },
   messageSubmit: { mode: 'queue' },
   debug: { traceLlm: false },
-  voice: { enabled: true },
-  supervisorApproval: { enabled: false },
-  supervisorAsk: { enabled: false },
+  voice: { enabled: false },
+  supervisorApproval: { enabled: true },
+  supervisorAsk: { enabled: true },
   compaction: { modelId: '' },
 }
 

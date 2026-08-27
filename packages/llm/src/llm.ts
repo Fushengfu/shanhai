@@ -123,7 +123,14 @@ export interface DeepSeekOptions {
   onTrace?: HttpTraceCallback
   /** 用户标识（网关按 user_id 隔离缓存/计费/用量统计），请求 body 顶层 user_id 字段 */
   userId?: string | number
+  /** thinking 模式（reasoner 模型）：assistant 消息缺 reasoning_content 时回传占位符，避免 DeepSeek 400「must be passed back」 */
+  supportsReasoning?: boolean
 }
+
+/** thinking 模式下 assistant 消息缺 reasoning_content 时的回传占位符。
+ * 网关在某些轮次（纯工具调用轮）会吞掉上游 reasoning_content 不转发，导致历史里该字段缺失；
+ * DeepSeek reasoner 要求多轮回传 reasoning_content，缺失即 400。用非空占位符兜底（参考 taco 的「继续」）。 */
+const REASONING_FALLBACK = '继续'
 
 /** 网关响应 choice（网关包装在 { code, data } 里，兼容裸 OpenAI 格式） */
 interface GatewayChoice {
@@ -170,7 +177,7 @@ function chatCompletionsUrl(baseUrl: string): string {
  *  - assistant 带 toolCall → 输出 tool_calls + content:null（OpenAI 规范：带 tool_calls 时 content 为 null）
  *  - tool 带 toolCallId → 输出 tool_call_id（缺失时网关报 "missing field tool_call_id"）
  */
-function serializeMessages(messages: ChatMessage[]): Array<Record<string, unknown>> {
+function serializeMessages(messages: ChatMessage[], supportsReasoning = false): Array<Record<string, unknown>> {
   return messages.map((m) => {
     const calls = m.toolCalls ?? (m.toolCall ? [m.toolCall] : [])
     if (m.role === 'assistant' && calls.length > 0) {
@@ -187,7 +194,12 @@ function serializeMessages(messages: ChatMessage[]): Array<Record<string, unknow
         })),
       }
       // thinking 模式：assistant 带 tool_calls 也必须回传 reasoning_content，否则网关 400
-      if (m.reasoningContent) msg.reasoning_content = m.reasoningContent
+      if (m.reasoningContent) {
+        msg.reasoning_content = m.reasoningContent
+      } else if (supportsReasoning) {
+        // 网关吞掉 reasoning_content 的轮次：用占位符兜底，确保 DeepSeek 校验通过
+        msg.reasoning_content = REASONING_FALLBACK
+      }
       return msg
     }
     if (m.role === 'tool') {
@@ -200,7 +212,11 @@ function serializeMessages(messages: ChatMessage[]): Array<Record<string, unknow
     }
     const msg: Record<string, unknown> = { role: m.role, content: m.content }
     // thinking 模式：assistant 文本消息回传 reasoning_content
-    if (m.role === 'assistant' && m.reasoningContent) msg.reasoning_content = m.reasoningContent
+    if (m.role === 'assistant' && m.reasoningContent) {
+      msg.reasoning_content = m.reasoningContent
+    } else if (m.role === 'assistant' && supportsReasoning) {
+      msg.reasoning_content = REASONING_FALLBACK
+    }
     return msg
   })
 }
@@ -234,7 +250,7 @@ export class DeepSeekProvider implements Model {
     const effectiveUserId = userId ?? this.opts.userId
     const body = {
       model: this.opts.model,
-      messages: serializeMessages(messages),
+      messages: serializeMessages(messages, this.opts.supportsReasoning),
       tools: tools?.map((t) => ({
         type: 'function',
         function: { name: t.name, description: t.description, parameters: t.inputSchema },
@@ -320,7 +336,7 @@ export class DeepSeekProvider implements Model {
     const effectiveUserId = userId ?? this.opts.userId
     const body = {
       model: this.opts.model,
-      messages: serializeMessages(messages),
+      messages: serializeMessages(messages, this.opts.supportsReasoning),
       tools: tools?.map((t) => ({
         type: 'function',
         function: { name: t.name, description: t.description, parameters: t.inputSchema },
@@ -649,6 +665,8 @@ export interface ProviderOptions {
   onTrace?: HttpTraceCallback
   /** 用户标识（网关按 user_id 隔离缓存/计费/用量统计），请求 body 顶层 user_id 字段 */
   userId?: string | number
+  /** thinking 模式（reasoner 模型）：assistant 消息缺 reasoning_content 时回传占位符，避免 DeepSeek 400 */
+  supportsReasoning?: boolean
 }
 
 /** Anthropic 缺省最大输出 token（用户自定义模型未指定时兜底；Claude 3.5 系列上限 8192） */
@@ -663,7 +681,7 @@ export function createModelProvider(opts: ProviderOptions): Model {
   if (opts.protocol === 'anthropic') {
     return new AnthropicProvider(opts)
   }
-  return new DeepSeekProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, maxTokens: opts.maxTokens, onUsage: opts.onUsage, onTrace: opts.onTrace, userId: opts.userId })
+  return new DeepSeekProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, maxTokens: opts.maxTokens, onUsage: opts.onUsage, onTrace: opts.onTrace, userId: opts.userId, supportsReasoning: opts.supportsReasoning })
 }
 
 /**

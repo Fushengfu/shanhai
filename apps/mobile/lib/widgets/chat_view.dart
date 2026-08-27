@@ -386,6 +386,11 @@ class _ChatViewState extends State<ChatView> {
     }
   }
 
+  /// 弹窗内容区最大高度：保证标题 + 内容 + 底部按钮始终都在屏幕内，
+  /// 内容过多时在内部滚动，底部「拒绝/允许/提交/取消」按钮不会被顶出屏幕。
+  double _dialogContentMaxHeight(BuildContext ctx) =>
+      MediaQuery.of(ctx).size.height * 0.55;
+
   void _showApproval(ApprovalRequest req) {
     if (!mounted || _activeRequestIds.contains(req.id)) return;
     _activeRequestIds.add(req.id);
@@ -405,32 +410,32 @@ class _ChatViewState extends State<ChatView> {
           ),
         ],
       ),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // 工具名（中文映射）独立一行，风险等级用彩色标签
-          Row(
+      content: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: _dialogContentMaxHeight(ctx)),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(
-                child: Text(
-                  friendlyToolName(req.toolName, req.args),
-                  style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Color(0xFFE0E0E0)),
-                ),
+              // 工具名（中文映射）独立一行，风险等级用彩色标签
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: Text(
+                      friendlyToolName(req.toolName, req.args),
+                      style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Color(0xFFE0E0E0)),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  _riskBadge(req.riskLevel),
+                ],
               ),
-              const SizedBox(width: 8),
-              _riskBadge(req.riskLevel),
+              const SizedBox(height: 12),
+              approvalArgsWidget(req.toolName, req.args),
             ],
           ),
-          const SizedBox(height: 12),
-          ConstrainedBox(
-            constraints: const BoxConstraints(maxHeight: 220),
-            child: SingleChildScrollView(
-              child: approvalArgsWidget(req.toolName, req.args),
-            ),
-          ),
-        ],
+        ),
       ),
       actions: [
         TextButton(
@@ -471,18 +476,23 @@ class _ChatViewState extends State<ChatView> {
           ),
         ],
       ),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (req.question.trim().isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Text(req.question, style: const TextStyle(fontSize: 14, color: Color(0xFFE0E0E0), height: 1.45)),
-            ),
-          if (req.reasoning != null && req.reasoning!.isNotEmpty) _ReasoningDisclosure(req.reasoning!),
-          body,
-        ],
+      content: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: _dialogContentMaxHeight(context)),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (req.question.trim().isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text(req.question, style: const TextStyle(fontSize: 14, color: Color(0xFFE0E0E0), height: 1.45)),
+                ),
+              if (req.reasoning != null && req.reasoning!.isNotEmpty) _ReasoningDisclosure(req.reasoning!),
+              body,
+            ],
+          ),
+        ),
       ),
       actions: actions,
     );
@@ -505,28 +515,23 @@ class _ChatViewState extends State<ChatView> {
   void _showSessionPicker(AskRequest req) {
     _showTrackedDialog(req.id, (ctx) => _askShell(
       req: req,
-      body: SizedBox(
-        width: double.maxFinite,
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 280),
-          child: ListView(
-            shrinkWrap: true,
-            children: req.sessionOptions!.map((s) {
-              return ListTile(
-                contentPadding: EdgeInsets.zero,
-                dense: true,
-                visualDensity: VisualDensity.compact,
-                leading: Icon(s.busy ? Icons.sync : Icons.forum_outlined, size: 18, color: s.busy ? const Color(0xFF22D3EE) : Colors.grey),
-                title: Text(s.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 14)),
-                subtitle: Text('${s.modelName} · ${s.stepCount} 步', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12)),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  widget.ws.sendCommand('respond_ask', {'requestId': req.id, 'answer': s.id});
-                },
-              );
-            }).toList(),
-          ),
-        ),
+      body: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: req.sessionOptions!.map((s) {
+          return ListTile(
+            contentPadding: EdgeInsets.zero,
+            dense: true,
+            visualDensity: VisualDensity.compact,
+            leading: Icon(s.busy ? Icons.sync : Icons.forum_outlined, size: 18, color: s.busy ? const Color(0xFF22D3EE) : Colors.grey),
+            title: Text(s.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 14)),
+            subtitle: Text('${s.modelName} · ${s.stepCount} 步', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12)),
+            onTap: () {
+              Navigator.pop(ctx);
+              widget.ws.sendCommand('respond_ask', {'requestId': req.id, 'answer': s.id});
+            },
+          );
+        }).toList(),
       ),
       actions: [
         TextButton(
@@ -543,27 +548,22 @@ class _ChatViewState extends State<ChatView> {
   void _showModelPicker(AskRequest req) {
     _showTrackedDialog(req.id, (ctx) => _askShell(
       req: req,
-      body: SizedBox(
-        width: double.maxFinite,
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 280),
-          child: ListView(
-            shrinkWrap: true,
-            children: req.modelOptions!.map((m) {
-              return ListTile(
-                contentPadding: EdgeInsets.zero,
-                dense: true,
-                visualDensity: VisualDensity.compact,
-                leading: const Icon(Icons.memory, size: 18, color: Colors.grey),
-                title: Text(m.name, style: const TextStyle(fontSize: 14)),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  widget.ws.sendCommand('respond_ask', {'requestId': req.id, 'answer': m.id});
-                },
-              );
-            }).toList(),
-          ),
-        ),
+      body: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: req.modelOptions!.map((m) {
+          return ListTile(
+            contentPadding: EdgeInsets.zero,
+            dense: true,
+            visualDensity: VisualDensity.compact,
+            leading: const Icon(Icons.memory, size: 18, color: Colors.grey),
+            title: Text(m.name, style: const TextStyle(fontSize: 14)),
+            onTap: () {
+              Navigator.pop(ctx);
+              widget.ws.sendCommand('respond_ask', {'requestId': req.id, 'answer': m.id});
+            },
+          );
+        }).toList(),
       ),
       actions: [
         TextButton(
@@ -862,6 +862,7 @@ class _OptionsAskDialogState extends State<_OptionsAskDialog> {
 
   AskRequest get req => widget.req;
   bool get _multiple => req.multiple;
+  double get _maxContentHeight => MediaQuery.of(context).size.height * 0.55;
 
   bool get _canSubmit {
     if (_customMode) return _textCtrl.text.trim().isNotEmpty;
@@ -921,26 +922,26 @@ class _OptionsAskDialogState extends State<_OptionsAskDialog> {
           ),
         ],
       ),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (req.question.trim().isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Text(req.question, style: const TextStyle(fontSize: 14, color: Color(0xFFE0E0E0), height: 1.45)),
-            ),
-          if (req.reasoning != null && req.reasoning!.isNotEmpty) _ReasoningDisclosure(req.reasoning!),
-          SizedBox(
-            width: double.maxFinite,
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 280),
-              child: SingleChildScrollView(
+      content: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: _maxContentHeight),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (req.question.trim().isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text(req.question, style: const TextStyle(fontSize: 14, color: Color(0xFFE0E0E0), height: 1.45)),
+                ),
+              if (req.reasoning != null && req.reasoning!.isNotEmpty) _ReasoningDisclosure(req.reasoning!),
+              SizedBox(
+                width: double.maxFinite,
                 child: _customMode ? _buildCustomInput() : _buildOptions(),
               ),
-            ),
+            ],
           ),
-        ],
+        ),
       ),
       actions: [
         if (_customMode)
@@ -1073,6 +1074,7 @@ class _OptionsAskDialogState extends State<_OptionsAskDialog> {
         border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
       ),
       onSubmitted: (_) => _submit(),
+      onChanged: (_) => setState(() {}), // 输入时刷新「提交」按钮启用态
     );
   }
 }

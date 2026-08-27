@@ -106,6 +106,59 @@ describe('DeepSeekProvider 消息序列化（OpenAI wire 格式）', () => {
       fetchSpy.mockRestore()
     }
   })
+
+  it('supportsReasoning 模式：缺 reasoning_content 的 assistant 消息回传占位符（网关吞 reasoning_content 兜底，修复 resume 400）', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ code: 0, data: { choices: [{ message: { content: 'ok' } }] } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    try {
+      const provider = new DeepSeekProvider({ apiKey: 'k', baseUrl: 'https://x.com', model: 'm', supportsReasoning: true })
+      await provider.complete([
+        { role: 'user', content: 'hi' },
+        // 网关在纯工具调用轮吞掉 reasoning_content，落盘后该字段缺失
+        { role: 'assistant', content: '', toolCall: { id: 'call-3', name: 'run_command', args: {} } },
+        { role: 'tool', content: 'r', toolCallId: 'call-3' },
+        // 文本 assistant 消息同样兜底
+        { role: 'assistant', content: '答案' },
+      ])
+      const body = JSON.parse((fetchSpy.mock.calls[0]?.[1] as RequestInit).body as string) as {
+        messages: Array<Record<string, unknown>>
+      }
+      expect(body.messages[1]).toMatchObject({ role: 'assistant', content: null, reasoning_content: '继续' })
+      expect(body.messages[3]).toMatchObject({ role: 'assistant', content: '答案', reasoning_content: '继续' })
+      // tool / user 消息不受影响
+      expect(body.messages[0]).not.toHaveProperty('reasoning_content')
+      expect(body.messages[2]).not.toHaveProperty('reasoning_content')
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+
+  it('非 supportsReasoning 模式：缺 reasoning_content 不回传占位符（普通模型不注入伪 reasoning）', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ code: 0, data: { choices: [{ message: { content: 'ok' } }] } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    try {
+      const provider = new DeepSeekProvider({ apiKey: 'k', baseUrl: 'https://x.com', model: 'm' })
+      await provider.complete([
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: '', toolCall: { id: 'call-4', name: 'read_file', args: {} } },
+        { role: 'tool', content: 'r', toolCallId: 'call-4' },
+      ])
+      const body = JSON.parse((fetchSpy.mock.calls[0]?.[1] as RequestInit).body as string) as {
+        messages: Array<Record<string, unknown>>
+      }
+      expect(body.messages[1]).not.toHaveProperty('reasoning_content')
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
 })
 
 describe('AnthropicProvider（Anthropic 原生 /messages 协议）', () => {

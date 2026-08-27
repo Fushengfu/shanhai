@@ -62,6 +62,8 @@ export async function fetchGatewayModels(apiKey: string, baseUrl: string): Promi
           maxTokens?: string | number
           temperature?: string | number
           provider?: string
+          supportsVision?: boolean
+          supportsReasoning?: boolean
           sortOrder?: number
           description?: string
           source?: string
@@ -81,6 +83,8 @@ export async function fetchGatewayModels(apiKey: string, baseUrl: string): Promi
       maxTokens: m.maxTokens != null ? Number(m.maxTokens) : undefined,
       temperature: m.temperature != null ? String(m.temperature) : undefined,
       provider: m.provider != null ? String(m.provider) : undefined,
+      supportsVision: m.supportsVision === true,
+      supportsReasoning: m.supportsReasoning === true,
       sortOrder: typeof m.sortOrder === 'number' ? m.sortOrder : undefined,
       description: m.description != null ? String(m.description) : undefined,
       source: m.source != null ? String(m.source) : undefined,

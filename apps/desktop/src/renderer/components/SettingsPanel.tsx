@@ -150,7 +150,7 @@ const SECTIONS: Array<{ id: SectionId; label: string; icon: ReactNode }> = [
 
 /** 设置面板：左侧分组导航 + 右侧内容区，配置通用设置（浏览器窗口显示等），持久化到 config.json，跨会话、重启保留。侧滑铺满主区域 */
 export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?: number; top?: number; onClose?: () => void; variant?: 'panel' | 'window' }) {
-  const [settings, setSettings] = useState<AppSettings>({ browser: { showOnCreate: true, enableWebBridge: true }, messageSubmit: { mode: 'queue' }, debug: { traceLlm: false }, voice: { enabled: false }, supervisorApproval: { enabled: false }, supervisorAsk: { enabled: false }, compaction: { modelId: '' } })
+  const [settings, setSettings] = useState<AppSettings>({ browser: { showOnCreate: true, enableWebBridge: false }, messageSubmit: { mode: 'queue' }, debug: { traceLlm: false }, voice: { enabled: false }, supervisorApproval: { enabled: true }, supervisorAsk: { enabled: true }, compaction: { modelId: '' } })
   const [models, setModels] = useState<GatewayModel[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)

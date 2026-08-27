@@ -270,6 +270,9 @@ export function createSessionsModule(
     const meta = ctx.sessions.get(sid)
     if (!meta || meta.isSupervisor) return { ok: false, message: `会话不存在: ${sid}` }
     meta.approvalPolicy = policy
+    // 会话级安全模式写入事件日志（approval/policy）：审批判断 effectiveApprovalPolicy 从事件日志回放，
+    // 只改 meta.approvalPolicy 会让管家 set_session_approval 设置的值不生效（回退全局 policy）。
+    meta.session.append('approval/policy', { policy })
     void persistSession(meta)
     if (ctx.currentSessionId === sid) ctx.approval.setPolicy(policy)
     return { ok: true, message: `已将会话「${meta.title}」(${sid}) 的安全模式设为 ${policy}` }
@@ -354,6 +357,8 @@ export function createSessionsModule(
     const meta = ctx.sessions.get(SUPERVISOR_ID)
     if (!meta) return { ok: false, message: '管家会话不存在' }
     meta.approvalPolicy = policy
+    // 会话级安全模式写入事件日志（approval/policy）：审批判断 effectiveApprovalPolicy 从事件日志回放。
+    meta.session.append('approval/policy', { policy })
     void persistSession(meta)
     return { ok: true, message: `管家安全模式已设为 ${policy}` }
   }
