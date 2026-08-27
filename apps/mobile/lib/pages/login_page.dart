@@ -35,11 +35,9 @@ class _LoginPageState extends State<LoginPage> {
   void initState() {
     super.initState();
     _stateSub = _ws.stateStream.listen((s) {
-      if (s == ConnState.connected && mounted && !_pendingDeviceChoice) {
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => HomePage(ws: _ws)),
-        );
-      }
+      // 只有真正配对到具体 Host（paired）才进主页；connected 仅表示连上了网关，
+      // 可能还处于「Host 离线」或「多设备待选」状态，此时不能进主页（否则 devices_list 会在跳转竞态中丢失）。
+      if (s == ConnState.paired) _maybeGoHome();
     });
     _eventSub = _ws.events.listen((e) {
       if (e.event == 'error' && mounted) {
@@ -59,8 +57,22 @@ class _LoginPageState extends State<LoginPage> {
         });
       } else if (e.event == 'devices_list' && mounted) {
         _showDevicePicker(e.payload['devices'] as List? ?? const []);
+      } else if (e.event == 'host_offline' && mounted) {
+        setState(() {
+          _status = '桌面端离线，等待重新连接…';
+          _busy = false;
+        });
       }
     });
+  }
+
+  /// 配对成功且当前未在选设备时，进入主页。
+  void _maybeGoHome() {
+    if (mounted && !_pendingDeviceChoice && _ws.state == ConnState.paired) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => HomePage(ws: _ws)),
+      );
+    }
   }
 
   /// 判断网关 error 消息是否为「登录态失效」：含 token 过期/无效/未授权/401 关键字。
@@ -90,6 +102,9 @@ class _LoginPageState extends State<LoginPage> {
     setState(() => _status = '正在连接所选设备…');
     await _ws.switchDevice(chosen);
     if (mounted) setState(() => _pendingDeviceChoice = false);
+    // switchDevice 内部重连后，网关的 connected("connected to host") 可能先于 _pendingDeviceChoice 复位到达，
+    // 导致 paired 事件已过、跳转被跳过；这里补一次判断。
+    if (mounted) _maybeGoHome();
   }
 
   Future<void> _login() async {

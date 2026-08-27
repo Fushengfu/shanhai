@@ -108,6 +108,12 @@ export function App() {
     window.shanhai?.setTheme(theme)
   }, [theme])
   const toggleTheme = useCallback(() => setTheme((t) => (t === 'light' ? 'dark' : 'light')), [])
+  // 订阅其它窗口（如会话管家）发起的主题切换：聊天窗口本身是写者，但也要响应管家窗口的切换，
+  // 实现双向同步。setTheme 对相同值会 bail out，不会与自身广播形成死循环。
+  useEffect(() => {
+    const off = window.shanhai?.onThemeChange((t) => setTheme(t))
+    return off
+  }, [])
   const loadedSessions = useRef<Set<string>>(new Set())
   // 会话列表排序：进行中置顶；其余按「最近活跃时间」倒序（发消息/执行任务即刷新 lastActiveAt，最新活跃排最顶）
   const sortedSessions = useMemo(() => {
@@ -494,7 +500,7 @@ export function App() {
     setSelectedModel('')
   }
 
-  async function handleAddModel(input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }): Promise<void> {
+  async function handleAddModel(input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }): Promise<void> {
     const m = await window.shanhai?.addCustomModel(input)
     if (m) {
       setModels([...getUiStoreSnapshot().models, m])
@@ -504,7 +510,7 @@ export function App() {
     }
   }
 
-  async function handleUpdateModel(id: string, input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }): Promise<void> {
+  async function handleUpdateModel(id: string, input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }): Promise<void> {
     const m = await window.shanhai?.updateCustomModel(id, input)
     if (m) {
       setModels(getUiStoreSnapshot().models.map((x) => (x.id === id ? m : x)))
@@ -891,7 +897,7 @@ export function App() {
       // 用于识别「有效录音」，并在连续静音 ≥ 3 秒时自动停止并提交前面有效部分
       const FRAME_SECONDS = 4096 / 16000 // 每帧约 0.256s
       const TRAILING_SILENCE_FRAMES = 12 // 连续静音 ≥ 约 3 秒（12 帧）触发自动停止/截断
-      const NOISE_ESTIMATE_FRAMES = 6 // 用前 6 帧（约 1.5s）估计噪声底
+      const NOISE_ESTIMATE_FRAMES = 6 // 前 6 帧（约 1.5s）用均值快速估计噪声底，之后转慢速滑动平均
       let noiseFloor = 0
       let totalFrames = 0
       let lastVoiceFrame = -1 // 最后一个有语音帧的索引
@@ -956,15 +962,15 @@ export function App() {
         const frame = new Float32Array(e.inputBuffer.getChannelData(0))
         chunks.push(frame)
         const r = audioRms(frame)
-        if (totalFrames < NOISE_ESTIMATE_FRAMES) {
-          noiseFloor = (noiseFloor * totalFrames + r) / (totalFrames + 1)
-          totalFrames++
-          return
-        }
+        // 有语音：RMS 超过噪声底阈值；开头噪声底尚未稳定时靠绝对阈值 0.012 兜底，不吞开头语音
         if (r > Math.max(noiseFloor * 3, 0.012)) {
           lastVoiceFrame = totalFrames
           consecutiveSilenceFrames = 0
         } else {
+          // 静音帧更新噪声底（前几帧快速均值估计，之后慢速滑动平均）；语音帧不参与，避免被大声开头污染噪声底
+          noiseFloor = totalFrames < NOISE_ESTIMATE_FRAMES
+            ? (noiseFloor * totalFrames + r) / (totalFrames + 1)
+            : noiseFloor * 0.95 + r * 0.05
           consecutiveSilenceFrames++
           // 已有有效语音且连续静音 ≥ 3 秒：自动停止并提交前面有效部分
           if (lastVoiceFrame >= 0 && consecutiveSilenceFrames >= TRAILING_SILENCE_FRAMES) {
@@ -975,7 +981,11 @@ export function App() {
         totalFrames++
       }
       source.connect(processor)
-      processor.connect(audioCtx.destination)
+      // 用静音 gain 驱动 ScriptProcessor：保持 onaudioprocess 有数据流触发，但不把麦克风声音回放到扬声器（避免回声/啸叫）
+      const silenceGain = audioCtx.createGain()
+      silenceGain.gain.value = 0
+      processor.connect(silenceGain)
+      silenceGain.connect(audioCtx.destination)
 
       mediaRecorderRef.current = {
         stop: () => finishRecording('manual'),

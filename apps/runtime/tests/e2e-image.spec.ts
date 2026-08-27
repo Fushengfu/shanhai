@@ -57,8 +57,8 @@ function makeRedPngDataUrl(): string {
 describe.skipIf(!hasCredential)('图片发送 E2E（真实网关 + 视觉模型）', () => {
   it('切到视觉模型后，带图片附件发送，模型能识别图片内容', async () => {
     const runtime = await bootstrap()
-    // 切到视觉模型 kimi-k3（deepseek-v4-flash 不支持图片）
-    runtime.switchModel('kimi-k3')
+    // 切到视觉模型 deepseek-v4-flash-vision-exp（deepseek-v4-flash 不支持图片）
+    runtime.switchModel('deepseek-v4-flash-vision-exp')
     const dataUrl = makeRedPngDataUrl()
     const result = await runtime.run('这张图片是什么颜色？一句话回答', {
       attachments: [{ type: 'image_url', image_url: { url: dataUrl } }],

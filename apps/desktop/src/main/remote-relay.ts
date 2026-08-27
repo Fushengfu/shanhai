@@ -115,12 +115,12 @@ function connect(): void {
   })
 }
 
-/** 启动心跳：定时发 ping 保活（发一条网关会透传、对端会忽略的轻量消息，让 TCP 保持数据流动） */
+/** 启动心跳：定时发 WebSocket 协议层 ping 帧保活（网关协议栈自动回 pong，不进入应用层消息解析，因此不会被误转发、不会触发 host_offline 报错） */
 function startPing(): void {
   stopPing()
   pingTimer = setInterval(() => {
     if (hostWs && hostWs.readyState === WebSocket.OPEN) {
-      sendToRelay({ type: 'ping' })
+      hostWs.ping()
     }
   }, PING_INTERVAL_MS)
 }

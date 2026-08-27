@@ -18,9 +18,9 @@ import { SessionPicker } from '../components/SessionPicker'
 import { ModelPicker } from '../components/ModelPicker'
 import { Composer } from '../components/Composer'
 import { TokenStatusBar } from '../components/TokenStatusBar'
-import { IconMonitor, IconWarn } from '../components/icons'
+import { IconMonitor, IconWarn, IconMoon, IconSun } from '../components/icons'
 import { btn, formatBytes, prettyValue, readFileAsDataUrl, LiveDuration, ThinkingDots } from '../components/ui'
-import { useThemeSync } from '../theme'
+import { useThemeSync, readTheme, applyTheme, type ThemeMode } from '../theme'
 
 /** 会话管家超级会话的固定 id（与 runtime 的 SUPERVISOR_ID 一致） */
 const SUPERVISOR_SID = 'supervisor'
@@ -178,6 +178,24 @@ export function SupervisorApp(): React.JSX.Element {
 
   // 主题：订阅主进程广播，跟随聊天窗口切换（亮/暗实时同步）
   useThemeSync()
+
+  // 管家窗口的主题切换入口：读取当前主题用于按钮图标，切换时写 localStorage + 应用 + 广播给所有窗口
+  const [theme, setThemeMode] = useState<ThemeMode>(() => readTheme())
+  useEffect(() => {
+    const off = window.shanhai?.onThemeChange((t) => setThemeMode(t))
+    return off
+  }, [])
+  const toggleTheme = useCallback((): void => {
+    const next: ThemeMode = theme === 'light' ? 'dark' : 'light'
+    setThemeMode(next)
+    applyTheme(next)
+    try {
+      localStorage.setItem('shanhai-theme', next)
+    } catch {
+      /* localStorage 不可用时静默忽略 */
+    }
+    window.shanhai?.setTheme(next)
+  }, [theme])
 
   // 启动时加载管家会话历史（跨重启保留）+ 管家工作目录
   useEffect(() => {
@@ -668,6 +686,15 @@ export function SupervisorApp(): React.JSX.Element {
         subtitle="主 Agent · 监控与调度所有会话"
         tone="purple"
         onClose={() => void window.shanhai?.hideSupervisorToBubble()}
+        actions={
+          <button
+            onClick={toggleTheme}
+            title={theme === 'light' ? '切换到暗色模式' : '切换到亮色模式'}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 10px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer' }}
+          >
+            {theme === 'light' ? <IconMoon /> : <IconSun />}
+          </button>
+        }
       />
 
       <div

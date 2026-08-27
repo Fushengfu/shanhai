@@ -91,6 +91,12 @@ export interface AppUpdateCheckResult {
   message?: string
 }
 
+/** 手机端（Android）APK 下载信息 */
+export interface MobileApkInfo {
+  downloadUrl: string
+  version?: string
+}
+
 /** 会话选择器中的单个会话选项（choose_session 工具专用） */
 export interface AskSessionOption {
   id: string
@@ -144,6 +150,10 @@ export interface GatewayModel {
   /** 调用协议：openai（默认）/ anthropic */
   protocol?: 'openai' | 'anthropic'
   custom?: boolean
+  /** 上下文窗口长度（token 数） */
+  contextLength?: number
+  /** 是否支持视觉（多模态）输入 */
+  supportsVision?: boolean
 }
 
 export interface ContentPart {
@@ -326,6 +336,8 @@ declare global {
       getUpdateStatus(): Promise<AppUpdateCheckResult | null>
       /** 订阅自动检查发现新版本时的推送 */
       onUpdateAvailable(cb: (result: AppUpdateCheckResult) => void): () => void
+      /** 获取手机端（Android）APK 下载信息（下载地址 + 版本号），失败返回 null */
+      getMobileApkInfo(packageName: string): Promise<MobileApkInfo | null>
       /** 读取全局 UI 共享状态快照 */
       getUiState(): Promise<GlobalUiState>
       /** 订阅全局 UI 共享状态变化 */
@@ -338,8 +350,8 @@ declare global {
       listModels(): Promise<GatewayModel[]>
       refreshModels(): Promise<GatewayModel[]>
       onModelsChanged(cb: () => void): () => void
-      addCustomModel(model: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }): Promise<GatewayModel>
-      updateCustomModel(id: string, model: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }): Promise<GatewayModel>
+      addCustomModel(model: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }): Promise<GatewayModel>
+      updateCustomModel(id: string, model: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }): Promise<GatewayModel>
       removeCustomModel(id: string): Promise<void>
       listSessions(): Promise<Array<{ id: string; title: string; workDir: string; lastActiveAt: number; busy: boolean }>>
       createSession(title?: string, workdir?: string): Promise<string>

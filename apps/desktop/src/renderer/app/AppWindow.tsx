@@ -46,14 +46,14 @@ export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
 
   // 模型管理应用：增删改查走 IPC，结果 patch 到主进程 store（聊天窗口自动同步）
   const customModels = ui.models.filter((m) => m.custom)
-  const handleAddModel = async (input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }): Promise<void> => {
+  const handleAddModel = async (input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }): Promise<void> => {
     const m = await window.shanhai?.addCustomModel(input)
     if (m) {
       patchUiStore({ models: [...getUiStoreSnapshot().models, m], selectedModel: m.id })
       void window.shanhai?.switchModel(m.id)
     }
   }
-  const handleUpdateModel = async (id: string, input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }): Promise<void> => {
+  const handleUpdateModel = async (id: string, input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }): Promise<void> => {
     const m = await window.shanhai?.updateCustomModel(id, input)
     if (m) patchUiStore({ models: getUiStoreSnapshot().models.map((x) => (x.id === id ? m : x)) })
   }

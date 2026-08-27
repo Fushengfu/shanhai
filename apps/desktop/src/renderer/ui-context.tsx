@@ -119,8 +119,8 @@ export interface UIContextValue {
 
   // —— shell.panels ——
   customModelDrawerOpen: boolean
-  addCustomModel: (input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }) => Promise<void>
-  updateCustomModel: (id: string, input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }) => Promise<void>
+  addCustomModel: (input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }) => Promise<void>
+  updateCustomModel: (id: string, input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }) => Promise<void>
   removeCustomModel: (id: string) => Promise<void>
   tracePanelOpen: boolean
   memoryPanelOpen: boolean

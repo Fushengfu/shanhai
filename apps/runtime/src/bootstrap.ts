@@ -59,7 +59,7 @@ import { createModelProviderModule } from './model-provider'
 import { createSessionsModule } from './sessions'
 import { createExecutionModule } from './execution'
 import { withConfigFile, ensureDeviceInfo, persistSelectedModel, persistLastActiveSessionId, readLastActiveSessionId, readSettings, writeSettings, getDeviceInfoState, setDeviceInfoName } from './config'
-import { spawnSay, createSystemVoiceService, transcribeAudioFile, gatewayAsrTranscribe, pcmBase64ToWavFile } from './voice'
+import { spawnSay, createSystemVoiceService, gatewayAsrTranscribe } from './voice'
 
 export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime> {
   // 初始化设备标识（远程连接多设备用）：读取/生成 deviceId + 设备名，早于任何 getDeviceInfo 调用
@@ -1137,24 +1137,14 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
 
     async transcribeAudio(audioBase64, _format) {
       if (!audioBase64) return ''
-      // ① 优先网关 ASR 端点（参考 taco ctx.voice.recognize：POST {baseUrl}/audio/asr，模型 stepaudio-2.5-asr，audioData 为 PCM base64）。
-      //    未登录无 apiKey 时跳过，直接降级 macOS Speech。
-      if (ctx.loggedIn && ctx.gatewayApiKey && ctx.gatewayBaseUrl) {
-        try {
-          const text = await gatewayAsrTranscribe(audioBase64, ctx.gatewayApiKey, ctx.gatewayBaseUrl)
-          if (text) return text
-        } catch (err) {
-          // 网关 ASR 失败（网络/模型不支持）→ 降级 macOS Speech
-          console.warn('[STT] 网关 ASR 识别失败，降级 macOS Speech:', err instanceof Error ? err.message : err)
-        }
-      }
-      // ② 降级 macOS Speech（本地 SFSpeechRecognizer）：PCM(Int16) base64 → WAV → 识别
+      // 语音识别统一走网关 ASR（对齐 taco，无本地 macOS Speech 降级）。
+      // 未登录无 apiKey 时无法识别，直接返回空，由前端提示。
+      if (!ctx.loggedIn || !ctx.gatewayApiKey || !ctx.gatewayBaseUrl) return ''
       try {
-        const wavPath = await pcmBase64ToWavFile(audioBase64)
-        const text = await transcribeAudioFile(wavPath)
-        await fs.rm(wavPath, { force: true }).catch(() => undefined)
+        const text = await gatewayAsrTranscribe(audioBase64, ctx.gatewayApiKey, ctx.gatewayBaseUrl)
         return text
-      } catch {
+      } catch (err) {
+        console.warn('[STT] 网关 ASR 识别失败:', err instanceof Error ? err.message : err)
         return ''
       }
     },

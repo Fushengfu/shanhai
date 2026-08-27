@@ -247,6 +247,8 @@ export function createModelProviderModule(
       apiKey: input.apiKey,
       baseUrl: input.baseUrl,
       protocol: input.protocol,
+      contextLength: input.contextLength,
+      supportsVision: input.supportsVision,
       custom: true,
     }
     ctx.customModels = [...ctx.customModels, custom]
@@ -265,10 +267,10 @@ export function createModelProviderModule(
       apiKey: input.apiKey,
       baseUrl: input.baseUrl,
       protocol: input.protocol,
-      contextLength: existing.contextLength,
+      contextLength: input.contextLength ?? existing.contextLength,
       maxTokens: existing.maxTokens,
       temperature: existing.temperature,
-      supportsVision: existing.supportsVision,
+      supportsVision: input.supportsVision ?? existing.supportsVision,
       supportsReasoning: existing.supportsReasoning,
       provider: existing.provider,
       sortOrder: existing.sortOrder,

@@ -65,7 +65,10 @@ export function DockApp(): React.JSX.Element {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        background: 'transparent',
+        // 浅灰底板：macOS 上靠 body 的 --bg-app 垫底，Windows 上 body 被圆角规则透明化，
+        // 这里显式给 Dock 容器补上 --bg-app，使两端观感一致（Windows 不再纯透明悬浮）。
+        background: 'var(--bg-app)',
+        borderRadius: 16,
         overflow: 'hidden',
         fontFamily: 'system-ui, sans-serif',
         userSelect: 'none',

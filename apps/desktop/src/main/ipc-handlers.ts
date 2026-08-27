@@ -6,7 +6,7 @@ import { getUiState, patchUiState, getWallpaper, setWallpaper, filterUiStateForW
 import { listSystemWallpapers, applySystemWallpaper } from './system-wallpaper'
 import { startRemoteServer, stopRemoteServer, getRemoteStatus } from './remote-server'
 import { startRemoteRelay, stopRemoteRelay, getRelayStatus, getRelayPreference } from './remote-relay'
-import { checkAndPromptForUpdate, getLastUpdateCheckResult } from './app-updater'
+import { checkAndPromptForUpdate, getLastUpdateCheckResult, fetchMobileApkInfo } from './app-updater'
 
 /**
  * 渲染进程 → 主进程 调用（IPC handler）。
@@ -137,10 +137,10 @@ export function registerIpc(): void {
   // —— 模型 ——
   ipcMain.handle('model:switch', async (_e, id: string) => runtime.switchModel(id))
   ipcMain.handle('model:current', async () => runtime.getCurrentModelId())
-  ipcMain.handle('model:addCustom', async (_e, input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }) =>
+  ipcMain.handle('model:addCustom', async (_e, input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }) =>
     runtime.addCustomModel(input),
   )
-  ipcMain.handle('model:updateCustom', async (_e, id: string, input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }) =>
+  ipcMain.handle('model:updateCustom', async (_e, id: string, input: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }) =>
     runtime.updateCustomModel(id, input),
   )
   ipcMain.handle('model:removeCustom', async (_e, id: string) => runtime.removeCustomModel(id))
@@ -242,4 +242,5 @@ export function registerIpc(): void {
     checkAndPromptForUpdate({ manual: true, parentWindow: BrowserWindow.fromWebContents(e.sender) }),
   )
   ipcMain.handle('app:get-update-status', async () => getLastUpdateCheckResult())
+  ipcMain.handle('mobile:get-apk-info', async (_e, packageName: string) => fetchMobileApkInfo(packageName))
 }

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 /// 连接状态
@@ -35,7 +36,6 @@ class WsClient {
   String? _targetDeviceId;
   bool _autoReconnect = false;
   bool _reconnecting = false;
-  Timer? _pingTimer;
   int _reconnectAttempts = 0;
 
   ConnState _state = ConnState.disconnected;
@@ -56,10 +56,19 @@ class WsClient {
   Future<void> connect(String host, int port) async {
     _setState(ConnState.connecting);
     final uri = Uri.parse('ws://$host:$port');
-    _channel = WebSocketChannel.connect(uri);
-    await _channel!.ready;
+    // 用 IOWebSocketChannel 并设 pingInterval：底层定期发协议层 ping 帧保活，
+    // 对端（局域网 ws server / 网关）协议栈自动回 pong，不进入应用层消息解析。
+    _channel = IOWebSocketChannel.connect(uri, pingInterval: const Duration(seconds: 30));
+    try {
+      await _channel!.ready.timeout(const Duration(seconds: 15));
+    } catch (e) {
+      // 握手失败/超时：清理连接并抛出，由调用方（ConnectPage）展示错误，避免永久挂起
+      await _channel?.sink.close();
+      _channel = null;
+      _setState(ConnState.disconnected);
+      rethrow;
+    }
     _setState(ConnState.connected);
-    _startPing();
     _sub = _channel!.stream.listen(
       _onMessage,
       onDone: _onDone,
@@ -91,11 +100,25 @@ class WsClient {
       query += '&targetDeviceId=${Uri.encodeComponent(_targetDeviceId!)}';
     }
     final uri = Uri.parse('$base$query');
-    _channel = WebSocketChannel.connect(uri);
-    await _channel!.ready;
+    // 用 IOWebSocketChannel 并设 pingInterval：底层定期发协议层 ping 帧保活，
+    // 网关协议栈自动回 pong，不进入应用层消息解析，因此不会被误转发、不会触发 host_offline 报错。
+    _channel = IOWebSocketChannel.connect(uri, pingInterval: const Duration(seconds: 30));
+    try {
+      await _channel!.ready.timeout(const Duration(seconds: 15));
+    } catch (e) {
+      // 握手失败/超时：清理连接，通知 UI 并交给自动重连兜底，同时向上抛出让调用方感知首次失败。
+      // 之前这里没 catch，导致「正在恢复登录」永久转圈且不重连（listen 尚未注册，onDone/onError 不会触发）。
+      await _channel?.sink.close();
+      _channel = null;
+      _setState(ConnState.disconnected);
+      if (!_events.isClosed) {
+        _events.add(ServerEvent('error', {'message': '连接网关失败：$e'}));
+      }
+      _scheduleReconnect();
+      rethrow;
+    }
     _setState(ConnState.connected);
     _reconnectAttempts = 0; // 连接成功，重置退避计数
-    _startPing();
     _sub = _channel!.stream.listen(
       _onMessage,
       onDone: _onDone,
@@ -104,11 +127,24 @@ class WsClient {
     );
   }
 
-  /// 切换到指定设备：设置 targetDeviceId 后重连（关闭当前连接触发自动重连）。
+  /// 切换到指定设备：设置 targetDeviceId 后关闭当前连接，并立即重连。
+  /// 注意：_sub.cancel() 之后订阅不会再触发 onDone/onError，因此必须显式重连，
+  /// 不能依赖「关闭连接触发自动重连」——那是之前「找不到连接对象」的根因。
   Future<void> switchDevice(String deviceId) async {
     _targetDeviceId = deviceId;
     await _sub?.cancel();
+    _sub = null;
     await _channel?.sink.close();
+    _channel = null;
+    if (_autoReconnect && _relayUrl != null && _relayToken != null) {
+      try {
+        await _doConnectRelay();
+      } catch (_) {
+        // 立即重连失败：回到断开态并交给自动重连兜底
+        _setState(ConnState.disconnected);
+        _scheduleReconnect();
+      }
+    }
   }
 
   void _onMessage(dynamic raw) {
@@ -121,6 +157,17 @@ class WsClient {
     switch (map['type']) {
       case 'paired':
         _setState(ConnState.paired);
+        break;
+      case 'connected':
+        // 网关在 Client 连接后下发 connected 消息，message 区分配对结果：
+        // - "connected to host"：已配对到具体 Host → paired（进入主页）
+        // - "connected to relay (host offline)"：Host 离线，仅连上网关 → 保持 connected，等待 Host 上线
+        final cmsg = (map['message'] as String?) ?? '';
+        if (cmsg.contains('connected to host')) {
+          _setState(ConnState.paired);
+        } else {
+          _setState(ConnState.connected);
+        }
         break;
       case 'host_disconnected':
         // 网关中继：桌面端 Host 离线。连接仍保留在 pending 队列，Host 上线后网关会关闭连接触发重连，
@@ -155,7 +202,6 @@ class WsClient {
   }
 
   void _onDone() {
-    _stopPing();
     _setState(ConnState.disconnected);
     _scheduleReconnect();
   }
@@ -163,19 +209,6 @@ class WsClient {
   void _onError(Object e) {
     if (!_events.isClosed) _events.add(ServerEvent('error', {'message': e.toString()}));
     _scheduleReconnect();
-  }
-
-  /// 启动心跳：定时发 ping 保活（发一条网关会透传、对端会忽略的轻量消息，让 TCP 保持数据流动）
-  void _startPing() {
-    _stopPing();
-    _pingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
-      _channel?.sink.add(jsonEncode({'type': 'ping'}));
-    });
-  }
-
-  void _stopPing() {
-    _pingTimer?.cancel();
-    _pingTimer = null;
   }
 
   /// 连接断开后延迟自动重连（仅 relay 模式；局域网模式配对码需用户重新输入，不自动重连）
@@ -219,7 +252,6 @@ class WsClient {
 
   Future<void> dispose() async {
     _autoReconnect = false; // 主动销毁，停止自动重连
-    _stopPing();
     await _sub?.cancel();
     await _channel?.sink.close();
     await _events.close();

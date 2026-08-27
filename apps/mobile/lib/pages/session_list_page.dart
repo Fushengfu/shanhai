@@ -17,6 +17,7 @@ class _SessionListPageState extends State<SessionListPage> {
   List<SessionSummary> _sessions = [];
   bool _loading = true;
   StreamSubscription<ServerEvent>? _eventSub;
+  StreamSubscription<ConnState>? _stateSub;
 
   @override
   void initState() {
@@ -28,11 +29,19 @@ class _SessionListPageState extends State<SessionListPage> {
         _refresh(silent: true);
       }
     });
+    // 切换设备后重连配对成功（paired）时，会话列表需要重新拉取新设备的数据，
+    // 否则 IndexedStack 保持本页存活、不会重建，列表会停留在旧设备。
+    _stateSub = widget.ws.stateStream.listen((s) {
+      if (s == ConnState.paired && mounted) {
+        _refresh(silent: true);
+      }
+    });
   }
 
   @override
   void dispose() {
     _eventSub?.cancel();
+    _stateSub?.cancel();
     super.dispose();
   }
 

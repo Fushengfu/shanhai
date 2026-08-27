@@ -3,7 +3,12 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 /// 会员 JWT 的本地安全存储（走 Keychain / Keystore 加密存储）。
 /// 跨重启保留登录态：登录成功后 save，启动时 read 自动登录，登出/token 失效时 clear。
 class TokenStore {
-  static const _storage = FlutterSecureStorage();
+  // resetOnError: true —— 华为等设备覆盖安装后 Keystore 里的加密 key 可能失效，
+  // 导致 read() 抛异常（默认 resetOnError=false 会直接抛，使启动页「正在恢复登录」永久转圈）。
+  // 开启后：解密失败时自动清除损坏数据并返回 null，走「未登录→回登录页」分支，不再卡死。
+  static const _storage = FlutterSecureStorage(
+    aOptions: AndroidOptions(resetOnError: true),
+  );
   static const _kToken = 'member_token';
   static const _kUsername = 'member_username';
 

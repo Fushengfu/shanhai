@@ -53,6 +53,12 @@ export interface AppUpdateCheckResult {
   message?: string
 }
 
+/** 手机端（Android）APK 下载信息 */
+export interface MobileApkInfo {
+  downloadUrl: string
+  version?: string
+}
+
 export interface ApprovalRequest {
   id: string
   sessionId?: string
@@ -231,6 +237,8 @@ export interface ShanhaiBridge {
   getUpdateStatus(): Promise<AppUpdateCheckResult | null>
   /** 订阅主进程自动检查发现新版本时的推送，返回取消订阅函数 */
   onUpdateAvailable(cb: (result: AppUpdateCheckResult) => void): () => void
+  /** 获取手机端（Android）APK 下载信息（下载地址 + 版本号），失败返回 null */
+  getMobileApkInfo(packageName: string): Promise<MobileApkInfo | null>
   // 认证
   status(): Promise<{ loggedIn: boolean; username: string | null }>
   login(username: string, password: string): Promise<{ username: string; nickname?: string }>
@@ -238,8 +246,8 @@ export interface ShanhaiBridge {
   listModels(): Promise<Array<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean }>>
   refreshModels(): Promise<Array<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean }>>
   onModelsChanged(cb: () => void): () => void
-  addCustomModel(model: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }): Promise<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean }>
-  updateCustomModel(id: string, model: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic' }): Promise<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean }>
+  addCustomModel(model: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }): Promise<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean; contextLength?: number; supportsVision?: boolean }>
+  updateCustomModel(id: string, model: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }): Promise<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean; contextLength?: number; supportsVision?: boolean }>
   removeCustomModel(id: string): Promise<void>
   // 会话
   listSessions(): Promise<Array<{ id: string; title: string; workDir: string; lastActiveAt: number; busy: boolean }>>
@@ -448,6 +456,7 @@ const bridge: ShanhaiBridge = {
     ipcRenderer.on('app:update-available', listener)
     return () => ipcRenderer.removeListener('app:update-available', listener)
   },
+  getMobileApkInfo: (packageName) => ipcRenderer.invoke('mobile:get-apk-info', packageName),
   status: () => ipcRenderer.invoke('auth:status'),
   login: (u, p) => ipcRenderer.invoke('auth:login', u, p),
   logout: () => ipcRenderer.invoke('auth:logout'),

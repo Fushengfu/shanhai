@@ -115,6 +115,8 @@ export interface DeepSeekOptions {
   apiKey: string
   baseUrl: string
   model: string
+  /** 最大输出 token（网关按此预留 completion；不传则网关用其默认预留值，可能远大于模型实际配置） */
+  maxTokens?: number
   /** 每次调用后回传 token 用量（成本统计） */
   onUsage?: (usage: TokenUsage) => void
   /** 每次 HTTP 调用后回传原始请求/响应（排查问题用） */
@@ -237,6 +239,8 @@ export class DeepSeekProvider implements Model {
         type: 'function',
         function: { name: t.name, description: t.description, parameters: t.inputSchema },
       })),
+      // max_tokens 显式下发，让网关按模型真实配置预留 completion，而非用其默认预留值（否则 1M 窗口可能被默认预留压掉几十万，导致误判超限）
+      ...(this.opts.maxTokens ? { max_tokens: this.opts.maxTokens } : {}),
       ...(effectiveUserId != null ? { user_id: effectiveUserId } : {}),
     }
     // 原始请求 = 最终提交给模型接口的完整 body（序列化前对象，含 model/messages/tools 全字段）
@@ -659,7 +663,7 @@ export function createModelProvider(opts: ProviderOptions): Model {
   if (opts.protocol === 'anthropic') {
     return new AnthropicProvider(opts)
   }
-  return new DeepSeekProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, onUsage: opts.onUsage, onTrace: opts.onTrace, userId: opts.userId })
+  return new DeepSeekProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, maxTokens: opts.maxTokens, onUsage: opts.onUsage, onTrace: opts.onTrace, userId: opts.userId })
 }
 
 /**

@@ -1,4 +1,4 @@
-package com.shanhai.shanhai_mobile
+package com.amulet.shanhai
 
 import io.flutter.embedding.android.FlutterActivity
 

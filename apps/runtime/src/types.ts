@@ -126,6 +126,10 @@ export interface CustomModelInput {
   model: string
   /** 调用协议：openai（默认）/ anthropic */
   protocol?: 'openai' | 'anthropic'
+  /** 上下文窗口长度（token 数），供上下文预算计算 */
+  contextLength?: number
+  /** 是否支持视觉（多模态）输入 */
+  supportsVision?: boolean
 }
 
 export interface Runtime {

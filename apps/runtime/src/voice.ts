@@ -1,9 +1,7 @@
-import { promises as fs } from 'node:fs'
-import { exec as execCallback, execFile as execFileCallback, spawn, type ChildProcess } from 'node:child_process'
+import { execFile as execFileCallback, spawn, type ChildProcess } from 'node:child_process'
 import { promisify } from 'node:util'
 import type { VoiceService } from '@shanhai/voice'
 
-const execAsync = promisify(execCallback)
 const execFileAsync = promisify(execFileCallback)
 
 /** 当前正在播放的 say 子进程：新播报来了先打断旧的，避免多条语音叠加播放 */
@@ -32,32 +30,14 @@ export function spawnSay(text: string, voice: string): Promise<void> {
   })
 }
 
-/** 真实语音：TTS 走 macOS say（真实发声），STT 需系统麦克风权限（暂返回空） */
+/** 系统语音服务：TTS 走 macOS say（真实发声）。
+ *  STT 不再走 macOS Speech——swift 独立进程没有 app bundle 与 NSSpeechRecognitionUsageDescription，
+ *  拿不到 TCC 授权，SFSpeechRecognizer 基本恒返回空；语音识别统一走网关 ASR（见 bootstrap.transcribeAudio）。 */
 export function createSystemVoiceService(): VoiceService {
   return {
-    transcribe: async (audio) => {
-      // Windows 暂未接入 STT（macOS Speech 识别不可用），直接返回空，不阻断流程
-      if (process.platform === 'win32') return ''
-      // 真实 STT：音频字节 → 临时文件 → afconvert 转 wav → macOS Speech 识别（失败返回空，不阻断）
-      if (audio.byteLength === 0) return ''
-      const base = `/tmp/shanhai-voice-${Date.now()}`
-      const src = `${base}.webm`
-      const wav = `${base}.wav`
-      try {
-        await fs.writeFile(src, Buffer.from(audio))
-        // webm(opus) → wav；失败则用原始文件直接识别（SFSpeechRecognizer 也能读部分容器格式）
-        try {
-          await execAsync(`afconvert -f WAVE -d LEI16 "${src}" "${wav}"`, { timeout: 15000 })
-        } catch {
-          return await transcribeAudioFile(src)
-        }
-        return await transcribeAudioFile(wav)
-      } catch {
-        return ''
-      } finally {
-        await fs.rm(src, { force: true }).catch(() => undefined)
-        await fs.rm(wav, { force: true }).catch(() => undefined)
-      }
+    transcribe: async () => {
+      // 本接口保留仅为满足 VoiceService 契约，实际语音识别走网关 ASR 主路径。
+      return ''
     },
     synthesize: async (text) => {
       // macOS：用绝对路径 execFile 调用 say（避免 shell 转义 / PATH 问题），
@@ -100,53 +80,6 @@ export function createSystemVoiceService(): VoiceService {
       }
       return new TextEncoder().encode(text).buffer as ArrayBuffer
     },
-  }
-}
-
-/** macOS Speech 语音识别脚本：识别音频文件（wav/m4a/aiff）转文字。运行时写入临时文件用 swift 执行。 */
-const STT_SWIFT = `
-import Speech
-import Foundation
-
-guard CommandLine.arguments.count > 1 else { print(""); exit(0) }
-let path = CommandLine.arguments[1]
-let url = URL(fileURLWithPath: path)
-
-guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN")) ?? SFSpeechRecognizer() else {
-    print("")
-    exit(0)
-}
-
-let request = SFSpeechURLRecognitionRequest(url: url)
-request.shouldReportPartialResults = false
-
-let semaphore = DispatchSemaphore(value: 0)
-var text = ""
-
-recognizer.recognitionTask(with: request) { result, error in
-    if let result = result, result.isFinal {
-        text = result.bestTranscription.formattedString
-        semaphore.signal()
-    } else if error != nil {
-        semaphore.signal()
-    }
-}
-
-_ = semaphore.wait(timeout: .now() + 30)
-print(text)
-`
-
-/** 用 macOS Speech 识别音频文件转文字（失败返回空串，不阻断） */
-export async function transcribeAudioFile(path: string): Promise<string> {
-  const scriptPath = `/tmp/shanhai-stt-${process.pid}.swift`
-  try {
-    await fs.writeFile(scriptPath, STT_SWIFT, 'utf8')
-    const { stdout } = await execAsync(`swift "${scriptPath}" "${path}"`, { timeout: 35000 })
-    return stdout.trim()
-  } catch {
-    return ''
-  } finally {
-    await fs.rm(scriptPath, { force: true }).catch(() => undefined)
   }
 }
 
@@ -204,26 +137,4 @@ export async function gatewayAsrTranscribe(pcmBase64: string, apiKey: string, ba
   } finally {
     clearTimeout(timer)
   }
-}
-
-/** PCM(Int16 16kHz 单声道) base64 → 写临时 WAV 文件，返回路径（供 macOS Speech 降级识别，SFSpeechRecognizer 不认裸 PCM） */
-export async function pcmBase64ToWavFile(pcmBase64: string): Promise<string> {
-  const pcm = Buffer.from(pcmBase64, 'base64')
-  const path = `/tmp/shanhai-pcm-${Date.now()}.wav`
-  const header = Buffer.alloc(44)
-  header.write('RIFF', 0)
-  header.writeUInt32LE(36 + pcm.length, 4)
-  header.write('WAVE', 8)
-  header.write('fmt ', 12)
-  header.writeUInt32LE(16, 16) // fmt 块大小
-  header.writeUInt16LE(1, 20) // PCM 编码
-  header.writeUInt16LE(1, 22) // 单声道
-  header.writeUInt32LE(16000, 24) // 采样率
-  header.writeUInt32LE(16000 * 2, 28) // 字节率
-  header.writeUInt16LE(2, 32) // 块对齐
-  header.writeUInt16LE(16, 34) // 位深
-  header.write('data', 36)
-  header.writeUInt32LE(pcm.length, 40)
-  await fs.writeFile(path, Buffer.concat([header, pcm]))
-  return path
 }

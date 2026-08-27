@@ -42,6 +42,12 @@ type VersionCheckData = {
   package_name?: string
 }
 
+/** 手机端（Android）APK 下载信息（从版本检查 API 获取） */
+export type MobileApkInfo = {
+  downloadUrl: string
+  version?: string
+}
+
 /** 一次版本检查/更新的结果（主进程 → 渲染层） */
 export type AppUpdateCheckResult = {
   success: boolean
@@ -209,6 +215,55 @@ async function fetchVersionCheck(
   })
 
   return data
+}
+
+/**
+ * 从网关公开版本检查 API 获取 Android APK 下载地址（供「下载手机端」入口使用）。
+ * 无需鉴权，失败返回 null。type=Android 由网关按平台下发对应安装包。
+ */
+export async function fetchMobileApkInfo(packageName: string): Promise<MobileApkInfo | null> {
+  try {
+    const query = new URLSearchParams({ type: 'Android', packageName })
+    const requestUrl = `${VERSION_CHECK_URL}?${query.toString()}`
+    console.log('[app-update] [mobile] request:', { url: requestUrl, packageName })
+
+    const resp = await fetch(requestUrl, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+    })
+    if (!resp.ok) {
+      console.warn('[app-update] [mobile] API 返回非 2xx:', resp.status)
+      return null
+    }
+
+    const text = await resp.text()
+    let json: unknown = null
+    try {
+      json = JSON.parse(text)
+    } catch {
+      console.warn('[app-update] [mobile] 响应不是合法 JSON')
+      return null
+    }
+
+    const envelope = json as ApiEnvelope<VersionCheckData>
+    const data = envelope.data ?? (json as VersionCheckData)
+    const downloadUrl = String(data.download_url ?? data.downloadUrl ?? '').trim()
+    if (!downloadUrl) {
+      console.warn('[app-update] [mobile] 响应中无 download_url')
+      return null
+    }
+
+    const result: MobileApkInfo = {
+      downloadUrl,
+      version: data.version ? String(data.version).trim() : undefined,
+    }
+    console.log('[app-update] [mobile] success:', result)
+    return result
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.warn('[app-update] [mobile] 获取 APK 下载信息失败:', msg)
+    return null
+  }
 }
 
 function resolveDialogWindow(parentWindow?: BrowserWindow | null): BrowserWindow | undefined {

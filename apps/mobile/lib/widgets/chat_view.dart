@@ -1,9 +1,9 @@
 import 'dart:async';
-import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:flutter_markdown/flutter_markdown.dart';
 import '../services/ws_client.dart';
 import '../models/protocol.dart';
+import 'message_bubbles.dart';
+import 'tool_step.dart';
 
 /// 通用聊天视图：历史消息 + 流式渲染 + 工具步骤 + 审批/提问弹窗 + 发送。
 /// 会话模式与管家模式复用（仅发送命令与历史加载回调不同），按 sessionId 过滤事件流。
@@ -415,19 +415,7 @@ class _ChatViewState extends State<ChatView> {
           Expanded(
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
-                : ListView.builder(
-                    controller: _scrollCtrl,
-                    reverse: true,
-                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-                    itemCount: _items.length + (_busy ? 1 : 0),
-                    itemBuilder: (ctx, i) {
-                      // reverse 列表：i=0 是视觉底部（最新）。流式气泡固定在最底部，
-                      // 历史消息按「新→旧」向上排列，进页天然停在最新位置，无需手动滚底。
-                      if (_busy && i == 0) return _buildStreamingBubble();
-                      final offset = _busy ? i - 1 : i;
-                      return _buildItem(_items[_items.length - 1 - offset]);
-                    },
-                  ),
+                : _buildList(),
           ),
           _buildComposer(),
         ],
@@ -435,25 +423,64 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
-  Widget _buildItem(HistoryItem item) {
-    switch (item) {
-      case UserItem():
-        return _UserBubble(content: item.content);
-      case AssistantItem():
-        return _AssistantBubble(content: item.content, reasoning: item.reasoningContent);
-      case ToolItem():
-        return _ToolCard(trace: item.trace);
+  /// 正序构建消息节点列表：把连续的 tool 步骤聚合到紧随其后的 assistant 气泡内
+  /// （对齐桌面端 ChatPlugin 的 toolBuffer 聚合逻辑），user/assistant 独立成气泡。
+  List<Widget> _buildNodes() {
+    final nodes = <Widget>[];
+    var toolBuffer = <ToolTrace>[];
+    void flushTools() {
+      if (toolBuffer.isEmpty) return;
+      nodes.add(Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [for (final t in toolBuffer) ToolStepWidget(trace: t)],
+      ));
+      toolBuffer = [];
     }
+
+    for (final item in _items) {
+      if (item is UserItem) {
+        flushTools();
+        nodes.add(UserBubble(content: item.content));
+      } else if (item is AssistantItem) {
+        nodes.add(AssistantBubble(
+          content: item.content,
+          reasoning: item.reasoningContent,
+          toolSteps: List<ToolTrace>.of(toolBuffer),
+          turnDuration: item.turnDuration,
+        ));
+        toolBuffer = [];
+      } else if (item is ToolItem) {
+        toolBuffer.add(item.trace);
+      }
+    }
+    // 尾部残留 tool（如任务中断、无 assistant 收尾）：独立渲染为紧凑步骤
+    flushTools();
+    return nodes;
+  }
+
+  Widget _buildList() {
+    final nodes = _buildNodes();
+    return ListView.builder(
+      controller: _scrollCtrl,
+      reverse: true,
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+      itemCount: nodes.length + (_busy ? 1 : 0),
+      itemBuilder: (ctx, i) {
+        // reverse 列表：i=0 是视觉底部（最新）。流式气泡固定在最底部，
+        // 历史消息按「新→旧」向上排列，进页天然停在最新位置，无需手动滚底。
+        if (_busy && i == 0) return _buildStreamingBubble();
+        final offset = _busy ? i - 1 : i;
+        return nodes[nodes.length - 1 - offset];
+      },
+    );
   }
 
   Widget _buildStreamingBubble() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (_pendingTools.isNotEmpty)
-          ..._pendingTools.map((t) => _ToolCard(trace: t)),
-        _AssistantBubble(content: _streaming, reasoning: _streamingReasoning, thinking: true),
-      ],
+    return AssistantBubble(
+      content: _streaming,
+      reasoning: _streamingReasoning,
+      toolSteps: _pendingTools,
+      thinking: true,
     );
   }
 
@@ -491,369 +518,5 @@ class _ChatViewState extends State<ChatView> {
         ),
       ),
     );
-  }
-}
-
-class _UserBubble extends StatelessWidget {
-  final String content;
-  const _UserBubble({required this.content});
-
-  @override
-  Widget build(BuildContext context) {
-    return Align(
-      alignment: Alignment.centerRight,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 6),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.78),
-        decoration: BoxDecoration(
-          color: const Color(0xFF2A2A3A),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Text(content, style: const TextStyle(fontSize: 15)),
-      ),
-    );
-  }
-}
-
-class _AssistantBubble extends StatelessWidget {
-  final String content;
-  final String? reasoning;
-  final bool thinking;
-  const _AssistantBubble({required this.content, this.reasoning, this.thinking = false});
-
-  @override
-  Widget build(BuildContext context) {
-    final hasContent = content.isNotEmpty;
-    final hasReasoning = reasoning != null && reasoning!.isNotEmpty;
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 6),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.86),
-        decoration: BoxDecoration(
-          color: const Color(0xFF1A1A24),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (hasReasoning)
-              ExpansionTile(
-                tilePadding: EdgeInsets.zero,
-                title: Text('思考过程', style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
-                childrenPadding: const EdgeInsets.only(bottom: 4),
-                children: [
-                  Text(reasoning!, style: TextStyle(fontSize: 13, color: Colors.grey.shade400, height: 1.5)),
-                ],
-              ),
-            if (hasContent)
-              MarkdownBody(
-                data: content,
-                selectable: true,
-                styleSheet: _markdownStyle(context),
-              ),
-            if (!hasContent && !hasReasoning && thinking)
-              Row(
-                children: [
-                  const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
-                  const SizedBox(width: 8),
-                  Text('思考中…', style: TextStyle(fontSize: 13, color: Colors.grey.shade500)),
-                ],
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// 深色主题下的 Markdown 样式（代码块/引用块适配深色气泡背景）
-MarkdownStyleSheet _markdownStyle(BuildContext context) {
-  return MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
-    p: const TextStyle(fontSize: 15, height: 1.5, color: Color(0xFFE5E7EB)),
-    code: const TextStyle(
-      fontSize: 13,
-      fontFamily: 'monospace',
-      backgroundColor: Color(0xFF2A2A3A),
-      color: Color(0xFF7DD3FC),
-    ),
-    codeblockDecoration: BoxDecoration(
-      color: const Color(0xFF14141C),
-      borderRadius: BorderRadius.circular(8),
-      border: Border.all(color: const Color(0xFF2A2A3A)),
-    ),
-    codeblockPadding: const EdgeInsets.all(10),
-    blockquoteDecoration: BoxDecoration(
-      color: const Color(0xFF1A1A24),
-      border: const Border(left: BorderSide(color: Color(0xFF8B5CF6), width: 3)),
-    ),
-    blockquotePadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-  );
-}
-
-/// 工具名 → 中文显示名（对齐桌面端 ToolStep 的 TOOL_META，避免向用户暴露英文原始名）
-const Map<String, String> _toolNameMap = {
-  'read_file': '读取文件',
-  'write_file': '写入文件',
-  'edit_file': '编辑文件',
-  'run_command': '执行命令',
-  'list_dir': '列出目录',
-  'image_analyze': '识别图片',
-  'computer_screenshot': '屏幕截图',
-  'computer_ocr': '文字识别',
-  'computer_action': '电脑操作',
-  'browser_create': '创建浏览器窗口',
-  'browser_list': '列出浏览器窗口',
-  'browser_navigate': '打开网页',
-  'browser_close': '关闭浏览器窗口',
-  'browser_screenshot': '网页截图',
-  'browser_get_info': '读取页面信息',
-  'browser_get_content': '读取页面内容',
-  'browser_evaluate': '执行页面脚本',
-  'browser_click': '点击页面元素',
-  'browser_type': '页面输入',
-  'browser_scroll': '滚动页面',
-  'browser_wait': '等待元素',
-  'browser_get_console_logs': '查看控制台日志',
-  'browser_get_network_requests': '查看网络请求',
-  'browser_get_cookies': '读取 Cookie',
-  'browser_set_cookie': '设置 Cookie',
-  'browser_clear_cookies': '清除 Cookie',
-  'rollback_file': '回滚文件',
-  'remember': '保存记忆',
-  'recall_memory': '召回记忆',
-  'plugin_inspect': '查看自修改',
-  'plugin_define': '定义动态包',
-  'plugin_run': '运行动态包',
-  'plugin_stop': '停止动态包',
-  'plugin_undefine': '删除动态包',
-  'list_sessions': '查看会话列表',
-  'inspect_session': '查看会话详情',
-  'list_models': '查看可用模型',
-  'switch_session': '切换激活会话',
-  'send_message': '给会话下发任务',
-  'inject_message': '给会话追加需求',
-  'set_session_model': '切换会话模型',
-  'set_session_approval': '配置会话安全模式',
-  'set_session_workdir': '设置会话工作目录',
-  'create_session': '新建会话',
-  'rename_session': '重命名会话',
-  'delete_session': '删除会话',
-  'choose_session': '选择会话',
-  'choose_model': '选择模型',
-  'ask_user': '向用户提问',
-};
-
-/// skill_run（可执行技能统一入口）的 skillId:action → 中文显示名
-const Map<String, String> _skillActionNameMap = {
-  'computer-use:screenshot': '屏幕截图',
-  'computer-use:ocr': '文字识别',
-  'computer-use:action': '电脑操作',
-  'browser-use:create': '创建浏览器窗口',
-  'browser-use:list': '列出浏览器窗口',
-  'browser-use:navigate': '打开网页',
-  'browser-use:close': '关闭浏览器窗口',
-  'browser-use:screenshot': '网页截图',
-  'browser-use:get_info': '读取页面信息',
-  'browser-use:get_content': '读取页面内容',
-  'browser-use:evaluate': '执行页面脚本',
-  'browser-use:click': '点击页面元素',
-  'browser-use:type': '页面输入',
-  'browser-use:scroll': '滚动页面',
-  'browser-use:wait': '等待元素',
-  'browser-use:get_console_logs': '查看控制台日志',
-  'browser-use:get_network_requests': '查看网络请求',
-  'browser-use:get_cookies': '读取 Cookie',
-  'browser-use:set_cookie': '设置 Cookie',
-  'browser-use:clear_cookies': '清除 Cookie',
-};
-
-/// 工具名 → 中文显示名（skill_run 按 skillId+action 细分，未知名回退为原英文名）
-String _friendlyToolName(String name, Map<String, dynamic>? args) {
-  if (name == 'skill_run') {
-    final skillId = args?['skillId']?.toString() ?? '';
-    final action = args?['action']?.toString() ?? '';
-    return _skillActionNameMap['$skillId:$action'] ?? '执行技能';
-  }
-  return _toolNameMap[name] ?? (name.isEmpty ? '工具操作' : name);
-}
-
-enum _ToolStatus { running, pendingApproval, done, error }
-
-/// 工具调用/结果卡片：可折叠，头部显示状态图标 + 工具名 + 耗时，展开后查看美化后的参数与结果。
-class _ToolCard extends StatefulWidget {
-  final ToolTrace trace;
-  const _ToolCard({required this.trace});
-
-  @override
-  State<_ToolCard> createState() => _ToolCardState();
-}
-
-class _ToolCardState extends State<_ToolCard> {
-  bool _expanded = false;
-
-  ToolTrace get trace => widget.trace;
-  bool get _isCall => trace.kind == 'tool-call';
-
-  _ToolStatus get _status {
-    if (_isCall) {
-      if (trace.approvalRequired && !trace.approved) return _ToolStatus.pendingApproval;
-      return _ToolStatus.running;
-    }
-    if (trace.error != null && trace.error!.isNotEmpty) return _ToolStatus.error;
-    return _ToolStatus.done;
-  }
-
-  String get _title {
-    final name = _friendlyToolName(trace.name, trace.args);
-    if (_status == _ToolStatus.pendingApproval) return '$name · 待审批';
-    if (_status == _ToolStatus.error) return '$name · 失败';
-    return name;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final status = _status;
-    return Container(
-      margin: const EdgeInsets.symmetric(vertical: 4),
-      decoration: BoxDecoration(
-        color: const Color(0xFF16161F),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.grey.shade800),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          InkWell(
-            onTap: () => setState(() => _expanded = !_expanded),
-            borderRadius: BorderRadius.circular(10),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              child: Row(
-                children: [
-                  _statusIcon(status),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      _title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _statusColor(status)),
-                    ),
-                  ),
-                  if (trace.durationMs != null)
-                    Text(_formatDuration(trace.durationMs!), style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
-                  const SizedBox(width: 6),
-                  Icon(_expanded ? Icons.expand_less : Icons.expand_more, size: 18, color: Colors.grey.shade500),
-                ],
-              ),
-            ),
-          ),
-          if (_expanded) _buildDetail(),
-        ],
-      ),
-    );
-  }
-
-  Widget _statusIcon(_ToolStatus s) {
-    switch (s) {
-      case _ToolStatus.running:
-        return const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2));
-      case _ToolStatus.pendingApproval:
-        return const Icon(Icons.lock_outline, size: 16, color: Color(0xFFF59E0B));
-      case _ToolStatus.error:
-        return const Icon(Icons.error_outline, size: 16, color: Color(0xFFF87171));
-      case _ToolStatus.done:
-        return const Icon(Icons.check_circle_outline, size: 16, color: Color(0xFF34D399));
-    }
-  }
-
-  Color _statusColor(_ToolStatus s) {
-    switch (s) {
-      case _ToolStatus.running:
-        return const Color(0xFF22D3EE);
-      case _ToolStatus.pendingApproval:
-        return const Color(0xFFF59E0B);
-      case _ToolStatus.error:
-        return const Color(0xFFF87171);
-      case _ToolStatus.done:
-        return const Color(0xFF34D399);
-    }
-  }
-
-  Widget _buildDetail() {
-    final args = _pretty(trace.args);
-    final result = _prettyResult();
-    final reasoning = trace.reasoning;
-    final hasReasoning = reasoning != null && reasoning.isNotEmpty;
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (hasReasoning) _detailBlock('思考', reasoning),
-          if (args.isNotEmpty) _detailBlock('参数', args),
-          if (result.isNotEmpty) _detailBlock('结果', result),
-          if (args.isEmpty && result.isEmpty && !hasReasoning)
-            Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Text('无参数 / 结果', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _detailBlock(String label, String text) {
-    return Padding(
-      padding: const EdgeInsets.only(top: 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(label, style: TextStyle(fontSize: 11, color: Colors.grey.shade500, fontWeight: FontWeight.w600)),
-          const SizedBox(height: 4),
-          Container(
-            width: double.infinity,
-            constraints: const BoxConstraints(maxHeight: 220),
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: const Color(0xFF14141C),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: const Color(0xFF2A2A3A)),
-            ),
-            child: SingleChildScrollView(
-              child: SelectableText(
-                text,
-                style: const TextStyle(fontSize: 12, fontFamily: 'monospace', color: Color(0xFFD1D5DB), height: 1.5),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  String _pretty(dynamic v) {
-    if (v == null) return '';
-    if (v is String) return v;
-    try {
-      const encoder = JsonEncoder.withIndent('  ');
-      return encoder.convert(v);
-    } catch (_) {
-      return v.toString();
-    }
-  }
-
-  String _prettyResult() {
-    if (trace.error != null && trace.error!.isNotEmpty) return trace.error!;
-    return _pretty(trace.result);
-  }
-
-  String _formatDuration(int ms) {
-    if (ms < 1000) return '$ms ms';
-    return '${(ms / 1000).toStringAsFixed(1)}s';
   }
 }

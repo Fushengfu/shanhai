@@ -18,6 +18,9 @@ const MODEL_PROVIDERS: Array<{ id: string; name: string; protocol: ModelProtocol
   { id: 'xiaomi', name: '小米 MiMo', protocol: 'openai', baseUrl: 'https://api.xiaomimimo.com/v1', models: ['mimo-v2.5-pro', 'mimo-v2.5'] },
 ]
 
+/** 自定义端点（不属于任何预置服务商）的默认 providerId */
+const CUSTOM_PROVIDER_ID = 'custom'
+
 /** 根据 baseUrl 反查服务商（编辑已配置模型时回填下拉）；匹配不到返回 undefined */
 function inferProvider(baseUrl: string): (typeof MODEL_PROVIDERS)[number] | undefined {
   const norm = (s: string) => s.replace(/\/+$/, '').toLowerCase()
@@ -25,16 +28,28 @@ function inferProvider(baseUrl: string): (typeof MODEL_PROVIDERS)[number] | unde
 }
 
 function Field({ label, value, onChange, placeholder, password }: { label: string; value: string; onChange: (v: string) => void; placeholder?: string; password?: boolean }) {
+  const [reveal, setReveal] = useState(false)
   return (
     <div style={{ marginBottom: 12 }}>
       <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4 }}>{label}</div>
-      <input
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        type={password ? 'password' : 'text'}
-        placeholder={placeholder}
-        style={{ width: '100%', padding: 9, borderRadius: 8, border: '1px solid var(--border-strong)', fontSize: 13, boxSizing: 'border-box', outline: 'none' }}
-      />
+      <div style={{ position: 'relative' }}>
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          type={password && !reveal ? 'password' : 'text'}
+          placeholder={placeholder}
+          style={{ width: '100%', padding: 9, paddingRight: password ? 56 : 9, borderRadius: 8, border: '1px solid var(--border-strong)', fontSize: 13, boxSizing: 'border-box', outline: 'none' }}
+        />
+        {password && (
+          <button
+            type="button"
+            onClick={() => setReveal((r) => !r)}
+            style={{ position: 'absolute', right: 6, top: '50%', transform: 'translateY(-50%)', padding: '4px 8px', borderRadius: 6, border: 'none', background: 'transparent', fontSize: 12, color: 'var(--accent)', cursor: 'pointer' }}
+          >
+            {reveal ? '隐藏' : '显示'}
+          </button>
+        )}
+      </div>
     </div>
   )
 }
@@ -42,20 +57,22 @@ function Field({ label, value, onChange, placeholder, password }: { label: strin
 export function CustomModelDrawer(props: {
   models: GatewayModel[]
   onClose?: () => void
-  onAdd: (m: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: ModelProtocol }) => Promise<void>
-  onUpdate: (id: string, m: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: ModelProtocol }) => Promise<void>
+  onAdd: (m: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: ModelProtocol; contextLength?: number; supportsVision?: boolean }) => Promise<void>
+  onUpdate: (id: string, m: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: ModelProtocol; contextLength?: number; supportsVision?: boolean }) => Promise<void>
   onRemove: (id: string) => Promise<void>
   onSelect: (id: string) => void
   variant?: 'panel' | 'window'
 }) {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [protocol, setProtocol] = useState<ModelProtocol>('openai')
-  const [providerId, setProviderId] = useState('')
+  const [providerId, setProviderId] = useState(CUSTOM_PROVIDER_ID)
   const [name, setName] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [model, setModel] = useState('')
   const [customModel, setCustomModel] = useState(false)
+  const [supportsVision, setSupportsVision] = useState(false)
+  const [contextLength, setContextLength] = useState('')
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -73,8 +90,10 @@ export function CustomModelDrawer(props: {
     setBaseUrl(first.baseUrl)
     setApiKey(first.apiKey)
     setModel(first.model ?? first.id)
-    setProviderId(inferProvider(first.baseUrl)?.id ?? '')
+    setProviderId(inferProvider(first.baseUrl)?.id ?? CUSTOM_PROVIDER_ID)
     setCustomModel(!inferProvider(first.baseUrl)?.models.includes(first.model ?? first.id))
+    setSupportsVision(!!first.supportsVision)
+    setContextLength(first.contextLength ? String(first.contextLength) : '')
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -82,6 +101,8 @@ export function CustomModelDrawer(props: {
     setEditingId(null)
     selectProtocol('openai')
     setApiKey('')
+    setSupportsVision(false)
+    setContextLength('')
     setErr('')
   }
 
@@ -94,8 +115,10 @@ export function CustomModelDrawer(props: {
     setApiKey(m.apiKey)
     setModel(m.model ?? m.id)
     const p = inferProvider(m.baseUrl)
-    setProviderId(p?.id ?? '')
+    setProviderId(p?.id ?? CUSTOM_PROVIDER_ID)
     setCustomModel(!p || !p.models.includes(m.model ?? m.id))
+    setSupportsVision(!!m.supportsVision)
+    setContextLength(m.contextLength ? String(m.contextLength) : '')
     setErr('')
   }
 
@@ -110,7 +133,7 @@ export function CustomModelDrawer(props: {
       setModel(first.models[0] ?? '')
       setCustomModel(false)
     } else {
-      setProviderId('')
+      setProviderId(CUSTOM_PROVIDER_ID)
       setName('')
       setBaseUrl(p === 'anthropic' ? 'https://api.anthropic.com' : '')
       setModel('')
@@ -121,7 +144,13 @@ export function CustomModelDrawer(props: {
 
   function selectProvider(id: string): void {
     const p = MODEL_PROVIDERS.find((x) => x.id === id)
-    if (!p) return
+    if (!p) {
+      // 自定义端点：不属于任何预置服务商，模型改为手动输入
+      setProviderId(CUSTOM_PROVIDER_ID)
+      setCustomModel(true)
+      setErr('')
+      return
+    }
     setProviderId(id)
     setProtocol(p.protocol)
     setName(p.name)
@@ -137,11 +166,12 @@ export function CustomModelDrawer(props: {
       setErr('请填写接口地址、API Key 与模型名')
       return
     }
+    const ctxLenNum = contextLength.trim() ? Number(contextLength.trim()) : undefined
     setLoading(true)
     setErr('')
     try {
-      if (editingId) await props.onUpdate(editingId, { name: finalName, baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), model: model.trim(), protocol })
-      else await props.onAdd({ name: finalName, baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), model: model.trim(), protocol })
+      if (editingId) await props.onUpdate(editingId, { name: finalName, baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), model: model.trim(), protocol, contextLength: ctxLenNum, supportsVision })
+      else await props.onAdd({ name: finalName, baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), model: model.trim(), protocol, contextLength: ctxLenNum, supportsVision })
     } catch (e) {
       setErr(String(e))
     } finally {
@@ -258,7 +288,7 @@ export function CustomModelDrawer(props: {
                 onChange={(e) => selectProvider(e.target.value)}
                 style={{ width: '100%', padding: 9, borderRadius: 8, border: '1px solid var(--border-strong)', fontSize: 13, boxSizing: 'border-box', outline: 'none', background: 'var(--bg-panel)' }}
               >
-                <option value="">自定义端点</option>
+                <option value={CUSTOM_PROVIDER_ID}>自定义端点</option>
                 {providersOfProtocol.map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name}
@@ -302,6 +332,30 @@ export function CustomModelDrawer(props: {
               )}
             </div>
             <Field label="API Key" value={apiKey} onChange={setApiKey} placeholder={protocol === 'anthropic' ? 'sk-ant-...' : 'sk-...'} password />
+
+            {/* 能力选项：多模态 + 上下文长度 */}
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                <input
+                  type="checkbox"
+                  checked={supportsVision}
+                  onChange={(e) => setSupportsVision(e.target.checked)}
+                  style={{ width: 16, height: 16, cursor: 'pointer' }}
+                />
+                支持多模态（视觉输入）
+              </label>
+            </div>
+
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4 }}>上下文长度（token，选填）</div>
+              <input
+                value={contextLength}
+                onChange={(e) => setContextLength(e.target.value.replace(/[^0-9]/g, ''))}
+                placeholder="例如 131072、200000，留空则使用默认"
+                inputMode="numeric"
+                style={{ width: '100%', padding: 9, borderRadius: 8, border: '1px solid var(--border-strong)', fontSize: 13, boxSizing: 'border-box', outline: 'none' }}
+              />
+            </div>
             {err && <p style={{ color: 'var(--danger)', fontSize: 12, marginBottom: 8, wordBreak: 'break-word' }}>{err}</p>}
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <button onClick={() => void submit()} disabled={loading} style={{ padding: '10px 20px', borderRadius: 8, border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 14, cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.6 : 1 }}>
