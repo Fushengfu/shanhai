@@ -13,6 +13,20 @@ const RUN_COMMAND_TIMEOUT_MS = 5 * 60 * 1000
 export type RiskLevel = 'readonly' | 'reversible' | 'irreversible' | 'high'
 
 /**
+ * 工具使用手册：usage = 使用规则（何时用 / 怎么用 / 推荐流程 / 参数建议），
+ * cautions = 注意事项（陷阱 / 禁止项 / 高频错误）。
+ *
+ * 对齐 taco 的 TOOL_GUIDE_MANUAL：每个工具就近维护自己的手册，
+ * 运行时由 buildToolGuidePrompt 拼装进系统提示词的「工具使用手册」块。
+ * description 承载的是「参数 schema 里就表达得了」的简短说明，而 guide 承载的是
+ * schema 表达不了的「用法 / 协作顺序 / 陷阱」——这正是模型仅靠 function schema 学不会的部分。
+ */
+export interface ToolGuide {
+  usage?: string[]
+  cautions?: string[]
+}
+
+/**
  * 工具契约：一个工具的完整定义。
  *
  * description 是隐式 prompt——写清「何时用 / 参数含义 / 返回什么 / 何时不能用」，
@@ -27,6 +41,9 @@ export interface ToolContract {
   /** 单工具执行超时（毫秒）。Infinity = 不设超时（等用户交互的工具，如 ask_user / choose_session / choose_model——用户思考/离开多久由用户决定）。
    *  未设置时 agent 用默认兜底（5 分钟），防止网络/进程/IO 类工具永久挂起卡死整个任务循环。 */
   timeoutMs?: number
+  /** 工具使用手册：运行时由 buildToolGuidePrompt 拼装进系统提示词的「工具使用手册」块。
+   *  缺省时该工具仅靠 description（通过 function schema 传给模型），不生成手册条目。 */
+  guide?: ToolGuide
   /** 动态风险解析：统一入口工具（如 skill_run）按 args 决定审批粒度（action 级）。
    *  返回 undefined 则回退到静态 riskLevel / approvalRequired。
    *  outsideWorkdir：本次操作是否访问工作目录之外（供「工作目录内免审批」安全模式按范围决定是否弹窗）。 */
@@ -246,28 +263,43 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
     return undefined
   }
 
-  /** read_file 默认分段读取行数：未指定 endLine 时每次默认读取 200 行，避免大文件一次返回全文撑爆上下文 */
+  /** read_file 默认分段读取行数（最小/默认粒度）：未指定 endLine 时每次默认读取 200 行，避免大文件一次返回全文撑爆上下文 */
   const READ_FILE_DEFAULT_LINES = 200
+  /** read_file 单次读取最大行数上限：超出自动截断并提示，避免一次读取过多撑爆上下文 */
+  const READ_FILE_MAX_LINES = 1000
 
-  /** read_file：读取文件内容（相对路径解析到工作目录，默认分段读取，每段至少 200 行，避免大文件一次返回全文） */
+  /** read_file：读取文件内容（相对路径解析到工作目录，默认分段读取：最少 200 行、单次最多 1000 行，避免大文件一次返回全文撑爆上下文） */
   const readFileTool: ToolContract = {
     name: 'read_file',
     description:
       '读取指定路径的文本文件内容。当需要查看文件内容时使用。' +
       'path 可以是绝对路径，也可以是相对于当前工作目录的相对路径（优先使用相对路径，保持操作范围在工作目录内）。' +
-      '默认分段读取：未指定行号时只读取前 200 行（文件不足 200 行则读全文），截断时会提示总行数与继续读取的 startLine。' +
-      '可用 startLine / endLine 按行范围分段读取（1-based、包含两端），避免一次读取全文导致上下文过长。',
+      '按行分段读取：未指定行号时每次最少读取 200 行（文件不足 200 行则读全文），单次最多读取 1000 行，截断时会提示总行数与继续读取的 startLine。' +
+      '可用 startLine / endLine 精确指定行范围（1-based、包含两端），范围超过单次上限 1000 行时自动截断并提示。',
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: '文件路径（绝对路径，或相对当前工作目录的相对路径）' },
         startLine: { type: 'number', description: '起始行号（1-based，包含，可选；不传默认从第 1 行开始）' },
-        endLine: { type: 'number', description: '结束行号（1-based，包含，可选；不传默认读取 200 行）' },
+        endLine: { type: 'number', description: '结束行号（1-based，包含，可选；不传默认读取 200 行；单次最多读取 1000 行，超出自动截断）' },
       },
       required: ['path'],
     },
     riskLevel: 'readonly',
     resolveRisk: readonlyPathResolveRisk,
+    guide: {
+      usage: [
+        '读取策略按文件大小智能选择：小文件（<500 行）直接全文读取，不指定 startLine/endLine；大文件（>=500 行）按行范围读取，每次至少读取 1000 行。',
+        '禁止 200-300 行的小块连续读取；需要读取大文件的多个区段时，合并为单次大范围读取（如 startLine=1, endLine=2000），而非多次小范围调用。',
+        '需要全局理解文件结构、查找跨区段引用、或文件被用户手动附加时，优先全文读取。',
+        '仅当明确知道目标代码所在行号范围（如修改某个具体函数）时，才使用精确的行范围读取。',
+      ],
+      cautions: [
+        '小文件禁止分块读取，直接全文读取更高效。',
+        '大文件读取时单次范围过小会导致多次往返调用，显著降低效率。',
+        '工作空间外文件读取属于高风险动作，必须等待用户授权确认后才能继续。',
+      ],
+    },
     execute: async (args) => {
       if (typeof args.path !== 'string' || args.path.trim() === '') {
         throw new Error('read_file 缺少 path 参数：请提供要读取的文件路径（相对或绝对路径）')
@@ -278,14 +310,19 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
       const total = lines.length
       const startLine = toLineNumber(args.startLine)
       const endLine = toLineNumber(args.endLine)
-      // 明确指定 endLine → 按精确范围读取（用户明确知道要读哪些行，不加截断提示）
+      // 明确指定 endLine → 按精确范围读取，但单次最多读取 1000 行（超出截断并提示继续）
       if (endLine !== undefined) {
         const start = Math.max(1, Math.floor(startLine ?? 1))
-        const end = Math.floor(endLine)
-        if (start > end) {
-          throw new Error(`read_file 行范围非法：startLine=${start} 大于 endLine=${end}`)
+        const requestedEnd = Math.floor(endLine)
+        if (start > requestedEnd) {
+          throw new Error(`read_file 行范围非法：startLine=${start} 大于 endLine=${requestedEnd}`)
         }
-        return lines.slice(start - 1, end).join('\n')
+        const end = Math.min(requestedEnd, start + READ_FILE_MAX_LINES - 1)
+        const content = lines.slice(start - 1, end).join('\n')
+        if (end < requestedEnd) {
+          return `${content}\n\n（单次最多读取 ${READ_FILE_MAX_LINES} 行，本次读取 ${start}-${end} 行，剩余 ${requestedEnd - end} 行未读。请用 startLine=${end + 1} 继续分段读取。）`
+        }
+        return content
       }
       // 未指定 endLine → 默认分段读取 200 行（不足则到文件末尾），截断时提示继续读取
       const start = Math.max(1, Math.floor(startLine ?? 1))
@@ -319,6 +356,17 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
     riskLevel: 'reversible',
     approvalRequired: true,
     resolveRisk: fileWriteScopeRisk,
+    guide: {
+      usage: [
+        '仅在需要重写整个文件时使用；局部变更优先用 edit_file（token 开销小）。',
+        '写入前先 read_file 确认目标文件当前结构，避免覆盖无关内容。',
+        '写入后回读关键片段验证落盘结果。',
+      ],
+      cautions: [
+        '严禁在未确认路径和内容时覆盖核心文件。',
+        '内容过大时不要一次性 write_file 重写整个大文件，优先 edit_file 局部改动。',
+      ],
+    },
     execute: async (args) => {
       if (typeof args.path !== 'string' || args.path.trim() === '') {
         throw new Error('write_file 缺少 path 参数：请提供要写入的文件路径（相对或绝对路径）')
@@ -368,6 +416,17 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
     riskLevel: 'reversible',
     approvalRequired: true,
     resolveRisk: fileWriteScopeRisk,
+    guide: {
+      usage: [
+        '先 read_file 定位并确认 oldText 与上下文完全一致后再替换。',
+        '默认只替换首个命中；多处命中场景需显式设置 replaceAll=true 或 expectedOccurrences。',
+        '替换后再次 read_file 校验函数/变量/语法是否保持正确。',
+      ],
+      cautions: [
+        '避免使用过短 oldText，防止误改到非目标位置。',
+        'oldText 未命中会直接报错，替换前务必用 read_file 拿到文件的真实当前内容（含空格/缩进/换行）。',
+      ],
+    },
     execute: async (args) => {
       if (typeof args.path !== 'string' || args.path.trim() === '') {
         throw new Error('edit_file 缺少 path 参数：请提供要修改的文件路径（相对或绝对路径）')
@@ -434,6 +493,19 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
       const cmd = typeof args.command === 'string' ? args.command : ''
       return { riskLevel: 'irreversible', approvalRequired: true, outsideWorkdir: commandLooksOutsideWorkdir(cmd) }
     },
+    guide: {
+      usage: [
+        '用于构建、测试、运行和验证真实结果，优先执行最小必要命令。',
+        '明确设置 cwd 到目标项目目录（run_command 参数无 cwd 时默认当前工作目录），避免在错误目录执行。',
+        '代码搜索默认优先使用 grep（grep -rn "关键字" 递归搜索并显示行号），而非逐文件 read_file。',
+        '搜索不到时拆分关键词、扩大搜索范围再试，最后才 read_file 整文件。',
+      ],
+      cautions: [
+        '命令失败时返回关键 stdout/stderr，并给出下一步处理动作。',
+        '未获用户明确授权时，禁止执行高风险破坏性命令（rm -rf、sudo 等）。',
+        '命令可能永久卡死时避免使用交互式命令，优先用非交互方式或加超时。',
+      ],
+    },
     execute: async (args) => {
       if (typeof args.command !== 'string' || args.command.trim() === '') {
         throw new Error('run_command 缺少 command 参数：请提供要执行的 shell 命令')
@@ -463,6 +535,16 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
     },
     riskLevel: 'readonly',
     resolveRisk: readonlyPathResolveRisk,
+    guide: {
+      usage: [
+        '用于快速理解目录结构，优先以较小 maxDepth 查看骨架，再决定深入哪一层。',
+        '定位目标后配合 read_file 深入读取具体文件；内容搜索统一优先 run_command + grep。',
+      ],
+      cautions: [
+        '避免反复列举深层大目录，噪声大且费 token；先 list_dir 看骨架、再用 read_file 精读目标文件。',
+        '默认跳过隐藏文件、node_modules、dist，找不到目标时用 run_command + grep 按文件名/内容搜索。',
+      ],
+    },
     execute: async (args) => {
       const raw = args.path ? String(args.path) : ''
       const dir = raw ? resolvePath(raw) : getCwd()
@@ -472,4 +554,28 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
   }
 
   return [readFileTool, writeFileTool, editFileTool, runCommandTool, listDirTool]
+}
+
+/**
+ * 拼装工具使用手册块：把每个工具就近维护的 guide（usage / cautions）组合成结构化提示词。
+ *
+ * 只输出「带 guide 且至少有 usage 或 cautions 之一」的工具——description 已通过 function schema
+ * 传给模型（见 @shanhai/llm 的 serializeTools），这里只补 schema 表达不了的「用法 / 协作顺序 / 陷阱」，
+ * 避免在系统提示词里重复 description 白白烧 token。
+ * 返回空字符串表示没有任何工具带手册，调用方据此跳过该块。
+ */
+export function buildToolGuidePrompt(tools: ToolContract[]): string {
+  const blocks: string[] = ['## 工具清单（每个工具都要遵守对应规范）']
+  for (const t of tools) {
+    const g = t.guide
+    if (!g) continue
+    const usage = g.usage && g.usage.length > 0 ? g.usage.map((u, i) => `${i + 1}. ${u}`).join('\n') : undefined
+    const cautions = g.cautions && g.cautions.length > 0 ? g.cautions.map((c) => `- ${c}`).join('\n') : undefined
+    if (!usage && !cautions) continue
+    const lines = [`### ${t.name}`]
+    if (usage) lines.push('使用规则：', usage)
+    if (cautions) lines.push('注意事项：', cautions)
+    blocks.push(lines.join('\n'))
+  }
+  return blocks.length > 0 ? blocks.join('\n') : ''
 }

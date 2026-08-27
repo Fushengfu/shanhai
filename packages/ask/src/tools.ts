@@ -32,6 +32,18 @@ function askUserTool(service: AskService, getSessionId: () => string): ToolContr
       required: ['question'],
     },
     riskLevel: 'readonly',
+    guide: {
+      usage: [
+        '只在「执行任务过程中」确实需要用户做关键决策时才用（如多个方案需用户选定、缺关键参数/凭证/路径无法继续、需用户确认是否继续）。',
+        '纯分析/排查/问答类问题一律直接给结论，不弹窗提问。',
+        '提问必须自包含：写清「当前在做什么/背景 + 为什么需要用户决定 + 具体要选什么」，每个选项写清「是什么 + 选它的后果」。',
+        '调用后必须等待用户回答，再基于回答继续执行。',
+      ],
+      cautions: [
+        '禁止只给一句空问句配几个孤零零的名词选项。',
+        '用户取消回答时返回错误，不要当作答案继续。',
+      ],
+    },
     // 等用户回答：不设超时（用户思考/离开多久由用户决定，不该被 5 分钟统一兜底打断）
     timeoutMs: Infinity,
     execute: async (args) => {

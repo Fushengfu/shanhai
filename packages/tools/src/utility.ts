@@ -40,6 +40,15 @@ function imageAnalyzeTool(analyzeImage: (imageUrl: string) => Promise<string>): 
       required: ['imageUrl'],
     },
     riskLevel: 'readonly',
+    guide: {
+      usage: [
+        '当需要理解图片内容、但当前模型无法直接查看图片（无视觉能力）时使用，传入图片 URL 或 data: URL。',
+        '当前模型支持视觉时不要用此工具，直接把图片作为多模态附件发给模型即可。',
+      ],
+      cautions: [
+        '只接受 URL / data: URL，不接受本地文件路径。',
+      ],
+    },
     execute: async (args) => {
       const imageUrl = String(args.imageUrl ?? '')
       if (!imageUrl) return '（未提供图片）'
@@ -64,6 +73,15 @@ function rollbackFileTool(rollbackFile: (path: string, snapshotId: string) => Pr
       required: ['path', 'snapshotId'],
     },
     riskLevel: 'reversible',
+    guide: {
+      usage: [
+        '撤销最近一次 write_file / edit_file 对文件的写入，恢复到写入前的快照状态。',
+        'snapshotId 从 write_file 返回结果的 snapshotId 字段取。',
+      ],
+      cautions: [
+        '只在确实需要撤销时用；快照不存在或已过期时回滚会失败。',
+      ],
+    },
     execute: async (args) => {
       const path = String(args.path ?? '')
       const snapshotId = String(args.snapshotId ?? '')
@@ -92,6 +110,15 @@ function rememberTool(memory: NonNullable<UtilityDeps['memory']>): ToolContract 
       required: ['scope', 'key', 'value'],
     },
     riskLevel: 'readonly',
+    guide: {
+      usage: [
+        '当用户表达稳定偏好、项目背景、环境约定或可复用的任务经验时，主动保存为长期记忆（跨会话生效）。',
+        'scope 选 user_preference（用户偏好）/ project_knowledge（项目知识）/ environment（环境约定）/ task_experience（任务经验）。',
+      ],
+      cautions: [
+        '不要滥用：只记录真正稳定、跨会话有价值的信息，一次性临时信息不要记。',
+      ],
+    },
     execute: async (args) => {
       const scope = String(args.scope ?? '')
       const key = String(args.key ?? '')
@@ -116,6 +143,14 @@ function recallMemoryTool(memory: NonNullable<UtilityDeps['memory']>): ToolContr
       },
     },
     riskLevel: 'readonly',
+    guide: {
+      usage: [
+        '需要回忆之前是否处理过类似问题、查找历史约定/偏好时，按 scope + 关键词召回长期记忆。',
+      ],
+      cautions: [
+        '纯关键词匹配，一次先用一个精准 keyword 试，不要连续多次调用。',
+      ],
+    },
     execute: async (args) => {
       const scope = args.scope ? String(args.scope) : undefined
       const keyword = args.keyword ? String(args.keyword) : undefined

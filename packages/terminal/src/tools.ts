@@ -34,6 +34,16 @@ function createTool(service: TerminalService): ToolContract {
       },
     },
     riskLevel: 'readonly',
+    guide: {
+      usage: [
+        '需要连续执行多步命令、跑长任务、或保持命令间状态（cd/export/后台进程）时创建持久终端。',
+        '一次性简单命令（ls、cat、grep）仍用 run_command，不要为单次命令创建终端。',
+        '建议传 name 标注用途（如「前端服务」「后端构建」）。',
+      ],
+      cautions: [
+        '终端是系统资源，不再需要时用 terminal_close 清理。',
+      ],
+    },
     execute: async (args) => {
       const terminalId = await service.create(
         typeof args.terminalId === 'string' && args.terminalId ? args.terminalId : undefined,
@@ -60,6 +70,17 @@ function runTool(service: TerminalService): ToolContract {
       required: ['command'],
     },
     riskLevel: 'reversible',
+    guide: {
+      usage: [
+        '在持久终端中执行命令，cd/export 等状态会保留到后续命令。',
+        '命令执行完成后返回完整输出（已去掉 ANSI 转义码和提示符）。',
+        '需要观察长任务进度时反复调用并只观察最近输出。',
+      ],
+      cautions: [
+        '禁止在终端中执行交互式命令（如需要用户输入确认的命令），会卡住直到超时。',
+        '如果命令长时间无输出，检查是否卡在交互提示上。',
+      ],
+    },
     execute: async (args) => {
       const command = String(args.command ?? '')
       if (!command) throw new Error('terminal_run 需要 command 参数')
@@ -80,6 +101,11 @@ function listTool(service: TerminalService): ToolContract {
     description: '列出当前活跃的终端会话（terminalId / 用途 / 当前目录）。多终端操作前先调用它确认目标终端。',
     inputSchema: { type: 'object', properties: {} },
     riskLevel: 'readonly',
+    guide: {
+      usage: [
+        '多终端操作前先调用它列出当前终端（terminalId/用途/当前目录），确认目标终端。',
+      ],
+    },
     execute: async () => {
       const terminals = await service.list()
       return { terminals }
@@ -94,6 +120,15 @@ function closeTool(service: TerminalService): ToolContract {
     description: '关闭指定终端会话，释放资源（含其中启动的后台进程）。不再需要该终端时调用。',
     inputSchema: { type: 'object', properties: { ...terminalIdProp } },
     riskLevel: 'reversible',
+    guide: {
+      usage: [
+        '关闭并销毁指定终端，释放 PTY 进程和内存。',
+      ],
+      cautions: [
+        '关闭终端后其中启动的后台进程（如开发服务器）也会被终止。',
+        '临时任务终端任务完成后立即关闭；开发服务器等长期任务可保留。',
+      ],
+    },
     execute: async (args) => {
       await service.close(typeof args.terminalId === 'string' ? args.terminalId : undefined)
       return { ok: true }

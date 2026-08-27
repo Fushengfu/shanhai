@@ -175,6 +175,15 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
         required: ['question'],
       },
       riskLevel: 'readonly',
+      guide: {
+        usage: [
+          '当用户要下发任务/切换模型/配置/删除某个会话，但没有明确说是哪个会话时，必须调用本工具弹出会话选择器让用户选，禁止用文本反问。',
+          '仅在能通过 list_sessions 唯一确定目标时跳过；目标不明确时才用。',
+        ],
+        cautions: [
+          '用户取消选择时返回失败，不要继续用猜测的会话。',
+        ],
+      },
       // 等用户选择：不设超时（用户思考/离开多久由用户决定，不该被 5 分钟统一兜底打断）
       timeoutMs: Infinity,
       execute: async (args) => {
@@ -197,6 +206,15 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
         required: ['question'],
       },
       riskLevel: 'readonly',
+      guide: {
+        usage: [
+          '当用户要切换某个会话的模型，但没有明确说是哪个模型时，必须调用本工具弹出模型选择器让用户选，禁止用文本反问。',
+          '仅在能通过 list_models 唯一确定目标时跳过；目标不明确时才用。',
+        ],
+        cautions: [
+          '用户取消选择时返回失败，不要继续用猜测的模型。',
+        ],
+      },
       // 等用户选择：不设超时（用户思考/离开多久由用户决定，不该被 5 分钟统一兜底打断）
       timeoutMs: Infinity,
       execute: async (args) => {
@@ -221,6 +239,15 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
         required: ['sessionId', 'content'],
       },
       riskLevel: 'reversible',
+      guide: {
+        usage: [
+          '向指定会话转发消息（等同用户手动切过去发消息），用原样完整转发，不删减、不代办、不合并。',
+          'sessionId 来自 list_sessions；多需求时明确的先下发、不明确的单独求助。',
+        ],
+        cautions: [
+          '管家只负责调度转发，不替目标会话执行具体的编码/文件任务。',
+        ],
+      },
       execute: async (args) => {
         const sid = String(args.sessionId ?? '')
         const content = String(args.content ?? '')
@@ -280,6 +307,16 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
         required: ['sessionId', 'policy'],
       },
       riskLevel: 'reversible',
+      guide: {
+        usage: [
+          '用户希望某会话自动执行、不要每次危险操作都弹审批时，用本工具把该会话安全模式设为 never（全自动）或 workdir（工作目录内免审批）。',
+          '设置前说明目标会话与模式及后果；设置后该模式持久化到该会话，后续危险操作按新模式判断是否审批。',
+        ],
+        cautions: [
+          '用户没有明确要求时不要擅自把会话改成 never（全自动执行）。',
+          'policy 只能取 ask/workdir/never，其它值会报错。',
+        ],
+      },
       execute: async (args) => {
         const policy = String(args.policy ?? '') as ApprovalPolicy
         if (policy !== 'ask' && policy !== 'workdir' && policy !== 'never') {
@@ -356,6 +393,14 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
         required: ['sessionId'],
       },
       riskLevel: 'irreversible',
+      guide: {
+        usage: [
+          '删除会话是危险且不可恢复的操作，执行前必须向用户复述目标会话 id 与标题，得到明确确认后才能删除。',
+        ],
+        cautions: [
+          '会话管家自己的会话不可删除。',
+        ],
+      },
       execute: async (args) => ctx.deleteSession(String(args.sessionId ?? '')),
     },
     {

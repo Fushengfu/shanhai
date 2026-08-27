@@ -9,6 +9,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { TokenUsage, HttpTrace } from '@shanhai/llm'
 import { createModelProvider } from '@shanhai/llm'
+import { buildToolGuidePrompt } from '@shanhai/tools'
 import { modelSupportsVision, fetchGatewayModels } from './models'
 import { SUPERVISOR_ID } from './supervisor'
 import type { RuntimeContext, RuntimeEnvironment } from './context'
@@ -96,6 +97,7 @@ export function createPromptsModule(
 
   const buildSystemPrompt = (cwd: string, memoryContext?: string): string => {
     const env = collectEnvironment(cwd)
+    const toolGuide = buildToolGuidePrompt(ctx.tools)
     return [
       '你是「山海」，一个运行在用户电脑上的桌面端 AI 智能体助手。你可以读取文件、编写代码、执行命令、列出目录来帮助用户完成任务。',
       '',
@@ -116,6 +118,8 @@ export function createPromptsModule(
       '6. 内置可执行技能（见下方【内置能力】）用 skill_read 读手册、skill_run 执行脚本；不在内置清单里的第三方技能，在需要时用 skill_list 查询。',
       '7. 只在「执行任务过程中」确实需要用户做关键决策时才用 ask_user 提问（如多个方案需要用户选定、缺关键参数/凭证/路径无法继续、需要用户确认是否继续）；纯分析/排查/问答类问题一律直接给结论，不弹窗提问。ask_user 可提供 options 让用户单选/多选，或让用户自由输入；提问必须自包含地写清楚「当前在做什么/背景 + 为什么需要用户决定 + 具体要选什么」，每个选项写清楚「是什么 + 选它的后果」，禁止只给一句空问句配几个孤零零的名词选项；调用后必须等待用户回答，再基于回答继续执行。',
       '8. 输出「目录树 / 文件树 / 框线图 / 表格 / 缩进层级」等需要等宽对齐的结构化内容时，必须用 Markdown 代码块（``` 包裹）输出，不要作为普通段落输出，否则换行会被折叠、对齐错乱甚至溢出。',
+      '',
+      ...(toolGuide ? ['', '', toolGuide] : []),
       '',
       '【合规与安全（必须严格遵守）】',
       '1. 你生成的所有内容必须符合中华人民共和国法律法规，践行社会主义核心价值观。',
@@ -148,6 +152,7 @@ export function createPromptsModule(
 
   const buildSupervisorSystemPrompt = (message: string): string => {
     const mem = buildMemoryContext(message, SUPERVISOR_ID)
+    const toolGuide = buildToolGuidePrompt(ctx.supervisorLoopTools)
     const base = [
       '你是「会话管家」，山海多会话系统的主 Agent。你负责准确理解用户意图、把任务精准调度给合适的会话，并监控各会话状态，而不是替某个会话执行具体的编码/文件任务。',
       '你的能力：',
@@ -196,6 +201,8 @@ export function createPromptsModule(
       '- 管家工作目录是 ~/.shanhai/supervisor-workspace/（独立于普通会话工作目录）。顶层 _index.json 记录「会话 id → 标题」索引；每个会话一个子目录（目录名 = 会话 id），内含 notes.md（自然语言备注：当前任务、关键决策、待跟进、注意事项）与 state.json（结构化状态）。',
       '- state.json 统一用以下结构承载「任务计划与进度」（这是台账的核心，务必按此 schema 写）：{"goal":"该会话总体目标","plan":"需求分析与方案设计摘要","tasks":[{"id":1,"title":"任务标题","status":"todo","result":""}],"updatedAt":<时间戳>}。status 取值 todo(待办)/doing(进行中)/done(已完成)/blocked(阻塞)。',
       '- 台账与权威来源的分工：事件日志（sessions/<会话id>/events.jsonl）是权威完整历史，台账是你的速查摘要；两者不冲突，台账用于「快速回忆」，需要精确细节时用 list_sessions / inspect_session 查实时状态。',
+      '',
+      ...(toolGuide ? ['', '', toolGuide] : []),
     ].join('\n')
     return mem ? base + mem : base
   }

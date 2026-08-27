@@ -26,6 +26,16 @@ function mcpListToolsTool(service: McpService): ToolContract {
       },
     },
     riskLevel: 'readonly',
+    guide: {
+      usage: [
+        '需要了解有哪些外部能力（经 MCP 协议接入的工具）可用时调用。',
+        '不传 serverId 返回全部服务器；传 serverId 只返回该服务器的工具清单。',
+        '调用任何 MCP 工具前必须先调用此工具确认可用工具及参数 schema。',
+      ],
+      cautions: [
+        '禁止跳过 mcp_list_tools 直接 mcp_call。',
+      ],
+    },
     execute: async (args) => {
       const serverId = args.serverId ? String(args.serverId).trim() : undefined
       if (serverId) {
@@ -57,6 +67,17 @@ function mcpCallTool(service: McpService): ToolContract {
     },
     riskLevel: 'irreversible',
     approvalRequired: true,
+    guide: {
+      usage: [
+        '必须在 mcp_list_tools 之后调用，严格按返回的 inputSchema 组装 arguments。',
+        'serverId 与 toolName 从 mcp_list_tools 返回的清单里取。',
+        'arguments 字段类型必须与 inputSchema 一致，不允许猜字段名。',
+      ],
+      cautions: [
+        '调用失败先检查 schema、参数和值类型，再决定是否重试。',
+        'MCP 返回的是外部能力结果，必须结合当前任务目标再做判断，不可机械转述。',
+      ],
+    },
     execute: async (args) => {
       const serverId = String(args.serverId ?? '').trim()
       const toolName = String(args.toolName ?? '').trim()

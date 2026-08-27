@@ -130,6 +130,22 @@ describe('原子工具', () => {
     await fs.rm(dir, { recursive: true, force: true })
   })
 
+  it('read_file 单次最多读取 1000 行（超出自动截断并提示）', async () => {
+    const dir = join('/tmp', `shanhai-tools-${Date.now()}`)
+    await fs.mkdir(dir, { recursive: true })
+    const bigLines = Array.from({ length: 1500 }, (_, i) => `line${i + 1}`)
+    await fs.writeFile(join(dir, 'huge.txt'), bigLines.join('\n'))
+    const readFileTool = createAtomicTools(() => dir).find((t) => t.name === 'read_file')!
+    // 明确指定 endLine=1500 → 单次上限 1000 行，截断并提示继续
+    const sliced = (await readFileTool.execute({ path: 'huge.txt', startLine: 1, endLine: 1500 })) as string
+    expect(sliced).toContain('line1')
+    expect(sliced).toContain('line1000')
+    expect(sliced).not.toContain('line1001')
+    expect(sliced).toContain('单次最多读取 1000 行')
+    expect(sliced).toContain('startLine=1001')
+    await fs.rm(dir, { recursive: true, force: true })
+  })
+
   it('edit_file 精确替换（唯一命中）', async () => {
     const dir = join('/tmp', `shanhai-tools-${Date.now()}`)
     await fs.mkdir(dir, { recursive: true })
