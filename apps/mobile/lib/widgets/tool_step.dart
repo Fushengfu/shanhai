@@ -54,6 +54,9 @@ const Map<String, String> _toolNameMap = {
   'plugin_run': '运行动态包',
   'plugin_stop': '停止动态包',
   'plugin_undefine': '删除动态包',
+  'plugin_test': '测试动态包',
+  'plugin_install': '安装动态包',
+  'plugin_uninstall': '卸载动态包',
   'list_sessions': '查看会话列表',
   'inspect_session': '查看会话详情',
   'list_models': '查看可用模型',
@@ -69,6 +72,20 @@ const Map<String, String> _toolNameMap = {
   'choose_session': '选择会话',
   'choose_model': '选择模型',
   'ask_user': '向用户提问',
+  'mcp_list_tools': '查看 MCP 工具',
+  'mcp_call': '调用 MCP 工具',
+  'skill_list': '查看技能列表',
+  'skill_read': '查看技能详情',
+  'terminal_create': '创建终端',
+  'terminal_run': '终端执行命令',
+  'terminal_list': '列出终端',
+  'terminal_close': '关闭终端',
+  'list_ledger': '查看台账目录',
+  'read_ledger': '读取台账',
+  'write_ledger': '写入台账',
+  'edit_ledger': '编辑台账',
+  'answer_ask': '代答提问',
+  'resolve_approval': '决策审批',
 };
 
 /// skill_run 的 skillId:action → 中文显示名
@@ -132,7 +149,30 @@ IconData _toolIcon(String name) {
     case 'plugin_run':
     case 'plugin_stop':
     case 'plugin_undefine':
+    case 'plugin_test':
+    case 'plugin_install':
+    case 'plugin_uninstall':
       return Icons.code;
+    case 'mcp_list_tools':
+    case 'mcp_call':
+      return Icons.hub_outlined;
+    case 'skill_list':
+    case 'skill_read':
+      return Icons.auto_awesome_outlined;
+    case 'terminal_create':
+    case 'terminal_run':
+    case 'terminal_list':
+    case 'terminal_close':
+      return Icons.terminal;
+    case 'list_ledger':
+    case 'read_ledger':
+    case 'write_ledger':
+    case 'edit_ledger':
+      return Icons.book_outlined;
+    case 'answer_ask':
+      return Icons.question_answer_outlined;
+    case 'resolve_approval':
+      return Icons.fact_check_outlined;
     case 'list_sessions':
     case 'inspect_session':
       return Icons.people_outline;

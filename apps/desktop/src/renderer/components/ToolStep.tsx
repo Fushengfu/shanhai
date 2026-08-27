@@ -44,6 +44,9 @@ export const TOOL_META: Record<string, { title: string; icon: React.ReactNode }>
   plugin_run: { title: '运行动态包', icon: <IconCode /> },
   plugin_stop: { title: '停止动态包', icon: <IconCode /> },
   plugin_undefine: { title: '删除动态包', icon: <IconCode /> },
+  plugin_test: { title: '测试动态包', icon: <IconCode /> },
+  plugin_install: { title: '安装动态包', icon: <IconCode /> },
+  plugin_uninstall: { title: '卸载动态包', icon: <IconCode /> },
   // 会话管家（主 Agent）专属工具：用于审批弹窗展示可读名称，避免暴露英文原始名
   list_sessions: { title: '查看会话列表', icon: <IconUsers /> },
   inspect_session: { title: '查看会话详情', icon: <IconUsers /> },
@@ -56,6 +59,20 @@ export const TOOL_META: Record<string, { title: string; icon: React.ReactNode }>
   create_session: { title: '新建会话', icon: <IconPlus /> },
   rename_session: { title: '重命名会话', icon: <IconEdit /> },
   delete_session: { title: '删除会话', icon: <IconTrash /> },
+  mcp_list_tools: { title: '查看 MCP 工具', icon: <IconWrench /> },
+  mcp_call: { title: '调用 MCP 工具', icon: <IconWrench /> },
+  skill_list: { title: '查看技能列表', icon: <IconWrench /> },
+  skill_read: { title: '查看技能详情', icon: <IconWrench /> },
+  terminal_create: { title: '创建终端', icon: <IconTerminal /> },
+  terminal_run: { title: '终端执行命令', icon: <IconTerminal /> },
+  terminal_list: { title: '列出终端', icon: <IconTerminal /> },
+  terminal_close: { title: '关闭终端', icon: <IconTerminal /> },
+  list_ledger: { title: '查看台账目录', icon: <IconFile /> },
+  read_ledger: { title: '读取台账', icon: <IconFile /> },
+  write_ledger: { title: '写入台账', icon: <IconFile /> },
+  edit_ledger: { title: '编辑台账', icon: <IconFile /> },
+  answer_ask: { title: '代答提问', icon: <IconSend /> },
+  resolve_approval: { title: '决策审批', icon: <IconShield /> },
 }
 
 /** skill_run（可执行技能统一入口）的 skillId + action → 中文标题 + 图标 */
