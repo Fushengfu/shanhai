@@ -113,7 +113,7 @@ export interface RuntimeContext {
   // —— 工具过程 + 审批桥 ——
   toolTraceCallbacks: Set<(trace: ToolTrace) => void>
   approvalCallbacks: Set<(req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }) => void>
-  pendingApprovals: Map<string, { resolve: (outcome: ApprovalOutcome) => void; sessionId?: string }>
+  pendingApprovals: Map<string, { resolve: (outcome: ApprovalOutcome) => void; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }>
   approvalResolvedCallbacks: Set<(requestId: string) => void>
   askResolvedCallbacks: Set<(requestId: string) => void>
   approval: ApprovalService

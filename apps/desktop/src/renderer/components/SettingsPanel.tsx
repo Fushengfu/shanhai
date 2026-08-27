@@ -161,9 +161,8 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
   const [dsbMsg, setDsbMsg] = useState('')
   const [dsbMsgOk, setDsbMsgOk] = useState(true)
   const [remote, setRemote] = useState<RemoteStatus | null>(null)
-  const [remoteBusy, setRemoteBusy] = useState(false)
+  const [refreshBusy, setRefreshBusy] = useState(false)
   const [relay, setRelay] = useState<RelayStatus | null>(null)
-  const [relayBusy, setRelayBusy] = useState(false)
   const [version, setVersion] = useState('')
   const [updateStatus, setUpdateStatus] = useState<AppUpdateCheckResult | null>(null)
   const [updateChecking, setUpdateChecking] = useState(false)
@@ -190,17 +189,17 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
       .catch(() => undefined)
   }, [])
 
-  const toggleRemote = useCallback(async () => {
-    setRemoteBusy(true)
+  const refreshRemoteCode = useCallback(async () => {
+    setRefreshBusy(true)
     try {
-      const s = remote?.enabled ? await window.shanhai?.remoteDisable() : await window.shanhai?.remoteEnable()
+      const s = await window.shanhai?.refreshRemoteCode()
       if (s) setRemote(s)
     } catch (e) {
-      console.error('[remote] 切换远程连接失败:', e)
+      console.error('[remote] 刷新配对码失败:', e)
     } finally {
-      setRemoteBusy(false)
+      setRefreshBusy(false)
     }
-  }, [remote?.enabled])
+  }, [])
 
   const loadRelay = useCallback(() => {
     void window.shanhai
@@ -210,18 +209,6 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
       })
       .catch(() => undefined)
   }, [])
-
-  const toggleRelay = useCallback(async () => {
-    setRelayBusy(true)
-    try {
-      const s = relay?.enabled ? await window.shanhai?.relayDisable() : await window.shanhai?.relayEnable()
-      if (s) setRelay(s)
-    } catch (e) {
-      console.error('[relay] 切换网关中继失败:', e)
-    } finally {
-      setRelayBusy(false)
-    }
-  }, [relay?.enabled])
 
   const openDsb = useCallback(async () => {
     setDsbBusy(true)
@@ -525,14 +512,12 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
               {activeSection === 'connection' && (
                 <>
                   <SectionTitle first>局域网远程</SectionTitle>
-                  <ToggleRow
-                    label="开启手机端远程控制"
-                    description="开启后，桌面端在本机局域网起一个配对码鉴权的 WebSocket 服务，手机 App 连同一 WiFi、输入配对码即可远程查看/控制会话。数据不出局域网。"
-                    checked={!!remote?.enabled}
-                    onChange={() => {
-                      if (!remoteBusy) void toggleRemote()
-                    }}
-                  />
+                  <div style={{ padding: '12px 0', borderBottom: '1px solid var(--border)' }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>手机端局域网直连</div>
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.5 }}>
+                      登录后自动开启：桌面端在本机局域网起一个配对码鉴权的 WebSocket 服务，手机 App 连同一 WiFi、输入配对码即可远程查看/控制会话。数据不出局域网。
+                    </div>
+                  </div>
                   {remote?.enabled ? (
                     <div style={{ padding: '8px 0', fontSize: 12, lineHeight: 1.9, color: 'var(--text-secondary)' }}>
                       <div>
@@ -543,17 +528,26 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                       </div>
                       <div style={{ color: 'var(--text-muted)' }}>已连接设备：{remote.pairedClients} 台（配对码 5 分钟内有效）</div>
                       <div style={{ color: 'var(--text-faint)' }}>在手机 App 里输入上述地址和配对码即可连接。</div>
+                      <button
+                        onClick={() => {
+                          if (!refreshBusy) void refreshRemoteCode()
+                        }}
+                        disabled={refreshBusy}
+                        style={{ ...smallIconBtn, marginTop: 8, padding: '4px 12px', fontSize: 12 }}
+                      >
+                        {refreshBusy ? '刷新中…' : '刷新配对码'}
+                      </button>
                     </div>
-                  ) : null}
+                  ) : (
+                    <div style={{ padding: '8px 0', fontSize: 12, color: 'var(--text-muted)' }}>未开启（登录后自动开启）</div>
+                  )}
                   <SectionTitle>网关中继（外网）</SectionTitle>
-                  <ToggleRow
-                    label="开启网关中继（外网可访问）"
-                    description="开启后，桌面端作为 Host 连网关中继服务，手机 App 用同一会员账号登录即可在外网远程查看/控制会话（无需同一 WiFi）。需先登录会员账号。"
-                    checked={!!relay?.enabled}
-                    onChange={() => {
-                      if (!relayBusy) void toggleRelay()
-                    }}
-                  />
+                  <div style={{ padding: '12px 0', borderBottom: '1px solid var(--border)' }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>外网远程（网关中继）</div>
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.5 }}>
+                      登录后自动开启：桌面端作为 Host 连网关中继服务，手机 App 用同一会员账号登录即可在外网远程查看/控制会话（无需同一 WiFi）。
+                    </div>
+                  </div>
                   {relay?.enabled ? (
                     <div style={{ padding: '8px 0', fontSize: 12, lineHeight: 1.9, color: 'var(--text-secondary)' }}>
                       <div>
@@ -563,7 +557,9 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                       <div>已连接手机：{relay.clientCount} 台</div>
                       <div style={{ color: 'var(--text-faint)' }}>手机 App 用同一会员账号登录后即可自动配对连接，无需配对码。</div>
                     </div>
-                  ) : null}
+                  ) : (
+                    <div style={{ padding: '8px 0', fontSize: 12, color: 'var(--text-muted)' }}>未开启（登录后自动开启）</div>
+                  )}
                 </>
               )}
 

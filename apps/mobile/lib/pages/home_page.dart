@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import '../services/update_service.dart';
 import '../services/ws_client.dart';
 import '../widgets/device_picker.dart';
+import '../widgets/update_dialog.dart';
 import 'session_list_page.dart';
 import 'supervisor_page.dart';
 
@@ -18,6 +20,7 @@ class _HomePageState extends State<HomePage> {
   int _index = 0;
   bool _hostOffline = false;
   bool _switchingDevice = false;
+  bool _checkingUpdate = false;
   StreamSubscription<ServerEvent>? _eventSub;
 
   @override
@@ -33,6 +36,26 @@ class _HomePageState extends State<HomePage> {
         _showDevicePicker(e.payload['devices'] as List? ?? const []);
       }
     });
+    // 进入主页后静默检查一次版本更新（有更新才弹窗，无更新不打扰）
+    Future.microtask(() => _checkUpdate(silent: true));
+  }
+
+  /// 版本检查：silent=true 时无更新不提示；手动触发（按钮）时无论结果都给反馈。
+  Future<void> _checkUpdate({bool silent = false}) async {
+    if (_checkingUpdate) return;
+    _checkingUpdate = true;
+    final result = await UpdateService().check();
+    _checkingUpdate = false;
+    if (!mounted) return;
+
+    if (result.hasUpdate && result.update != null) {
+      await showUpdateDialog(context, result.update!);
+    } else if (!silent) {
+      final msg = result.error ?? '当前已是最新版本';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(msg, style: const TextStyle(fontSize: 13))),
+      );
+    }
   }
 
   /// 请求设备列表后弹出选择器，选中后切换连接目标设备
@@ -65,6 +88,11 @@ class _HomePageState extends State<HomePage> {
         foregroundColor: Colors.white,
         elevation: 0,
         actions: [
+          IconButton(
+            tooltip: '检查更新',
+            icon: const Icon(Icons.system_update_alt),
+            onPressed: () => _checkUpdate(silent: false),
+          ),
           IconButton(
             tooltip: '切换设备',
             icon: const Icon(Icons.devices_outlined),

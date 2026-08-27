@@ -442,40 +442,31 @@ export function SupervisorApp(): React.JSX.Element {
     void window.shanhai?.supervisorSetApproval(policy)
   }
 
-  /** 响应管家会话的审批请求：通知 runtime 后从 store 队列移除该请求（否则弹窗会一直显示） */
+  /** 响应管家会话的审批请求：通知 runtime 后由 onApprovalResolved 事件统一移除（否则弹窗会一直显示） */
   async function respondApproval(outcome: 'allowed-once' | 'rejected'): Promise<void> {
     const req = (getUiStoreSnapshot().approvalQueues[SUPERVISOR_SID] ?? [])[0]
     if (!req) return
     await window.shanhai?.respondApproval(outcome, req.id)
-    const prev = getUiStoreSnapshot().approvalQueues
-    const q = (prev[SUPERVISOR_SID] ?? []).slice(1)
-    const next = { ...prev }
-    next[SUPERVISOR_SID] = q
-    patchUiStore({ approvalQueues: next })
+    // 弹窗关闭由 runtime 的 onApprovalResolved 事件统一驱动（ui-store removeApprovalRequest），
+    // 此处不再手动 patchUiStore 移除，避免与 resolved 事件双重移除。
   }
 
-  /** 响应管家会话的 AI 提问：通知 runtime 后从 store 队列移除该提问 */
+  /** 响应管家会话的 AI 提问：通知 runtime 后由 onAskResolved 事件统一移除 */
   async function respondAsk(answer: string): Promise<void> {
     const req = (getUiStoreSnapshot().askQueues[SUPERVISOR_SID] ?? [])[0]
     if (!req) return
     await window.shanhai?.respondAsk(req.id, answer)
-    const prev = getUiStoreSnapshot().askQueues
-    const q = (prev[SUPERVISOR_SID] ?? []).slice(1)
-    const next = { ...prev }
-    next[SUPERVISOR_SID] = q
-    patchUiStore({ askQueues: next })
+    // 弹窗关闭由 runtime 的 onAskResolved 事件统一驱动（ui-store removeAskRequest），
+    // 此处不再手动 patchUiStore 移除，避免与 resolved 事件双重移除。
   }
 
-  /** 取消管家会话的 AI 提问/选择：通知 runtime 取消（resolve 为取消标记），再从 store 队列移除 */
+  /** 取消管家会话的 AI 提问/选择：通知 runtime 取消（resolve 为取消标记），由 onAskResolved 事件统一移除 */
   async function cancelAsk(): Promise<void> {
     const req = (getUiStoreSnapshot().askQueues[SUPERVISOR_SID] ?? [])[0]
     if (!req) return
     await window.shanhai?.cancelAsk(req.id)
-    const prev = getUiStoreSnapshot().askQueues
-    const q = (prev[SUPERVISOR_SID] ?? []).slice(1)
-    const next = { ...prev }
-    next[SUPERVISOR_SID] = q
-    patchUiStore({ askQueues: next })
+    // 弹窗关闭由 runtime 的 onAskResolved 事件统一驱动（ui-store removeAskRequest），
+    // 此处不再手动 patchUiStore 移除，避免与 resolved 事件双重移除。
   }
 
   function stopSend(): void {

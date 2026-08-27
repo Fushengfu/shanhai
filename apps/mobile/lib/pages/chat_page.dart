@@ -15,6 +15,7 @@ class ChatPage extends StatelessWidget {
       ws: ws,
       sessionId: session.id,
       title: session.title,
+      initialIncompleteTurn: session.hasIncompleteTurn,
       sendFn: (message) => ws.sendCommand('send_message', {'sessionId': session.id, 'message': message, 'mode': 'insert'}),
       loadHistoryFn: () async {
         final r = await ws.sendCommand('get_history', {'sessionId': session.id});

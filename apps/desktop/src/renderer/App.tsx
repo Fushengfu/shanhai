@@ -480,16 +480,25 @@ export function App() {
     await refreshSessions()
   }
 
-  async function handleLogin(u: string, p: string): Promise<void> {
-    const r = await window.shanhai!.login(u, p)
+  async function applyLoginUi(username: string): Promise<void> {
     setLoggedIn(true)
-    setUsername(r.username)
+    setUsername(username)
     setLoginOpen(false)
     // 登录成功后刷新模型列表（含 apiKey/baseUrl），切换到真实网关模型
     const list = await window.shanhai!.listModels()
     setModels(list)
     const current = await window.shanhai!.getCurrentModelId()
     setSelectedModel(current && list.some((m) => m.id === current) ? current : (list[0]?.id ?? ''))
+  }
+
+  async function handleLogin(u: string, p: string): Promise<void> {
+    const r = await window.shanhai!.login(u, p)
+    await applyLoginUi(r.username)
+  }
+
+  async function handleRegister(u: string, p: string, nickname?: string, phone?: string, email?: string): Promise<void> {
+    const r = await window.shanhai!.register(u, p, nickname, phone, email)
+    await applyLoginUi(r.username)
   }
 
   async function handleLogout(): Promise<void> {
@@ -708,11 +717,8 @@ export function App() {
     const req = (approvalQueues[sid] ?? [])[0]
     if (!req) return
     await window.shanhai?.respondApproval(outcome, req.id)
-    const prevApproval = getUiStoreSnapshot().approvalQueues
-    const q = (prevApproval[sid] ?? []).slice(1)
-    const next = { ...prevApproval }
-    next[sid] = q
-    patchUiStore({ approvalQueues: next })
+    // 弹窗关闭由 runtime 的 onApprovalResolved 事件统一驱动（ui-store removeApprovalRequest），
+    // 此处不再手动 patchUiStore 移除，避免与 resolved 事件双重移除。
   }
 
   /** 回答 AI 的提问（只响应当前会话队列的头一个，会话级隔离） */
@@ -721,11 +727,8 @@ export function App() {
     const req = (askQueues[sid] ?? [])[0]
     if (!req) return
     await window.shanhai?.respondAsk(req.id, answer)
-    const prevAsk = getUiStoreSnapshot().askQueues
-    const q = (prevAsk[sid] ?? []).slice(1)
-    const next = { ...prevAsk }
-    next[sid] = q
-    patchUiStore({ askQueues: next })
+    // 弹窗关闭由 runtime 的 onAskResolved 事件统一驱动（ui-store removeAskRequest），
+    // 此处不再手动 patchUiStore 移除，避免与 resolved 事件双重移除。
   }
 
   /** 取消 AI 的提问/选择（只取消当前会话队列的头一个，会话级隔离；resolve 为取消标记而非把取消当答案） */
@@ -734,11 +737,8 @@ export function App() {
     const req = (askQueues[sid] ?? [])[0]
     if (!req) return
     await window.shanhai?.cancelAsk(req.id)
-    const prevAsk = getUiStoreSnapshot().askQueues
-    const q = (prevAsk[sid] ?? []).slice(1)
-    const next = { ...prevAsk }
-    next[sid] = q
-    patchUiStore({ askQueues: next })
+    // 弹窗关闭由 runtime 的 onAskResolved 事件统一驱动（ui-store removeAskRequest），
+    // 此处不再手动 patchUiStore 移除，避免与 resolved 事件双重移除。
   }
 
   /** 应答 browser 半投递审批（自修改 K5：用户 approve 才投递界面） */
@@ -1174,6 +1174,7 @@ export function App() {
     // overlays
     loginOpen,
     handleLogin,
+    handleRegister,
     previewImage,
   }
 

@@ -133,6 +133,7 @@ export interface UIContextValue {
   // —— shell.overlays ——
   loginOpen: boolean
   handleLogin: (u: string, p: string) => Promise<void>
+  handleRegister: (u: string, p: string, nickname?: string, phone?: string, email?: string) => Promise<void>
   previewImage: string | null
 }
 

@@ -181,6 +181,16 @@ export async function handleCommand(send: (obj: unknown) => void, msg: IncomingC
         data = { ok: true }
         break
       }
+      case 'get_pending_requests': {
+        // 手机端连接/进入会话后主动查询待处理的审批/提问，恢复弹窗。
+        // 审批与提问都是一次性广播事件，客户端若错过（切走会话、连接前已发出）需据此恢复，
+        // 否则工具会一直阻塞等待应答、弹窗永远看不到。
+        data = {
+          approvals: runtime.listPendingApprovals(),
+          asks: runtime.listPendingAsks(),
+        }
+        break
+      }
       case 'get_token_stats':
         data = runtime.getTokenStats()
         break
@@ -203,6 +213,8 @@ export function subscribeRuntimeEvents(runtime: Runtime, broadcast: (event: stri
     runtime.onUserMessage((sessionId, message, turnSeq) => broadcast('user_message', { sessionId, message, turnSeq })),
     runtime.onApprovalRequest((req) => broadcast('approval_request', req)),
     runtime.onAskRequest((req) => broadcast('ask_request', req)),
+    runtime.onApprovalResolved((requestId) => broadcast('approval_resolved', { requestId })),
+    runtime.onAskResolved((requestId) => broadcast('ask_resolved', { requestId })),
     runtime.onSupervisorResult((sessionId, title, result, error) => broadcast('supervisor_result', { sessionId, title, result, error })),
     runtime.onTokenStats((sessionId, stats) => broadcast('token_stats', { sessionId, stats })),
     runtime.onCurrentSessionChanged((sessionId) => broadcast('current_session_changed', { sessionId })),

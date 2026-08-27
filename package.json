@@ -1,25 +1,14 @@
 {
-  "name": "shanhai",
+  "name": "@shanhai/desktop",
+  "version": "1.0.0",
   "private": true,
-  "version": "0.1.0",
+  "packageManager": "pnpm@10.5.0",
   "type": "module",
-  "description": "山海——通用桌面端多 Agent 智能体（自研插件内核，接口对齐 DSH）",
-  "engines": {
-    "node": ">=20"
-  },
-  "scripts": {
-    "build": "pnpm -r build",
-    "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test",
-    "clean": "pnpm -r exec rm -rf dist node_modules"
-  },
-  "devDependencies": {
-    "@types/node": "^22.10.2",
-    "tsup": "^8.3.5",
-    "typescript": "^5.6.3",
-    "vitest": "^2.1.8"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": ["electron", "esbuild", "node-pty"]
+  "description": "山海桌面端（Electron 壳）：主进程 boot host + IPC + React 流式渲染",
+  "main": "./dist/main/index.js",
+  "dependencies": {
+    "node-pty": "^1.0.0",
+    "tesseract.js": "^7.0.0",
+    "ws": "^8.21.3"
   }
 }

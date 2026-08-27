@@ -4,7 +4,8 @@ import { getRuntime, setRuntime } from './runtime'
 import { initUiStore } from './ui-store'
 import { registerPush } from './push'
 import { registerIpc } from './ipc-handlers'
-import { startRemoteRelay, getRelayPreference } from './remote-relay'
+import { startRemoteRelay } from './remote-relay'
+import { startRemoteServer } from './remote-server'
 import { createWindow, loadWindowContent, showChatWindow, toggleChatWindow, ensureDesktopLayer, ICON_PATH } from './window-manager'
 import { scheduleStartupUpdateCheck } from './app-updater'
 
@@ -54,9 +55,12 @@ app.whenReady().then(async () => {
   initUiStore(getRuntime())
   registerIpc()
 
-  // 恢复上次的网关中继开关：偏好为开启则自动连接。
-  // 未登录时 startRemoteRelay 会保持 enabled=true 但暂不建连（getMemberToken 为空），登录后由 auth:login 补连。
-  if (getRelayPreference()) startRemoteRelay()
+  // 启动时若已登录（本地凭证已恢复），自动开启远程连接（外网中继 + 局域网）。
+  // 未登录则不开启，登录后由 auth:login 触发开启；退出登录由 auth:logout 自动关闭。
+  if (getRuntime().loggedIn) {
+    startRemoteRelay()
+    startRemoteServer()
+  }
 
   // 桌面壳窗口（全屏壁纸，忽略鼠标作为背景层；先创建，后续窗口浮在其上）
   const desktopWin = createWindow({ type: 'desktop' })

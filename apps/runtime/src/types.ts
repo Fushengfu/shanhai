@@ -148,6 +148,8 @@ export interface Runtime {
   username: string | null
   /** 账号密码登录（SHA-256），成功后拉取会员模型并切换为真实网关模型 */
   login(username: string, password: string): Promise<{ username: string; nickname?: string }>
+  /** 注册会员（手机号即账号，SHA-256），成功后等价于登录 */
+  register(username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string }>
   logout(): Promise<void>
   /** 当前会员 JWT（登录后有效，供远程连接走网关 bridge 鉴权；未登录返回空串） */
   getMemberToken(): string
@@ -257,6 +259,8 @@ export interface Runtime {
   onApprovalRequest(cb: (req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }) => void): () => void
   /** UI 应答审批（requestId 定位具体审批请求，支持并行会话） */
   respondApproval(outcome: ApprovalOutcome, requestId: string): void
+  /** 查询当前待处理的审批请求（供手机端连接后恢复弹窗，避免错过一次性事件） */
+  listPendingApprovals(): Array<{ id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }>
   /** 审批被管家决策 resolve 后回调（requestId 定位，UI 据此关闭对应弹窗） */
   onApprovalResolved(cb: (requestId: string) => void): () => void
   /** 提问被管家代答 resolve 后回调（requestId 定位，UI 据此关闭对应弹窗） */
@@ -267,6 +271,8 @@ export interface Runtime {
   respondAsk(requestId: string, answer: string): void
   /** UI 取消回答/选择（requestId 定位具体提问，resolve 为取消标记） */
   cancelAsk(requestId: string): void
+  /** 查询当前待处理的提问请求（供手机端连接后恢复弹窗，避免错过一次性事件） */
+  listPendingAsks(): AskRequest[]
 
   /** 流式增量回调（sessionId 标识来源会话） */
   onDelta(cb: (sessionId: string, text: string) => void): () => void

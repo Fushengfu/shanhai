@@ -59,7 +59,7 @@ export const ASK_CANCELLED = '__ASK_CANCELLED__'
  * - cancelSession：取消某会话所有待回答提问（删除会话时避免 agent 永久卡在等待）
  */
 export class AskService {
-  private readonly pending = new Map<string, { resolve: (answer: string) => void; sessionId?: string }>()
+  private readonly pending = new Map<string, { resolve: (answer: string) => void; sessionId?: string; req: AskRequest }>()
   private readonly listeners = new Set<(req: AskRequest) => void>()
 
   /** 发起提问并阻塞等待用户回答 */
@@ -90,7 +90,7 @@ export class AskService {
       modelOptions: opts?.modelOptions,
     }
     return new Promise<string>((resolve) => {
-      this.pending.set(id, { resolve, sessionId: opts?.sessionId })
+      this.pending.set(id, { resolve, sessionId: opts?.sessionId, req })
       this.listeners.forEach((cb) => cb(req))
     })
   }
@@ -99,6 +99,12 @@ export class AskService {
   onRequest(cb: (req: AskRequest) => void): () => void {
     this.listeners.add(cb)
     return () => this.listeners.delete(cb)
+  }
+
+  /** 查询当前待处理的提问请求（供手机端连接后恢复弹窗：提问是一次性广播事件，
+   *  客户端若错过「切走会话 / 连接前已发出」，可据此主动恢复，避免卡片永久看不到） */
+  listPending(): AskRequest[] {
+    return [...this.pending.values()].map((p) => p.req)
   }
 
   /** 用户提交回答（resolve 对应提问），返回是否找到并 resolve 了该提问（供管家代答判断提问是否存在） */

@@ -39,13 +39,13 @@ class _DevicePickerSheet extends StatelessWidget {
               final clientCount = m['clientCount'] ?? 0;
               return ListTile(
                 onTap: () => Navigator.of(context).pop(id),
-                leading: const Icon(Icons.computer_outlined),
-                title: Text(name),
-                subtitle: Text([hostname, os, '已连接 $clientCount 台手机'].where((s) => s.isNotEmpty).join(' · ')),
-                trailing: const Icon(Icons.chevron_right),
+                leading: const Icon(Icons.computer_outlined, size: 18),
+                title: Text(name, style: const TextStyle(fontSize: 14)),
+                subtitle: Text([hostname, os, '已连接 $clientCount 台手机'].where((s) => s.isNotEmpty).join(' · '), style: const TextStyle(fontSize: 12)),
+                trailing: const Icon(Icons.chevron_right, size: 18),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                 tileColor: const Color(0xFF22222E),
-                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
               );
             }),
           ],

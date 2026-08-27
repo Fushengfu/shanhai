@@ -87,7 +87,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   ctx.sessionOrigin = new Map<string, 'user' | 'supervisor'>()
   ctx.toolTraceCallbacks = new Set<(trace: ToolTrace) => void>()
   ctx.approvalCallbacks = new Set<(req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }) => void>()
-  ctx.pendingApprovals = new Map<string, { resolve: (outcome: ApprovalOutcome) => void; sessionId?: string }>()
+  ctx.pendingApprovals = new Map<string, { resolve: (outcome: ApprovalOutcome) => void; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }>()
   ctx.approvalResolvedCallbacks = new Set<(requestId: string) => void>()
   ctx.askResolvedCallbacks = new Set<(requestId: string) => void>()
   ctx.computerUse = createPlatformComputerUseService()
@@ -244,7 +244,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     console.log('[supervisor-wake] 审批请求产生：', req.id, req.toolName, 'sessionId=', req.sessionId, 'origin=', origin, '开关=', ctx.currentSettings.supervisorApproval.enabled)
     const promise = new Promise<ApprovalOutcome>((resolve) => {
       // 记录发起审批的会话 id：删除会话时按会话拒绝其待审批请求，避免 agent 永久卡在 await
-      ctx.pendingApprovals.set(req.id, { resolve, sessionId: req.sessionId })
+      ctx.pendingApprovals.set(req.id, { resolve, sessionId: req.sessionId, toolName: req.toolName, args: req.args, riskLevel: req.riskLevel })
     })
     // 管家接管：仅当「管家下发 + 开关开启」时唤醒管家决策（非阻塞，弹窗仍显示、用户仍可手动点）；
     // 用户侧（含手机远程）始终只走弹窗手动审批，不唤醒管家。
@@ -530,8 +530,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     computerUse: ctx.computerUse,
     browserUse: ctx.browserUse,
 
-    loggedIn: ctx.loggedIn,
-    username: ctx.username,
+    get loggedIn() {
+      return ctx.loggedIn
+    },
+    get username() {
+      return ctx.username
+    },
     getMemberToken() {
       return ctx.memberToken
     },
@@ -553,6 +557,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
     async login(u, p) {
       return modelProviderModule.login(u, p)
+    },
+    async register(username, password, nickname, phone, email) {
+      return modelProviderModule.register(username, password, nickname, phone, email)
     },
     async logout() {
       return modelProviderModule.logout()
@@ -739,7 +746,20 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       if (p) {
         p.resolve(outcome)
         ctx.pendingApprovals.delete(requestId)
+        // 统一广播「已解决」：桌面端/手机端任一处理审批后，UI 弹窗据此关闭，跨端同步状态
+        ctx.approvalResolvedCallbacks.forEach((cb) => cb(requestId))
       }
+    },
+    listPendingApprovals() {
+      // 供手机端连接后恢复弹窗：审批请求是一次性广播事件，客户端若错过（切走/连接前发出）
+      // 需要主动查询当前待处理审批，否则看不到弹窗、工具会一直阻塞等待。
+      return [...ctx.pendingApprovals.entries()].map(([id, p]) => ({
+        id,
+        sessionId: p.sessionId,
+        toolName: p.toolName,
+        args: p.args,
+        riskLevel: p.riskLevel,
+      }))
     },
     onApprovalResolved(cb) {
       ctx.approvalResolvedCallbacks.add(cb)
@@ -753,10 +773,17 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       return ctx.askService.onRequest(cb)
     },
     respondAsk(requestId, answer) {
-      ctx.askService.respond(requestId, answer)
+      if (ctx.askService.respond(requestId, answer)) {
+        ctx.askResolvedCallbacks.forEach((cb) => cb(requestId))
+      }
     },
     cancelAsk(requestId) {
       ctx.askService.cancel(requestId)
+      ctx.askResolvedCallbacks.forEach((cb) => cb(requestId))
+    },
+    listPendingAsks() {
+      // 供手机端连接后恢复弹窗（与 listPendingApprovals 同理）
+      return ctx.askService.listPending()
     },
 
     onDelta(cb) {

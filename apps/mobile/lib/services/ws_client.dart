@@ -238,6 +238,13 @@ class WsClient {
     _channel?.sink.add(jsonEncode({'type': 'list_devices'}));
   }
 
+  /// 查询当前待处理的审批/提问请求（连接后恢复弹窗）。
+  /// 审批/提问是一次性广播事件，客户端若错过（切走会话、连接前已发出），
+  /// 需主动查询并恢复弹窗，否则工具会一直阻塞等待应答。
+  Future<CmdResult> getPendingRequests() {
+    return sendCommand('get_pending_requests');
+  }
+
   /// 发送命令，返回结果（带超时兜底）
   Future<CmdResult> sendCommand(String cmd, [Map<String, dynamic>? payload]) {
     final id = ++_cmdSeq;

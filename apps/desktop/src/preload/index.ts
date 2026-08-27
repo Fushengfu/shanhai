@@ -223,6 +223,8 @@ export interface ShanhaiBridge {
   remoteDisable(): Promise<RemoteStatus>
   /** 查询远程连接状态 */
   remoteStatus(): Promise<RemoteStatus>
+  /** 刷新局域网配对码（默认常开后，5 分钟过期的配对码需要刷新） */
+  refreshRemoteCode(): Promise<RemoteStatus>
   /** 开启网关中继（外网可达），桌面端作为 Host 连网关 */
   relayEnable(url?: string): Promise<RelayStatus>
   /** 关闭网关中继 */
@@ -242,6 +244,7 @@ export interface ShanhaiBridge {
   // 认证
   status(): Promise<{ loggedIn: boolean; username: string | null }>
   login(username: string, password: string): Promise<{ username: string; nickname?: string }>
+  register(username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string }>
   logout(): Promise<void>
   listModels(): Promise<Array<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean }>>
   refreshModels(): Promise<Array<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean }>>
@@ -445,6 +448,7 @@ const bridge: ShanhaiBridge = {
   remoteEnable: (port) => ipcRenderer.invoke('remote:enable', port),
   remoteDisable: () => ipcRenderer.invoke('remote:disable'),
   remoteStatus: () => ipcRenderer.invoke('remote:status'),
+  refreshRemoteCode: () => ipcRenderer.invoke('remote:refreshCode'),
   relayEnable: (url) => ipcRenderer.invoke('remote:relayEnable', url),
   relayDisable: () => ipcRenderer.invoke('remote:relayDisable'),
   relayStatus: () => ipcRenderer.invoke('remote:relayStatus'),
@@ -459,6 +463,7 @@ const bridge: ShanhaiBridge = {
   getMobileApkInfo: (packageName) => ipcRenderer.invoke('mobile:get-apk-info', packageName),
   status: () => ipcRenderer.invoke('auth:status'),
   login: (u, p) => ipcRenderer.invoke('auth:login', u, p),
+  register: (u, p, nickname, phone, email) => ipcRenderer.invoke('auth:register', u, p, nickname, phone, email),
   logout: () => ipcRenderer.invoke('auth:logout'),
   listModels: () => ipcRenderer.invoke('auth:listModels'),
   refreshModels: () => ipcRenderer.invoke('auth:refreshModels'),

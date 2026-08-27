@@ -1,7 +1,4 @@
 import { WebSocket } from 'ws'
-import { app } from 'electron'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
 import { getRuntime } from './runtime'
 import { handleCommand, subscribeRuntimeEvents } from './remote-protocol'
 
@@ -14,6 +11,9 @@ import { handleCommand, subscribeRuntimeEvents } from './remote-protocol'
  *
  * 网关 bridge 的协议：Host 发的消息原样转发给所有 Client；Client 发的消息原样转发给 Host；
  * 网关自身会下发控制消息（connected / host_disconnected / client_connected / client_disconnected 等，字段名为 Type）。
+ *
+ * 生命周期与登录态绑定：登录后自动开启（startRemoteRelay），退出登录自动关闭（stopRemoteRelay），
+ * 不再依赖手动开关。数据同步（runtime 事件转发）延迟到有手机连上后才建立，避免无手机时无谓订阅。
  */
 
 const DEFAULT_RELAY_URL = 'wss://aisocket.bjctykj.com/ws'
@@ -51,6 +51,18 @@ function broadcastEvent(event: string, payload: unknown): void {
   sendToRelay({ type: 'event', event, payload })
 }
 
+/** 建立 runtime 事件订阅（数据同步）：仅在有手机连上后调用，避免无客户端时的无谓订阅 */
+function ensureSyncSubscribed(): void {
+  if (unsubs.length > 0) return
+  unsubs = subscribeRuntimeEvents(getRuntime(), broadcastEvent)
+}
+
+/** 取消 runtime 事件订阅（数据同步） */
+function unsubscribeSync(): void {
+  unsubs.forEach((u) => u())
+  unsubs = []
+}
+
 function connect(): void {
   const runtime = getRuntime()
   const token = runtime.getMemberToken()
@@ -76,10 +88,9 @@ function connect(): void {
   ws.on('open', () => {
     connected = true
     reconnectAttempts = 0 // 连接成功，重置退避计数
+    clientCount = 0 // 重连后重置客户端计数，等网关重新下发 client_connected 再同步
     startPing() // 心跳保活
-    // 订阅事件转发（重连时先清理旧订阅）
-    unsubs.forEach((u) => u())
-    unsubs = subscribeRuntimeEvents(runtime, broadcastEvent)
+    unsubscribeSync() // 数据同步延迟到手机连上后再建立
   })
 
   ws.on('message', (raw) => {
@@ -94,8 +105,10 @@ function connect(): void {
       void handleCommand(sendToRelay, { type: 'cmd', id: msg.id ?? 0, cmd: msg.cmd ?? '', payload: msg.payload ?? {} })
     } else if (msg.type === 'client_connected') {
       clientCount += 1
+      ensureSyncSubscribed() // 第一台手机连上 → 开始同步数据
     } else if (msg.type === 'client_disconnected') {
       clientCount = Math.max(0, clientCount - 1)
+      if (clientCount === 0) unsubscribeSync() // 最后一台手机断开 → 停止同步
     }
     // 网关控制消息（connected / host_disconnected / error 等）忽略
   })
@@ -104,8 +117,7 @@ function connect(): void {
     connected = false
     hostWs = null
     stopPing()
-    unsubs.forEach((u) => u())
-    unsubs = []
+    unsubscribeSync()
     if (enabled) scheduleReconnect()
   })
 
@@ -150,7 +162,6 @@ export function startRemoteRelay(url: string = DEFAULT_RELAY_URL): RelayStatus {
   if (enabled && hostWs) return getRelayStatus()
 
   enabled = true
-  persistRelayPreference(true)
   if (!getRuntime().getMemberToken()) {
     // 未登录：保持 enabled 但连接不建立，登录后需重新 start
     connected = false
@@ -163,15 +174,13 @@ export function startRemoteRelay(url: string = DEFAULT_RELAY_URL): RelayStatus {
 /** 关闭网关中继：断开 Host 连接并停止重连。幂等。 */
 export function stopRemoteRelay(): void {
   enabled = false
-  persistRelayPreference(false)
   if (reconnectTimer) {
     clearTimeout(reconnectTimer)
     reconnectTimer = null
   }
   stopPing()
   reconnectAttempts = 0
-  unsubs.forEach((u) => u())
-  unsubs = []
+  unsubscribeSync()
   if (hostWs) {
     hostWs.close()
     hostWs = null
@@ -188,32 +197,5 @@ export function getRelayStatus(): RelayStatus {
     url: relayUrl,
     username: getRuntime().username,
     clientCount,
-  }
-}
-
-/** 中继偏好持久化文件路径（userData/relay.json，参考壁纸 wallpaper.json 的做法，独立于 runtime config） */
-function relayPreferencePath(): string {
-  return join(app.getPath('userData'), 'relay.json')
-}
-
-/** 读取上次是否开启过网关中继；无文件/损坏返回 false（默认关闭，与现状一致） */
-export function getRelayPreference(): boolean {
-  try {
-    const raw = readFileSync(relayPreferencePath(), 'utf8')
-    const parsed = JSON.parse(raw) as { enabled?: unknown }
-    return parsed.enabled === true
-  } catch {
-    return false
-  }
-}
-
-/** 持久化中继开关偏好；失败只告警，不中断主流程 */
-function persistRelayPreference(enabled: boolean): void {
-  try {
-    const dir = app.getPath('userData')
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-    writeFileSync(relayPreferencePath(), JSON.stringify({ enabled }), 'utf8')
-  } catch (err) {
-    console.warn('[山海] 保存中继开关偏好失败：', err)
   }
 }

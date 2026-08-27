@@ -41,6 +41,21 @@ export interface AuthSession {
   balance?: number
 }
 
+/** 网关登录/注册响应（兼容多种 token 字段命名） */
+interface RawAuthResponse {
+  code?: number
+  message?: string
+  token?: string
+  memberToken?: string
+  access_token?: string
+  data?: {
+    token?: string
+    memberToken?: string
+    access_token?: string
+    member?: { nickname?: string; avatar?: string; balance?: number }
+  }
+}
+
 export interface AuthServiceOptions {
   /** 网关基地址（会员体系），如 https://agent.bjctykj.com */
   baseUrl: string
@@ -80,25 +95,41 @@ export class AuthService {
       throw new Error(`login failed ${res.status}: ${body}`)
     }
     // 网关响应：{ code, data: { token|memberToken|access_token, member }, message }（兼容多种字段）
-    const raw = (await res.json()) as {
-      code?: number
-      message?: string
-      token?: string
-      memberToken?: string
-      access_token?: string
-      data?: {
-        token?: string
-        memberToken?: string
-        access_token?: string
-        member?: { nickname?: string; avatar?: string; balance?: number }
-      }
+    return this.parseSessionResponse((await res.json()) as RawAuthResponse, username, 'login')
+  }
+
+  /**
+   * 注册会员：手机号即账号（username），密码 SHA-256 加密后提交。
+   * 参考网关 /api/member/register，body { username, password, nickname?, phone?, email? }。
+   */
+  async register(username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<AuthSession> {
+    const body: Record<string, string> = {
+      username,
+      password: AuthService.sha256Hex(password),
     }
+    if (nickname) body.nickname = nickname
+    if (phone) body.phone = phone
+    if (email) body.email = email
+    const res = await fetch(`${this.opts.baseUrl.replace(/\/$/, '')}/api/member/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(`register failed ${res.status}: ${text}`)
+    }
+    return this.parseSessionResponse((await res.json()) as RawAuthResponse, username, 'register')
+  }
+
+  /** 解析登录/注册响应为 AuthSession（兼容 code/data/token 多种字段） */
+  private parseSessionResponse(raw: RawAuthResponse, username: string, op: string): AuthSession {
     if (raw.code !== undefined && raw.code !== 0) {
-      throw new Error(raw.message ?? `login failed code=${raw.code}`)
+      throw new Error(raw.message ?? `${op} failed code=${raw.code}`)
     }
     const token = raw.data?.token ?? raw.token ?? raw.data?.memberToken ?? raw.memberToken ?? raw.data?.access_token ?? raw.access_token
     if (!token) {
-      throw new Error(`login response missing token: ${JSON.stringify(raw).slice(0, 300)}`)
+      throw new Error(`${op} response missing token: ${JSON.stringify(raw).slice(0, 300)}`)
     }
     const member = raw.data?.member
     return {

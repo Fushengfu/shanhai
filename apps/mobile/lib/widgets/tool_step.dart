@@ -806,3 +806,93 @@ class _ToolStepWidgetState extends State<ToolStepWidget> {
   }
   return (total: tools.length, success: success, failed: failed, running: running);
 }
+
+/// 风险等级 → 中文文案（对齐桌面端 riskLevelLabel，不暴露英文枚举值）
+String riskLevelLabel(String level) {
+  const map = {
+    'readonly': '只读',
+    'reversible': '可逆修改',
+    'irreversible': '不可逆操作',
+    'high': '高风险',
+  };
+  return map[level] ?? (level.isEmpty ? '普通' : level);
+}
+
+/// 审批弹窗参数友好渲染（对齐桌面端 renderApprovalDetail 的精简版）：
+/// 命令→终端块、写/编辑文件→路径 + 变更规模、其余→友好键值对（长值截断），
+/// 避免把整个 args map 直接 dump 出来撑大弹窗。
+Widget approvalArgsWidget(String name, Map<String, dynamic> args) {
+  if (args.isEmpty) {
+    return const Text('（无参数）', style: TextStyle(fontSize: 12, color: _cTextMuted));
+  }
+  // 执行命令：完整显示命令（通常一行，是审批的关键信息）
+  if (name == 'run_command') {
+    final cmd = args['command']?.toString() ?? '';
+    if (cmd.isNotEmpty) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(color: const Color(0xFF282C34), borderRadius: BorderRadius.circular(6)),
+        child: Text.rich(
+          TextSpan(children: [
+            const TextSpan(text: '\$ ', style: TextStyle(color: Color(0xFF7F848E))),
+            TextSpan(text: cmd, style: const TextStyle(color: Color(0xFF61AFEF))),
+          ]),
+          style: const TextStyle(fontFamily: 'monospace', fontSize: 12, height: 1.4),
+        ),
+      );
+    }
+  }
+  // 写入/编辑文件：只显示路径 + 变更规模，正文大段代码不再撑爆弹窗
+  if (name == 'write_file' || name == 'edit_file') {
+    final path = args['path']?.toString() ?? '';
+    final before = name == 'edit_file' ? (args['oldText']?.toString() ?? '') : '';
+    final after = name == 'write_file' ? (args['content']?.toString() ?? '') : (args['newText']?.toString() ?? '');
+    final addLines = after.isEmpty ? 0 : after.split('\n').length;
+    final delLines = before.isEmpty ? 0 : before.split('\n').length;
+    final isNew = name == 'write_file';
+    final head = path.isNotEmpty
+        ? '$path · ${isNew ? '新建，+$addLines 行' : '+$addLines −$delLines 行'}'
+        : (isNew ? '新建文件，+$addLines 行' : '+$addLines −$delLines 行');
+    return Text(head, maxLines: 3, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12, color: _cText, fontFamily: 'monospace', height: 1.4));
+  }
+  // 其余：友好键值对，长值截断
+  return _argsKvWidget(args);
+}
+
+/// 友好键值对（对齐桌面端 formatArgs）：key 灰、value 白，长值截断
+Widget _argsKvWidget(Map<String, dynamic> args) {
+  final entries = args.entries.toList();
+  return Column(
+    mainAxisSize: MainAxisSize.min,
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      for (final e in entries)
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 1.5),
+          child: Text.rich(
+            TextSpan(children: [
+              TextSpan(text: '${e.key}：', style: const TextStyle(color: _cTextMuted)),
+              TextSpan(text: _prettyArg(e.value), style: const TextStyle(color: _cText)),
+            ]),
+            style: const TextStyle(fontSize: 12, height: 1.5),
+          ),
+        ),
+    ],
+  );
+}
+
+/// 参数值截断（对齐桌面端 prettyValue，长字符串截断避免撑大弹窗）
+String _prettyArg(dynamic v) {
+  String s;
+  if (v is String) {
+    s = v;
+  } else {
+    try {
+      s = const JsonEncoder().convert(v);
+    } catch (_) {
+      s = v.toString();
+    }
+  }
+  return s.length > 200 ? '${s.substring(0, 200)}…' : s;
+}

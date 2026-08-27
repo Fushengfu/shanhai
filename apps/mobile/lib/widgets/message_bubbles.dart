@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import '../models/protocol.dart';
 import 'tool_step.dart';
@@ -17,24 +18,102 @@ const Color _cRunning = Color(0xFF22D3EE);
 const Color _cSuccess = Color(0xFF34D399);
 const Color _cError = Color(0xFFF87171);
 
-/// 用户消息气泡（右对齐、紫底白字、右下小角）
+/// 用户消息气泡（右对齐、紫底白字、右下小角）。
+/// 长按弹出操作菜单：复制 / 重新生成（重试）/ 编辑并重发（对齐桌面端 UserMessage 的操作）。
 class UserBubble extends StatelessWidget {
   final String content;
-  const UserBubble({super.key, required this.content});
+  /// 重新生成（resend 原内容，不带 newContent）
+  final VoidCallback? onResend;
+  /// 编辑并重发（resend 带 newContent）
+  final ValueChanged<String>? onEdit;
+
+  const UserBubble({super.key, required this.content, this.onResend, this.onEdit});
+
+  Future<void> _showMenu(BuildContext context) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: const Color(0xFF1C1C26),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.copy_outlined, size: 20, color: Color(0xFFE0E0E0)),
+              title: const Text('复制', style: TextStyle(color: Color(0xFFE0E0E0))),
+              onTap: () => Navigator.pop(ctx, 'copy'),
+            ),
+            if (onResend != null)
+              ListTile(
+                leading: const Icon(Icons.refresh, size: 20, color: Color(0xFFE0E0E0)),
+                title: const Text('重新生成', style: TextStyle(color: Color(0xFFE0E0E0))),
+                onTap: () => Navigator.pop(ctx, 'resend'),
+              ),
+            if (onEdit != null)
+              ListTile(
+                leading: const Icon(Icons.edit_outlined, size: 20, color: Color(0xFFE0E0E0)),
+                title: const Text('编辑并重发', style: TextStyle(color: Color(0xFFE0E0E0))),
+                onTap: () => Navigator.pop(ctx, 'edit'),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (action == null) return;
+    if (!context.mounted) return;
+    if (action == 'copy') {
+      await Clipboard.setData(ClipboardData(text: content));
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已复制')));
+      }
+    } else if (action == 'resend') {
+      onResend?.call();
+    } else if (action == 'edit') {
+      await _promptEdit(context);
+    }
+  }
+
+  Future<void> _promptEdit(BuildContext context) async {
+    final ctrl = TextEditingController(text: content);
+    final newContent = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('编辑并重发'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          minLines: 2,
+          maxLines: 6,
+          decoration: const InputDecoration(hintText: '修改后重新发送'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          TextButton(onPressed: () => Navigator.pop(ctx, ctrl.text.trim()), child: const Text('发送')),
+        ],
+      ),
+    );
+    ctrl.dispose();
+    if (newContent != null && newContent.isNotEmpty) {
+      onEdit?.call(newContent);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Align(
-      alignment: Alignment.centerRight,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 6),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.78),
-        decoration: const BoxDecoration(
-          color: _cAccent,
-          borderRadius: BorderRadius.only(topLeft: Radius.circular(16), topRight: Radius.circular(16), bottomLeft: Radius.circular(16), bottomRight: Radius.circular(4)),
+    return GestureDetector(
+      onLongPress: () => _showMenu(context),
+      child: Align(
+        alignment: Alignment.centerRight,
+        child: Container(
+          margin: const EdgeInsets.symmetric(vertical: 6),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.78),
+          decoration: const BoxDecoration(
+            color: _cAccent,
+            borderRadius: BorderRadius.only(topLeft: Radius.circular(16), topRight: Radius.circular(16), bottomLeft: Radius.circular(16), bottomRight: Radius.circular(4)),
+          ),
+          child: Text(content, style: const TextStyle(fontSize: 15, color: Colors.white, height: 1.5)),
         ),
-        child: Text(content, style: const TextStyle(fontSize: 15, color: Colors.white, height: 1.5)),
       ),
     );
   }

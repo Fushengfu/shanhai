@@ -322,6 +322,8 @@ declare global {
       remoteDisable(): Promise<RemoteStatus>
       /** 查询远程连接状态 */
       remoteStatus(): Promise<RemoteStatus>
+      /** 刷新局域网配对码（默认常开后，5 分钟过期的配对码需要刷新） */
+      refreshRemoteCode(): Promise<RemoteStatus>
       /** 开启网关中继（外网可达），桌面端作为 Host 连网关 */
       relayEnable(url?: string): Promise<RelayStatus>
       /** 关闭网关中继 */
@@ -346,6 +348,7 @@ declare global {
       patchUiState(patch: Partial<GlobalUiState>): Promise<void>
       status(): Promise<{ loggedIn: boolean; username: string | null }>
       login(u: string, p: string): Promise<{ username: string; nickname?: string }>
+      register(u: string, p: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string }>
       logout(): Promise<void>
       listModels(): Promise<GatewayModel[]>
       refreshModels(): Promise<GatewayModel[]>

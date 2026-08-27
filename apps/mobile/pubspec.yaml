@@ -40,6 +40,10 @@ dependencies:
   http: ^1.2.2
   # 登录态本地安全存储（Keychain / Keystore）：跨重启缓存会员 JWT，避免每次打开都要重新登录
   flutter_secure_storage: ^9.2.2
+  # 版本检查更新：读当前 versionName/versionCode
+  package_info_plus: ^8.3.1
+  # 打开下载链接（浏览器下载 APK）
+  url_launcher: ^6.3.2
 
 dev_dependencies:
   flutter_test:

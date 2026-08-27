@@ -9,7 +9,7 @@
 import { promises as fs } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import type { GatewayModel, ModelTier } from '@shanhai/auth'
+import type { AuthSession, GatewayModel, ModelTier } from '@shanhai/auth'
 import { TokenExpiredError } from '@shanhai/auth'
 import type { Model } from '@shanhai/llm'
 import { createModelProvider } from '@shanhai/llm'
@@ -36,6 +36,8 @@ export interface ModelProviderModule {
   refreshGatewayModels(): Promise<GatewayModel[]>
   /** 账号密码登录（SHA-256），成功后拉取会员模型并切换为真实网关模型 */
   login(u: string, p: string): Promise<{ username: string; nickname?: string }>
+  /** 注册会员（手机号即账号，SHA-256），成功后等价于登录：拉模型 + 持久化凭证 */
+  register(username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string }>
   /** 退出登录：清空凭证，保留自定义模型与选中模型偏好 */
   logout(): Promise<void>
   /** 网关模型列表（系统内置 + 用户自定义） */
@@ -123,6 +125,12 @@ export function createModelProviderModule(
     } catch {
       // 无凭证，未登录
     }
+    // 启动后 ctx.model 仍是初始 mock provider（本函数只恢复 id、不切换 provider）。
+    // 若选中模型当前可解析（如自定义模型已随 customModels 恢复），立即 applyModel 使 ctx.model 与选中模型一致；
+    // 网关模型尚未 fetch（allModels 找不到），保持现状，交由登录后的 applyAuthSession 处理。
+    if (ctx.currentModelId && allModels().some((m) => m.id === ctx.currentModelId)) {
+      applyModel(ctx.currentModelId)
+    }
   }
 
   const applyGatewayModels = async (models: GatewayModel[]): Promise<void> => {
@@ -169,8 +177,8 @@ export function createModelProviderModule(
     return ctx.gatewayModels
   }
 
-  const login = async (u: string, p: string): Promise<{ username: string; nickname?: string }> => {
-    const s = await ctx.authService.login(u, p)
+  /** 登录/注册共用的「会话落地」逻辑：设置登录态 + 拉模型 + 持久化凭证 */
+  const applyAuthSession = async (s: AuthSession): Promise<{ username: string; nickname?: string }> => {
     ctx.loggedIn = true
     ctx.username = s.nickname ?? s.username
     ctx.memberToken = s.token
@@ -197,6 +205,16 @@ export function createModelProviderModule(
       selectedModelId: ctx.currentModelId,
     })
     return { username: s.nickname ?? s.username, nickname: s.nickname }
+  }
+
+  const login = async (u: string, p: string): Promise<{ username: string; nickname?: string }> => {
+    const s = await ctx.authService.login(u, p)
+    return applyAuthSession(s)
+  }
+
+  const register = async (username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string }> => {
+    const s = await ctx.authService.register(username, password, nickname, phone, email)
+    return applyAuthSession(s)
   }
 
   const logout = async (): Promise<void> => {
@@ -253,6 +271,8 @@ export function createModelProviderModule(
     }
     ctx.customModels = [...ctx.customModels, custom]
     await persistCustomModels(ctx.customModels)
+    // 通知前端刷新模型列表（否则主进程 ui-store 不重拉，跨窗口/下拉框看不到新模型，需重启才生效）
+    ctx.modelsChangedCallbacks.forEach((cb) => cb())
     return custom
   }
 
@@ -279,22 +299,32 @@ export function createModelProviderModule(
       custom: true,
     }
     ctx.customModels = ctx.customModels.map((m) => (m.id === id ? updated : m))
-    // 若正在使用该模型，同步更新 provider
-    if (ctx.currentModelId === id && updated.baseUrl) {
-      ctx.model = createModelProvider({ apiKey: updated.apiKey, baseUrl: updated.baseUrl, model: updated.model ?? updated.id, protocol: updated.protocol, maxTokens: updated.maxTokens, onUsage: tokenStats.onUsage, onTrace: tokenStats.onHttpTrace })
+    // 清除旧 provider 缓存，避免 resolveProvider 命中旧配置（编辑后仍用旧 apiKey/baseUrl/model）
+    ctx.modelProviders.delete(id)
+    // 若正在使用该模型，重新解析 provider（resolveProvider 会重建并缓存新配置）
+    if (ctx.currentModelId === id) {
+      applyModel(id)
     }
     await persistCustomModels(ctx.customModels)
+    ctx.modelsChangedCallbacks.forEach((cb) => cb())
     return updated
   }
 
   const removeCustomModel = async (id: string): Promise<void> => {
     ctx.customModels = ctx.customModels.filter((m) => m.id !== id)
+    ctx.modelProviders.delete(id)
     if (ctx.currentModelId === id) {
       ctx.currentModelId = ''
       ctx.model = await createGatewayModel(tokenStats.onUsage, tokenStats.onHttpTrace)
     }
+    // 删除的是全局默认模型时，回退到剩余模型第一个（否则重启后 restoreCredentials 会恢复已删除的 id）
+    if (ctx.defaultModelId === id) {
+      ctx.defaultModelId = ctx.customModels[0]?.id ?? ctx.gatewayModels[0]?.id ?? ''
+      void persistSelectedModel(ctx.defaultModelId)
+    }
     tokenStats.refreshContextLength()
     await persistCustomModels(ctx.customModels)
+    ctx.modelsChangedCallbacks.forEach((cb) => cb())
   }
 
   const getCurrentModelId = (): string => ctx.currentModelId
@@ -313,6 +343,7 @@ export function createModelProviderModule(
     refreshModelsViaApiKey,
     refreshGatewayModels,
     login,
+    register,
     logout,
     listModels,
     refreshModels,

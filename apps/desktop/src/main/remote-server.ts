@@ -11,10 +11,13 @@ import { handleCommand, subscribeRuntimeEvents } from './remote-protocol'
  * 输入配对码配对后，即可远程查看/控制桌面端的会话。命令路由 / 事件转发逻辑在 remote-protocol.ts 复用。
  *
  * 方式二（网关中继，外网可达）见 remote-relay.ts。
+ *
+ * 生命周期与登录态绑定：登录后自动开启（startRemoteServer），退出登录自动关闭（stopRemoteServer）。
+ * 数据同步（runtime 事件转发）延迟到有手机配对成功后才建立，无配对客户端时停止订阅。
  */
 
 const DEFAULT_PORT = 47800
-/** 配对码有效期（5 分钟，过期需在桌面端重新开启） */
+/** 配对码有效期（5 分钟，过期需在桌面端刷新） */
 const PAIRING_CODE_TTL_MS = 5 * 60 * 1000
 
 export interface RemoteStatus {
@@ -37,7 +40,7 @@ let pairingExpiresAt = 0
 /** 已配对（通过配对码校验）的连接，只有它们能发命令、收事件 */
 const authedClients = new Set<WebSocket>()
 /** 事件转发回调的取消函数，stop 时统一清理，避免重复订阅/内存泄漏 */
-const unsubs: Array<() => void> = []
+let unsubs: Array<() => void> = []
 
 /** 获取本机局域网 IPv4（非 internal 的第一个，拿不到回退 127.0.0.1） */
 function getLanIp(): string {
@@ -65,6 +68,18 @@ function broadcastEvent(event: string, payload: unknown): void {
   }
 }
 
+/** 建立 runtime 事件订阅（数据同步）：仅在有手机配对成功后才建立，避免无客户端时的无谓订阅 */
+function ensureSyncSubscribed(): void {
+  if (unsubs.length > 0) return
+  unsubs = subscribeRuntimeEvents(getRuntime(), broadcastEvent)
+}
+
+/** 取消 runtime 事件订阅（数据同步） */
+function unsubscribeSync(): void {
+  unsubs.forEach((u) => u())
+  unsubs = []
+}
+
 function handlePair(sock: WebSocket, code: string): void {
   if (!pairingCode || Date.now() > pairingExpiresAt) {
     send(sock, { type: 'error', message: '配对码已过期，请在桌面端重新开启远程连接' })
@@ -74,16 +89,17 @@ function handlePair(sock: WebSocket, code: string): void {
     send(sock, { type: 'error', message: '配对码错误' })
     return
   }
+  const wasEmpty = authedClients.size === 0
   authedClients.add(sock)
+  if (wasEmpty) ensureSyncSubscribed() // 第一台手机配对成功 → 开始同步数据
   // 配对成功后发一个短期 token，供后续（可选）断线重连校验；当前以「连接已配对」为准
   const token = randomBytes(24).toString('hex')
   send(sock, { type: 'paired', token })
 }
 
-/** 开启远程服务：起 WS 服务 + 生成配对码 + 订阅事件转发。幂等（已开启则直接返回状态）。 */
+/** 开启远程服务：起 WS 服务 + 生成配对码。幂等（已开启则直接返回状态）。数据同步延迟到有手机配对成功。 */
 export function startRemoteServer(port: number = DEFAULT_PORT): RemoteStatus {
   if (wss) return getRemoteStatus()
-  const runtime = getRuntime()
 
   wss = new WebSocketServer({ host: '0.0.0.0', port })
   pairingCode = String(randomInt(0, 1000000)).padStart(6, '0')
@@ -110,7 +126,10 @@ export function startRemoteServer(port: number = DEFAULT_PORT): RemoteStatus {
         send(sock, { type: 'error', message: '未知消息类型' })
       }
     })
-    sock.on('close', () => authedClients.delete(sock))
+    sock.on('close', () => {
+      authedClients.delete(sock)
+      if (authedClients.size === 0) unsubscribeSync() // 最后一台手机断开 → 停止同步
+    })
   })
 
   wss.on('error', (err) => {
@@ -120,16 +139,24 @@ export function startRemoteServer(port: number = DEFAULT_PORT): RemoteStatus {
     wss = null
     pairingCode = ''
     pairingExpiresAt = 0
+    unsubscribeSync()
   })
 
-  unsubs.push(...subscribeRuntimeEvents(runtime, broadcastEvent))
+  return getRemoteStatus()
+}
+
+/** 刷新配对码（默认常开后，5 分钟过期的配对码需要能刷新，供设置面板触发） */
+export function refreshPairingCode(): RemoteStatus {
+  if (wss) {
+    pairingCode = String(randomInt(0, 1000000)).padStart(6, '0')
+    pairingExpiresAt = Date.now() + PAIRING_CODE_TTL_MS
+  }
   return getRemoteStatus()
 }
 
 /** 关闭远程服务：清理事件订阅 + 断开所有连接。幂等。 */
 export function stopRemoteServer(): void {
-  for (const u of unsubs) u()
-  unsubs.length = 0
+  unsubscribeSync()
   authedClients.clear()
   if (wss) {
     wss.close()

@@ -4,8 +4,8 @@ import { getRuntime } from './runtime'
 import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow, toggleMaximizeWindow, resizeDockWindow, hideSupervisorToBubble, showSupervisorFromBubble, moveSupervisorBubble, hideToSystemDesktop, getWindowType } from './window-manager'
 import { getUiState, patchUiState, getWallpaper, setWallpaper, filterUiStateForWindow, type UiStoreState } from './ui-store'
 import { listSystemWallpapers, applySystemWallpaper } from './system-wallpaper'
-import { startRemoteServer, stopRemoteServer, getRemoteStatus } from './remote-server'
-import { startRemoteRelay, stopRemoteRelay, getRelayStatus, getRelayPreference } from './remote-relay'
+import { startRemoteServer, stopRemoteServer, getRemoteStatus, refreshPairingCode } from './remote-server'
+import { startRemoteRelay, stopRemoteRelay, getRelayStatus } from './remote-relay'
 import { checkAndPromptForUpdate, getLastUpdateCheckResult, fetchMobileApkInfo } from './app-updater'
 
 /**
@@ -20,11 +20,24 @@ export function registerIpc(): void {
   ipcMain.handle('auth:status', async () => ({ loggedIn: runtime.loggedIn, username: runtime.username }))
   ipcMain.handle('auth:login', async (_e, u: string, p: string) => {
     const result = await runtime.login(u, p)
-    // 登录成功后，若用户之前开启过中继，自动恢复连接（覆盖「启动时未登录、登录后补连」的场景）
-    if (getRelayPreference()) startRemoteRelay()
+    // 登录成功后自动开启远程连接（外网中继 + 局域网），不再依赖手动开关
+    startRemoteRelay()
+    startRemoteServer()
     return result
   })
-  ipcMain.handle('auth:logout', async () => runtime.logout())
+  ipcMain.handle('auth:register', async (_e, u: string, p: string, nickname?: string, phone?: string, email?: string) => {
+    const result = await runtime.register(u, p, nickname, phone, email)
+    // 注册成功即登录：自动开启远程连接（外网中继 + 局域网）
+    startRemoteRelay()
+    startRemoteServer()
+    return result
+  })
+  ipcMain.handle('auth:logout', async () => {
+    await runtime.logout()
+    // 退出登录自动关闭远程连接（外网中继 + 局域网）
+    stopRemoteRelay()
+    stopRemoteServer()
+  })
   ipcMain.handle('auth:listModels', async () => runtime.listModels())
   ipcMain.handle('auth:refreshModels', async () => runtime.refreshModels())
 
@@ -227,6 +240,7 @@ export function registerIpc(): void {
     return getRemoteStatus()
   })
   ipcMain.handle('remote:status', async () => getRemoteStatus())
+  ipcMain.handle('remote:refreshCode', async () => refreshPairingCode())
 
   // —— 远程连接（网关中继，外网可达：桌面端作为 Host 连网关，手机同账号登录作为 Client 自动配对）——
   ipcMain.handle('remote:relayEnable', async (_e, url?: string) => startRemoteRelay(url))

@@ -193,6 +193,7 @@ class AskRequest {
   final bool multiple;
   final String? placeholder;
   final String? kind;
+  final String? reasoning;
   final List<SessionSummary>? sessionOptions;
   final List<ModelOption>? modelOptions;
 
@@ -204,6 +205,7 @@ class AskRequest {
     required this.multiple,
     this.placeholder,
     this.kind,
+    this.reasoning,
     this.sessionOptions,
     this.modelOptions,
   });
@@ -217,6 +219,7 @@ class AskRequest {
       multiple: (j['multiple'] ?? false) as bool,
       placeholder: j['placeholder'] as String?,
       kind: j['kind'] as String?,
+      reasoning: j['reasoning'] as String?,
       sessionOptions: (j['sessionOptions'] as List?)
           ?.map((e) => SessionSummary.fromJson(e as Map<String, dynamic>))
           .toList(),

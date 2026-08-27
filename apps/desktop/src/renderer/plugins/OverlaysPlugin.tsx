@@ -8,7 +8,7 @@ function OverlaysSlot(): React.JSX.Element {
   const ctx = useUIContext()
   return (
     <>
-      {ctx.loginOpen && <LoginModal onClose={() => ctx.setLoginOpen(false)} onLogin={ctx.handleLogin} />}
+      {ctx.loginOpen && <LoginModal onClose={() => ctx.setLoginOpen(false)} onLogin={ctx.handleLogin} onRegister={ctx.handleRegister} />}
       {ctx.previewImage && <ImagePreview src={ctx.previewImage} onClose={() => ctx.setPreviewImage(null)} />}
     </>
   )
