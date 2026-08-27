@@ -50,75 +50,90 @@ function registerToggleShortcut(): void {
   }
 }
 
-app.whenReady().then(async () => {
-  setRuntime(await bootHost())
-  initUiStore(getRuntime())
-  registerIpc()
+// 单例锁：同一时间只允许一个山海实例运行。
+// 多实例会共用 ~/.shanhai/config.json 里的同一个 deviceId，在网关上互相顶替连接（乒乓），
+// 引发「连接一直转圈」「已连接手机数虚高」等问题，因此必须禁止多开。
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
 
-  // 启动时若已登录（本地凭证已恢复），自动开启远程连接（外网中继 + 局域网）。
-  // 未登录则不开启，登录后由 auth:login 触发开启；退出登录由 auth:logout 自动关闭。
-  if (getRuntime().loggedIn) {
-    startRemoteRelay()
-    startRemoteServer()
-  }
-
-  // 桌面壳窗口（全屏壁纸，忽略鼠标作为背景层；先创建，后续窗口浮在其上）
-  const desktopWin = createWindow({ type: 'desktop' })
-  await loadWindowContent(desktopWin)
-  // Dock 窗口（底部应用图标栏，独立于桌面壳以保持可点击）
-  const dockWin = createWindow({ type: 'dock' })
-  await loadWindowContent(dockWin)
-  // 聊天窗口（浮动在桌面之上，承载对话主界面）：默认隐藏，启动时仅显示桌面壳 + Dock + 会话管家窗口，
-  // 用户通过 Dock「聊天」图标 / 托盘 / 全局快捷键打开聊天窗口
-  const chatWin = createWindow({ type: 'chat', show: false })
-  await loadWindowContent(chatWin)
-  // 会话管家窗口（独立常驻，右侧停靠，承载主 Agent 单会话聊天界面）
-  const supervisorWin = createWindow({ type: 'supervisor' })
-  await loadWindowContent(supervisorWin)
-  registerPush()
-
-  // 启动应用版本自动检查：1 秒后查一次，之后每 10 分钟查一次（发现新版本主动推送渲染层亮角标）
-  scheduleStartupUpdateCheck(chatWin)
-
-  // 恢复已安装插件（AI 自研应用跨会话/跨重启留存）：在窗口就绪 + 广播注册后执行，
-  // 确保 browser 半 UI 代码能正确投递到渲染进程（否则 restore 时窗口尚未创建，投递会丢失）。
-  await getRuntime().restoreInstalledPlugins()
-
-  // Dock 图标：失败只告警，绝不因图标路径无效而中断启动（历史 bug：曾因此导致窗口创建被跳过）
-  try {
-    if (process.platform === 'darwin' && app.dock) app.dock.setIcon(ICON_PATH)
-  } catch (err) {
-    console.warn('[山海] 设置 Dock 图标失败：', err)
-  }
-
-  // 托盘：失败只告警，不影响主窗口使用
-  try {
-    createTray()
-  } catch (err) {
-    console.warn('[山海] 创建托盘失败：', err)
-  }
-
-  registerToggleShortcut()
-
-  // 任意山海窗口获得焦点时纠正桌面层级：把桌面壳抬到所有非山海窗口之上、
-  // 山海其它窗口保持在桌面壳之上（否则失焦再聚焦后会出现「聊天/管家窗口显示但桌面背景缺失」）
-  app.on('browser-window-focus', () => ensureDesktopLayer())
-
-  app.on('activate', () => {
+if (!gotSingleInstanceLock) {
+  // 已有实例在运行：立即退出本实例，不创建任何窗口、不连网关。
+  app.quit()
+} else {
+  // 有第二个实例尝试启动时：唤起并聚焦已有实例的聊天窗口，而不是再开一套。
+  app.on('second-instance', () => {
     if (app.isReady()) showChatWindow()
   })
-})
 
-// ⌘Q / Dock 右键退出：先置 isQuitting，让 close 事件放行（否则窗口只会 hide 不会退出）
-app.on('before-quit', () => {
-  isQuitting = true
-})
+  app.whenReady().then(async () => {
+    setRuntime(await bootHost())
+    initUiStore(getRuntime())
+    registerIpc()
 
-app.on('will-quit', () => {
-  globalShortcut.unregisterAll()
-})
+    // 启动时若已登录（本地凭证已恢复），自动开启远程连接（外网中继 + 局域网）。
+    // 未登录则不开启，登录后由 auth:login 触发开启；退出登录由 auth:logout 自动关闭。
+    if (getRuntime().loggedIn) {
+      startRemoteRelay()
+      startRemoteServer()
+    }
 
-app.on('window-all-closed', () => {
-  // macOS 常驻托盘，关窗不退出；其他平台仍按默认退出
-  if (process.platform !== 'darwin') app.quit()
-})
+    // 桌面壳窗口（全屏壁纸，忽略鼠标作为背景层；先创建，后续窗口浮在其上）
+    const desktopWin = createWindow({ type: 'desktop' })
+    await loadWindowContent(desktopWin)
+    // Dock 窗口（底部应用图标栏，独立于桌面壳以保持可点击）
+    const dockWin = createWindow({ type: 'dock' })
+    await loadWindowContent(dockWin)
+    // 聊天窗口（浮动在桌面之上，承载对话主界面）：默认隐藏，启动时仅显示桌面壳 + Dock + 会话管家窗口，
+    // 用户通过 Dock「聊天」图标 / 托盘 / 全局快捷键打开聊天窗口
+    const chatWin = createWindow({ type: 'chat', show: false })
+    await loadWindowContent(chatWin)
+    // 会话管家窗口（独立常驻，右侧停靠，承载主 Agent 单会话聊天界面）
+    const supervisorWin = createWindow({ type: 'supervisor' })
+    await loadWindowContent(supervisorWin)
+    registerPush()
+
+    // 启动应用版本自动检查：1 秒后查一次，之后每 10 分钟查一次（发现新版本主动推送渲染层亮角标）
+    scheduleStartupUpdateCheck(chatWin)
+
+    // 恢复已安装插件（AI 自研应用跨会话/跨重启留存）：在窗口就绪 + 广播注册后执行，
+    // 确保 browser 半 UI 代码能正确投递到渲染进程（否则 restore 时窗口尚未创建，投递会丢失）。
+    await getRuntime().restoreInstalledPlugins()
+
+    // Dock 图标：失败只告警，绝不因图标路径无效而中断启动（历史 bug：曾因此导致窗口创建被跳过）
+    try {
+      if (process.platform === 'darwin' && app.dock) app.dock.setIcon(ICON_PATH)
+    } catch (err) {
+      console.warn('[山海] 设置 Dock 图标失败：', err)
+    }
+
+    // 托盘：失败只告警，不影响主窗口使用
+    try {
+      createTray()
+    } catch (err) {
+      console.warn('[山海] 创建托盘失败：', err)
+    }
+
+    registerToggleShortcut()
+
+    // 任意山海窗口获得焦点时纠正桌面层级：把桌面壳抬到所有非山海窗口之上、
+    // 山海其它窗口保持在桌面壳之上（否则失焦再聚焦后会出现「聊天/管家窗口显示但桌面背景缺失」）
+    app.on('browser-window-focus', () => ensureDesktopLayer())
+
+    app.on('activate', () => {
+      if (app.isReady()) showChatWindow()
+    })
+  })
+
+  // ⌘Q / Dock 右键退出：先置 isQuitting，让 close 事件放行（否则窗口只会 hide 不会退出）
+  app.on('before-quit', () => {
+    isQuitting = true
+  })
+
+  app.on('will-quit', () => {
+    globalShortcut.unregisterAll()
+  })
+
+  app.on('window-all-closed', () => {
+    // macOS 常驻托盘，关窗不退出；其他平台仍按默认退出
+    if (process.platform !== 'darwin') app.quit()
+  })
+}

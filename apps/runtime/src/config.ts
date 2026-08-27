@@ -1,5 +1,5 @@
 import { promises as fs } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { homedir, hostname as osHostname } from 'node:os'
 import type { GatewayModel } from '@shanhai/auth'
@@ -22,6 +22,9 @@ export async function withConfigFile<T>(mutate: (cfg: Record<string, unknown>) =
       // 新文件 / 损坏：从空对象开始
     }
     const result = await mutate(cfg)
+    // 确保 ~/.shanhai/ 目录存在再写临时文件：全新安装（Windows 首次运行）时该目录尚未创建，
+    // 直接 writeFile 会抛 ENOENT（open config.json.tmp），导致启动流程中断、窗口创建不出来（表现为「点击图标没反应」）。
+    await fs.mkdir(dirname(path), { recursive: true })
     const tmp = `${path}.tmp`
     await fs.writeFile(tmp, JSON.stringify(cfg, null, 2), { mode: 0o600 })
     await fs.rename(tmp, path)
@@ -41,18 +44,24 @@ export async function ensureDeviceInfo(): Promise<void> {
   const hostname = osHostname()
   const osName = process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'win32' : 'linux'
   const generatedId = randomUUID()
-  await withConfigFile((cfg) => {
-    const existingId = typeof cfg.deviceId === 'string' && cfg.deviceId ? cfg.deviceId : ''
-    const existingName = typeof cfg.deviceName === 'string' && cfg.deviceName ? cfg.deviceName : ''
-    if (!existingId) cfg.deviceId = generatedId
-    if (!existingName) cfg.deviceName = hostname
-    deviceInfo = {
-      deviceId: existingId || generatedId,
-      deviceName: existingName || hostname,
-      hostname,
-      os: osName,
-    }
-  })
+  // 先用生成值兜底：即使持久化失败（如磁盘只读/无权限），getDeviceInfo 仍能返回可用标识，不阻断启动
+  deviceInfo = { deviceId: generatedId, deviceName: hostname, hostname, os: osName }
+  try {
+    await withConfigFile((cfg) => {
+      const existingId = typeof cfg.deviceId === 'string' && cfg.deviceId ? cfg.deviceId : ''
+      const existingName = typeof cfg.deviceName === 'string' && cfg.deviceName ? cfg.deviceName : ''
+      if (!existingId) cfg.deviceId = generatedId
+      if (!existingName) cfg.deviceName = hostname
+      deviceInfo = {
+        deviceId: existingId || generatedId,
+        deviceName: existingName || hostname,
+        hostname,
+        os: osName,
+      }
+    })
+  } catch {
+    // 持久化失败不阻断启动：deviceInfo 已用生成值兜底（首次运行时 ~/.shanhai 目录已由 withConfigFile 内 mkdir 确保）
+  }
 }
 
 /** 持久化选中模型到 config.json（下次打开不再重复选择） */

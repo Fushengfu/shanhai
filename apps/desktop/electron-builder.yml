@@ -50,12 +50,15 @@ win:
     - target: portable
       arch: [x64]
   icon: assets/icon.ico
+  # 可执行文件名用英文（避免 Windows 上「山海.exe」中文名带来的路径/兼容问题）；
+  # 快捷方式与菜单显示名仍由 productName「山海」+ shortcutName「山海」控制，保持中文。
+  executableName: Shanhai
 
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
   perMachine: false
-  artifactName: Shanhai-${version}-${arch}-setup.${ext}
+  artifactName: Shanhai-${version}-${arch}.${ext}
   shortcutName: 山海
   uninstallDisplayName: 山海
 
