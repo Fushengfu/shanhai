@@ -152,6 +152,7 @@ export async function readSettings(): Promise<AppSettings> {
       voice: { enabled: s?.voice?.enabled ?? DEFAULT_SETTINGS.voice.enabled },
       supervisorApproval: { enabled: s?.supervisorApproval?.enabled ?? DEFAULT_SETTINGS.supervisorApproval.enabled },
       supervisorAsk: { enabled: s?.supervisorAsk?.enabled ?? DEFAULT_SETTINGS.supervisorAsk.enabled },
+      supervisorClientRun: { enabled: s?.supervisorClientRun?.enabled ?? DEFAULT_SETTINGS.supervisorClientRun.enabled },
       compaction: { modelId: s?.compaction?.modelId ?? DEFAULT_SETTINGS.compaction.modelId },
     }
   } catch {
@@ -163,6 +164,7 @@ export async function readSettings(): Promise<AppSettings> {
       voice: { ...DEFAULT_SETTINGS.voice },
       supervisorApproval: { ...DEFAULT_SETTINGS.supervisorApproval },
       supervisorAsk: { ...DEFAULT_SETTINGS.supervisorAsk },
+      supervisorClientRun: { ...DEFAULT_SETTINGS.supervisorClientRun },
       compaction: { ...DEFAULT_SETTINGS.compaction },
     }
   }
@@ -180,6 +182,7 @@ export async function writeSettings(patch: Partial<AppSettings>): Promise<void> 
         voice: { ...DEFAULT_SETTINGS.voice, ...(cur.voice ?? {}), ...(patch.voice ?? {}) },
         supervisorApproval: { ...DEFAULT_SETTINGS.supervisorApproval, ...(cur.supervisorApproval ?? {}), ...(patch.supervisorApproval ?? {}) },
         supervisorAsk: { ...DEFAULT_SETTINGS.supervisorAsk, ...(cur.supervisorAsk ?? {}), ...(patch.supervisorAsk ?? {}) },
+        supervisorClientRun: { ...DEFAULT_SETTINGS.supervisorClientRun, ...(cur.supervisorClientRun ?? {}), ...(patch.supervisorClientRun ?? {}) },
         compaction: { ...DEFAULT_SETTINGS.compaction, ...(cur.compaction ?? {}), ...(patch.compaction ?? {}) },
       }
       cfg.settings = merged

@@ -226,6 +226,18 @@ export function filterUiStateForWindow(type: WindowType | undefined, s: UiStoreS
   }
 }
 
+/** 插件专用精简快照：只暴露登录态 + 用户名 + 壁纸，不含 apiKey/会话历史/token 等敏感或重数据（plugin:invoke 的 getUiState 用） */
+export interface PluginUiState {
+  loggedIn: boolean
+  username: string | null
+  wallpaper: string | null
+}
+
+/** 插件窗口的 getUiState 精简版：只返回登录态 + 用户名 + 壁纸，物理隔离 apiKey / 会话消息流 / 审批队列等敏感数据 */
+export function filterUiStateForPlugin(s: UiStoreState): PluginUiState {
+  return { loggedIn: s.loggedIn, username: s.username, wallpaper: s.wallpaper }
+}
+
 /** 判断窗口类型是否消费共享状态（仅 supervisor-bubble 纯静态悬浮图标不消费，广播时跳过；dock 需消费登录态） */
 export function windowConsumesUiState(type: WindowType | undefined): boolean {
   return type !== 'supervisor-bubble'

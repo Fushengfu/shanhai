@@ -90,6 +90,12 @@ export interface AppSettings {
      *  false 时无论谁下发都由用户手动回答。用户手动回答始终优先、始终可用。 */
     enabled: boolean
   }
+  supervisorClientRun: {
+    /** 是否允许管家接管「插件界面组件投递确认」：true 时，管家下发的任务里 plugin_run/plugin_test 触发的
+     *  browser 半投递确认由管家决策（批准/拒绝后弹窗自动关闭）；false 时无论谁下发都由用户手动确认。
+     *  用户手动点击始终优先、始终可用。 */
+    enabled: boolean
+  }
   compaction: {
     /** 统一压缩模型 id：上下文超限触发 LLM 摘要时用的模型。空串 = 未配置，回退当前会话模型。 */
     modelId: string
@@ -104,6 +110,7 @@ export type AppSettingsPatch = {
   voice?: Partial<AppSettings['voice']>
   supervisorApproval?: Partial<AppSettings['supervisorApproval']>
   supervisorAsk?: Partial<AppSettings['supervisorAsk']>
+  supervisorClientRun?: Partial<AppSettings['supervisorClientRun']>
   compaction?: Partial<AppSettings['compaction']>
 }
 
@@ -115,6 +122,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   voice: { enabled: false },
   supervisorApproval: { enabled: true },
   supervisorAsk: { enabled: true },
+  supervisorClientRun: { enabled: true },
   compaction: { modelId: '' },
 }
 
@@ -338,8 +346,10 @@ export interface Runtime {
   onClientRunRequest(cb: (req: { requestId: string; sessionId: string; pkgId: string; name: string; purpose: string }) => void): () => void
   /** UI 应答 browser 半投递审批（approved=true 投递，false 拒绝） */
   respondClientRun(requestId: string, approved: boolean): void
-  /** browser 半代码投递回调（UI 收到后 slots 注册渲染） */
-  onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
+  /** browser 半投递确认被管家决策 resolve 后回调（requestId 定位，UI 据此关闭对应弹窗） */
+  onClientRunResolved(cb: (requestId: string) => void): () => void
+  /** browser 半代码投递回调（UI 收到后 slots 注册渲染）；entryHtml 为 client 半编译产物绝对路径（第 2/3 步，无源码时窗口应用仍可注册） */
+  onClientCode(cb: (payload: { pkgId: string; name: string; code: string; permissions?: string[]; entryHtml?: string; icon?: string }) => void): () => void
   /** browser 半卸载回调（UI 移除组件） */
   onClientRemove(cb: (pkgId: string) => void): () => void
   /** 打开插件窗口应用（appId = 插件持久化 id，主进程 openApp 复用 app 窗口类型承载） */

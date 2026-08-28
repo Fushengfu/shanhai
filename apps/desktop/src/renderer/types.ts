@@ -284,12 +284,12 @@ declare global {
       openApp(appId: string): Promise<boolean>
       /** 关闭一个插件应用窗口 */
       closeApp(appId: string): Promise<void>
-      /** 查询动态插件窗口应用（appId = 插件持久化 id），返回 { appId, name, clientCode } 或 null */
-      getPluginApp(appId: string): Promise<{ appId: string; name: string; clientCode: string } | null>
+      /** 查询动态插件窗口应用（appId = 插件持久化 id），返回 { appId, name, clientCode, icon? } 或 null */
+      getPluginApp(appId: string): Promise<{ appId: string; name: string; clientCode: string; icon?: string } | null>
       /** 列出所有已安装的动态插件窗口应用（供桌面壳 Dock 渲染应用图标） */
-      listPluginApps(): Promise<Array<{ appId: string; name: string; clientCode: string }>>
+      listPluginApps(): Promise<Array<{ appId: string; name: string; clientCode: string; icon?: string }>>
       /** 订阅动态插件窗口应用清单变化（安装/卸载时主进程广播完整清单） */
-      onPluginAppsChanged(cb: (apps: Array<{ appId: string; name: string; clientCode: string }>) => void): () => void
+      onPluginAppsChanged(cb: (apps: Array<{ appId: string; name: string; clientCode: string; icon?: string }>) => void): () => void
       /** 桌面被点击时，把聊天/应用窗口带回桌面之上（fire-and-forget） */
       restoreAboveDesktop(): void
       /** 隐藏聊天窗口（自定义关闭按钮，聊天窗口常驻不销毁） */
@@ -420,6 +420,7 @@ declare global {
       selfmodInspect(sessionId?: string): Promise<unknown>
       onClientRunRequest(cb: (req: ClientRunRequest) => void): () => void
       respondClientRun(requestId: string, approved: boolean): Promise<void>
+      onClientRunResolved(cb: (requestId: string) => void): () => void
       onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
       onClientRemove(cb: (pkgId: string) => void): () => void
       listMemory(sessionId: string): Promise<MemoryEntry[]>

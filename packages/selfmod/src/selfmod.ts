@@ -1,6 +1,15 @@
 import { PluginInventory, PluginStore, DisposerStack, type DynamicPackage } from '@shanhai/kernel'
 import type { ToolContract } from '@shanhai/tools'
 import vm from 'node:vm'
+import { createRequire } from 'node:module'
+import { existsSync, readFileSync, promises as fs } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { scaffoldPlugin, SCAFFOLD_WORKSPACE_DIR } from './scaffold'
+import { buildPlugin, verifyBuildArtifacts, type PluginBuildResult } from './build'
+
+// 主进程 require 上下文（加载 host 半编译产物 host.cjs；selfmod 被 desktop/runtime bundle 成 ESM，故用 createRequire 拿 CJS require）
+const nodeRequire = createRequire(import.meta.url)
 
 /**
  * K5 自修改运行时（对齐 DSH 的 extensions 机制）：让 agent 在会话中检查、定义、运行、停止自己的插件。
@@ -72,6 +81,66 @@ function evalHostCode(code: string): (ctx: HostFacade) => unknown {
   return factory as (ctx: HostFacade) => unknown
 }
 
+/** 兼容两种导出形态：CJS `module.exports = fn`（mod 即 fn）与 ESM→CJS 转换 `export default fn`（mod.default = fn） */
+function extractFactory(mod: unknown): unknown {
+  if (typeof mod === 'function') return mod
+  if (mod && typeof mod === 'object') {
+    const m = mod as Record<string, unknown>
+    if (typeof m.default === 'function') return m.default
+    if (typeof m.factory === 'function') return m.factory
+  }
+  return mod
+}
+
+/**
+ * require 加载 host 半编译产物（自包含 bundle），返回工厂函数 (ctx) => disposer。
+ *
+ * 第 3 步：host 半脱离 node:vm 源码字符串，改为加载 esbuild 打包的 dist/host.cjs，从而能 require 第三方依赖。
+ * - 依赖解析：host.cjs 应为「自包含 bundle」（esbuild --bundle --platform=node --format=cjs），第三方依赖已打进产物，
+ *   主进程只 require 产物、不做运行时 node_modules 解析。
+ * - 越权防护（兜底审计）：产物必须自包含，不得 external 山海内部包 / electron 主进程 API——
+ *   否则插件可 require('electron') 触达主进程底层能力。命中则拒绝加载。
+ */
+function loadHostEntry(entry: string): (ctx: HostFacade) => unknown {
+  const src = readFileSync(entry, 'utf8')
+  if (/\brequire\s*\(\s*['"](electron|@shanhai[^'"]*)['"]\s*\)/.test(src)) {
+    throw new Error('host 半编译产物违规 external（electron / @shanhai/*），请以自包含 bundle 重新构建')
+  }
+  const resolved = nodeRequire.resolve(entry)
+  delete nodeRequire.cache[resolved]
+  const factory = extractFactory(nodeRequire(entry))
+  if (typeof factory !== 'function') {
+    throw new Error('host 半编译产物必须导出工厂函数：(ctx) => disposer')
+  }
+  return factory as (ctx: HostFacade) => unknown
+}
+
+/** 卸载 host 半编译产物：清除 require 缓存，避免重复加载/内存泄漏（stop/uninstall/撤回时调用） */
+function unloadHostEntry(entry: string): void {
+  try {
+    const resolved = nodeRequire.resolve(entry)
+    delete nodeRequire.cache[resolved]
+  } catch {
+    // 产物已删除 / 从未加载
+  }
+}
+
+/** 规范化插件 id（name 转 kebab-case；空或含非法字符则报错）。persistIdOf 与 plugin_build/test_load/verify 共用 */
+function normalizePluginId(raw: string): string {
+  const id = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  if (!id) {
+    throw new Error('插件 name 无法生成持久化 id（需含字母/数字/连字符），请给插件一个英文短 id（如 todo-list）')
+  }
+  if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+    throw new Error(`非法持久化 id（仅允许字母/数字/下划线/连字符）: ${id}`)
+  }
+  return id
+}
+
 export class SelfModifyRuntime {
   private readonly inventory = new PluginInventory()
   private readonly services = new Map<string, unknown>()
@@ -95,7 +164,22 @@ export class SelfModifyRuntime {
   }
 
   /** plugin_define：记录 package（语法检查不运行），返回卡片 */
-  define(def: { name: string; purpose: string; code?: string; client?: string }, sessionId: string): DynamicPackage {
+  define(
+    def: {
+      name: string
+      purpose: string
+      code?: string
+      client?: string
+      permissions?: string[]
+      icon?: string
+      dependencies?: Record<string, string>
+      /** host 半编译产物绝对路径（工程化链路 / 测试加载用；install 时会自动探测，通常无需显式传） */
+      entryHost?: string
+      /** client 半窗口入口绝对路径（工程化链路 / 测试加载用） */
+      entryHtml?: string
+    },
+    sessionId: string,
+  ): DynamicPackage {
     return this.inventory.define({ ...def, sessionId })
   }
 
@@ -111,57 +195,31 @@ export class SelfModifyRuntime {
       throw new Error(`动态包 "${pkg.name}" 属于其他会话，无权运行`)
     }
     if (pkg.status === 'running') throw new Error(`动态包 "${pkg.name}" 已在运行`)
-    if (!pkg.code && !pkg.client) throw new Error(`动态包 "${pkg.name}" 没有可运行的代码`)
+    if (!pkg.code && !pkg.client && !pkg.entryHost && !pkg.entryHtml) {
+      throw new Error(`动态包 "${pkg.name}" 没有可运行的代码（需 code / client / entryHost / entryHtml 至少其一）`)
+    }
 
     const stack = new DisposerStack()
 
-    // —— host 半：vm 沙箱评估，facade 只暴露 on / provide / tools.register 三条自动撤销路径 ——
-    if (pkg.code) {
+    // —— host 半：优先 require 编译产物（entryHost），否则 vm 沙箱评估源码（code）。facade 只暴露五条能力 ——
+    if (pkg.entryHost && existsSync(pkg.entryHost)) {
+      const factory = loadHostEntry(pkg.entryHost)
+      // 卸载时清 require 缓存，避免重复加载/内存泄漏（stack 撤销时调用）
+      const entry = pkg.entryHost
+      stack.collect(() => unloadHostEntry(entry))
+      const ret = await factory(this.buildFacade(pkg, stack))
+      stack.collect(ret as () => void | Promise<void>)
+    } else if (pkg.code) {
       const factory = evalHostCode(pkg.code)
-      const facade: HostFacade = {
-        on: (name, listener) => {
-          const off = this.hooks.onEvent(name, listener)
-          stack.collect(() => {
-            off()
-          })
-        },
-        provide: (name, impl) => {
-          this.services.set(name, impl)
-          stack.collect(() => {
-            if (this.services.get(name) === impl) this.services.delete(name)
-          })
-        },
-        tools: {
-          register: (tool) => {
-            const off = this.hooks.registerTool(tool)
-            stack.collect(() => {
-              off()
-            })
-          },
-        },
-        openWindow: (appId) => {
-          // 打开本插件的窗口应用：appId 缺省 = 插件 id（已安装插件即持久化 id）
-          // 自动注册撤销：plugin_stop / plugin_uninstall / plugin_test 撤回时自动关闭该窗口
-          const target = appId ?? pkg.id
-          this.hooks.openAppWindow(target)
-          stack.collect(() => {
-            this.hooks.closeAppWindow(target)
-          })
-        },
-        closeWindow: (appId) => {
-          // 显式关闭本插件的窗口应用（appId 缺省 = 插件 id）
-          this.hooks.closeAppWindow(appId ?? pkg.id)
-        },
-        // 刻意不暴露 effect()：动态 package 的 cleanup 只能走上面几条，杜绝裸副作用
-      }
-      const ret = await factory(facade)
+      const ret = await factory(this.buildFacade(pkg, stack))
       stack.collect(ret as () => void | Promise<void>)
     }
 
     // —— browser 半：round-trip 审批（用户 approve 才投递；reject 则撤销 host 半并抛错）——
+    // 有 client 源码（slots/窗口组件）或 client 编译产物（entryHtml）都要注册窗口应用。
     // skipApproval（install/restore 已获授权）时直接投递，不再二次弹审批。
     let clientDelivered = false
-    if (pkg.client) {
+    if (pkg.client || pkg.entryHtml) {
       const approved = opts.skipApproval ? true : await this.hooks.requestClientRun(pkg, sessionId)
       if (!approved) {
         await stack.dispose()
@@ -174,6 +232,46 @@ export class SelfModifyRuntime {
     this.disposers.set(pkg.id, () => stack.dispose())
     this.inventory.setStatus(pkg.id, 'running')
     return { clientDelivered }
+  }
+
+  /** 构造 host 半 façade：只暴露 on / provide / tools.register / openWindow / closeWindow 五条能力，且都自动撤销（不暴露 effect()） */
+  private buildFacade(pkg: DynamicPackage, stack: DisposerStack): HostFacade {
+    return {
+      on: (name, listener) => {
+        const off = this.hooks.onEvent(name, listener)
+        stack.collect(() => {
+          off()
+        })
+      },
+      provide: (name, impl) => {
+        this.services.set(name, impl)
+        stack.collect(() => {
+          if (this.services.get(name) === impl) this.services.delete(name)
+        })
+      },
+      tools: {
+        register: (tool) => {
+          const off = this.hooks.registerTool(tool)
+          stack.collect(() => {
+            off()
+          })
+        },
+      },
+      openWindow: (appId) => {
+        // 打开本插件的窗口应用：appId 缺省 = 插件 id（已安装插件即持久化 id）
+        // 自动注册撤销：plugin_stop / plugin_uninstall / plugin_test 撤回时自动关闭该窗口
+        const target = appId ?? pkg.id
+        this.hooks.openAppWindow(target)
+        stack.collect(() => {
+          this.hooks.closeAppWindow(target)
+        })
+      },
+      closeWindow: (appId) => {
+        // 显式关闭本插件的窗口应用（appId 缺省 = 插件 id）
+        this.hooks.closeAppWindow(appId ?? pkg.id)
+      },
+      // 刻意不暴露 effect()：动态 package 的 cleanup 只能走上面几条，杜绝裸副作用
+    }
   }
 
   /** plugin_stop：撤回 host 半 + browser 半，定义保留可再跑 */
@@ -211,18 +309,25 @@ export class SelfModifyRuntime {
 
   /** 计算持久化 id：name 转 kebab-case；空或含非法字符则报错 */
   private static persistIdOf(pkg: DynamicPackage, explicit?: string): string {
-    const raw = (explicit ?? pkg.name)
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9_-]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-    if (!raw) {
-      throw new Error(`插件 name 无法生成持久化 id（需含字母/数字/连字符），请给插件一个英文短 id（如 todo-list）`)
-    }
-    if (!/^[a-zA-Z0-9_-]+$/.test(raw)) {
-      throw new Error(`非法持久化 id（仅允许字母/数字/下划线/连字符）: ${raw}`)
-    }
-    return raw
+    return normalizePluginId(explicit ?? pkg.name)
+  }
+
+  /**
+   * 部署编译产物（第 7 步收口）：消除「plugin_build 产物在 workspace、install 探测 plugins/<id>/dist」之间的手动 cp。
+   * 若 plugins/<id>/dist 无任何产物、但 plugins-workspace/<id>/dist 有，则自动复制整个 dist 过去，再交给 install 探测。
+   * 已有产物或 workspace 无产物时静默跳过（保持向后兼容：用户手动 cp 的场景不受影响）。
+   */
+  private async deployArtifacts(id: string): Promise<void> {
+    if (!this.store) return
+    const hostEntry = this.store.entryFile(id, 'host')
+    const htmlEntry = this.store.entryFile(id, 'client')
+    if (existsSync(hostEntry) || existsSync(htmlEntry)) return
+    const wsDist = join(SCAFFOLD_WORKSPACE_DIR, id, 'dist')
+    if (!existsSync(wsDist)) return
+    if (!existsSync(join(wsDist, 'host.cjs')) && !existsSync(join(wsDist, 'client.html'))) return
+    const targetDist = dirname(hostEntry)
+    await fs.mkdir(targetDist, { recursive: true })
+    await fs.cp(wsDist, targetDist, { recursive: true })
   }
 
   /** plugin_install：把验证通过的动态包持久化到内核并激活（跨会话、跨重启留存） */
@@ -230,10 +335,23 @@ export class SelfModifyRuntime {
     const pkg = this.inventory.get(dynId)
     if (!pkg) throw new Error(`动态包不存在: ${dynId}`)
     if (pkg.sessionId !== sessionId) throw new Error(`动态包 "${pkg.name}" 属于其他会话，无权安装`)
-    if (!pkg.code && !pkg.client) throw new Error(`动态包 "${pkg.name}" 没有可安装的代码`)
     if (!this.store) throw new Error('插件仓库未装配，无法安装')
 
     const id = SelfModifyRuntime.persistIdOf(pkg, persistId)
+
+    // 部署产物：workspace/dist 有产物且 plugins/<id>/dist 无产物时自动复制（消除手动 cp）
+    await this.deployArtifacts(id)
+
+    // 探测编译产物（id 确定后，产物路径 = ~/.shanhai/plugins/<id>/dist/{host.cjs,client.html}）
+    const entryHost = this.store.entryFile(id, 'host')
+    const entryHtml = this.store.entryFile(id, 'client')
+    const hasHost = existsSync(entryHost)
+    const hasHtml = existsSync(entryHtml)
+
+    // 至少要有一种可执行载体：host 半源码 / client 半源码 / host 编译产物 / client 编译产物
+    if (!pkg.code && !pkg.client && !hasHost && !hasHtml) {
+      throw new Error(`动态包 "${pkg.name}" 没有可安装的代码（需 code / client / dist/host.cjs / dist/client.html 至少其一）`)
+    }
 
     // 已存在同名已安装插件 → 视为升级：先卸载旧的
     if (this.inventory.list().some((p) => p.id === id && p.status === 'installed')) {
@@ -246,11 +364,15 @@ export class SelfModifyRuntime {
     }
     this.inventory.rename(dynId, id)
     this.inventory.setSession(id, '*')
+    // 把探测到的产物路径写回 package（run 阶段据此 require host.cjs / 注册 client.html 窗口应用）
+    pkg.entryHost = hasHost ? entryHost : undefined
+    pkg.entryHtml = hasHtml ? entryHtml : undefined
 
     // 激活（install 工具顶层已审批，skipApproval 避免 browser 半二次弹窗）
     await this.run(id, sessionId, { skipApproval: true })
 
-    // 持久化
+    // 持久化（permissions / entryHost / entryHtml / icon / dependencies / kind 随 manifest 落盘，install 顶层审批即视为批准其声明的权限）
+    // kind：有编译产物（dist/host.cjs 或 dist/client.html）记为 bundled（工程化），否则记为 source（快速原型，仅源码字符串）。
     await this.store.install({
       id,
       name: pkg.name,
@@ -258,6 +380,12 @@ export class SelfModifyRuntime {
       version: pkg.version,
       code: pkg.code,
       client: pkg.client,
+      permissions: pkg.permissions ?? [],
+      entryHost: pkg.entryHost,
+      entryHtml: pkg.entryHtml,
+      icon: pkg.icon,
+      dependencies: pkg.dependencies,
+      kind: hasHost || hasHtml ? 'bundled' : 'source',
       installedAt: Date.now(),
     })
 
@@ -298,6 +426,11 @@ export class SelfModifyRuntime {
         client: meta.client,
         version: meta.version,
         sessionId: '*',
+        permissions: meta.permissions ?? [],
+        entryHost: meta.entryHost,
+        entryHtml: meta.entryHtml,
+        icon: meta.icon,
+        dependencies: meta.dependencies,
       })
       try {
         await this.run(pkg.id, '*', { skipApproval: true })
@@ -309,6 +442,146 @@ export class SelfModifyRuntime {
       }
     }
     return restored
+  }
+
+  /**
+   * plugin_build：进程内编译插件应用项目（第 6 步）。
+   * 用山海进程内已有的 esbuild / vite 构建 dist/host.cjs + dist/client.html，不依赖用户手动 npm install。
+   */
+  async build(id: string, projectDir?: string): Promise<PluginBuildResult> {
+    const dir = projectDir ? String(projectDir) : join(SCAFFOLD_WORKSPACE_DIR, id)
+    return buildPlugin(dir, id)
+  }
+
+  /**
+   * plugin_test_load：把编译产物复制到临时目录（~/.shanhai/plugins-test/<id>/）做「干跑加载」，
+   * 验证 host 半能 require + factory 被调用 + ctx 五条能力可用 + 能正常卸载回收（disposer + require.cache 清理），
+   * 全程不触达正式 ~/.shanhai/plugins/、不注册 pluginApps、不广播 Dock（用 mock hooks + 独立 runtime 隔离）。
+   */
+  async testLoad(id: string, projectDir?: string): Promise<Record<string, unknown>> {
+    const pid = normalizePluginId(id)
+    const srcDir = projectDir ? String(projectDir) : join(SCAFFOLD_WORKSPACE_DIR, pid)
+    const distDir = join(srcDir, 'dist')
+    const hostSrc = join(distDir, 'host.cjs')
+    const clientSrc = join(distDir, 'client.html')
+
+    if (!existsSync(hostSrc) && !existsSync(clientSrc)) {
+      throw new Error(`插件项目无编译产物（需先 plugin_build 产出 dist/host.cjs 或 dist/client.html）: ${srcDir}`)
+    }
+
+    // 复制到临时目录，隔离加载
+    const tmpDir = join(homedir(), '.shanhai', 'plugins-test', pid)
+    await fs.rm(tmpDir, { recursive: true, force: true })
+    await fs.cp(distDir, join(tmpDir, 'dist'), { recursive: true })
+    const tmpHost = join(tmpDir, 'dist', 'host.cjs')
+
+    const openCalls: string[] = []
+    const closeCalls: string[] = []
+    const events: string[] = []
+    const provided: string[] = []
+    const registeredTools: string[] = []
+
+    const mockHooks: SelfModifyHooks = {
+      listServices: () => [],
+      listTools: () => [],
+      listSlots: () => [],
+      registerTool: (tool) => {
+        registeredTools.push(tool.name)
+        return () => {}
+      },
+      onEvent: (name) => {
+        events.push(name)
+        return () => {}
+      },
+      requestClientRun: async () => true,
+      deliverClient: async () => {},
+      removeClient: async () => {},
+      openAppWindow: (appId) => openCalls.push(appId),
+      closeAppWindow: (appId) => closeCalls.push(appId),
+    }
+
+    const mock = new SelfModifyRuntime(mockHooks, null)
+    let factoryCalled = false
+    let disposerCalled = false
+    try {
+      const pkg = mock.define({ name: pid, purpose: 'plugin_test_load 临时加载', entryHost: existsSync(tmpHost) ? tmpHost : undefined }, '*')
+      const { clientDelivered } = await mock.run(pkg.id, '*')
+      factoryCalled = true
+      const report = mock.inspect('*') as { services: string[] }
+      provided.push(...report.services.filter((s) => ![''].includes(s)))
+      const hostLoaded = existsSync(tmpHost) ? nodeRequire.cache[nodeRequire.resolve(tmpHost)] !== undefined : true
+      // 卸载回收
+      await mock.stop(pkg.id)
+      disposerCalled = true
+      const cacheCleared = existsSync(tmpHost) ? nodeRequire.cache[nodeRequire.resolve(tmpHost)] === undefined : true
+      return {
+        ok: true,
+        id: pid,
+        tmpDir,
+        hostEntry: tmpHost,
+        clientHtml: existsSync(join(tmpDir, 'dist', 'client.html')) ? join(tmpDir, 'dist', 'client.html') : null,
+        factoryCalled,
+        hostLoaded,
+        disposerCalled,
+        requireCacheCleared: cacheCleared,
+        openWindowCalls: openCalls,
+        closeWindowCalls: closeCalls,
+        eventSubscriptions: events,
+        serviceNames: provided,
+        registeredTools,
+        clientDelivered,
+      }
+    } finally {
+      // 确保清理临时目录，不留残留
+      await fs.rm(tmpDir, { recursive: true, force: true })
+    }
+  }
+
+  /**
+   * plugin_verify：对编译产物做「等价验证」（不依赖 GUI 截图）：产物存在性 + host 半越权审计 +
+   * host 半可加载（factory 是函数）+ client.html 结构（含 #root 与产物引用）。GUI 弹窗/白名单桥调用
+   * 由 AI 在 install 后经 computer-use/browser-use 截图补充。
+   */
+  async verify(id: string, projectDir?: string): Promise<Record<string, unknown>> {
+    const pid = normalizePluginId(id)
+    const dir = projectDir ? String(projectDir) : join(SCAFFOLD_WORKSPACE_DIR, pid)
+    const { hostEntry, clientHtml, hostAudit } = await verifyBuildArtifacts(dir)
+
+    let hostLoadable: { ok: boolean; reason?: string } | null = null
+    if (hostEntry) {
+      try {
+        const factory = loadHostEntry(hostEntry)
+        hostLoadable = { ok: typeof factory === 'function' }
+        unloadHostEntry(hostEntry)
+      } catch (err) {
+        hostLoadable = { ok: false, reason: err instanceof Error ? err.message : String(err) }
+      }
+    }
+
+    let clientInfo: Record<string, unknown> | null = null
+    if (clientHtml) {
+      try {
+        const html = await fs.readFile(clientHtml, 'utf8')
+        clientInfo = {
+          hasRoot: html.includes('id="root"') || html.includes("id='root'"),
+          referencesAssets: /assets\//.test(html) || /src=/.test(html),
+          bytes: html.length,
+        }
+      } catch (err) {
+        clientInfo = { error: err instanceof Error ? err.message : String(err) }
+      }
+    }
+
+    return {
+      id: pid,
+      projectDir: resolve(dir),
+      hostEntry: hostEntry ? true : false,
+      clientHtml: clientHtml ? true : false,
+      hostAudit,
+      hostLoadable,
+      clientInfo,
+      verdict: (hostAudit?.ok !== false && hostLoadable?.ok !== false && (hostEntry || clientHtml) ? 'pass' : 'fail'),
+    }
   }
 
   /** 五个 model-facing 工具（plugin_inspect / define / run / stop / undefine） */
@@ -336,7 +609,7 @@ export class SelfModifyRuntime {
       description:
         '开发插件前先 skill_read plugin-protocol 读完整规范（本文是精炼速查版）。' +
         '定义一个动态插件包（仅记录、不运行），返回 dyn-<n> id。name 是包名，purpose 说明用途。' +
-        '【host 半 code】必须 module.exports = (ctx) => disposer（不能写裸箭头函数，否则 vm 沙箱取不到导出会报错）。ctx 提供五条能力：' +
+        '【host 半 code】两条链路：① 快速原型 = 源码字符串，必须 module.exports = (ctx) => disposer（不能写裸箭头函数，否则 vm 沙箱取不到导出会报错）；② 工程化 = 编译产物 dist/host.cjs（esbuild 自包含 bundle，require 加载、可 require 第三方依赖，install 时自动探测）。ctx 提供五条能力：' +
         'on(name,listener) 订阅内核事件、provide(name,impl) 注册命名服务、tools.register(tool) 注册全局工具、' +
         'openWindow(appId?) 打开本插件独立窗口、closeWindow(appId?) 关闭它；刻意不暴露 effect()，cleanup 只走前四条自动撤销路径。' +
         'disposer 可为 函数 / null / Iterable / Promise（撤销时逆序调用，单个失败不阻断其余）。' +
@@ -354,6 +627,9 @@ export class SelfModifyRuntime {
           purpose: { type: 'string', description: '用途说明（一句话）' },
           code: { type: 'string', description: 'host 半源码（可选）' },
           client: { type: 'string', description: 'browser 半源码（可选，须用 React.createElement，不能写 JSX）' },
+          permissions: { type: 'array', items: { type: 'string' }, description: '可选：插件声明的白名单能力名清单（窗口应用形态才需要，用于调 window.shanhaiPlugin 桥）。完整可声明清单：getVersion / clipboardWriteText / clipboardReadText / speak / selectDirectory / listSessions / listMemory / getUiState(精简版) / closeApp(仅自身) / getWallpaper / getTokenStats。缺省=空数组=最小权限；install 时随 manifest 落盘并审批' },
+          icon: { type: 'string', description: '可选：图标相对路径（相对插件目录，如 icon.png / assets/icon.png），供 Dock 图标渲染用；需该文件已放在 ~/.shanhai/plugins/<id>/ 下' },
+          dependencies: { type: 'object', description: '可选：依赖声明（包名→版本），仅供工程化插件的 package.json 参考/审计，运行时不自解析依赖' },
         },
         required: ['name', 'purpose'],
       },
@@ -365,10 +641,13 @@ export class SelfModifyRuntime {
             purpose: String(args.purpose ?? ''),
             code: args.code ? String(args.code) : undefined,
             client: args.client ? String(args.client) : undefined,
+            permissions: Array.isArray(args.permissions) ? args.permissions.map((x) => String(x)) : undefined,
+            icon: args.icon ? String(args.icon) : undefined,
+            dependencies: args.dependencies && typeof args.dependencies === 'object' ? (args.dependencies as Record<string, string>) : undefined,
           },
           sid(),
         )
-        return { id: pkg.id, name: pkg.name, purpose: pkg.purpose, status: pkg.status }
+        return { id: pkg.id, name: pkg.name, purpose: pkg.purpose, status: pkg.status, permissions: pkg.permissions }
       },
     }
 
@@ -467,6 +746,88 @@ export class SelfModifyRuntime {
       execute: async (args) => this.uninstall(String(args.id ?? '')),
     }
 
-    return [inspectTool, defineTool, runTool, stopTool, undefineTool, testTool, installTool, uninstallTool]
+    const scaffoldTool: ToolContract = {
+      name: 'plugin_scaffold',
+      description:
+        '从内置模板生成一个可编译的「插件应用」项目到 ~/.shanhai/plugins-workspace/<id>/（含 src/host.ts 主机半、' +
+        'src/App.tsx + src/main.tsx + client.html 客户机半、package.json 依赖与 build 脚本、vite/esbuild 构建配置、tsconfig、README）。' +
+        '用于「工程化开发复杂插件界面」。这是流水线第 1 步，后续用 plugin_build（进程内编译，免 npm install）→ plugin_test_load → plugin_verify → plugin_install（自动部署产物）串成闭环，无需手动 npm install / cp。' +
+        '模板随包分发（终端用户不读仓库源码也能拿到）。生成后返回 dir（项目绝对路径）、files（文件清单）、nextSteps（下一步操作）。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: '插件英文短 id（用于目录名 + 持久化 id，仅 [a-zA-Z0-9_-]，如 todo-list）' },
+          name: { type: 'string', description: '可选：显示名（缺省 = id）' },
+          purpose: { type: 'string', description: '可选：用途说明（缺省 = 山海插件应用）' },
+        },
+        required: ['id'],
+      },
+      riskLevel: 'reversible',
+      execute: async (args) => {
+        const result = await scaffoldPlugin(String(args.id ?? ''), {
+          name: args.name ? String(args.name) : undefined,
+          purpose: args.purpose ? String(args.purpose) : undefined,
+        })
+        return result
+      },
+    }
+
+    const buildTool: ToolContract = {
+      name: 'plugin_build',
+      description:
+        '编译一个「插件应用」项目（由 plugin_scaffold 生成，位于 ~/.shanhai/plugins-workspace/<id>/）到其 dist/ 目录，' +
+        '产出 dist/host.cjs（esbuild 自包含 bundle）+ dist/client.html + dist/assets/*（vite 完整 React bundle）。' +
+        '进程内构建：用山海自带的 esbuild/vite，不依赖用户手动 npm install / node。' +
+        '这是「编写 → 编译 → 测试加载 → 验证 → 安装」流水线的第 2 步（scaffold 之后）。返回 hostEntry/clientHtml/assets/warnings。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: '插件英文短 id（项目目录 ~/.shanhai/plugins-workspace/<id>/，缺省据此定位）' },
+          projectDir: { type: 'string', description: '可选：插件项目目录绝对路径（缺省用 ~/.shanhai/plugins-workspace/<id>）' },
+        },
+        required: ['id'],
+      },
+      riskLevel: 'reversible',
+      execute: async (args) => this.build(String(args.id ?? ''), args.projectDir ? String(args.projectDir) : undefined),
+    }
+
+    const testLoadTool: ToolContract = {
+      name: 'plugin_test_load',
+      description:
+        '把编译产物复制到临时目录（~/.shanhai/plugins-test/<id>/）做「干跑加载」：require dist/host.cjs + 调用 factory，' +
+        '验证 host 半能跑起来、ctx 五条能力（on/provide/tools.register/openWindow/closeWindow）可用、能正常卸载回收（disposer + require.cache 清理）。' +
+        '不污染正式 ~/.shanhai/plugins/、不注册 Dock 图标。返回 factoryCalled/hostLoaded/disposerCalled/requireCacheCleared/各 ctx 能力调用记录。' +
+        '流水线第 3 步（plugin_build 之后）。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: '插件英文短 id（项目目录 ~/.shanhai/plugins-workspace/<id>/，缺省据此定位）' },
+          projectDir: { type: 'string', description: '可选：插件项目目录绝对路径（缺省用 ~/.shanhai/plugins-workspace/<id>）' },
+        },
+        required: ['id'],
+      },
+      riskLevel: 'reversible',
+      execute: async (args) => this.testLoad(String(args.id ?? ''), args.projectDir ? String(args.projectDir) : undefined),
+    }
+
+    const verifyTool: ToolContract = {
+      name: 'plugin_verify',
+      description:
+        '对编译产物做「等价验证」：产物存在性（dist/host.cjs + dist/client.html）+ host 半越权审计（不 external electron/@shanhai/*）' +
+        '+ host 半可加载（factory 是函数）+ client.html 结构（含 #root 与产物引用）。返回 verdict（pass/fail）。' +
+        'GUI 弹窗/白名单桥 window.shanhaiPlugin 调用的截图验证由 AI 在 install 后用 computer-use/browser-use 补充。流水线第 4 步。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: '插件英文短 id（项目目录 ~/.shanhai/plugins-workspace/<id>/，缺省据此定位）' },
+          projectDir: { type: 'string', description: '可选：插件项目目录绝对路径（缺省用 ~/.shanhai/plugins-workspace/<id>）' },
+        },
+        required: ['id'],
+      },
+      riskLevel: 'readonly',
+      execute: async (args) => this.verify(String(args.id ?? ''), args.projectDir ? String(args.projectDir) : undefined),
+    }
+
+    return [inspectTool, defineTool, runTool, stopTool, undefineTool, testTool, installTool, uninstallTool, scaffoldTool, buildTool, testLoadTool, verifyTool]
   }
 }

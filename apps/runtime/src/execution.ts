@@ -38,6 +38,7 @@ export interface ExecutionModule {
   wakeSupervisorForApproval(req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }): void
   wakeSupervisorForAsk(req: AskRequest): void
   wakeSupervisorForResult(sid: string, title: string, result?: string, error?: string): void
+  wakeSupervisorForClientRun(req: { requestId: string; sessionId: string; pkgId: string; name: string; purpose: string }): void
   resend(sessionId: string, userMessageIndex: number, newContent?: string): Promise<string>
   resume(sessionId: string): Promise<string>
   retrySession(sessionId: string): Promise<string>
@@ -295,6 +296,30 @@ export function createExecutionModule(
         ctx.askResolvedCallbacks.forEach((cb) => cb(requestId))
         return { ok: true, message: `已代答提问 ${requestId}` }
       },
+      resolveClientRun: (requestId, approved) => {
+        const p = ctx.pendingClientRuns.get(requestId)
+        if (!p) {
+          console.log('[supervisor-wake] resolve_client_run 未命中：', requestId, 'pendingClientRuns 现存=', [...ctx.pendingClientRuns.keys()].join(','))
+          return { ok: false, message: `投递请求不存在或已处理: ${requestId}` }
+        }
+        p.resolve(approved)
+        ctx.pendingClientRuns.delete(requestId)
+        console.log('[supervisor-wake] resolve_client_run 已决策：', requestId, approved)
+        ctx.clientRunResolvedCallbacks.forEach((cb) => cb(requestId))
+        return { ok: true, message: `已${approved ? '允许' : '拒绝'}投递请求 ${requestId}` }
+      },
+      resumeSession: async (sid) => {
+        const meta = ctx.sessions.get(sid)
+        if (!meta || meta.isSupervisor) return { ok: false, message: `会话不存在: ${sid}` }
+        if (ctx.runningLoops.has(sid)) return { ok: false, message: `会话「${meta.title}」(${sid}) 正在执行中，无法断点续跑` }
+        if (!hasIncompleteTurn(sid)) return { ok: false, message: `会话「${meta.title}」(${sid}) 没有未完成的轮次，无需续跑` }
+        // 断点续跑：resume 从事件日志回放已执行历史、从断点继续（不新增用户消息、不篡改历史对话），
+        // 工具执行时的审批判断仍从该会话事件日志回放 approval/policy，即仍受该会话安全模式（approvalPolicy）约束。
+        void resume(sid).catch((err) => {
+          console.error('[supervisor] resume_session 续跑失败:', err instanceof Error ? err.message : err)
+        })
+        return { ok: true, message: `已恢复会话「${meta.title}」(${sid}) 从断点继续执行` }
+      },
     }).map(wrapTool),
     ...createSupervisorLedgerTools().map(wrapTool),
   ]
@@ -389,6 +414,23 @@ export function createExecutionModule(
     const turnSeq = supMeta ? supMeta.session.list().filter((e) => e.type === 'user/message' && !(e.data as { injected?: boolean }).injected).length + 1 : 1
     ctx.userMessageCallbacks.forEach((cb) => cb(SUPERVISOR_ID, prompt, turnSeq))
     console.log('[supervisor-wake] 任务回传入队：', sid, 'queue=', ctx.supervisorWakeQueue.length, 'supervisorWaking=', ctx.supervisorWaking, 'runningLoops.has=', ctx.runningLoops.has(SUPERVISOR_ID))
+    void drainSupervisorWake()
+  }
+
+  function wakeSupervisorForClientRun(req: { requestId: string; sessionId: string; pkgId: string; name: string; purpose: string }): void {
+    const sid = req.sessionId ?? ''
+    const title = sid ? (ctx.sessions.get(sid)?.title ?? sid) : sid
+    const prompt =
+      `【投递请求】会话「${title}」(${sid}) 请求向界面投递一个插件界面组件（插件 client 半代码）。\n` +
+      `动态包：${req.name}（${req.pkgId}）\n` +
+      `用途：${req.purpose}\n\n` +
+      `请判断是否允许投递，并调用 resolve_client_run 工具决策：requestId="${req.requestId}"，approved 取 true（允许投递）或 false（拒绝投递）。` +
+      `这是把插件界面代码投递到界面执行的安全敏感操作，用途可疑请拒绝；不要替该会话执行具体操作。`
+    ctx.supervisorWakeQueue.push(prompt)
+    const supMeta = ctx.sessions.get(SUPERVISOR_ID)
+    const turnSeq = supMeta ? supMeta.session.list().filter((e) => e.type === 'user/message' && !(e.data as { injected?: boolean }).injected).length + 1 : 1
+    ctx.userMessageCallbacks.forEach((cb) => cb(SUPERVISOR_ID, prompt, turnSeq))
+    console.log('[supervisor-wake] 投递请求入队：', req.requestId, 'pkg=', req.pkgId, 'queue=', ctx.supervisorWakeQueue.length, 'supervisorWaking=', ctx.supervisorWaking, 'runningLoops.has=', ctx.runningLoops.has(SUPERVISOR_ID))
     void drainSupervisorWake()
   }
 
@@ -616,6 +658,7 @@ export function createExecutionModule(
     wakeSupervisorForApproval,
     wakeSupervisorForAsk,
     wakeSupervisorForResult,
+    wakeSupervisorForClientRun,
     resend,
     resume,
     retrySession,

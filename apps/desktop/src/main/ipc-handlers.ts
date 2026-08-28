@@ -1,9 +1,9 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
 import { SUPERVISOR_ID } from '@shanhai/runtime'
 import { getRuntime } from './runtime'
-import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow, toggleMaximizeWindow, resizeDockWindow, hideSupervisorToBubble, showSupervisorFromBubble, moveSupervisorBubble, hideToSystemDesktop, getWindowType } from './window-manager'
+import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow, toggleMaximizeWindow, resizeDockWindow, hideSupervisorToBubble, showSupervisorFromBubble, moveSupervisorBubble, hideToSystemDesktop, getWindowType, getWindowAppId } from './window-manager'
 import { getPluginApp, listPluginApps } from './plugin-apps'
-import { getUiState, patchUiState, getWallpaper, setWallpaper, filterUiStateForWindow, type UiStoreState } from './ui-store'
+import { getUiState, patchUiState, getWallpaper, setWallpaper, filterUiStateForWindow, filterUiStateForPlugin, type UiStoreState } from './ui-store'
 import { listSystemWallpapers, applySystemWallpaper } from './system-wallpaper'
 import { startRemoteServer, stopRemoteServer, getRemoteStatus, refreshPairingCode } from './remote-server'
 import { startRemoteRelay, stopRemoteRelay, getRelayStatus } from './remote-relay'
@@ -262,4 +262,64 @@ export function registerIpc(): void {
   )
   ipcMain.handle('app:get-update-status', async () => getLastUpdateCheckResult())
   ipcMain.handle('mobile:get-apk-info', async (_e, packageName: string) => fetchMobileApkInfo(packageName))
+
+  // —— 插件窗口白名单 IPC（第 1 步：插件专用 preload 的统一入口，双层校验）——
+  // 第一层：插件窗口只能经专用 preload（window.shanhaiPlugin）调用，物理拿不到全量 window.shanhai；
+  // 第二层：此处按「插件 id + 能力名」校验——反查发起窗口的插件 appId，能力必须在全局白名单内，
+  //         且插件 manifest 声明的 permissions[] 里包含该能力，否则拒绝。危险接口（auth/chat/supervisor/
+  //         model/remote/approval:setPolicy/session:delete/settings:set/wallpaper:set 等）永不进白名单。
+  const PLUGIN_CAPABILITIES = new Set([
+    'getVersion', 'clipboardWriteText', 'clipboardReadText', 'speak', 'selectDirectory',
+    'listSessions', 'listMemory', 'getUiState', 'closeApp', 'getWallpaper', 'getTokenStats',
+  ])
+  ipcMain.handle('plugin:invoke', async (e, capability: string, ...args: unknown[]) => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    const appId = win ? getWindowAppId(win) : undefined
+    if (!appId) throw new Error('插件能力调用缺少窗口上下文（仅插件窗口可调 window.shanhaiPlugin）')
+    const pkg = getPluginApp(appId)
+    if (!pkg) throw new Error(`未知插件应用: ${appId}`)
+    if (!PLUGIN_CAPABILITIES.has(capability)) throw new Error(`能力不在插件白名单: ${capability}`)
+    if (!pkg.permissions.includes(capability)) {
+      throw new Error(`插件 "${pkg.name}" 未声明权限「${capability}」，请在其 manifest.permissions 中声明`)
+    }
+    switch (capability) {
+      case 'getVersion':
+        return app.getVersion()
+      case 'clipboardWriteText':
+        clipboard.writeText(String(args[0] ?? ''))
+        return
+      case 'clipboardReadText':
+        return clipboard.readText()
+      case 'speak':
+        await runtime.voice.synthesize(String(args[0] ?? ''))
+        return
+      case 'selectDirectory': {
+        const options: Electron.OpenDialogOptions = {
+          title: '选择目录',
+          defaultPath: (typeof args[0] === 'string' ? args[0] : '') || app.getPath('home'),
+          properties: ['openDirectory', 'createDirectory'],
+        }
+        const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+        if (result.canceled || result.filePaths.length === 0) return null
+        return result.filePaths[0]
+      }
+      case 'listSessions':
+        return runtime.listSessions()
+      case 'listMemory':
+        return runtime.listMemory(String(args[0] ?? ''))
+      case 'getUiState':
+        // 精简版：只暴露登录态 + 用户名 + 壁纸，隔离 apiKey / 会话历史 / token 等敏感数据
+        return filterUiStateForPlugin(getUiState())
+      case 'closeApp':
+        // 仅自身 id：插件只能关闭自己的窗口，无法越权关闭其它 app 窗口
+        closeApp(appId)
+        return
+      case 'getWallpaper':
+        return getWallpaper()
+      case 'getTokenStats':
+        return runtime.getTokenStats(typeof args[0] === 'string' ? args[0] : undefined)
+      default:
+        throw new Error(`未实现的插件能力: ${capability}`)
+    }
+  })
 }

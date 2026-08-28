@@ -317,6 +317,20 @@ export function App() {
       if (!sid) return
       setClientRunRequests((prev) => ({ ...prev, [sid]: [...(prev[sid] ?? []), req] }))
     })
+    // 投递确认被决策（用户手动点，或管家 resolve_client_run 代管）后，主进程广播 resolved 事件，据此移除对应弹窗。
+    // requestId 无会话维度，遍历所有会话队列移除命中项（幂等：用户手动点已 slice 过则 no-op）。
+    const offClientRunResolved = api.onClientRunResolved((requestId) => {
+      setClientRunRequests((prev) => {
+        let changed = false
+        const next: Record<string, ClientRunRequest[]> = {}
+        for (const [sid, q] of Object.entries(prev)) {
+          const filtered = q.filter((r) => r.requestId !== requestId)
+          if (filtered.length !== q.length) changed = true
+          if (filtered.length > 0) next[sid] = filtered
+        }
+        return changed ? next : prev
+      })
+    })
     const offClientCode = api.onClientCode((payload) => {
       mountClientCode(payload.pkgId, payload.code)
     })
@@ -327,6 +341,7 @@ export function App() {
     return () => {
       offModelsChanged()
       offClientRun()
+      offClientRunResolved()
       offClientCode()
       offClientRemove()
     }

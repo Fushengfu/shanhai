@@ -29,8 +29,8 @@ import { join } from 'node:path'
 import { gzip as gzipCb, gunzip as gunzipCb } from 'node:zlib'
 import { effectiveApprovalPolicy, effectiveModelId, type ApprovalPolicy, type SessionEvent } from '@shanhai/session'
 
-/** 活跃段滚动阈值（字节）：超过即归档为 gz 段，默认 5MB */
-export const SEGMENT_MAX_BYTES = 5 * 1024 * 1024
+/** 活跃段滚动阈值（字节）：超过即归档为 gz 段，默认 10MB */
+export const SEGMENT_MAX_BYTES = 10 * 1024 * 1024
 
 /** gzip 压缩（异步，不阻塞事件循环）；level 9 换取更小归档体积（归档一次性成本） */
 function gzip(buf: Buffer): Promise<Buffer> {

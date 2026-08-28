@@ -143,7 +143,7 @@ export function toolSummary(name: string, args?: Record<string, unknown>): strin
   if (!args) return ''
   const a = args
   if (name === 'skill_run') return skillRunSummary(args)
-  if (name === 'read_file' || name === 'write_file') return String(a.path ?? '')
+  if (name === 'read_file' || name === 'write_file' || name === 'edit_file' || name === 'rollback_file') return String(a.path ?? '')
   if (name === 'run_command') return String(a.command ?? '')
   if (name === 'list_dir') return a.path ? String(a.path) : '当前目录'
   if (name === 'image_analyze') return String(a.imageUrl ?? '').slice(0, 48)

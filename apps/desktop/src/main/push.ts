@@ -29,9 +29,13 @@ export function registerPush(): void {
   runtime.onReasoning((sessionId, text) => broadcast('chat:reasoning', sessionId, text))
   // 自修改（K5）：browser 半投递的 round-trip 审批 + 代码投递 + 卸载（非 store 状态）
   runtime.onClientRunRequest((req) => broadcast('selfmod:client-run-request', req))
+  // 投递确认被决策（用户手动点或管家 resolve_client_run）后广播「已解决」，UI 据此关闭对应弹窗（跨端同步）
+  runtime.onClientRunResolved((requestId) => broadcast('selfmod:client-run-resolved', requestId))
   runtime.onClientCode((payload) => {
-    // 动态插件窗口应用：把 client 半源码注册进主进程清单（app 窗口渲染时查询），再广播给聊天窗口 slots
-    registerPluginApp(payload.pkgId, payload.name, payload.code)
+    // 动态插件窗口应用：把 client 半源码 + 权限清单 + client 编译产物（entryHtml）注册进主进程清单
+    // （app 窗口渲染时查询 + plugin:invoke 校验），再广播给聊天窗口 slots。
+    // 纯编译产物插件（无 clientCode 只有 entryHtml）也在此注册，使 Dock 图标 + isPluginApp + loadFile 生效。
+    registerPluginApp(payload.pkgId, payload.name, payload.code, payload.permissions ?? [], payload.entryHtml, payload.icon)
     broadcast('selfmod:client-code', payload)
     // 通知桌面壳 Dock 刷新动态插件应用图标
     broadcast('plugin-apps:changed', listPluginApps())

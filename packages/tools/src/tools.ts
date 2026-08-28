@@ -263,19 +263,20 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
     return undefined
   }
 
-  /** read_file 默认分段读取行数（最小/默认粒度）：未指定 endLine 时每次默认读取 200 行，避免大文件一次返回全文撑爆上下文 */
-  const READ_FILE_DEFAULT_LINES = 200
+  /** read_file 默认分段读取行数（最小/默认粒度）：未指定 endLine 时每次默认读取 1000 行，避免大文件一次返回全文撑爆上下文 */
+  const READ_FILE_DEFAULT_LINES = 1000
   /** read_file 单次读取最大行数上限：超出自动截断并提示，避免一次读取过多撑爆上下文 */
-  const READ_FILE_MAX_LINES = 1000
+  const READ_FILE_MAX_LINES = 2000
 
-  /** read_file：读取文件内容（相对路径解析到工作目录，默认分段读取：最少 200 行、单次最多 1000 行，避免大文件一次返回全文撑爆上下文） */
+  /** read_file：读取文件内容（相对路径解析到工作目录，默认分段读取：最少 1000 行、单次最多 2000 行，避免大文件一次返回全文撑爆上下文） */
   const readFileTool: ToolContract = {
     name: 'read_file',
     description:
       '读取指定路径的文本文件内容。当需要查看文件内容时使用。' +
       'path 可以是绝对路径，也可以是相对于当前工作目录的相对路径（优先使用相对路径，保持操作范围在工作目录内）。' +
-      '按行分段读取：未指定行号时每次最少读取 200 行（文件不足 200 行则读全文），单次最多读取 1000 行，截断时会提示总行数与继续读取的 startLine。' +
-      '可用 startLine / endLine 精确指定行范围（1-based、包含两端），范围超过单次上限 1000 行时自动截断并提示。',
+      '按行分段读取：未指定行号时每次最少读取 1000 行（文件不足 1000 行则读全文），单次最多读取 2000 行，截断时会提示总行数与继续读取的 startLine。' +
+      '可用 startLine / endLine 精确指定行范围（1-based、包含两端），范围超过单次上限 2000 行时自动截断并提示。' +
+      '注意：避免连续使用相同参数调用此工具，以免造成重复读取。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -289,10 +290,11 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
     resolveRisk: readonlyPathResolveRisk,
     guide: {
       usage: [
-        '读取策略按文件大小智能选择：小文件（<500 行）直接全文读取，不指定 startLine/endLine；大文件（>=500 行）按行范围读取，每次至少读取 1000 行。',
+        '读取策略按文件大小智能选择：小文件（<1000 行）直接全文读取，不指定 startLine/endLine；大文件（>=1000 行）按行范围读取，每次至少读取 1000 行。',
         '禁止 200-300 行的小块连续读取；需要读取大文件的多个区段时，合并为单次大范围读取（如 startLine=1, endLine=2000），而非多次小范围调用。',
         '需要全局理解文件结构、查找跨区段引用、或文件被用户手动附加时，优先全文读取。',
         '仅当明确知道目标代码所在行号范围（如修改某个具体函数）时，才使用精确的行范围读取。',
+        '注意：避免连续使用相同参数调用此工具，以免造成重复读取。',
       ],
       cautions: [
         '小文件禁止分块读取，直接全文读取更高效。',
@@ -324,7 +326,7 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
         }
         return content
       }
-      // 未指定 endLine → 默认分段读取 200 行（不足则到文件末尾），截断时提示继续读取
+      // 未指定 endLine → 默认分段读取 1000 行（不足则到文件末尾），截断时提示继续读取
       const start = Math.max(1, Math.floor(startLine ?? 1))
       const end = Math.min(start + READ_FILE_DEFAULT_LINES - 1, total)
       if (start > end) {

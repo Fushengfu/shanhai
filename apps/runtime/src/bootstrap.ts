@@ -104,6 +104,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     voice: { enabled: DEFAULT_SETTINGS.voice.enabled },
     supervisorApproval: { enabled: DEFAULT_SETTINGS.supervisorApproval.enabled },
     supervisorAsk: { enabled: DEFAULT_SETTINGS.supervisorAsk.enabled },
+    supervisorClientRun: { enabled: DEFAULT_SETTINGS.supervisorClientRun.enabled },
     compaction: { modelId: DEFAULT_SETTINGS.compaction.modelId },
   } as AppSettings
   ctx.askService = new AskService()
@@ -116,7 +117,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   ctx.supervisorLoopTools = [] as ToolContract[]
   ctx.clientRunCallbacks = new Set<(req: { requestId: string; sessionId: string; pkgId: string; name: string; purpose: string }) => void>()
   ctx.pendingClientRuns = new Map<string, { resolve: (approved: boolean) => void; sessionId?: string }>()
-  ctx.clientCodeCallbacks = new Set<(payload: { pkgId: string; name: string; code: string }) => void>()
+  ctx.clientRunResolvedCallbacks = new Set<(requestId: string) => void>()
+  ctx.clientCodeCallbacks = new Set<(payload: { pkgId: string; name: string; code: string; permissions?: string[]; entryHtml?: string }) => void>()
   ctx.clientRemoveCallbacks = new Set<(pkgId: string) => void>()
   ctx.openAppWindowCallbacks = new Set<(appId: string) => void>()
   ctx.closeAppWindowCallbacks = new Set<(appId: string) => void>()
@@ -402,9 +404,14 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         const requestId = `client-run-${Date.now()}-${Math.random().toString(36).slice(2)}`
         ctx.pendingClientRuns.set(requestId, { resolve, sessionId })
         ctx.clientRunCallbacks.forEach((cb) => cb({ requestId, sessionId, pkgId: pkg.id, name: pkg.name, purpose: pkg.purpose }))
+        // 管家接管：管家下发的任务里 plugin_run/plugin_test 触发投递确认时，若「管家接管投递」开关开启，唤醒管家决策（非阻塞，弹窗仍显示、用户仍可手动点）
+        const origin = sessionId ? (ctx.sessionOrigin.get(sessionId) ?? 'user') : 'user'
+        if (origin === 'supervisor' && ctx.currentSettings.supervisorClientRun.enabled) {
+          void executionModule.wakeSupervisorForClientRun({ requestId, sessionId, pkgId: pkg.id, name: pkg.name, purpose: pkg.purpose })
+        }
       }),
     deliverClient: async (pkg: DynamicPackage) => {
-      ctx.clientCodeCallbacks.forEach((cb) => cb({ pkgId: pkg.id, name: pkg.name, code: pkg.client ?? '' }))
+      ctx.clientCodeCallbacks.forEach((cb) => cb({ pkgId: pkg.id, name: pkg.name, code: pkg.client ?? '', permissions: pkg.permissions ?? [], entryHtml: pkg.entryHtml, icon: pkg.icon }))
     },
     removeClient: async (pkgId: string) => {
       ctx.clientRemoveCallbacks.forEach((cb) => cb(pkgId))
@@ -1150,7 +1157,14 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       if (p) {
         p.resolve(approved)
         ctx.pendingClientRuns.delete(requestId)
+        // 统一广播「已解决」：桌面端/手机端任一处理投递后，UI 弹窗据此关闭，跨端同步状态
+        ctx.clientRunResolvedCallbacks.forEach((cb) => cb(requestId))
       }
+    },
+
+    onClientRunResolved(cb) {
+      ctx.clientRunResolvedCallbacks.add(cb)
+      return () => ctx.clientRunResolvedCallbacks.delete(cb)
     },
 
     onClientCode(cb) {
@@ -1209,7 +1223,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
 
     getSettings() {
-      return { browser: { ...ctx.currentSettings.browser }, messageSubmit: { ...ctx.currentSettings.messageSubmit }, debug: { ...ctx.currentSettings.debug }, voice: { ...ctx.currentSettings.voice }, supervisorApproval: { ...ctx.currentSettings.supervisorApproval }, supervisorAsk: { ...ctx.currentSettings.supervisorAsk }, compaction: { ...ctx.currentSettings.compaction } }
+      return { browser: { ...ctx.currentSettings.browser }, messageSubmit: { ...ctx.currentSettings.messageSubmit }, debug: { ...ctx.currentSettings.debug }, voice: { ...ctx.currentSettings.voice }, supervisorApproval: { ...ctx.currentSettings.supervisorApproval }, supervisorAsk: { ...ctx.currentSettings.supervisorAsk }, supervisorClientRun: { ...ctx.currentSettings.supervisorClientRun }, compaction: { ...ctx.currentSettings.compaction } }
     },
 
     async getHttpTrace(id) {
@@ -1246,6 +1260,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         voice: { ...ctx.currentSettings.voice, ...(patch.voice ?? {}) },
         supervisorApproval: { ...ctx.currentSettings.supervisorApproval, ...(patch.supervisorApproval ?? {}) },
         supervisorAsk: { ...ctx.currentSettings.supervisorAsk, ...(patch.supervisorAsk ?? {}) },
+        supervisorClientRun: { ...ctx.currentSettings.supervisorClientRun, ...(patch.supervisorClientRun ?? {}) },
         compaction: { ...ctx.currentSettings.compaction, ...(patch.compaction ?? {}) },
       }
       // 实时同步到浏览器后端（影响后续新建窗口是否显示，已存在窗口不受影响）
@@ -1274,7 +1289,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         }
       }
       await writeSettings(ctx.currentSettings)
-      return { browser: { ...ctx.currentSettings.browser }, messageSubmit: { ...ctx.currentSettings.messageSubmit }, debug: { ...ctx.currentSettings.debug }, voice: { ...ctx.currentSettings.voice }, supervisorApproval: { ...ctx.currentSettings.supervisorApproval }, supervisorAsk: { ...ctx.currentSettings.supervisorAsk }, compaction: { ...ctx.currentSettings.compaction } }
+      return { browser: { ...ctx.currentSettings.browser }, messageSubmit: { ...ctx.currentSettings.messageSubmit }, debug: { ...ctx.currentSettings.debug }, voice: { ...ctx.currentSettings.voice }, supervisorApproval: { ...ctx.currentSettings.supervisorApproval }, supervisorAsk: { ...ctx.currentSettings.supervisorAsk }, supervisorClientRun: { ...ctx.currentSettings.supervisorClientRun }, compaction: { ...ctx.currentSettings.compaction } }
     },
   }
 }

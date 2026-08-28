@@ -5,7 +5,9 @@ export default defineConfig([
     entry: { 'main/index': 'src/main/index.ts' },
     format: ['esm'],
     // tesseract.js 动态 import（computer-use 跨平台 OCR 用），保持 external 让其从 node_modules 加载 wasm/worker 资源
-    external: ['electron', 'node-pty', 'tesseract.js', 'tesseract.js-core'],
+    // 进程内构建器（第 6 步）：selfmod 的 build.ts 在运行时动态 import vite / @vitejs/plugin-react、createRequire 定位 esbuild，
+    // 需 external，否则会把 vite 全家桶 + esbuild 二进制打进主进程产物
+    external: ['electron', 'node-pty', 'tesseract.js', 'tesseract.js-core', 'esbuild', 'vite', '@vitejs/plugin-react'],
     // 把 @shanhai/* 打包进产物，避免 electron ESM 解析 workspace 软链接失败
     noExternal: [/@shanhai\//],
     clean: true,
@@ -13,7 +15,7 @@ export default defineConfig([
   },
   {
     // preload 用 CommonJS（electron sandbox preload 不支持 ESM import）
-    entry: { 'preload/index': 'src/preload/index.ts' },
+    entry: { 'preload/index': 'src/preload/index.ts', 'preload/plugin': 'src/preload/plugin.ts' },
     format: ['cjs'],
     external: ['electron'],
     clean: false,

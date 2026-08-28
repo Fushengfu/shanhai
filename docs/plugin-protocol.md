@@ -3,69 +3,76 @@
 > 本文是山海 AI「插件（selfmod / K5 自修改）」的**权威、唯一、机器可读**协议规范。
 > 它由源码真实契约梳理而成，AI 开发插件前**必须先读本文，禁止靠猜或试错**。
 > 若本文与工具描述文字冲突，以本文为准；若本文与源码实现冲突，以源码为准并回读本文修正。
+>
+> 内置同步：本文是**唯一权威源**。`packages/skills/src/plugin-protocol.generated.ts` 由
+> `packages/skills/scripts/gen-plugin-protocol.mjs` 从本文自动生成，`skill.ts` 的内置技能 `plugin-protocol`（instructions）引用它。
+> 改协议**只改本文**，再跑 `pnpm --filter @shanhai/skills gen:protocol`（`build` 前会自动执行）即可同步。
+> 打包分发后 AI 通过 `skill_list` / `skill_read('plugin-protocol')` 即可读到本规范（无需读仓库源码）。
 
 - 源码锚点（grep 定位用）：
-  - `packages/selfmod/src/selfmod.ts` —— host 半契约 `HostFacade`、生命周期 `SelfModifyRuntime`
+  - `packages/selfmod/src/selfmod.ts` —— host 半契约 `HostFacade`、生命周期 `SelfModifyRuntime`、插件工具链
+  - `packages/selfmod/src/build.ts` —— `plugin_build` 进程内构建器、越权审计
+  - `packages/selfmod/src/scaffold.ts` —— `plugin_scaffold` 内置模板
   - `packages/kernel/src/selfmod/inventory.ts` —— `DynamicPackage`、`InstalledPackageMeta`、`PluginStore`（落盘）
   - `packages/kernel/src/runtime/dispose.ts` —— `DisposerStack`（disposer 收集/撤销）
   - `packages/kernel-modules/src/client/slot.ts` —— `CORE_SLOTS`（UI 插槽清单）
   - `apps/desktop/src/renderer/App.tsx` —— client 半 UI 插槽形态的执行/卸载
-  - `apps/desktop/src/renderer/app/AppWindow.tsx` —— client 半窗口应用形态的编译/渲染
+  - `apps/desktop/src/renderer/app/AppWindow.tsx` —— client 半窗口应用形态（快速原型路径）
+  - `apps/desktop/src/preload/plugin.ts` —— 插件专用 preload（`window.shanhaiPlugin` 白名单桥）
+  - `apps/desktop/src/main/ipc-handlers.ts` —— `plugin:invoke` 统一入口 + `PLUGIN_CAPABILITIES` 白名单
   - `apps/desktop/src/main/plugin-apps.ts` / `push.ts` —— 窗口应用注册表 + Dock 图标广播
   - `apps/runtime/src/bootstrap.ts` —— `SelfModifyHooks` 的实现装配
 
 ---
 
-## 1. 核心概念
+## 0. 两条链路总览
 
-一个「插件」= 一个 **动态 package（DynamicPackage）**，由两段**源码字符串**组成（可只提供其一）：
+插件开发有两条链路，**并存、按「有无 dist 编译产物」自动选择**：
 
-| 半 | 运行环境 | 契约入口 | 用途 |
-|----|----------|----------|------|
-| host 半（`code`） | 进程内（Node `vm` 沙箱） | `module.exports = (ctx) => disposer` | 注册服务/事件/工具、开/关窗口 |
-| client 半（`client`） | 浏览器渲染进程（`new Function` 编译） | 见 §3 两种形态 | 挂 UI 组件（插槽）或渲染独立窗口 |
+| 链路 | 载体 | 适用场景 | 工具流 |
+|------|------|----------|--------|
+| **快速原型** | 源码字符串（`code` / `client`） | 临时小组件、快速验证 | `plugin_define` → `plugin_run`/`plugin_test` → `plugin_install` |
+| **工程化** | 独立构建产物（`dist/host.cjs` + `dist/client.html`） | 复杂界面、第三方依赖、长期使用 | `plugin_scaffold` → `plugin_build` → `plugin_test_load` → `plugin_verify` → `plugin_install` |
 
-- 动态 package 默认**仅内存态**：`plugin_define` 只记录不落盘；只有 `plugin_install` 才落盘持久化。
-- 会话隔离：`plugin_define` 产生的 package 归当前会话所有；`plugin_install` 后 `sessionId` 置为 `'*'`（全局）。
+- 工程化链路的 host 半 / client 半产物一旦存在，`plugin_install` / `plugin_run` 会**自动优先使用产物**（跳过源码字符串）。
+- 无产物时回退到快速原型路径（`node:vm` 评估 host 半、`new Function` 渲染 client 半）。
 
-`DynamicPackage` 字段（`packages/kernel/src/selfmod/inventory.ts`）：
-
-```ts
-interface DynamicPackage {
-  id: string          // define 时生成 'dyn-<n>'，install 后改为持久化 id
-  name: string
-  purpose: string
-  code?: string       // host 半源码
-  client?: string     // client 半源码
-  version?: string
-  status: 'defined' | 'running' | 'stopped' | 'installed'
-  sessionId: string
-}
-```
+一个「插件」= 一个 **动态 package（DynamicPackage）**，最终由一个**目录**承载（见 §6）。
 
 ---
 
-## 2. host 半契约
+## 1. host 半契约
 
-### 2.1 入口：必须 `module.exports = (ctx) => disposer`
+host 半在**进程内**运行，入口统一为**工厂函数 `(ctx) => disposer`**。有两种加载方式：
 
-host 半在 `node:vm` 沙箱内执行，沙箱只注入 `module` / `exports` 两个对象：
+### 1.1 快速原型：`node:vm` 评估源码字符串（`code` 字段）
+
+`evalHostCode` 的沙箱只注入 `module` / `exports` 两个对象：
 
 ```js
-// evalHostCode 的真实沙箱：
 const sandbox = { module: { exports: {} }, exports: {} }
 ```
 
-执行后取 `sandbox.module.exports`，**必须是函数**，否则抛错：
-
-```
-host 半代码必须导出函数：(ctx) => disposer
-```
+执行后取 `sandbox.module.exports`，**必须是函数**，否则抛错 `host 半代码必须导出函数：(ctx) => disposer`。
 
 > ⚠️ **坑 1**：host 半**必须**写成 `module.exports = (ctx) => {...}` 或 `module.exports = function (ctx) {...}`。
 > 裸箭头函数 `(ctx) => {...}`（没有 `module.exports =`）会因 `module.exports` 为空对象而报错。
 
-### 2.2 `ctx` 提供的能力（`HostFacade`，逐条）
+### 1.2 工程化：`require` 编译产物（`entryHost` 字段）
+
+`loadHostEntry` 用 `require(~/.shanhai/plugins/<id>/dist/host.cjs)` 加载，从而能 **require 第三方 npm 依赖**。
+
+**编译产物契约（必须满足，否则拒绝加载）：**
+
+1. **自包含 bundle**：用 `esbuild src/host.ts --bundle --platform=node --format=cjs --outfile=dist/host.cjs` 打包，第三方依赖打进产物；主进程**不做运行时 node_modules 解析**。
+2. **越权审计规则**：产物不得 `require('electron')` / `require('@shanhai/*')`。`loadHostEntry` 会正则扫描产物源码，命中则抛错 `host 半编译产物违规 external（electron / @shanhai/*）`。
+3. **导出兼容**：`extractFactory` 兼容三种形态 —— `module.exports = fn`（mod 即 fn）、`export default fn`（mod.default）、`exports.factory = fn`（mod.factory）。
+
+> ⚠️ **隔离本质**：`node:vm` 沙箱从来不是安全边界（`this.constructor.constructor('return process')()` 可逃逸），
+> 改 require 后隔离强度**没有实质下降**。host 半始终是「本地代码、信任立场等同 bash」。真正的防护靠：
+> facade 只暴露五条能力（不注入 `process`/`require`/`electron`/`module`/`ipcMain`）+ 产物 external 审计。
+
+### 1.3 `ctx` 提供的能力（`HostFacade`，逐条）
 
 ```ts
 interface HostFacade {
@@ -79,14 +86,13 @@ interface HostFacade {
 
 | 能力 | 签名 | 语义 | 是否自动撤销 |
 |------|------|------|--------------|
-| `ctx.on` | `(name, listener) => void` | 订阅内核事件总线（`kernel.ctx.on`），返回无 | ✅ 撤销时自动 off |
-| `ctx.provide` | `(name, impl) => void` | 注册一个命名服务到内存 map（当前仅被 `plugin_inspect` 报告，无服务发现/注入消费） | ✅ 撤销时自动删除 |
+| `ctx.on` | `(name, listener) => void` | 订阅内核事件总线，返回无 | ✅ 撤销时自动 off |
+| `ctx.provide` | `(name, impl) => void` | 注册命名服务到内存 map（当前仅被 `plugin_inspect` 报告，无服务发现/注入消费） | ✅ 撤销时自动删除 |
 | `ctx.tools.register` | `(tool: ToolContract) => void` | 向全局工具表注册一个 model-facing 工具 | ✅ 撤销时自动移除 |
 | `ctx.openWindow` | `(appId?: string) => void` | 打开本插件的窗口应用（`appId` 缺省 = 插件 id） | ✅ 撤销时自动关闭该窗口 |
 | `ctx.closeWindow` | `(appId?: string) => void` | 显式关闭本插件的窗口应用（`appId` 缺省 = 插件 id） | ❌ 主动关闭，不挂撤销 |
 
-> ⚠️ **刻意不暴露 `effect()`**：host 半的 cleanup 只能走上面 4 条自动撤销路径（`on`/`provide`/`tools.register`/`openWindow`），
-> 从机制上杜绝「裸副作用」导致插件无法热插拔。
+> ⚠️ **刻意不暴露 `effect()`**：host 半的 cleanup 只能走上面 4 条自动撤销路径（`on`/`provide`/`tools.register`/`openWindow`）。
 
 `ctx.tools.register` 的 `ToolContract`（`packages/tools/src/tools.ts`）：
 
@@ -98,18 +104,18 @@ interface ToolContract {
   riskLevel: 'readonly' | 'reversible' | 'irreversible' | 'high'
   approvalRequired?: boolean
   timeoutMs?: number                           // Infinity = 不超时（等用户交互）
-  guide?: ToolGuide                            // 工具使用手册条目
+  guide?: ToolGuide
   resolveRisk?: (args) => { riskLevel; approvalRequired?; outsideWorkdir? }
   execute: (args: Record<string, unknown>) => unknown | Promise<unknown>
 }
 ```
 
-### 2.3 disposer 的合法形式
+### 1.4 disposer 的合法形式
 
-`(ctx) => disposer` 的返回值交给 `DisposerStack.collect`，支持四种形式（`dispose.ts`）：
+`(ctx) => disposer` 的返回值交给 `DisposerStack.collect`，支持四种形式：
 
-1. **函数** `() => void` 或 `() => Promise<void>` —— 撤销时调用；
-2. **`null` / `undefined`** —— 无副作用，忽略；
+1. **函数** `() => void` 或 `() => Promise<void>`；
+2. **`null` / `undefined`**（无副作用，忽略）；
 3. **Iterable / AsyncIterable**，逐个 yield disposer；
 4. **Promise<disposer>**。
 
@@ -117,19 +123,13 @@ disposer 在 `plugin_stop` / `plugin_uninstall` / `plugin_undefine` / `plugin_te
 
 ---
 
-## 3. client 半契约（两种形态，二选一）
+## 2. client 半契约
 
-client 半代码在浏览器里用 `new Function(...)` 编译，**不经过 JSX 编译**。
-> ⚠️ **坑 2**：写组件**必须用 `React.createElement(...)`，禁止写 `<div>` 这类 JSX 语法**（否则 `new Function` 直接语法报错）。
+client 半运行在浏览器渲染进程，两种形态二选一；工程化链路的窗口应用形态走 `loadFile` 独立入口。
 
-### 3.1 形态 A：UI 插槽形态（默认，投递到聊天窗口）
+### 2.1 形态 A：UI 插槽形态（默认，投递到聊天窗口）
 
-编译方式（`App.tsx` `mountClientCode`）：
-
-```js
-new Function('React', 'slots', 'useUIContext', code)
-factory(React, slotsForPkg, useUIContext)
-```
+编译方式（`App.tsx` `mountClientCode`）：`new Function('React', 'slots', 'useUIContext', code)`。
 
 三个入参：
 
@@ -137,18 +137,13 @@ factory(React, slotsForPkg, useUIContext)
 |------|---------|------|
 | `React` | React 命名空间 | 用 `React.createElement` 建元素 |
 | `slots` | `{ register(reg) => dispose }` | **只有 `register` 一个方法**，不是完整 SlotRegistry |
-| `useUIContext` | `() => UIContextValue` | 在组件内读取框架派生的应用状态 |
-
-`slots.register` 的参数：
+| `useUIContext` | `() => UIContextValue` | 组件内读取框架派生的应用状态 |
 
 ```ts
 slots.register({ slot: string, id: string, component: React.ComponentType }): () => void
-// slot:      目标插槽名（见 §4）
-// id:        本包内的注册 id（会拼成 `${pkgId}:${id}`）
-// component: React 函数组件（内部可调 useUIContext()）
 ```
 
-返回的 `factory(...)` 结果若是函数，会作为该包的 browser 半 disposer 存起来（卸载时调用）。
+> ⚠️ **坑 2**：client 半源码字符串用 `new Function` 编译，**不经过 JSX**，写组件**必须用 `React.createElement(...)`，禁止写 `<div>` 这类 JSX 语法**。
 
 **最小骨架**：
 
@@ -163,16 +158,13 @@ function (React, slots, useUIContext) {
 }
 ```
 
-### 3.2 形态 B：窗口应用形态（配合 host 半 `openWindow`）
+### 2.2 形态 B：窗口应用形态（配合 host 半 `openWindow`）
 
-编译方式（`AppWindow.tsx` `DynamicPluginWindow`）：
+窗口应用形态有**两条子路径**：
 
-```js
-new Function('React', 'helpers', clientCode)
-const result = factory(React, { close: onClose, appId, name })
-```
+#### a. 快速原型：`new Function`（`client` 源码字符串）
 
-`helpers` 三个字段：
+编译方式（`AppWindow.tsx` `DynamicPluginWindow`）：`new Function('React', 'helpers', clientCode)`。
 
 ```ts
 helpers = {
@@ -182,12 +174,8 @@ helpers = {
 }
 ```
 
-> ⚠️ **坑 3**：**必须 `return` 一个 React 组件函数**（`function XxxWindow() {...}`），
-> 不能 `return` 一个对象、也不能写「箭头函数直接返回对象」。
-> 若 `factory` 返回的不是函数，窗口会显示「插件未提供窗口界面」占位。
-
-> ⚠️ **坑 4**：窗口应用形态的 client 半在**独立 app 渲染进程**执行，**不在 `UIContext.Provider` 内**，
-> 因此**不能调 `useUIContext()`**，只能通过 `helpers.close` / `helpers.appId` / `helpers.name` 拿信息。
+> ⚠️ **坑 3**：**必须 `return` 一个 React 组件函数**（`function XxxWindow() {...}`），不能 `return` 对象、不能「箭头函数直接返回对象」；返回非函数时窗口显示「插件未提供窗口界面」占位。
+> ⚠️ **坑 4**：窗口应用形态跑在**独立 app 渲染进程**、不在 `UIContext.Provider` 内，因此**不能调 `useUIContext()`**，只用 `helpers`。
 
 **最小骨架**：
 
@@ -202,13 +190,23 @@ function (React, helpers) {
 }
 ```
 
+#### b. 工程化：`loadFile` 加载 `dist/client.html`（`entryHtml` 字段）
+
+主进程 `openApp` 检测到 `~/.shanhai/plugins/<id>/dist/client.html` 后，**`loadFile` 加载独立渲染入口**（脱离 `new Function`）：
+
+- 窗口内容由 `dist/client.html` + `dist/assets/*`（vite 完整 React bundle）渲染，**可用完整 React + JSX + 任意依赖 + 复杂 UI**。
+- 该入口挂**插件专用 preload**（`plugin.cjs`），暴露两个桥：
+  - `window.shanhaiPlugin`（白名单桥，11 项能力，见 §7）—— 插件调山海公开接口的**唯一**通道；
+  - `window.shanhai`（宿主桥，**极度缩小**：仅 `windowType`/`platform`/`windowAppId`/`getPluginApp`/`closeApp`，无任何危险接口）。
+- 构建配置要求：`base: './'`（Electron `loadFile(file://)` 下资源必须相对路径）。
+
 ---
 
-## 4. UI 插槽清单（`CORE_SLOTS`）
+## 3. UI 插槽清单（`CORE_SLOTS`）
 
-`packages/kernel-modules/src/client/slot.ts` 定义，`plugin_inspect` 通过 `listSlots()` 向 agent 暴露。
+`packages/kernel-modules/src/client/slot.ts` 定义，`plugin_inspect` 通过 `listSlots()` 暴露。
 
-**覆盖型**（`SlotView` 取「最后注册」渲染，后注册覆盖、注销回退，用于「整体替换某区块」）：
+**覆盖型**（后注册整体替换、注销回退，用于「整体替换某区块」）：
 
 ```
 shell.sidebar    shell.header      shell.chat        shell.composer
@@ -216,100 +214,157 @@ shell.statusbar  shell.terminal    shell.welcome     shell.panels
 shell.overlays   dynamic-extension
 ```
 
-**追加型**（`AppendSlotView` 把「全部注册」依次渲染、互不覆盖，用于「加按钮/小组件」）：
+**追加型**（全部注册依次渲染、互不覆盖，用于「加按钮/小组件」）：
 
 ```
 composer.below   composer.actions  header.actions    chat.below
 ```
 
-> ⚠️ **坑 5（历史缺口，现已修复）**：`shell.terminal` 之前被内置插件注册（`TerminalPlugin.tsx`）并在 `App.tsx` 消费，
-> 但曾一度漏在 `CORE_SLOTS` 之外，导致 agent 通过 `plugin_inspect` 看不到这个可挂载 slot。
-> 现版本已把 `shell.terminal` 补进 `CORE_SLOTS`。
+> ⚠️ **坑 5（历史缺口，现已修复）**：`shell.terminal` 曾一度漏在 `CORE_SLOTS` 之外，现版本已补进。
 
 ---
 
-## 5. 生命周期（define → test → install → run/stop → uninstall）
+## 4. 生命周期与流水线
 
 状态机：`defined` → `running` → `stopped` → `installed`。
+
+### 4.1 快速原型链路（`plugin_*` 核心工具）
 
 | 工具 | 做什么 | status 变化 | 是否落盘 |
 |------|--------|-------------|----------|
 | `plugin_define` | 记录 package（不语法检查、不运行），返回 `dyn-<n>` id | → `defined` | 否 |
-| `plugin_run` | vm 评估 host 半 + 投递 client 半（有 client 时 **round-trip 审批**） | → `running` | 否 |
+| `plugin_run` | 评估 host 半 + 投递 client 半（有 client 时 **round-trip 审批**） | → `running` | 否 |
 | `plugin_stop` | 撤销 host 半（disposer）+ browser 半（removeClient），定义保留 | → `stopped` | 否 |
 | `plugin_undefine` | `stop` 后遗忘定义 | 移除 | 否 |
 | `plugin_test` | 幂等「撤回 → 运行 → 撤回」，返回 `{ ok, clientDelivered }` | 不变 | 否 |
 | `plugin_install` | 见下 | → `installed` | ✅ |
-| `plugin_uninstall` | disposer + removeClient + 删落盘文件 | 移除 | 删文件 |
-| 启动 `restoreAll` | 加载所有已安装插件并重新激活（免审批） | → `installed` | 读文件 |
+| `plugin_uninstall` | disposer + removeClient + 删落盘目录 | 移除 | 删目录 |
+| 启动 `restoreAll` | 加载所有已安装插件并重新激活（免审批） | → `installed` | 读目录 |
 
-### 5.1 `plugin_install` 的精确顺序
+### 4.2 工程化流水线（`plugin_scaffold` → `build` → `test_load` → `verify` → `install`）
 
-1. 校验 package 存在、有 code/client、store 已装配；
+| 工具 | 做什么 | 产物 |
+|------|--------|------|
+| `plugin_scaffold` | 从内置模板生成可编译项目到 `~/.shanhai/plugins-workspace/<id>/` | src + 构建配置 + package.json |
+| `plugin_build` | 进程内编译（esbuild host + vite client） | `dist/host.cjs` + `dist/client.html` + `dist/assets/*` |
+| `plugin_test_load` | 把产物复制到临时目录 `~/.shanhai/plugins-test/<id>/` 干跑加载，验证能跑 + 能卸载 | 校验报告（不污染正式目录） |
+| `plugin_verify` | 产物存在性 + 越权审计 + host 可加载 + client.html 结构 | verdict（pass/fail） |
+| `plugin_install` | 持久化安装（自动部署产物到 `plugins/<id>/dist/`） | `~/.shanhai/plugins/<id>/` |
+
+> `plugin_build` 用山海进程内已有的 esbuild/vite 构建，**不依赖用户手动 npm install / node**。
+> `plugin_test_load` 全程用 mock hooks + 独立 runtime，不触达正式 `~/.shanhai/plugins/`、不注册 Dock 图标。
+
+### 4.3 `plugin_install` 的精确顺序
+
+1. 校验 package 存在、有可执行载体（`code`/`client`/`dist/host.cjs`/`dist/client.html` 至少其一）、store 已装配；
 2. 用 `persistIdOf(name, persistId)` 生成持久化 id（name 转 kebab-case，仅允许 `[a-zA-Z0-9_-]`，否则报错）；
-3. 若已有同 id 的已安装插件 → 先 `uninstall` 旧的（视为升级）；
-4. 若当前 package `running` → 先 `stop`（用旧 id 正确卸载 client）；
-5. `rename(dynId, persistId)` + `setSession('*')`；
-6. `run(id, sessionId, { skipApproval: true })` —— **激活，且不再二次弹审批**（install 工具顶层已审批）；
-7. `store.install(meta)` 落盘 `manifest.json`；
-8. `setStatus('installed')`，返回 `{ id, installed: true }`。
+3. **部署产物**：若 `plugins/<id>/dist/` 无产物、但 `plugins-workspace/<id>/dist/` 有，自动复制（消除手动 cp）；
+4. 探测 `entryHost` / `entryHtml`，写回 package；
+5. 若已有同 id 的已安装插件 → 先 `uninstall` 旧的（视为升级）；
+6. 若当前 package `running` → 先 `stop`；
+7. `rename(dynId, persistId)` + `setSession('*')`；
+8. `run(id, sessionId, { skipApproval: true })` —— **激活，且不再二次弹审批**；
+9. `store.install(meta)` 落盘 `manifest.json`；
+10. `setStatus('installed')`，返回 `{ id, installed: true }`。
 
-### 5.2 openWindow / closeWindow 的配对与自动撤销
+### 4.4 openWindow / closeWindow 的配对与自动撤销
 
 - `ctx.openWindow(appId?)`：`target = appId ?? pkg.id`，调 `openAppWindow(target)`，**并 `stack.collect(() => closeAppWindow(target))`** 注册撤销。
-- 因此：`plugin_stop` / `plugin_uninstall` / `plugin_test`（撤回）时，**已打开的窗口会被自动关闭**（closeWindow 撤销路径）。
-- `ctx.closeWindow(appId?)`：`closeAppWindow(appId ?? pkg.id)`，只主动关闭、不挂撤销。
+- 因此 `plugin_stop` / `plugin_uninstall` / `plugin_test`（撤回）时，**已打开窗口自动关闭**。
+- `ctx.closeWindow(appId?)`：只主动关闭、不挂撤销。
 - 窗口打开是**惰性**的：`openApp` 已有则聚焦、否则创建；`closeApp` 真正 `destroy()` 窗口。
-- 窗口应用注册表（主进程 `plugin-apps.ts`）：`appId → { name, clientCode }`，client 半源码字符串天然可跨渲染进程传输。
+- 窗口应用注册表（主进程 `plugin-apps.ts`）：`appId → { name, clientCode, entryHtml, icon, ... }`。
 
-> ⚠️ **坑 6**：`ctx.openWindow()` 是在 `run` 阶段被调用的，因此 `plugin_install` / `plugin_run` 一执行完，窗口就**已经弹出**了，而不是「装完只挂 Dock 图标、点图标才开窗」。若产品预期是「点击 Dock 图标才开窗」，则 host 半**不要**在 `run` 阶段直接调 `openWindow`，而应把开窗交给 Dock 图标点击触发的 `openApp` 链路。
+> ⚠️ **坑 6**：`ctx.openWindow()` 在 `run` 阶段被调用，`plugin_install` / `plugin_run` 一执行完窗口**已弹出**（非「点 Dock 图标才开窗」）。若产品预期「点 Dock 才开窗」，host 半不要在 `run` 阶段直接调 `openWindow`。
 
 ---
 
-## 6. 落盘格式（`~/.shanhai/plugins/<id>/manifest.json`）
+## 5. 落盘格式（目录型）
 
-`PluginStore.install` 落盘，权限 `0o600`，目录 `<id>` 与 id 同名。
+一个插件 = 一个目录 `~/.shanhai/plugins/<id>/`，内含 `manifest.json` + `dist/`（产物）+ 可选 `icon` / `assets` / `src` / `package.json`：
 
-```json
-{
-  "id": "todo-list",
-  "name": "待办清单",
-  "purpose": "在聊天窗口加一个待办小组件",
-  "version": "1.0.0",
-  "code": "module.exports = (ctx) => { ... }",
-  "client": "function (React, slots, useUIContext) { ... }",
-  "installedAt": 1720000000000
-}
+```
+~/.shanhai/plugins/<id>/
+├── manifest.json        # 元数据 + 权限（见下）
+├── dist/
+│   ├── host.cjs         # host 半编译产物（工程化）
+│   ├── client.html      # client 半窗口入口（工程化）
+│   └── assets/*         # client bundle（js/css 等）
+├── icon.png             # 可选：Dock 图标（或 assets/icon.png）
+├── assets/              # 可选：附加静态资源
+├── src/                 # 可选：源码（供改后重编译）
+└── package.json         # 可选：依赖声明
 ```
 
-对应 `InstalledPackageMeta`：
+### 5.1 `manifest.json` 完整 schema（`InstalledPackageMeta`）
 
 ```ts
 interface InstalledPackageMeta {
-  id: string
+  id: string                       // 持久化 id（= 目录名）
   name: string
   purpose: string
   version?: string
-  code?: string      // host 半
-  client?: string    // client 半
+  // —— 快速原型（源码字符串）——
+  code?: string                    // host 半源码
+  client?: string                  // client 半源码
+  // —— 工程化（编译产物 + 资源）——
+  entryHost?: string               // host 半产物绝对路径 dist/host.cjs
+  entryHtml?: string               // client 半窗口入口绝对路径 dist/client.html
+  icon?: string                    // 图标相对路径（相对插件目录）
+  assets?: string[]                // 附加资源相对路径索引
+  dependencies?: Record<string, string>  // 依赖声明（包名→版本，仅审计用）
+  kind?: 'source' | 'bundled'      // source=快速原型，bundled=工程化（自动判定）
   installedAt: number
+  permissions?: string[]           // 已审批权限清单（plugin:invoke 白名单能力名）
 }
 ```
 
-- 安全：id 仅允许 `[a-zA-Z0-9_-]`，且 resolve 后强制校验落在仓库目录内，杜绝路径穿越。
-- `uninstall` 删除整个 `<id>` 目录（不存在静默成功）。
+- 落盘权限 `0o600`；id 仅允许 `[a-zA-Z0-9_-]`，resolve 后强制校验落在仓库目录内，杜绝路径穿越。
+- `uninstall` 递归删除整个 `<id>` 目录（不存在静默成功）。
+- **向后兼容**：只有 `code`/`client`、无 `dist`/`icon` 的「旧快速原型」格式（目录里仅一个 manifest.json）仍能正常 install/restore。
 
 ---
 
-## 7. 注意事项 / 坑（速查）
+## 6. 安全模型：插件专用 preload + 白名单 IPC
 
-1. **host 半必须 `module.exports = (ctx) => disposer`**，不能裸箭头函数。
-2. **client 半 `new Function` 编译，不经过 JSX**，必须 `React.createElement`。
+插件窗口（`type:'app'` 且 `isPluginApp`）挂**专用 preload** `plugin.cjs`（`contextIsolation:true` + `nodeIntegration:false`），暴露 `window.shanhaiPlugin` 白名单桥。所有能力统一走主进程 `plugin:invoke` 入口，按「插件 id + 能力名」**双层校验**：
+
+1. 能力必须在全局白名单 `PLUGIN_CAPABILITIES`；
+2. 插件的 `manifest.permissions[]` 声明了该能力（install 时审批）。
+
+未声明则抛错拒绝。**危险接口（`auth:*` / `chat:run` / `supervisor:*` / `model:switch` / `model:addCustom` / `remote:disable` / `approval:setPolicy` / `session:delete` / `settings:set` / `wallpaper:set` 等）永不进白名单，物理拿不到。**
+
+## 7. 白名单能力清单（11 项）
+
+| 能力 | 说明 |
+|------|------|
+| `getVersion` | 应用版本号 |
+| `clipboardWriteText` | 写剪贴板 |
+| `clipboardReadText` | 读剪贴板 |
+| `speak` | 语音播报（TTS） |
+| `selectDirectory` | 打开目录选择器，返回绝对路径 |
+| `listSessions` | 列出用户会话（只读） |
+| `listMemory` | 列出指定会话长期记忆（只读） |
+| `getUiState` | 精简 UI 状态（登录态 + 用户名 + 壁纸，隔离敏感数据） |
+| `closeApp` | 关闭当前插件自己的窗口（仅自身，无法越权关其它窗口） |
+| `getWallpaper` | 读取桌面壁纸 |
+| `getTokenStats` | token 用量快照（只读） |
+
+> 完整可声明清单即上述 11 项；`permissions` 缺省 = 空数组 = 最小权限。
+
+---
+
+## 8. 注意事项 / 坑（速查）
+
+1. **host 半必须 `module.exports = (ctx) => disposer`**（或 `export default`），不能裸箭头函数。
+2. **client 半源码字符串 `new Function` 编译、不经过 JSX**，必须 `React.createElement`（工程化 client 半用 loadFile，可写 JSX）。
 3. **窗口应用形态必须 return 组件函数**，不能 return 对象/箭头函数返回对象。
-4. **窗口应用形态不能 `useUIContext()`**（独立进程、不在 Provider 内），只用 `helpers`。
+4. **窗口应用形态不能 `useUIContext()`**（独立进程、不在 Provider 内），只用 `helpers`（快速原型）或 `window.shanhaiPlugin`（工程化）。
 5. **UI 插槽形态的 `slots` 只有 `register` 一个方法**。
 6. **`openWindow` 在 `run` 阶段即开窗**，install 时窗口立即弹出（非点击 Dock 才开）。
 7. **host 半无 `effect()`**，cleanup 只走 4 条自动撤销路径。
-8. **`tools.register` 注册的是全局工具**（`ctx.tools.push`），非会话隔离。
+8. **`tools.register` 注册的是全局工具**（非会话隔离）。
 9. **`provide` 的服务仅 `plugin_inspect` 报告用**，目前无服务发现/注入机制消费它。
-10. client 半源码字符串跨渲染进程传输（序列化），主进程 `plugin-apps` 维护 `appId → { name, clientCode }`，Dock 图标经 `plugin-apps:changed` 广播刷新。
+10. **host 半编译产物必须自包含**，不得 external `electron` / `@shanhai/*`（越权审计拒绝加载）。
+11. **client 半源码字符串跨渲染进程传输**（序列化），主进程 `plugin-apps` 维护注册表，Dock 图标经 `plugin-apps:changed` 广播刷新。
+12. **`plugin_build` 产物在 workspace**，`plugin_install` 自动部署到 `plugins/<id>/dist/`（无需手动 cp）。

@@ -318,6 +318,9 @@ export class AgentLoop {
       const text = response.text ?? ''
       this.session.append('assistant/message', { content: text, reasoningContent: response.reasoningContent })
       this.session.append('turn/end', { turn: 1, text })
+      // 兜底：最终回答轮期间用户仍可能插入消息（竞态窗口），此时任务已收尾、不再发起下一轮 LLM 请求，
+      // 落盘这些注入消息（injected 标记）避免完全丢失。它们不会发给模型（任务已结束），但保留在历史末尾。
+      this.flushPendingInjections()
       return text
     }
     // 达到步数上限：不直接抛错，追加一条强制收敛指令，让模型基于已有执行结果直接给出最终结论

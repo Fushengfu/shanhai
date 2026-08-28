@@ -149,7 +149,8 @@ export interface RuntimeContext {
   // —— 自修改 ——
   clientRunCallbacks: Set<(req: { requestId: string; sessionId: string; pkgId: string; name: string; purpose: string }) => void>
   pendingClientRuns: Map<string, { resolve: (approved: boolean) => void; sessionId?: string }>
-  clientCodeCallbacks: Set<(payload: { pkgId: string; name: string; code: string }) => void>
+  clientRunResolvedCallbacks: Set<(requestId: string) => void>
+  clientCodeCallbacks: Set<(payload: { pkgId: string; name: string; code: string; permissions?: string[]; entryHtml?: string; icon?: string }) => void>
   clientRemoveCallbacks: Set<(pkgId: string) => void>
   /** 打开插件窗口应用的回调（主进程订阅后调 window-manager openApp，appId = 插件持久化 id） */
   openAppWindowCallbacks: Set<(appId: string) => void>

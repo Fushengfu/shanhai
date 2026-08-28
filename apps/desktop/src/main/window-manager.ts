@@ -1,6 +1,7 @@
 import { app, BrowserWindow, Menu, screen, type MenuItemConstructorOptions } from 'electron'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { isPluginApp, resolvePluginEntryHtml } from './plugin-apps'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -74,6 +75,8 @@ export interface CreateWindowOptions {
   height?: number
   fullscreen?: boolean
   show?: boolean
+  /** 是否插件应用窗口（true 时挂插件专用 preload，只暴露 window.shanhaiPlugin 白名单桥；内置 app 保持全量 window.shanhai） */
+  isPlugin?: boolean
 }
 
 /**
@@ -81,7 +84,7 @@ export interface CreateWindowOptions {
  * 关闭语义按类型区分：chat/desktop 点关闭只隐藏（常驻，托盘/快捷键恢复）；app 直接销毁（用完即关）。
  */
 export function createWindow(opts: CreateWindowOptions): BrowserWindow {
-  const { type, appId } = opts
+  const { type, appId, isPlugin } = opts
   // 桌面壳窗口：无边框 + 覆盖屏幕工作区（workArea = 屏幕减去系统菜单栏与 Dock，保留系统 UI 可见；
   // 非原生 fullscreen space，避免聊天窗口被切到别的 Space）
   // Dock 窗口：无边框、底部居中的 Dock 栏（应用图标，独立于桌面壳以便可点击）
@@ -135,7 +138,8 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
     show: opts.show ?? true,
     icon: ICON_PATH,
     webPreferences: {
-      preload: join(__dirname, '../preload/index.cjs'),
+      // 插件应用窗口挂专用 preload（只暴露 window.shanhaiPlugin 白名单桥），内置 app 窗口保持全量 window.shanhai
+      preload: join(__dirname, isPlugin ? '../preload/plugin.cjs' : '../preload/index.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       additionalArguments: [
@@ -184,6 +188,14 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
 export function getWindowType(win: BrowserWindow): WindowType | undefined {
   for (const meta of windows.values()) {
     if (meta.win === win) return meta.type
+  }
+  return undefined
+}
+
+/** 根据 BrowserWindow 实例反查其 appId（plugin:invoke 校验发起插件窗口身份用；无则 undefined） */
+export function getWindowAppId(win: BrowserWindow): string | undefined {
+  for (const meta of windows.values()) {
+    if (meta.win === win) return meta.appId
   }
   return undefined
 }
@@ -432,8 +444,16 @@ export async function openApp(appId: string): Promise<boolean> {
     showWindow(existing.win)
     return true
   }
-  const win = createWindow({ type: 'app', appId, width: 980, height: 720 })
-  await loadWindowContent(win)
+  const win = createWindow({ type: 'app', appId, width: 980, height: 720, isPlugin: isPluginApp(appId) })
+  // 插件窗口：优先加载编译产物 dist/client.html（独立渲染入口，支持完整 React + JSX + 依赖 + 复杂 UI）；
+  // 无编译产物（快速原型链路）则降级走统一 renderer/index.html → AppWindow → DynamicPluginWindow new Function。
+  // 内置 app 窗口（terminal/trace/memory/models 等）保持统一 renderer 不变。
+  const pluginEntry = isPluginApp(appId) ? resolvePluginEntryHtml(appId) : undefined
+  if (pluginEntry) {
+    await win.loadFile(pluginEntry)
+  } else {
+    await loadWindowContent(win)
+  }
   showWindow(win)
   return true
 }

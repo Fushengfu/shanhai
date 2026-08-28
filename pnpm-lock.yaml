@@ -7,21 +7,6 @@ settings:
 importers:
 
   .:
-    devDependencies:
-      '@types/node':
-        specifier: ^22.10.2
-        version: 22.20.1
-      tsup:
-        specifier: ^8.3.5
-        version: 8.5.1(jiti@2.7.0)(postcss@8.5.26)(typescript@5.9.3)
-      typescript:
-        specifier: ^5.6.3
-        version: 5.9.3
-      vitest:
-        specifier: ^2.1.8
-        version: 2.1.9(@types/node@22.20.1)
-
-  apps/desktop:
     dependencies:
       node-pty:
         specifier: ^1.0.0
@@ -29,6 +14,27 @@ importers:
       tesseract.js:
         specifier: ^7.0.0
         version: 7.0.0(encoding@0.1.13)
+      ws:
+        specifier: ^8.21.3
+        version: 8.21.3
+
+  apps/desktop:
+    dependencies:
+      '@vitejs/plugin-react':
+        specifier: ^4.7.0
+        version: 4.7.0(vite@5.4.21(@types/node@22.20.1))
+      esbuild:
+        specifier: ^0.27.7
+        version: 0.27.7
+      node-pty:
+        specifier: ^1.0.0
+        version: 1.1.0
+      tesseract.js:
+        specifier: ^7.0.0
+        version: 7.0.0(encoding@0.1.13)
+      vite:
+        specifier: ^5.4.21
+        version: 5.4.21(@types/node@22.20.1)
       ws:
         specifier: ^8.21.3
         version: 8.21.3
@@ -60,9 +66,6 @@ importers:
       '@types/ws':
         specifier: ^8.18.1
         version: 8.18.1
-      '@vitejs/plugin-react':
-        specifier: ^4.3.4
-        version: 4.7.0(vite@5.4.21(@types/node@22.20.1))
       '@xterm/addon-fit':
         specifier: ^0.10.0
         version: 0.10.0(@xterm/xterm@5.5.0)
@@ -99,9 +102,9 @@ importers:
       typescript:
         specifier: ^5.6.3
         version: 5.9.3
-      vite:
-        specifier: ^5.4.11
-        version: 5.4.21(@types/node@22.20.1)
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
 
   apps/runtime:
     dependencies:

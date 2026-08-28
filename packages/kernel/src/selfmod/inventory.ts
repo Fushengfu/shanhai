@@ -15,6 +15,16 @@ export interface DynamicPackage {
   status: DynamicPackageStatus
   sessionId: string
   capabilities?: Capability
+  /** 插件声明的权限清单（plugin:invoke 白名单能力名，install 时随 manifest 落盘并审批）。缺省 = 空数组 = 最小权限 */
+  permissions?: string[]
+  /** host 半编译产物绝对路径（dist/host.cjs，第 3 步起支持；install 时探测填充，替代 node:vm 源码字符串） */
+  entryHost?: string
+  /** client 半编译产物绝对路径（dist/client.html，第 2 步起支持；install 时探测填充，替代 new Function 源码字符串） */
+  entryHtml?: string
+  /** 图标相对路径（相对插件目录，如 icon.png / assets/icon.png；第 4 步起支持，供 Dock 图标渲染用） */
+  icon?: string
+  /** 依赖声明（包名 → 版本，仅供工程化插件的 package.json 参考/审计，运行时不自解析依赖） */
+  dependencies?: Record<string, string>
 }
 
 export interface InspectReport {
@@ -43,6 +53,11 @@ export class PluginInventory {
     version?: string
     sessionId: string
     id?: string
+    permissions?: string[]
+    entryHost?: string
+    entryHtml?: string
+    icon?: string
+    dependencies?: Record<string, string>
   }): DynamicPackage {
     const id = def.id ?? `dyn-${++this.counter}`
     const pkg: DynamicPackage = {
@@ -54,6 +69,11 @@ export class PluginInventory {
       version: def.version,
       status: 'defined',
       sessionId: def.sessionId,
+      permissions: def.permissions ?? [],
+      entryHost: def.entryHost,
+      entryHtml: def.entryHtml,
+      icon: def.icon,
+      dependencies: def.dependencies,
     }
     this.packages.set(pkg.id, pkg)
     return pkg
@@ -110,6 +130,20 @@ export interface InstalledPackageMeta {
   code?: string
   client?: string
   installedAt: number
+  /** 已审批的权限清单（plugin:invoke 白名单能力名，install 时随 manifest 落盘） */
+  permissions?: string[]
+  /** host 半编译产物绝对路径（dist/host.cjs，第 3 步起支持） */
+  entryHost?: string
+  /** client 半编译产物绝对路径（dist/client.html，第 2 步起支持） */
+  entryHtml?: string
+  /** 图标相对路径（相对插件目录，如 icon.png / assets/icon.png；第 4 步起支持，供 Dock 图标渲染用） */
+  icon?: string
+  /** 附加资源相对路径索引（相对插件目录，可选；供窗口/Dock 按需加载静态资源） */
+  assets?: string[]
+  /** 依赖声明（包名 → 版本，仅供工程化插件的 package.json 参考/审计，运行时不自解析依赖） */
+  dependencies?: Record<string, string>
+  /** 落盘形态：source=快速原型（仅 code/client 源码字符串），bundled=工程化（含 dist 编译产物）。缺省按字段推断 */
+  kind?: 'source' | 'bundled'
 }
 
 /**
@@ -134,6 +168,24 @@ export class PluginStore {
     if (target !== join(root, id) && !target.startsWith(root + sep)) {
       throw new Error(`插件 id 越界: ${id}`)
     }
+    return target
+  }
+
+  /** 返回插件编译产物文件绝对路径（dist/host.cjs 或 dist/client.html，不判断存在性，id 需合法）。第 3 步起用 */
+  entryFile(id: string, kind: 'host' | 'client'): string {
+    return join(this.pkgDir(id), 'dist', kind === 'host' ? 'host.cjs' : 'client.html')
+  }
+
+  /**
+   * 返回插件目录内某个资源的绝对路径（第 4 步起：icon / assets 等相对插件目录的文件）。
+   * 路径穿越防御：拒绝绝对路径、拒绝含 `..` 的相对路径、resolve 后强制落在插件目录内。
+   * 返回 undefined 表示非法路径（不抛错，供调用方按「无此资源」降级处理）。
+   */
+  resourceFile(id: string, rel: string): string | undefined {
+    if (!rel || rel.startsWith('/') || rel.includes('..')) return undefined
+    const dir = this.pkgDir(id)
+    const target = resolve(dir, rel)
+    if (target !== join(dir, rel) && !target.startsWith(dir + sep)) return undefined
     return target
   }
 

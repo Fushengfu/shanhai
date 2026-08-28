@@ -84,6 +84,10 @@ export interface SupervisorContext {
   resolveApproval(requestId: string, outcome: 'allowed-once' | 'rejected'): { ok: boolean; message: string }
   /** 提问请求到达时，管家代答目标会话的提问（answer 为代答内容，有选项时填选中项、无选项时填文字），代答后对应弹窗关闭 */
   answerAsk(requestId: string, answer: string): { ok: boolean; message: string }
+  /** 插件界面组件投递请求到达时，管家决策是否允许把插件 client 半代码投递到界面执行（approved=true 允许 / false 拒绝），决策后对应弹窗关闭 */
+  resolveClientRun(requestId: string, approved: boolean): { ok: boolean; message: string }
+  /** 断点续跑：对「空闲 + 有未完成轮次」的会话，从事件日志回放已执行历史、从断点继续（不新增用户消息、不篡改历史对话、不重新开始） */
+  resumeSession(sessionId: string): Promise<{ ok: boolean; message: string }>
 }
 
 const MODE_DESC =
@@ -277,6 +281,38 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
       },
     },
     {
+      name: 'resume_session',
+      description:
+        '断点续跑：恢复一个「有未完成轮次且空闲」的会话继续执行，等同用户在该会话点击「继续执行」按钮。' +
+        'sessionId 来自 list_sessions；仅当该会话 hasIncompleteTurn=true 且 busy=false（空闲）时有效。' +
+        '续跑从会话事件日志回放已执行历史、从断点继续，不新增用户消息、不篡改历史对话、不重新开始。' +
+        '非法目标（会话不存在 / 正在执行 / 无未完成轮次 / 管家自身）会被拒绝。' +
+        '这是唯一正确的断点续跑方式；用户要求「继续/恢复/续跑」某个中断的会话时必须用本工具，禁止用 send_message 发消息变通（那会新增一条用户消息、把续跑当成新需求）。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string', description: '目标会话 id（来自 list_sessions，hasIncompleteTurn=true 且 busy=false）' },
+        },
+        required: ['sessionId'],
+      },
+      riskLevel: 'reversible',
+      guide: {
+        usage: [
+          '当用户要求「继续/恢复/续跑」某个中断（未完成轮次）的会话时，用本工具从断点继续，不要用 send_message 发消息变通。',
+          '先 list_sessions 确认目标会话 hasIncompleteTurn=true 且 busy=false，再调用。',
+        ],
+        cautions: [
+          '只对「有未完成轮次且空闲」的会话有效；正在执行或已完成轮次的会话会被拒绝。',
+          '续跑不新增用户消息、不篡改历史，恢复后仍受该会话安全模式（approvalPolicy）约束。',
+        ],
+      },
+      execute: async (args) => {
+        const sid = String(args.sessionId ?? '')
+        if (!sid) return { ok: false, message: 'sessionId 不能为空' }
+        return ctx.resumeSession(sid)
+      },
+    },
+    {
       name: 'set_session_model',
       description:
         '切换指定会话使用的模型（等同用户手动在该会话切换模型）。' +
@@ -447,6 +483,29 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
         const answer = String(args.answer ?? '')
         if (!requestId) return { ok: false, message: 'requestId 不能为空' }
         return ctx.answerAsk(requestId, answer)
+      },
+    },
+    {
+      name: 'resolve_client_run',
+      description:
+        '插件界面组件投递请求到达时（管家接管的投递确认），决定是否允许把插件 client 半代码投递到界面执行。' +
+        'requestId 来自【投递请求】通知里的 id；approved 取 true（允许投递）或 false（拒绝投递）。' +
+        '决策后对应会话的投递确认弹窗会自动关闭，目标会话按决策继续或中止投递。' +
+        '仅在收到【投递请求】通知、且需要替用户把关时调用；只读决策，不执行任何实际代码。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          requestId: { type: 'string', description: '投递请求 id（来自【投递请求】通知）' },
+          approved: { type: 'boolean', description: 'true=允许投递到界面，false=拒绝投递' },
+        },
+        required: ['requestId', 'approved'],
+      },
+      riskLevel: 'readonly',
+      execute: async (args) => {
+        const requestId = String(args.requestId ?? '')
+        const approved = args.approved === true
+        if (!requestId) return { ok: false, message: 'requestId 不能为空' }
+        return ctx.resolveClientRun(requestId, approved)
       },
     },
   ]

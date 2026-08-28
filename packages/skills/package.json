@@ -15,7 +15,8 @@
   },
   "files": ["dist"],
   "scripts": {
-    "build": "tsup",
+    "gen:protocol": "node scripts/gen-plugin-protocol.mjs",
+    "build": "node scripts/gen-plugin-protocol.mjs && tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
