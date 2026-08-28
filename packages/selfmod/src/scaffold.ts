@@ -43,21 +43,24 @@ interface PluginContext {
   closeWindow(appId?: string): void
 }
 
-// 声明 CommonJS 的 module（host 半契约：module.exports = (ctx) => disposer）
-declare const module: { exports: unknown }
+// 声明 CommonJS 的 module（host 半契约：module.exports = (ctx) => disposer）。
+// 注意必须用 var 而非 const：const 是块级声明，会与 @types/node 的全局 var module（module.d.ts）
+// 冲突，报「Cannot redeclare block-scoped variable module」；var 可与其共存，插件项目 typecheck 才不报重复声明。
+declare var module: { exports: unknown }
 
 module.exports = (ctx: PluginContext): (() => void) => {
-  // 1) 打开本插件的独立窗口（appId 缺省 = 插件 id）。
-  //    注意：openWindow 在 install/run 阶段即开窗（不是等点 Dock 图标；点 Dock 是另一条 openApp 链路）。
-  ctx.openWindow()
+  // 1) 窗口应用默认「不自动开窗」：安装/加载后由用户主动打开（点 Dock 图标 → openApp → loadFile dist/client.html）。
+  //    如需程序化开窗（例如收到某个事件时），在事件回调里显式调 ctx.openWindow()。
+  // ctx.openWindow()  // ← 取消注释即可在 install/run 阶段立即开窗（不推荐：会打断用户当前工作）
 
   // 2) 订阅内核事件示例（撤销时自动取消订阅）
   ctx.on('<PLUGIN_ID>:ping', (payload) => {
     console.log('[<PLUGIN_ID>] 收到事件：', payload)
   })
 
-  // 3) 注册命名服务（plugin_inspect 可查 services 列表）
-  ctx.provide('<PLUGIN_ID>:service', { ping: () => 'pong' })
+  // 3) 注册命名服务（plugin_inspect 可查 services 列表）。
+  //    若 impl 是函数，client 半可通过 window.shanhaiPlugin.invokePluginService('<PLUGIN_ID>:getData', arg) 调用它（client → host RPC）。
+  ctx.provide('<PLUGIN_ID>:getData', async (query: unknown) => ({ echo: String(query ?? ''), at: Date.now() }))
 
   // 4) 注册全局工具示例（撤销时自动注销）—— 需要时取消注释
   // ctx.tools.register({
@@ -246,14 +249,29 @@ function ActionsCard(): JSX.Element {
   )
 }
 
-/** 标题栏：frameless 窗口的自定义标题 + 关闭按钮 */
+/** 取宿主桥（window.shanhai：仅 windowType/platform/windowAppId/getPluginApp/closeApp/minimizeWindow/toggleMaximizeWindow） */
+const host = (): NonNullable<Window['shanhai']> => {
+  if (!window.shanhai) throw new Error('window.shanhai 不可用（插件专用 preload 未挂载）')
+  return window.shanhai
+}
+
+/** 标题栏：frameless 窗口的统一自定义标题栏（拖动区 + 最小化/最大化/关闭，与山海内置应用同风格） */
 function TitleBar(): JSX.Element {
   return (
     <header className="titlebar">
       <span className="title">插件窗口 · 编译产物渲染</span>
-      <button className="close" onClick={() => void api().closeApp()} title="关闭窗口">
-        ✕
-      </button>
+      <span className="spacer" />
+      <div className="winbtns">
+        <button className="winbtn" onClick={() => host().minimizeWindow()} title="最小化">
+          ─
+        </button>
+        <button className="winbtn" onClick={() => void host().toggleMaximizeWindow()} title="最大化/还原">
+          □
+        </button>
+        <button className="winbtn close" onClick={() => void api().closeApp()} title="关闭窗口">
+          ✕
+        </button>
+      </div>
     </header>
   )
 }
@@ -317,12 +335,33 @@ export interface ShanhaiPluginBridge {
   getWallpaper(): Promise<string | null>
   /** token 用量快照（只读） */
   getTokenStats(sessionId?: string): Promise<unknown>
+  /**
+   * 调用本插件 host 半注册的自定义服务（client → host RPC）。
+   * 入参：服务名（host 半 ctx.provide 注册的 name）+ 可变参数；返回值必须是 JSON 可序列化数据。
+   * 默认放行（无需 permissions 声明）；只能调「本插件」的服务，无法越权调其它插件/内核。
+   */
+  invokePluginService(name: string, ...args: unknown[]): Promise<unknown>
 }
 
 declare global {
   interface Window {
     shanhaiPlugin?: ShanhaiPluginBridge
+    /** 宿主桥（窗口控制 + 只读信息，按 sender 反查自身窗口，无法越权） */
+    shanhai?: ShanhaiHostBridge
   }
+}
+
+/** 插件窗口宿主桥（window.shanhai）：窗口控制 + 只读信息，主进程按 sender 反查自身窗口 */
+export interface ShanhaiHostBridge {
+  windowType: string
+  platform: string
+  windowAppId?: string
+  getPluginApp(appId: string): Promise<unknown>
+  closeApp(appId: string): Promise<void>
+  minimizeWindow(): void
+  toggleMaximizeWindow(): Promise<boolean>
+  /** 订阅主题变更（主进程 ui:theme 广播给所有窗口），返回取消订阅函数。插件窗口据此跟随内置应用亮/暗切换 */
+  onThemeChange(cb: (theme: 'light' | 'dark') => void): () => void
 }
 
 export {}
@@ -377,7 +416,18 @@ body {
   font-size: 13px;
 }
 
-.close {
+.spacer {
+  flex: 1;
+}
+
+.winbtns {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  -webkit-app-region: no-drag;
+}
+
+.winbtn {
   -webkit-app-region: no-drag;
   border: none;
   background: transparent;
@@ -389,7 +439,12 @@ body {
   font-size: 14px;
 }
 
-.close:hover {
+.winbtn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+
+.winbtn.close:hover {
   background: rgba(255, 82, 82, 0.2);
   color: #ff6b6b;
 }
@@ -621,8 +676,15 @@ client 半在独立窗口渲染（完整 React + JSX + 任意依赖），并通�
 
   安装激活（plugin_install 会自动把 workspace 产物部署到 plugins/<PLUGIN_ID>/dist/，无需手动 cp）：
 
-    plugin_define(name="<PLUGIN_ID>", purpose="<PLUGIN_PURPOSE>")
+    plugin_define(
+      name="<PLUGIN_ID>",
+      purpose="<PLUGIN_PURPOSE>",
+      permissions=["getVersion","getUiState","listSessions","clipboardWriteText","clipboardReadText","speak"]
+    )
     plugin_install(persistId="<PLUGIN_ID>")
+
+  说明：permissions 声明插件要调的白名单能力（模板 App.tsx 用到上述 6 项）；
+  closeApp（关闭自己窗口）无需声明、默认放行。漏声明会导致对应 window.shanhaiPlugin 调用被拒。
 
   完整流水线：plugin_scaffold → plugin_build → plugin_test_load → plugin_verify → plugin_install。
 
@@ -639,7 +701,8 @@ client 半在独立窗口渲染（完整 React + JSX + 任意依赖），并通�
 ## 注意
 
   - host 半契约：必须 module.exports = (ctx) => disposer，disposer 可为函数/null/数组/Promise。
-  - ctx.openWindow() 在 install/run 阶段即开窗（不是等点 Dock 图标）。
+  - 窗口应用默认「不自动开窗」：安装/加载后由用户点 Dock 图标主动打开（openApp → loadFile dist/client.html）；
+    如需程序化开窗，在事件回调里显式调 ctx.openWindow()。
   - client 半跑在独立渲染进程、挂插件专用 preload，只有 window.shanhaiPlugin（白名单）
     与 window.shanhai（宿主桥，仅 getPluginApp/closeApp），没有 chat 窗口的 useUIContext。
 `
@@ -722,7 +785,7 @@ export async function scaffoldPlugin(id: string, opts: { name?: string; purpose?
       `2. 编译：plugin_build(id="${pid}")（进程内 esbuild/vite，免 npm install，产出 dist/host.cjs + dist/client.html）`,
       `3. 测试加载：plugin_test_load(id="${pid}")（临时目录干跑，不污染正式目录）`,
       `4. 验证：plugin_verify(id="${pid}")（越权审计 + 产物结构校验）`,
-      `5. 安装：plugin_define(name="${name}", purpose="${purpose}") → plugin_install(persistId="${pid}")（自动部署产物到 plugins/${pid}/dist/，无需手动 cp）`,
+      `5. 安装：plugin_define(name="${name}", purpose="${purpose}", permissions=["getVersion","getUiState","listSessions","clipboardWriteText","clipboardReadText","speak"]) → plugin_install(persistId="${pid}")（自动部署产物到 plugins/${pid}/dist/，无需手动 cp；closeApp 默认放行无需声明）`,
     ],
   }
 }

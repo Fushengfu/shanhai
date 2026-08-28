@@ -144,6 +144,8 @@ function normalizePluginId(raw: string): string {
 export class SelfModifyRuntime {
   private readonly inventory = new PluginInventory()
   private readonly services = new Map<string, unknown>()
+  /** 按「插件 id → 服务名 → impl」分组的 host 半服务表（client 半 RPC 用，见 invokeService）。与 services 并存：前者全局去重供 plugin_inspect 报告，后者按插件隔离供 RPC 调用。 */
+  private readonly hostServices = new Map<string, Map<string, unknown>>()
   private readonly disposers = new Map<string, () => Promise<void>>()
 
   constructor(
@@ -170,6 +172,8 @@ export class SelfModifyRuntime {
       purpose: string
       code?: string
       client?: string
+      /** 版本号（如 2.0.0），install 时随 manifest 落盘；覆盖升级时用于标识版本 */
+      version?: string
       permissions?: string[]
       icon?: string
       dependencies?: Record<string, string>
@@ -201,6 +205,23 @@ export class SelfModifyRuntime {
 
     const stack = new DisposerStack()
 
+    // —— browser 半：round-trip 审批（用户 approve 才投递；reject 则撤销并抛错）——
+    // 有 client 源码（slots/窗口组件）或 client 编译产物（entryHtml）都要注册窗口应用。
+    // skipApproval（install/restore 已获授权）时直接投递，不再二次弹审批。
+    // 必须先于 host 半 factory：factory 内 ctx.openWindow() 会触发主进程 openApp → isPluginApp 反查
+    // 窗口注册表；若此时尚未 deliverClient 注册，会误判为非插件窗口（挂错 preload + 走 loadWindowContent
+    // 降级，显示「未提供窗口界面」而非编译产物）。故先注册窗口应用，再执行 host 半。
+    let clientDelivered = false
+    if (pkg.client || pkg.entryHtml) {
+      const approved = opts.skipApproval ? true : await this.hooks.requestClientRun(pkg, sessionId)
+      if (!approved) {
+        await stack.dispose()
+        throw new Error(`用户拒绝了动态包 "${pkg.name}" 的浏览器半投递`)
+      }
+      await this.hooks.deliverClient(pkg)
+      clientDelivered = true
+    }
+
     // —— host 半：优先 require 编译产物（entryHost），否则 vm 沙箱评估源码（code）。facade 只暴露五条能力 ——
     if (pkg.entryHost && existsSync(pkg.entryHost)) {
       const factory = loadHostEntry(pkg.entryHost)
@@ -213,20 +234,6 @@ export class SelfModifyRuntime {
       const factory = evalHostCode(pkg.code)
       const ret = await factory(this.buildFacade(pkg, stack))
       stack.collect(ret as () => void | Promise<void>)
-    }
-
-    // —— browser 半：round-trip 审批（用户 approve 才投递；reject 则撤销 host 半并抛错）——
-    // 有 client 源码（slots/窗口组件）或 client 编译产物（entryHtml）都要注册窗口应用。
-    // skipApproval（install/restore 已获授权）时直接投递，不再二次弹审批。
-    let clientDelivered = false
-    if (pkg.client || pkg.entryHtml) {
-      const approved = opts.skipApproval ? true : await this.hooks.requestClientRun(pkg, sessionId)
-      if (!approved) {
-        await stack.dispose()
-        throw new Error(`用户拒绝了动态包 "${pkg.name}" 的浏览器半投递`)
-      }
-      await this.hooks.deliverClient(pkg)
-      clientDelivered = true
     }
 
     this.disposers.set(pkg.id, () => stack.dispose())
@@ -244,9 +251,19 @@ export class SelfModifyRuntime {
         })
       },
       provide: (name, impl) => {
+        // 全局命名服务（plugin_inspect 报告用）
         this.services.set(name, impl)
+        // 按插件 id 分组（client 半 RPC 用：client 只能调「本插件」注册的服务，见 invokeService）
+        let byId = this.hostServices.get(pkg.id)
+        if (!byId) {
+          byId = new Map()
+          this.hostServices.set(pkg.id, byId)
+        }
+        byId.set(name, impl)
         stack.collect(() => {
           if (this.services.get(name) === impl) this.services.delete(name)
+          const m = this.hostServices.get(pkg.id)
+          if (m && m.get(name) === impl) m.delete(name)
         })
       },
       tools: {
@@ -307,6 +324,20 @@ export class SelfModifyRuntime {
     return { ok: true, clientDelivered }
   }
 
+  /**
+   * client 半 → host 半自定义 RPC：按「插件 id + 服务名」调用 host 半 provide() 注册的服务。
+   * 由主进程 plugin:invoke 的 invokePluginService 能力反查窗口 appId → 插件 id 后调用。
+   * 安全边界：只查「本插件」的服务表（hostServices 按插件 id 分组），无法越权调其它插件/内核服务；
+   * 返回值经 IPC 回传渲染进程，必须是 JSON 可序列化数据（函数/类实例会被序列化丢弃）。
+   */
+  async invokeService(appId: string, name: string, args: unknown[] = []): Promise<unknown> {
+    const impl = this.hostServices.get(appId)?.get(name)
+    if (typeof impl !== 'function') {
+      throw new Error(`插件 "${appId}" 未注册可调用的 host 服务「${name}」（需在 host 半用 ctx.provide(name, fn) 注册）`)
+    }
+    return (impl as (...a: unknown[]) => unknown)(...args)
+  }
+
   /** 计算持久化 id：name 转 kebab-case；空或含非法字符则报错 */
   private static persistIdOf(pkg: DynamicPackage, explicit?: string): string {
     return normalizePluginId(explicit ?? pkg.name)
@@ -339,7 +370,15 @@ export class SelfModifyRuntime {
 
     const id = SelfModifyRuntime.persistIdOf(pkg, persistId)
 
-    // 部署产物：workspace/dist 有产物且 plugins/<id>/dist 无产物时自动复制（消除手动 cp）
+    // 已存在同名已安装插件 → 视为升级：先卸载旧的（撤销运行 + 删除旧目录含旧 dist）。
+    // 必须在 deployArtifacts 之前：否则旧 dist 会让 deployArtifacts「已有产物即跳过」→ 新产物不部署，
+    // 而随后 uninstall 又把旧 dist 整个目录删掉，最终 manifest 指向已删除文件（覆盖升级产物丢失）。
+    if (this.inventory.list().some((p) => p.id === id && p.status === 'installed')) {
+      await this.uninstall(id)
+    }
+
+    // 部署产物：workspace/dist 有产物且 plugins/<id>/dist 无产物时自动复制（消除手动 cp）。
+    // 覆盖升级时旧目录已在上一步删除，此处会正常部署新产物。
     await this.deployArtifacts(id)
 
     // 探测编译产物（id 确定后，产物路径 = ~/.shanhai/plugins/<id>/dist/{host.cjs,client.html}）
@@ -351,11 +390,6 @@ export class SelfModifyRuntime {
     // 至少要有一种可执行载体：host 半源码 / client 半源码 / host 编译产物 / client 编译产物
     if (!pkg.code && !pkg.client && !hasHost && !hasHtml) {
       throw new Error(`动态包 "${pkg.name}" 没有可安装的代码（需 code / client / dist/host.cjs / dist/client.html 至少其一）`)
-    }
-
-    // 已存在同名已安装插件 → 视为升级：先卸载旧的
-    if (this.inventory.list().some((p) => p.id === id && p.status === 'installed')) {
-      await this.uninstall(id)
     }
 
     // 若已 running 先撤回（用旧 id 正确卸载 client），再以持久化 id 重新激活
@@ -616,7 +650,7 @@ export class SelfModifyRuntime {
         '【client 半 client】两种形态（均用 new Function 编译、不经过 JSX，必须用 React.createElement 写、禁止 <div> 这类 JSX 语法）：' +
         '① UI 插槽形态（默认）：function(React, slots, useUIContext){ slots.register({ slot, id, component }) }，slots 只有 register 一个方法，component 内可调 useUIContext()；' +
         '② 窗口应用形态（配合 host 半 openWindow）：function(React, helpers){ return 组件函数 }（helpers={ close, appId, name }），必须 return 一个 React 组件函数、不能写箭头函数直接返回对象，且窗口形态在独立渲染进程、不能用 useUIContext()。' +
-        '注意：openWindow 在 run/install 阶段即开窗（点 Dock 图标才开窗是另一条 openApp 链路）。' +
+        '注意：窗口应用默认「不自动开窗」——安装/加载后由用户点 Dock 图标主动打开（openApp → loadFile dist/client.html）；只有 host 半 factory 显式调 ctx.openWindow() 才会在 run/install 阶段立即开窗（会打断用户当前工作，不推荐）。' +
         'slot 分两类：① 覆盖型（后注册整体替换、注销回退）：shell.sidebar/shell.header/shell.chat/shell.composer/shell.statusbar/shell.terminal/shell.welcome/shell.panels/shell.overlays/dynamic-extension；' +
         '② 追加型（互不覆盖）：composer.below/composer.actions/header.actions/chat.below。想「加按钮/小组件」优先用追加型，不要用覆盖型替换整个区块。' +
         '闭环：plugin_define → plugin_test（自测，临时运行并撤回）→ plugin_install（安装进内核、跨会话/跨重启留存）→ plugin_uninstall（卸载）；plugin_run 仅临时运行、不持久化。',
@@ -630,6 +664,7 @@ export class SelfModifyRuntime {
           permissions: { type: 'array', items: { type: 'string' }, description: '可选：插件声明的白名单能力名清单（窗口应用形态才需要，用于调 window.shanhaiPlugin 桥）。完整可声明清单：getVersion / clipboardWriteText / clipboardReadText / speak / selectDirectory / listSessions / listMemory / getUiState(精简版) / closeApp(仅自身) / getWallpaper / getTokenStats。缺省=空数组=最小权限；install 时随 manifest 落盘并审批' },
           icon: { type: 'string', description: '可选：图标相对路径（相对插件目录，如 icon.png / assets/icon.png），供 Dock 图标渲染用；需该文件已放在 ~/.shanhai/plugins/<id>/ 下' },
           dependencies: { type: 'object', description: '可选：依赖声明（包名→版本），仅供工程化插件的 package.json 参考/审计，运行时不自解析依赖' },
+          version: { type: 'string', description: '可选：插件版本号（如 2.0.0），install 时随 manifest.json 落盘；覆盖升级时用于标识版本' },
         },
         required: ['name', 'purpose'],
       },
@@ -644,6 +679,7 @@ export class SelfModifyRuntime {
             permissions: Array.isArray(args.permissions) ? args.permissions.map((x) => String(x)) : undefined,
             icon: args.icon ? String(args.icon) : undefined,
             dependencies: args.dependencies && typeof args.dependencies === 'object' ? (args.dependencies as Record<string, string>) : undefined,
+            version: args.version ? String(args.version) : undefined,
           },
           sid(),
         )

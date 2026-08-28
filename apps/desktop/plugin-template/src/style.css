@@ -48,7 +48,18 @@ body {
   font-size: 13px;
 }
 
-.close {
+.spacer {
+  flex: 1;
+}
+
+.winbtns {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  -webkit-app-region: no-drag;
+}
+
+.winbtn {
   -webkit-app-region: no-drag;
   border: none;
   background: transparent;
@@ -60,7 +71,12 @@ body {
   font-size: 14px;
 }
 
-.close:hover {
+.winbtn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+
+.winbtn.close:hover {
   background: rgba(255, 82, 82, 0.2);
   color: #ff6b6b;
 }

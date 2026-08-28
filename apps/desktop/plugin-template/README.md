@@ -70,7 +70,7 @@ dist/assets/*          # client bundle（js/css，自包含）
 ```ts
 // 必须 module.exports = (ctx) => disposer（不能写成裸箭头函数）
 module.exports = (ctx) => {
-  ctx.openWindow()                 // 打开本插件独立窗口（install/run 阶段即开窗）
+  // ctx.openWindow()               // 打开本插件独立窗口（默认「不自动开窗」，用户点 Dock 图标主动打开）
   ctx.on('event:name', (p) => {})  // 订阅内核事件（撤销时自动取消订阅）
   ctx.provide('svc:name', {})      // 注册命名服务（plugin_inspect 可查）
   ctx.tools.register({ name, description, inputSchema, execute })  // 注册全局工具

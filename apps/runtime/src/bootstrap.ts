@@ -1147,6 +1147,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       return ctx.selfmod.restoreAll()
     },
 
+    invokePluginService(appId, name, args) {
+      return ctx.selfmod.invokeService(appId, name, args)
+    },
+
     onClientRunRequest(cb) {
       ctx.clientRunCallbacks.add(cb)
       return () => ctx.clientRunCallbacks.delete(cb)

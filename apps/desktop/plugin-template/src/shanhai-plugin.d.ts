@@ -31,12 +31,33 @@ export interface ShanhaiPluginBridge {
   getWallpaper(): Promise<string | null>
   /** token 用量快照（只读） */
   getTokenStats(sessionId?: string): Promise<unknown>
+  /**
+   * 调用本插件 host 半注册的自定义服务（client → host RPC）。
+   * 入参：服务名（host 半 ctx.provide 注册的 name）+ 可变参数；返回值必须是 JSON 可序列化数据。
+   * 默认放行（无需 permissions 声明）；只能调「本插件」的服务，无法越权调其它插件/内核。
+   */
+  invokePluginService(name: string, ...args: unknown[]): Promise<unknown>
 }
 
 declare global {
   interface Window {
     shanhaiPlugin?: ShanhaiPluginBridge
+    /** 宿主桥（窗口控制 + 只读信息，按 sender 反查自身窗口，无法越权） */
+    shanhai?: ShanhaiHostBridge
   }
+}
+
+/** 插件窗口宿主桥（window.shanhai）：窗口控制 + 只读信息，主进程按 sender 反查自身窗口 */
+export interface ShanhaiHostBridge {
+  windowType: string
+  platform: string
+  windowAppId?: string
+  getPluginApp(appId: string): Promise<unknown>
+  closeApp(appId: string): Promise<void>
+  minimizeWindow(): void
+  toggleMaximizeWindow(): Promise<boolean>
+  /** 订阅主题变更（主进程 ui:theme 广播给所有窗口），返回取消订阅函数。插件窗口据此跟随内置应用亮/暗切换 */
+  onThemeChange(cb: (theme: 'light' | 'dark') => void): () => void
 }
 
 export {}

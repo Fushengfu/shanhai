@@ -27,7 +27,8 @@ const windowAppId: string | undefined = readArg('--shanhai-app-id=')
 
 /**
  * 宿主桥：AppWindow 渲染 client 半所需的最小能力。
- * getPluginApp 拉取 clientCode（只读）、closeApp 关闭自身窗口，均无害；危险接口不在此暴露。
+ * getPluginApp 拉取 clientCode（只读）、closeApp 关闭自身窗口、minimizeWindow/toggleMaximizeWindow
+ * 操作自身窗口（主进程按 sender 反查，无法越权操作其它窗口），均无害；危险接口不在此暴露。
  */
 const hostBridge = {
   windowType,
@@ -35,6 +36,14 @@ const hostBridge = {
   windowAppId,
   getPluginApp: (appId: string) => ipcRenderer.invoke('plugin-app:get', appId),
   closeApp: (appId: string) => ipcRenderer.invoke('window:closeApp', appId),
+  minimizeWindow: () => ipcRenderer.send('window:minimize'),
+  toggleMaximizeWindow: () => ipcRenderer.invoke('window:toggleMaximize'),
+  /** 订阅主题变更（主进程 ui:theme 广播给所有窗口），返回取消订阅函数。插件窗口据此跟随内置应用亮/暗切换 */
+  onThemeChange: (cb: (theme: 'light' | 'dark') => void): (() => void) => {
+    const listener = (_e: unknown, theme: 'light' | 'dark') => cb(theme)
+    ipcRenderer.on('ui:theme', listener)
+    return () => ipcRenderer.removeListener('ui:theme', listener)
+  },
 }
 contextBridge.exposeInMainWorld('shanhai', hostBridge)
 
@@ -64,6 +73,12 @@ export interface ShanhaiPluginBridge {
   getWallpaper(): Promise<string | null>
   /** token 用量快照（只读） */
   getTokenStats(sessionId?: string): Promise<unknown>
+  /**
+   * 调用本插件 host 半注册的自定义服务（client → host RPC）。
+   * 入参：服务名（host 半 ctx.provide 注册的 name）+ 可变参数；返回值必须是 JSON 可序列化数据。
+   * 默认放行（无需 permissions 声明）；只能调「本插件」的服务，无法越权调其它插件/内核。
+   */
+  invokePluginService(name: string, ...args: unknown[]): Promise<unknown>
 }
 
 /** 统一入口：所有能力走主进程 plugin:invoke 双层校验 */
@@ -83,6 +98,7 @@ const pluginBridge: ShanhaiPluginBridge = {
   closeApp: () => invoke('closeApp') as Promise<void>,
   getWallpaper: () => invoke('getWallpaper') as Promise<string | null>,
   getTokenStats: (sessionId) => invoke('getTokenStats', sessionId) as Promise<unknown>,
+  invokePluginService: (name, ...rest) => invoke('invokePluginService', name, rest) as Promise<unknown>,
 }
 
 contextBridge.exposeInMainWorld('shanhaiPlugin', pluginBridge)

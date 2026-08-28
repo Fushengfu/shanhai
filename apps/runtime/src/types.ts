@@ -360,6 +360,8 @@ export interface Runtime {
   closePluginApp(appId: string): Promise<{ ok: boolean }>
   /** 订阅「关闭插件窗口」请求（主进程订阅后调 window-manager closeApp） */
   onClosePluginApp(cb: (appId: string) => void): () => void
+  /** client 半 → host 半自定义 RPC：按「插件 id + 服务名」调用 host 半 provide() 注册的服务（仅限本插件，无法越权） */
+  invokePluginService(appId: string, name: string, args: unknown[]): Promise<unknown>
   /** 列出长期记忆（按会话隔离，仅返回当前会话的记忆） */
   listMemory(sessionId: string): Array<{ id: number; scope: string; key: string; value: unknown; source: string; confidence: number; timestamp: number; sessionId?: string }>
   /** 删除一条长期记忆（按 id） */

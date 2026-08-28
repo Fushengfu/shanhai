@@ -157,14 +157,29 @@ function ActionsCard(): JSX.Element {
   )
 }
 
-/** 标题栏：frameless 窗口的自定义标题 + 关闭按钮 */
+/** 取宿主桥（window.shanhai：仅 windowType/platform/windowAppId/getPluginApp/closeApp/minimizeWindow/toggleMaximizeWindow） */
+const host = (): NonNullable<Window['shanhai']> => {
+  if (!window.shanhai) throw new Error('window.shanhai 不可用（插件专用 preload 未挂载）')
+  return window.shanhai
+}
+
+/** 标题栏：frameless 窗口的统一自定义标题栏（拖动区 + 最小化/最大化/关闭，与山海内置应用同风格） */
 function TitleBar(): JSX.Element {
   return (
     <header className="titlebar">
       <span className="title">插件窗口 · 编译产物渲染</span>
-      <button className="close" onClick={() => void api().closeApp()} title="关闭窗口">
-        ✕
-      </button>
+      <span className="spacer" />
+      <div className="winbtns">
+        <button className="winbtn" onClick={() => host().minimizeWindow()} title="最小化">
+          ─
+        </button>
+        <button className="winbtn" onClick={() => void host().toggleMaximizeWindow()} title="最大化/还原">
+          □
+        </button>
+        <button className="winbtn close" onClick={() => void api().closeApp()} title="关闭窗口">
+          ✕
+        </button>
+      </div>
     </header>
   )
 }

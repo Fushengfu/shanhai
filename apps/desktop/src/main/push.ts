@@ -1,4 +1,5 @@
 import { BrowserWindow } from 'electron'
+import { safeSend } from './safe-send'
 import { getRuntime } from './runtime'
 import { getUiState, subscribeUiState, filterUiStateForWindow, windowConsumesUiState } from './ui-store'
 import { getWindowType, openApp, closeApp } from './window-manager'
@@ -16,7 +17,7 @@ export function registerPush(): void {
 
   const broadcast = (channel: string, ...args: unknown[]): void => {
     for (const win of BrowserWindow.getAllWindows()) {
-      if (!win.isDestroyed()) win.webContents.send(channel, ...args)
+      safeSend(win, channel, ...args)
     }
   }
 
@@ -59,7 +60,7 @@ export function registerPush(): void {
       if (win.isDestroyed()) continue
       const type = getWindowType(win)
       if (!windowConsumesUiState(type)) continue
-      win.webContents.send('ui:state', filterUiStateForWindow(type, full))
+      safeSend(win, 'ui:state', filterUiStateForWindow(type, full))
     }
   })
 }

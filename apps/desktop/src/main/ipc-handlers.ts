@@ -1,5 +1,6 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
 import { SUPERVISOR_ID } from '@shanhai/runtime'
+import { safeSend } from './safe-send'
 import { getRuntime } from './runtime'
 import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow, toggleMaximizeWindow, resizeDockWindow, hideSupervisorToBubble, showSupervisorFromBubble, moveSupervisorBubble, hideToSystemDesktop, getWindowType, getWindowAppId } from './window-manager'
 import { getPluginApp, listPluginApps } from './plugin-apps'
@@ -209,7 +210,7 @@ export function registerIpc(): void {
   // —— 主题切换（亮/暗）：聊天窗口切换后广播给所有窗口，让各独立窗口（会话管家/Dock/桌面壳/应用窗口）实时跟随 ——
   ipcMain.on('theme:set', (_e, theme: 'light' | 'dark') => {
     for (const win of BrowserWindow.getAllWindows()) {
-      if (!win.isDestroyed()) win.webContents.send('ui:theme', theme)
+      safeSend(win, 'ui:theme', theme)
     }
   })
 
@@ -271,6 +272,7 @@ export function registerIpc(): void {
   const PLUGIN_CAPABILITIES = new Set([
     'getVersion', 'clipboardWriteText', 'clipboardReadText', 'speak', 'selectDirectory',
     'listSessions', 'listMemory', 'getUiState', 'closeApp', 'getWallpaper', 'getTokenStats',
+    'invokePluginService',
   ])
   ipcMain.handle('plugin:invoke', async (e, capability: string, ...args: unknown[]) => {
     const win = BrowserWindow.fromWebContents(e.sender)
@@ -279,7 +281,12 @@ export function registerIpc(): void {
     const pkg = getPluginApp(appId)
     if (!pkg) throw new Error(`未知插件应用: ${appId}`)
     if (!PLUGIN_CAPABILITIES.has(capability)) throw new Error(`能力不在插件白名单: ${capability}`)
-    if (!pkg.permissions.includes(capability)) {
+    // closeApp 是「关闭自身窗口」的无害能力（appId 由窗口反查，无法越权关其它窗口），默认放行、不要求 permissions 声明：
+    // 否则 AI 生成插件时若漏声明 closeApp，插件窗口将无法关闭（体验灾难）。其余能力仍需 permissions 显式声明。
+    // invokePluginService 同理：它只能调「本插件」host 半注册的服务（appId 反查 + host 服务按插件 id 分组隔离），
+    // 无法越权调其它插件/内核服务，属插件内部前后端通信，默认放行（不要求 permissions 声明）。
+    const alwaysAllowed = capability === 'closeApp' || capability === 'invokePluginService'
+    if (!alwaysAllowed && !pkg.permissions.includes(capability)) {
       throw new Error(`插件 "${pkg.name}" 未声明权限「${capability}」，请在其 manifest.permissions 中声明`)
     }
     switch (capability) {
@@ -318,6 +325,9 @@ export function registerIpc(): void {
         return getWallpaper()
       case 'getTokenStats':
         return runtime.getTokenStats(typeof args[0] === 'string' ? args[0] : undefined)
+      case 'invokePluginService':
+        // client → host 自定义 RPC：appId 反查窗口 → 插件 id，只调「本插件」host 半注册的服务（无法越权）
+        return runtime.invokePluginService(appId, String(args[0] ?? ''), Array.isArray(args[1]) ? args[1] : [])
       default:
         throw new Error(`未实现的插件能力: ${capability}`)
     }

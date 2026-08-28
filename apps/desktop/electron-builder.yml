@@ -13,6 +13,7 @@ files:
   - assets/**
   - package.json
   - "!dist/**/*.map"
+  - "!node_modules/**/*.map"
   - "!**/.DS_Store"
 
 # 原生模块与 wasm 资源必须解包到真实文件系统（asar 内无法被 worker_threads / require 原生 .node 加载）

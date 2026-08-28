@@ -86,13 +86,15 @@ interface HostFacade {
 
 | 能力 | 签名 | 语义 | 是否自动撤销 |
 |------|------|------|--------------|
-| `ctx.on` | `(name, listener) => void` | 订阅内核事件总线，返回无 | ✅ 撤销时自动 off |
-| `ctx.provide` | `(name, impl) => void` | 注册命名服务到内存 map（当前仅被 `plugin_inspect` 报告，无服务发现/注入消费） | ✅ 撤销时自动删除 |
+| `ctx.on` | `(name, listener) => void` | 订阅内核事件总线，返回无（⚠️ 当前内核**不广播任何事件**，可订阅事件清单为空，见下） | ✅ 撤销时自动 off |
+| `ctx.provide` | `(name, impl) => void` | 注册命名服务。**若 `impl` 是函数，client 半可经 `window.shanhaiPlugin.invokePluginService(name, ...args)` 调用它（client→host RPC，见 §7）** | ✅ 撤销时自动删除 |
 | `ctx.tools.register` | `(tool: ToolContract) => void` | 向全局工具表注册一个 model-facing 工具 | ✅ 撤销时自动移除 |
 | `ctx.openWindow` | `(appId?: string) => void` | 打开本插件的窗口应用（`appId` 缺省 = 插件 id） | ✅ 撤销时自动关闭该窗口 |
 | `ctx.closeWindow` | `(appId?: string) => void` | 显式关闭本插件的窗口应用（`appId` 缺省 = 插件 id） | ❌ 主动关闭，不挂撤销 |
 
 > ⚠️ **刻意不暴露 `effect()`**：host 半的 cleanup 只能走上面 4 条自动撤销路径（`on`/`provide`/`tools.register`/`openWindow`）。
+
+> ⚠️ **坑 14（`ctx.on` 无可订阅内核事件）**：`ctx.on` 桥接到内核事件总线 `kernel.ctx.on`，但当前内核**零 `emit` 调用**——没有内核事件会广播，可订阅事件清单**为空**。插件 `ctx.on('任意名字', ...)` 只是挂一个永远不会被触发的监听器（除非未来内核广播事件，或插件间协作，但 facade 也未暴露 emit）。开发时**不要依赖 `ctx.on` 接收内核事件**；它仅作为「未来内核事件 + 插件自定义协作」的占位能力保留。
 
 `ctx.tools.register` 的 `ToolContract`（`packages/tools/src/tools.ts`）：
 
@@ -197,8 +199,16 @@ function (React, helpers) {
 - 窗口内容由 `dist/client.html` + `dist/assets/*`（vite 完整 React bundle）渲染，**可用完整 React + JSX + 任意依赖 + 复杂 UI**。
 - 该入口挂**插件专用 preload**（`plugin.cjs`），暴露两个桥：
   - `window.shanhaiPlugin`（白名单桥，11 项能力，见 §7）—— 插件调山海公开接口的**唯一**通道；
-  - `window.shanhai`（宿主桥，**极度缩小**：仅 `windowType`/`platform`/`windowAppId`/`getPluginApp`/`closeApp`，无任何危险接口）。
+  - `window.shanhai`（宿主桥，**极度缩小**：仅 `windowType`/`platform`/`windowAppId`/`getPluginApp`/`closeApp`/`minimizeWindow`/`toggleMaximizeWindow`，无任何危险接口）。
 - 构建配置要求：`base: './'`（Electron `loadFile(file://)` 下资源必须相对路径）。
+
+> ⚠️ **坑 13（frameless 窗口必读）**：插件窗口与山海其它窗口一样是 **frameless（`frame:false`、无系统标题栏）**，因此 **client 半必须自己提供统一标题栏**，否则「窗口拖不动、关不掉、找不到窗口控制」：
+> 1. **拖动手柄**：顶部标题栏加 CSS `-webkit-app-region: drag;`（按钮等可点元素要 `-webkit-app-region: no-drag;` 否则点不到）；
+> 2. **窗口控制三按钮**（最小化/最大化/关闭，与山海内置应用同风格）：
+>    - 最小化 → `window.shanhai.minimizeWindow()`（宿主桥，按 sender 反查自身窗口，无需 permission）；
+>    - 最大化/还原 → `window.shanhai.toggleMaximizeWindow()`（宿主桥，返回是否最大化）；
+>    - 关闭 → `window.shanhaiPlugin.closeApp()`（工程化）或 `helpers.close`（快速原型）。`closeApp` 默认放行、无需声明 permission。
+> - **脚手架模板已内置这套标题栏**（`TitleBar` 组件 + `.titlebar`/`.winbtn` 样式），AI 生成插件直接复用，不要自己另写一套。
 
 ---
 
@@ -256,16 +266,19 @@ composer.below   composer.actions  header.actions    chat.below
 
 ### 4.3 `plugin_install` 的精确顺序
 
-1. 校验 package 存在、有可执行载体（`code`/`client`/`dist/host.cjs`/`dist/client.html` 至少其一）、store 已装配；
-2. 用 `persistIdOf(name, persistId)` 生成持久化 id（name 转 kebab-case，仅允许 `[a-zA-Z0-9_-]`，否则报错）；
-3. **部署产物**：若 `plugins/<id>/dist/` 无产物、但 `plugins-workspace/<id>/dist/` 有，自动复制（消除手动 cp）；
-4. 探测 `entryHost` / `entryHtml`，写回 package；
-5. 若已有同 id 的已安装插件 → 先 `uninstall` 旧的（视为升级）；
+1. 校验 package 存在、store 已装配（`!store` 报错）；生成持久化 id（`persistIdOf`，name 转 kebab-case，仅允许 `[a-zA-Z0-9_-]`）；
+2. 若已有同 id 的已安装插件 → 先 `uninstall` 旧的（视为升级：撤销运行 + 删除旧目录含旧 dist）；
+3. **部署产物**：若 `plugins/<id>/dist/` 无产物、但 `plugins-workspace/<id>/dist/` 有，自动复制（消除手动 cp）——覆盖升级时旧目录已在上一步删除，此处会正常部署新产物；
+4. **探测** `entryHost` / `entryHtml`（部署后产物才可见），写回 package；
+5. **校验可执行载体**：`code` / `client` / `dist/host.cjs` / `dist/client.html` 至少其一（部署后 dist 产物才参与判定），否则报错「没有可安装的代码」；
 6. 若当前 package `running` → 先 `stop`；
 7. `rename(dynId, persistId)` + `setSession('*')`；
 8. `run(id, sessionId, { skipApproval: true })` —— **激活，且不再二次弹审批**；
 9. `store.install(meta)` 落盘 `manifest.json`；
 10. `setStatus('installed')`，返回 `{ id, installed: true }`。
+
+> 顺序要点：**先 uninstall 旧的（覆盖升级）→ 部署 workspace 产物 → 探测 entryHost/entryHtml → 再做可执行载体校验**。
+> 关键：`uninstall` 必须在 `deployArtifacts` **之前**——否则旧 dist 会让 deployArtifacts「已有产物即跳过」→ 新产物不部署，而随后 uninstall 又把旧 dist 整个目录删掉，最终 manifest 指向已删除文件（覆盖升级产物丢失）。
 
 ### 4.4 openWindow / closeWindow 的配对与自动撤销
 
@@ -275,7 +288,7 @@ composer.below   composer.actions  header.actions    chat.below
 - 窗口打开是**惰性**的：`openApp` 已有则聚焦、否则创建；`closeApp` 真正 `destroy()` 窗口。
 - 窗口应用注册表（主进程 `plugin-apps.ts`）：`appId → { name, clientCode, entryHtml, icon, ... }`。
 
-> ⚠️ **坑 6**：`ctx.openWindow()` 在 `run` 阶段被调用，`plugin_install` / `plugin_run` 一执行完窗口**已弹出**（非「点 Dock 图标才开窗」）。若产品预期「点 Dock 才开窗」，host 半不要在 `run` 阶段直接调 `openWindow`。
+> ⚠️ **坑 6**：窗口应用默认「**不自动开窗**」——脚手架模板的 host 半**不**直接调 `ctx.openWindow()`，安装/加载后由用户点 Dock 图标主动打开（`openApp → loadFile dist/client.html`）。只有插件作者**主动**在事件回调里调 `ctx.openWindow()` 才会立即开窗（会打断用户当前工作，不推荐）。
 
 ---
 
@@ -321,6 +334,7 @@ interface InstalledPackageMeta {
 
 - 落盘权限 `0o600`；id 仅允许 `[a-zA-Z0-9_-]`，resolve 后强制校验落在仓库目录内，杜绝路径穿越。
 - `uninstall` 递归删除整个 `<id>` 目录（不存在静默成功）。
+- **版本号 `version`**：`plugin_define` 工具入参可选 `version`（如 `2.0.0`），`install` 时随 manifest 落盘；覆盖升级时用于标识版本（不改目录结构、不参与 id 计算）。工程化插件若只想用 `package.json` 的 version 表达，可二选一，但「install 落盘的版本」以 `plugin_define(version)` / manifest 为准。
 - **向后兼容**：只有 `code`/`client`、无 `dist`/`icon` 的「旧快速原型」格式（目录里仅一个 manifest.json）仍能正常 install/restore。
 
 ---
@@ -332,9 +346,13 @@ interface InstalledPackageMeta {
 1. 能力必须在全局白名单 `PLUGIN_CAPABILITIES`；
 2. 插件的 `manifest.permissions[]` 声明了该能力（install 时审批）。
 
-未声明则抛错拒绝。**危险接口（`auth:*` / `chat:run` / `supervisor:*` / `model:switch` / `model:addCustom` / `remote:disable` / `approval:setPolicy` / `session:delete` / `settings:set` / `wallpaper:set` 等）永不进白名单，物理拿不到。**
+未声明则抛错拒绝。**默认放行的例外（无需 `permissions` 声明）**：
+- `closeApp`（关闭自身窗口）：「appId 由窗口反查、无法越权关其它窗口」的无害能力，避免漏声明导致窗口无法关闭。
+- `invokePluginService`（client→host RPC）：只能调「本插件」host 半注册的服务（appId 反查 + host 服务按插件 id 分组隔离），无法越权调其它插件/内核服务，属插件内部前后端通信。
 
-## 7. 白名单能力清单（11 项）
+**危险接口（`auth:*` / `chat:run` / `supervisor:*` / `model:switch` / `model:addCustom` / `remote:disable` / `approval:setPolicy` / `session:delete` / `settings:set` / `wallpaper:set` 等）永不进白名单，物理拿不到。**
+
+## 7. 白名单能力清单（12 项）
 
 | 能力 | 说明 |
 |------|------|
@@ -346,11 +364,12 @@ interface InstalledPackageMeta {
 | `listSessions` | 列出用户会话（只读） |
 | `listMemory` | 列出指定会话长期记忆（只读） |
 | `getUiState` | 精简 UI 状态（登录态 + 用户名 + 壁纸，隔离敏感数据） |
-| `closeApp` | 关闭当前插件自己的窗口（仅自身，无法越权关其它窗口） |
+| `closeApp` | 关闭当前插件自己的窗口（仅自身，无法越权关其它窗口）。**默认放行**：无需在 `permissions` 声明，窗口关闭按钮始终可用 |
 | `getWallpaper` | 读取桌面壁纸 |
 | `getTokenStats` | token 用量快照（只读） |
+| `invokePluginService` | 调用本插件 host 半注册的自定义服务（client→host RPC，见 §1.3 `ctx.provide`）。入参：服务名 + 可变参数，返回值须 JSON 可序列化。**默认放行**：无需 `permissions` 声明 |
 
-> 完整可声明清单即上述 11 项；`permissions` 缺省 = 空数组 = 最小权限。
+> 完整可声明清单即上述 12 项；`permissions` 缺省 = 空数组 = 最小权限。
 
 ---
 
@@ -361,10 +380,12 @@ interface InstalledPackageMeta {
 3. **窗口应用形态必须 return 组件函数**，不能 return 对象/箭头函数返回对象。
 4. **窗口应用形态不能 `useUIContext()`**（独立进程、不在 Provider 内），只用 `helpers`（快速原型）或 `window.shanhaiPlugin`（工程化）。
 5. **UI 插槽形态的 `slots` 只有 `register` 一个方法**。
-6. **`openWindow` 在 `run` 阶段即开窗**，install 时窗口立即弹出（非点击 Dock 才开）。
+6. **窗口应用默认「不自动开窗」**，安装/加载后由用户点 Dock 图标主动打开（非自动弹出）。
 7. **host 半无 `effect()`**，cleanup 只走 4 条自动撤销路径。
 8. **`tools.register` 注册的是全局工具**（非会话隔离）。
-9. **`provide` 的服务仅 `plugin_inspect` 报告用**，目前无服务发现/注入机制消费它。
+9. **`provide` 的函数 impl 可被 client 半 `invokePluginService` 调用**（client→host RPC，见 §7）；非函数 impl 仅 `plugin_inspect` 报告用。
 10. **host 半编译产物必须自包含**，不得 external `electron` / `@shanhai/*`（越权审计拒绝加载）。
 11. **client 半源码字符串跨渲染进程传输**（序列化），主进程 `plugin-apps` 维护注册表，Dock 图标经 `plugin-apps:changed` 广播刷新。
 12. **`plugin_build` 产物在 workspace**，`plugin_install` 自动部署到 `plugins/<id>/dist/`（无需手动 cp）。
+13. **插件窗口主题跟随**：宿主桥 `window.shanhai.onThemeChange(cb)` 订阅主进程 `ui:theme` 广播（内置应用切换亮/暗时实时下发）。**回调签名写死为 `onThemeChange(cb: (theme: 'light' | 'dark') => void)`**：cb 收到的参数是**裸字符串** `'light' | 'dark'`（不是对象，主进程 `ipc-handlers.ts` 的 `safeSend(win, 'ui:theme', theme)` 塞的就是字符串），直接 `theme === 'dark'` 判断即可，不要按对象 `{ theme }` 解包。插件窗口挂载时读 `localStorage.getItem('shanhai-theme')` 得到初始主题，`document.documentElement.setAttribute('data-theme', theme)` 驱动 CSS 变量。脚手架模板的 `style.css` 已内嵌与内置应用一致的主题变量（`--bg-subtle`/`--text-muted`/`--accent` 等），AI 生成插件开箱即随主题切换。**AI 真机自验如何切主题**：主题切换入口是「聊天窗口顶栏右侧的月亮/太阳图标按钮」（无文字、hover 提示「切换到暗色/亮色模式」）或「会话管家窗口标题栏右侧的月亮/太阳按钮」，点一下即切换亮/暗并广播给所有窗口（含插件窗口）；**无快捷键**。
+14. **`ctx.on` 无可订阅内核事件**：内核事件总线零 `emit`，`ctx.on` 仅作占位能力保留。

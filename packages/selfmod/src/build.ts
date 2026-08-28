@@ -32,6 +32,33 @@ function findNodeModulesUp(fromDir: string): string | null {
   }
 }
 
+/**
+ * 修复 electron-builder 打包后 esbuild 二进制的 spawn 路径（ENOTDIR）。
+ *
+ * 打包后 esbuild 二进制被 asarUnpack 解包到 app.asar.unpacked（真实文件系统），但 esbuild 的
+ * JS 主包在 app.asar 内，其 `require.resolve('@esbuild/<platform>/bin/esbuild')` 返回的是 asar 内
+ * 路径；Electron 的 asar fs 拦截让 `fs.existsSync` 误判为 true，而 `child_process.spawn` 无法执行
+ * asar 内路径（app.asar 是文件而非目录）→ 抛 `spawn ENOTDIR`。故按阶段设置 ESBUILD_BINARY_PATH
+ * 指向 unpacked 里的真实二进制。
+ *
+ * 注意有两个 esbuild 副本、版本不同：顶层 esbuild（host 半编译用）与 vite 内部 esbuild（client 半
+ * 的 esbuild-transpile 用）。二者二进制版本不同，需分别定位，故用 subdir 区分。
+ *
+ * @param subdir 相对 unpacked/node_modules 的子目录（vite 内部 esbuild 传 'vite/node_modules'，顶层传 ''）
+ */
+function patchEsbuildBinaryPath(subdir: string): void {
+  const rp = (process as unknown as { resourcesPath?: string }).resourcesPath
+  if (!rp) return
+  // 非打包环境（dev 直接跑 node / electron . 跑源码）：resourcesPath 下无 app.asar，esbuild 二进制
+  // 在真实 node_modules，require.resolve 正确，无需修复。
+  if (!existsSync(join(rp, 'app.asar'))) return
+  const platform = `${process.platform}-${process.arch}`
+  const binName = process.platform === 'win32' ? 'esbuild.exe' : 'esbuild'
+  const base = join(rp, 'app.asar.unpacked', 'node_modules')
+  const bin = join(base, subdir, '@esbuild', platform, 'bin', binName)
+  if (existsSync(bin)) process.env.ESBUILD_BINARY_PATH = bin
+}
+
 type EsbuildModule = { build: (opts: Record<string, unknown>) => Promise<unknown>; buildSync: (opts: Record<string, unknown>) => unknown }
 
 /** 定位 esbuild（CJS，可 require）：先直接 require，再从 vite / tsup 的依赖树回退定位 */
@@ -152,6 +179,8 @@ export async function buildPlugin(projectDir: string, id: string): Promise<Plugi
         alias['react-dom'] = reactDomDir
         alias['react-dom/client'] = join(reactDomDir, 'client.js')
       }
+      // 打包环境：vite 的 esbuild-transpile 用 vite 内部 esbuild（0.21.x），需把其二进制指到 unpacked
+      patchEsbuildBinaryPath(join('vite', 'node_modules'))
       await vite.build({
         root: absDir,
         base: './',
@@ -188,6 +217,8 @@ export async function buildPlugin(projectDir: string, id: string): Promise<Plugi
       warnings.push('进程内 esbuild 不可用，跳过 host 半构建（产物将无 host.cjs）')
     } else {
       const nm = findNodeModulesUp(dirname(fileURLToPath(import.meta.url)))
+      // 打包环境：host 半用顶层 esbuild（0.27.x），需把其二进制指到 unpacked
+      patchEsbuildBinaryPath('')
       await esbuild.build({
         entryPoints: [resolve(absDir, 'src', 'host.ts')],
         bundle: true,

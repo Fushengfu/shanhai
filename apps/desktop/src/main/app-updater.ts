@@ -5,6 +5,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { safeSend } from './safe-send'
 
 /**
  * 应用版本检查更新（纯手写，不依赖 electron-updater）。
@@ -572,8 +573,8 @@ export async function checkAndPromptForUpdate(
     console.log('[app-update] check result:', output)
 
     // 自动检查发现新版本时主动推送给渲染进程
-    if (output.hasUpdate && options.parentWindow && !options.parentWindow.isDestroyed()) {
-      options.parentWindow.webContents.send(UPDATE_AVAILABLE_CHANNEL, output)
+    if (output.hasUpdate) {
+      safeSend(options.parentWindow, UPDATE_AVAILABLE_CHANNEL, output)
     }
 
     return output

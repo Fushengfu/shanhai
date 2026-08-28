@@ -19,21 +19,24 @@ interface PluginContext {
   closeWindow(appId?: string): void
 }
 
-// 声明 CommonJS 的 module（host 半契约：module.exports = (ctx) => disposer）
-declare const module: { exports: unknown }
+// 声明 CommonJS 的 module（host 半契约：module.exports = (ctx) => disposer）。
+// 注意必须用 var 而非 const：const 是块级声明，会与 @types/node 的全局 var module（module.d.ts）
+// 冲突，报「Cannot redeclare block-scoped variable module」；var 可与其共存，插件项目 typecheck 才不报重复声明。
+declare var module: { exports: unknown }
 
 module.exports = (ctx: PluginContext): (() => void) => {
-  // 1) 打开本插件的独立窗口（appId 缺省 = 插件 id）。
-  //    注意：openWindow 在 install/run 阶段即开窗（不是等点 Dock 图标；点 Dock 是另一条 openApp 链路）。
-  ctx.openWindow()
+  // 1) 窗口应用默认「不自动开窗」：安装/加载后由用户主动打开（点 Dock 图标 → openApp → loadFile dist/client.html）。
+  //    如需程序化开窗（例如收到某个事件时），在事件回调里显式调 ctx.openWindow()。
+  // ctx.openWindow()  // ← 取消注释即可在 install/run 阶段立即开窗（不推荐：会打断用户当前工作）
 
   // 2) 订阅内核事件示例（撤销时自动取消订阅）
   ctx.on('demo-plugin:ping', (payload) => {
     console.log('[demo-plugin] 收到事件：', payload)
   })
 
-  // 3) 注册命名服务（plugin_inspect 可查 services 列表）
-  ctx.provide('demo-plugin:service', { ping: () => 'pong' })
+  // 3) 注册命名服务（plugin_inspect 可查 services 列表）。
+  //    若 impl 是函数，client 半可通过 window.shanhaiPlugin.invokePluginService('demo-plugin:getData', arg) 调用它（client → host RPC）。
+  ctx.provide('demo-plugin:getData', async (query: unknown) => ({ echo: String(query ?? ''), at: Date.now() }))
 
   // 4) 注册全局工具示例（撤销时自动注销）—— 需要时取消注释
   // ctx.tools.register({
