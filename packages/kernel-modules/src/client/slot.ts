@@ -53,6 +53,7 @@ export const CORE_SLOTS = [
   'shell.chat',
   'shell.composer',
   'shell.statusbar',
+  'shell.terminal',
   'shell.welcome',
   'shell.panels',
   'shell.overlays',

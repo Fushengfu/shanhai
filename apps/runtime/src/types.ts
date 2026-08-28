@@ -342,6 +342,14 @@ export interface Runtime {
   onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
   /** browser 半卸载回调（UI 移除组件） */
   onClientRemove(cb: (pkgId: string) => void): () => void
+  /** 打开插件窗口应用（appId = 插件持久化 id，主进程 openApp 复用 app 窗口类型承载） */
+  openPluginApp(appId: string): Promise<{ ok: boolean }>
+  /** 订阅「打开插件窗口」请求（主进程订阅后调 window-manager openApp） */
+  onOpenPluginApp(cb: (appId: string) => void): () => void
+  /** 关闭插件窗口应用（appId = 插件持久化 id，主进程 closeApp 销毁对应 app 窗口） */
+  closePluginApp(appId: string): Promise<{ ok: boolean }>
+  /** 订阅「关闭插件窗口」请求（主进程订阅后调 window-manager closeApp） */
+  onClosePluginApp(cb: (appId: string) => void): () => void
   /** 列出长期记忆（按会话隔离，仅返回当前会话的记忆） */
   listMemory(sessionId: string): Array<{ id: number; scope: string; key: string; value: unknown; source: string; confidence: number; timestamp: number; sessionId?: string }>
   /** 删除一条长期记忆（按 id） */

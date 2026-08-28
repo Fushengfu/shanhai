@@ -151,6 +151,10 @@ export interface RuntimeContext {
   pendingClientRuns: Map<string, { resolve: (approved: boolean) => void; sessionId?: string }>
   clientCodeCallbacks: Set<(payload: { pkgId: string; name: string; code: string }) => void>
   clientRemoveCallbacks: Set<(pkgId: string) => void>
+  /** 打开插件窗口应用的回调（主进程订阅后调 window-manager openApp，appId = 插件持久化 id） */
+  openAppWindowCallbacks: Set<(appId: string) => void>
+  /** 关闭插件窗口应用的回调（主进程订阅后调 window-manager closeApp 销毁对应窗口） */
+  closeAppWindowCallbacks: Set<(appId: string) => void>
   pluginStore: PluginStore
   selfmod: SelfModifyRuntime
 

@@ -1,7 +1,8 @@
 import { BrowserWindow } from 'electron'
 import { getRuntime } from './runtime'
 import { getUiState, subscribeUiState, filterUiStateForWindow, windowConsumesUiState } from './ui-store'
-import { getWindowType } from './window-manager'
+import { getWindowType, openApp, closeApp } from './window-manager'
+import { registerPluginApp, unregisterPluginApp, listPluginApps } from './plugin-apps'
 
 /**
  * 主进程 → 渲染进程 事件推送（广播到所有窗口）。
@@ -28,8 +29,23 @@ export function registerPush(): void {
   runtime.onReasoning((sessionId, text) => broadcast('chat:reasoning', sessionId, text))
   // 自修改（K5）：browser 半投递的 round-trip 审批 + 代码投递 + 卸载（非 store 状态）
   runtime.onClientRunRequest((req) => broadcast('selfmod:client-run-request', req))
-  runtime.onClientCode((payload) => broadcast('selfmod:client-code', payload))
-  runtime.onClientRemove((pkgId) => broadcast('selfmod:client-remove', pkgId))
+  runtime.onClientCode((payload) => {
+    // 动态插件窗口应用：把 client 半源码注册进主进程清单（app 窗口渲染时查询），再广播给聊天窗口 slots
+    registerPluginApp(payload.pkgId, payload.name, payload.code)
+    broadcast('selfmod:client-code', payload)
+    // 通知桌面壳 Dock 刷新动态插件应用图标
+    broadcast('plugin-apps:changed', listPluginApps())
+  })
+  runtime.onClientRemove((pkgId) => {
+    unregisterPluginApp(pkgId)
+    broadcast('selfmod:client-remove', pkgId)
+    // 通知桌面壳 Dock 移除动态插件应用图标
+    broadcast('plugin-apps:changed', listPluginApps())
+  })
+  // 插件窗口应用：host 半 ctx.openWindow → runtime.openAppWindow → 主进程 openApp（复用 app 窗口类型）
+  runtime.onOpenPluginApp((appId) => void openApp(appId))
+  // 插件窗口应用关闭：host 半 ctx.closeWindow / 撤销时 → runtime.closeAppWindow → 主进程 closeApp（销毁对应窗口）
+  runtime.onClosePluginApp((appId) => void closeApp(appId))
 
   // 全局 UI 共享状态变化 → 广播快照（按窗口类型过滤：dock/supervisor-bubble 不消费共享状态直接跳过；
   // desktop 只收登录态+壁纸精简快照；chat/supervisor/app 收完整快照。避免把含所有会话完整历史的重快照发给不消费的窗口）

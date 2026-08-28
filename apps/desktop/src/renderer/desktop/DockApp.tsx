@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { APP_REGISTRY } from '../apps/registry'
 import { useThemeSync } from '../theme'
 import { useUiStore, patchUiStore } from '../store-client'
-import { IconAvatar, IconMonitor } from '../components/icons'
+import { IconAvatar, IconMonitor, IconCode } from '../components/icons'
 
 /**
  * Dock 窗口（多窗口桌面系统的底部应用图标栏）。
@@ -19,6 +19,20 @@ export function DockApp(): React.JSX.Element {
 
   // 退出登录菜单（登录态下点击登录状态项弹出）
   const [authMenuOpen, setAuthMenuOpen] = useState(false)
+
+  // 动态插件窗口应用图标（AI 自研插件 install 后桌面壳 Dock 显示，点击 openApp 打开）
+  const [pluginApps, setPluginApps] = useState<Array<{ appId: string; name: string; clientCode: string }>>([])
+  useEffect(() => {
+    let mounted = true
+    void window.shanhai?.listPluginApps().then((apps) => {
+      if (mounted) setPluginApps(apps)
+    })
+    const off = window.shanhai?.onPluginAppsChanged((apps) => setPluginApps(apps))
+    return () => {
+      mounted = false
+      off?.()
+    }
+  }, [])
 
   // 主题：订阅主进程广播，跟随聊天窗口切换（亮/暗实时同步）
   useThemeSync()
@@ -126,6 +140,43 @@ export function DockApp(): React.JSX.Element {
               <app.Icon />
             </span>
             <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{app.name}</span>
+          </button>
+        ))}
+
+        {/* 动态插件窗口应用（AI 自研插件 install 后自动显示，点击打开独立窗口） */}
+        {pluginApps.map((app) => (
+          <button
+            key={`plugin-${app.appId}`}
+            data-dock-icon
+            onClick={() => void window.shanhai?.openApp(app.appId)}
+            title={`${app.name}（动态插件应用）`}
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: 6,
+              width: 72,
+              padding: '10px 4px 8px',
+              borderRadius: 14,
+              border: '1px solid var(--border-soft)',
+              background: 'var(--bg-sidebar)',
+              color: 'var(--text)',
+              cursor: 'pointer',
+              transition: 'transform 0.12s ease',
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.transform = 'translateY(-4px)'
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.transform = 'translateY(0)'
+            }}
+          >
+            <span style={{ transform: 'scale(1.6)', display: 'inline-flex' }}>
+              <IconCode />
+            </span>
+            <span style={{ fontSize: 11, color: 'var(--text-secondary)', maxWidth: 64, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {app.name}
+            </span>
           </button>
         ))}
 

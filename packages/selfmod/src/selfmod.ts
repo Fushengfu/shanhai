@@ -12,16 +12,23 @@ import vm from 'node:vm'
  *
  * 沙箱约束（对齐设计文档 1.9）：
  * - host 半在 node:vm 中评估，隔离 globals（非安全边界，信任立场等同 bash 访问）。
- * - 沙箱 ctx façade 刻意不暴露 effect()，cleanup 路径只限 on / provide / tools.register 三条，
- *   且三条都自动撤销——从机制上杜绝「裸副作用」导致无法热插拔。
+ * - 沙箱 ctx façade 刻意不暴露 effect()，cleanup 路径只限 on / provide / tools.register / openWindow 四条，
+ *   且都自动撤销——从机制上杜绝「裸副作用」导致无法热插拔（openWindow 撤销时自动关闭已打开的窗口）。
  * - 动态 package 仅内存态：不落盘、不装包、不存活重启；session 隔离（一个会话定义的 package 其他会话不可见）。
  */
 
-/** host 半代码契约：module.exports = (ctx) => disposer；ctx 只提供 on / provide / tools.register */
+/**
+ * host 半代码契约：必须 `module.exports = (ctx) => disposer`（不能写裸箭头函数，否则 vm 沙箱取不到导出函数会报错）。
+ * ctx 提供 on / provide / tools.register / openWindow / closeWindow 五条能力；disposer 可为函数 / null / Iterable / Promise，撤销时逆序调用。
+ */
 interface HostFacade {
   on(name: string, listener: (...args: unknown[]) => unknown): void
   provide(name: string, impl: unknown): void
   tools: { register(tool: ToolContract): void }
+  /** 打开本插件的窗口应用（appId 缺省 = 插件 id，已安装插件即持久化 id；窗口内容由 client 半源码提供） */
+  openWindow(appId?: string): void
+  /** 关闭本插件的窗口应用（appId 缺省 = 插件 id）；撤销/卸载/停止时也会自动关闭所有已打开窗口 */
+  closeWindow(appId?: string): void
 }
 
 /** 自修改运行时对外的依赖注入点（由 bootstrap 装配，桥接到内核事件总线 / 工具注册表 / IPC） */
@@ -42,6 +49,10 @@ export interface SelfModifyHooks {
   deliverClient(pkg: DynamicPackage): Promise<void>
   /** 通知渲染进程卸载 browser 半 */
   removeClient(pkgId: string): Promise<void>
+  /** 打开插件的窗口应用（appId = 插件持久化 id；由主进程 openApp 复用 app 窗口类型承载，窗口内容由 client 半源码提供） */
+  openAppWindow(appId: string): void
+  /** 关闭插件的窗口应用（appId = 插件持久化 id；由主进程 closeApp 销毁对应 app 窗口） */
+  closeAppWindow(appId: string): void
 }
 
 /** vm 沙箱评估 host 半代码，拿到工厂函数 (ctx) => disposer */
@@ -128,7 +139,20 @@ export class SelfModifyRuntime {
             })
           },
         },
-        // 刻意不暴露 effect()：动态 package 的 cleanup 只能走上面三条，杜绝裸副作用
+        openWindow: (appId) => {
+          // 打开本插件的窗口应用：appId 缺省 = 插件 id（已安装插件即持久化 id）
+          // 自动注册撤销：plugin_stop / plugin_uninstall / plugin_test 撤回时自动关闭该窗口
+          const target = appId ?? pkg.id
+          this.hooks.openAppWindow(target)
+          stack.collect(() => {
+            this.hooks.closeAppWindow(target)
+          })
+        },
+        closeWindow: (appId) => {
+          // 显式关闭本插件的窗口应用（appId 缺省 = 插件 id）
+          this.hooks.closeAppWindow(appId ?? pkg.id)
+        },
+        // 刻意不暴露 effect()：动态 package 的 cleanup 只能走上面几条，杜绝裸副作用
       }
       const ret = await factory(facade)
       stack.collect(ret as () => void | Promise<void>)
@@ -310,16 +334,19 @@ export class SelfModifyRuntime {
     const defineTool: ToolContract = {
       name: 'plugin_define',
       description:
-        '定义一个新的动态插件包（仅记录、不运行）。name 是包名，purpose 说明用途，' +
-        'code 是 host 半源码（运行在进程内，导出函数 (ctx) => disposer，ctx 提供 on/provide/tools.register）。' +
-        'client 是 browser 半源码（投递到界面），契约形如 (React, slots, useUIContext) => { slots.register({ slot, id, component }) }；' +
-        'component 必须是 React 组件，内部可调 useUIContext() 获取会话/消息/输入/发消息等应用状态；' +
-        '注意：client 代码在浏览器里用 new Function 执行，不经过 JSX 编译，所以写组件必须用 React.createElement(...)，禁止写 <div> 这类 JSX 语法。' +
-        'slot 分两类：' +
-        '① 覆盖型（整体替换该区块，后注册覆盖，注销回退）：shell.sidebar / shell.header / shell.chat / shell.composer / shell.statusbar / shell.welcome / shell.panels / shell.overlays / dynamic-extension；' +
-        '② 追加型（往区块内部追加，互不覆盖，用于「加按钮/小组件」）：composer.below（输入框下方）/ composer.actions（输入框工具栏）/ header.actions（顶栏右侧）/ chat.below（消息流下方）。' +
-        '想「在某处加一个按钮或小组件」时优先用追加型插槽，不要用覆盖型去替换整个区块。' +
-        '定义后返回 dyn-<n> id。完整闭环：plugin_define（定义）→ plugin_test（自测）→ plugin_install（安装进内核，跨会话/跨重启留存）→ plugin_uninstall（卸载）；plugin_run 仅临时运行、不持久化。',
+        '开发插件前先 skill_read plugin-protocol 读完整规范（本文是精炼速查版）。' +
+        '定义一个动态插件包（仅记录、不运行），返回 dyn-<n> id。name 是包名，purpose 说明用途。' +
+        '【host 半 code】必须 module.exports = (ctx) => disposer（不能写裸箭头函数，否则 vm 沙箱取不到导出会报错）。ctx 提供五条能力：' +
+        'on(name,listener) 订阅内核事件、provide(name,impl) 注册命名服务、tools.register(tool) 注册全局工具、' +
+        'openWindow(appId?) 打开本插件独立窗口、closeWindow(appId?) 关闭它；刻意不暴露 effect()，cleanup 只走前四条自动撤销路径。' +
+        'disposer 可为 函数 / null / Iterable / Promise（撤销时逆序调用，单个失败不阻断其余）。' +
+        '【client 半 client】两种形态（均用 new Function 编译、不经过 JSX，必须用 React.createElement 写、禁止 <div> 这类 JSX 语法）：' +
+        '① UI 插槽形态（默认）：function(React, slots, useUIContext){ slots.register({ slot, id, component }) }，slots 只有 register 一个方法，component 内可调 useUIContext()；' +
+        '② 窗口应用形态（配合 host 半 openWindow）：function(React, helpers){ return 组件函数 }（helpers={ close, appId, name }），必须 return 一个 React 组件函数、不能写箭头函数直接返回对象，且窗口形态在独立渲染进程、不能用 useUIContext()。' +
+        '注意：openWindow 在 run/install 阶段即开窗（点 Dock 图标才开窗是另一条 openApp 链路）。' +
+        'slot 分两类：① 覆盖型（后注册整体替换、注销回退）：shell.sidebar/shell.header/shell.chat/shell.composer/shell.statusbar/shell.terminal/shell.welcome/shell.panels/shell.overlays/dynamic-extension；' +
+        '② 追加型（互不覆盖）：composer.below/composer.actions/header.actions/chat.below。想「加按钮/小组件」优先用追加型，不要用覆盖型替换整个区块。' +
+        '闭环：plugin_define → plugin_test（自测，临时运行并撤回）→ plugin_install（安装进内核、跨会话/跨重启留存）→ plugin_uninstall（卸载）；plugin_run 仅临时运行、不持久化。',
       inputSchema: {
         type: 'object',
         properties: {

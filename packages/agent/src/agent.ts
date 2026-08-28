@@ -127,8 +127,9 @@ export class AgentLoop {
     // 从 session 事件日志回放历史（多轮对话 + 断点续跑：中断后历史仍在 session）
     this.replayHistory(messages)
 
-    // 发起新任务（非断点续跑）：默认全量回放；若回放历史事件的消息条数超过 1000，则裁剪保留最近 20 个对话回合（避免上下文超限）
-    this.trimHistoryIfTooLong(messages)
+    // 用户发起的新任务（新发消息 / 编辑重发 / 点击重发）：始终按最近 20 轮对话回放（每轮只保留用户消息 + 最终 assistant 回复正文，
+    // 丢弃更早历史与工具执行过程），不再全量回放。断点续跑 resumeRun() 走独立路径，保留全量已执行历史。
+    this.trimHistoryToRecentTurns(messages)
 
     // 追加当前消息（含多模态附件，附件一并写入事件日志，回放时还原）。
     // 落盘永远保留原始 message + attachments；发给模型的内容在有 modelContent 时用降级后的文字（如图片降级）
@@ -185,21 +186,12 @@ export class AgentLoop {
     }
   }
 
-  /** 发起时上下文裁剪（仅用户发起新任务 run() 时调用，断点续跑 resumeRun() 不调用）：
-   * 回放历史事件后，若满足「回放消息条数超过 MAX_HISTORY_MESSAGES（1000 条）」或「token 达到窗口 70% 临界值」任一条件，
-   * 则裁剪保留最近 MAX_HISTORY_TURNS 个对话回合（20 对 user/assistant 正文），每个回合只留「用户原始消息 + 最终 assistant 回复正文」，
-   * 丢弃中间的 tool/call、tool/result、assistant(tool_calls) 工具执行过程，最大程度压缩体积同时保留对话主线。
-   * 按 user 消息为回合边界，不切断「assistant(tool_calls) ↔ tool」配对（这些过程整体丢弃，不会产生孤立 tool 消息）。
-   * token 判断依据 lastUsageTotalTokens（最后一次 LLM 返回的真实 usage.total_tokens，非本地估算）。
-   * 说明：此裁剪是发起时的兜底，不做 LLM 摘要（摘要交给循环中的 maybeCompact，见下）。 */
-  private trimHistoryIfTooLong(messages: ChatMessage[]): void {
-    // 回放的历史消息条数（排除 system prompt）
-    const historyCount = messages.filter((m) => m.role !== 'system').length
-    const overLength = historyCount > MAX_HISTORY_MESSAGES
-    // token 达到窗口 70% 临界值（真实 usage.totalTokens）
-    const overBudget = this.budget ? this.lastUsageTotalTokens > Math.floor(this.budget * COMPACTION_THRESHOLD) : false
-    // 满足「超过 1000 条」或「token 达 70%」任一条件即裁剪到 20 对
-    if (!overLength && !overBudget) return
+  /** 用户发起新任务时（run()，即新发消息 / 编辑重发 / 点击重发）始终裁剪历史到最近 MAX_HISTORY_TURNS 个对话回合。
+   * 每个回合只保留「用户原始消息 + 最终 assistant 回复正文」，丢弃中间的 tool/call、tool/result、assistant(tool_calls)
+   * 工具执行过程，最大程度压缩体积同时保留对话主线。按 user 消息为回合边界，不切断「assistant(tool_calls) ↔ tool」配对
+   * （这些过程整体丢弃，不会产生孤立 tool 消息）。历史不足 MAX_HISTORY_TURNS 轮时保留全部（等于未裁剪）。
+   * 断点续跑 resumeRun() 不调用本方法，保留全量已执行历史。 */
+  private trimHistoryToRecentTurns(messages: ChatMessage[]): void {
     const trimmed = this.buildTrimmedMessages(messages)
     messages.length = 0
     messages.push(...trimmed)
@@ -408,7 +400,7 @@ export class AgentLoop {
 
   /** 循环中压缩：最近一次真实 usage.total_tokens 达到窗口 70% 临界值（COMPACTION_THRESHOLD）时，仅针对「当前轮」（最后一条 user 消息之后已执行的工具调用与结果）
    * 做 LLM 摘要，生成一段本轮进度摘要，保证本轮任务连贯性后继续执行。历史回合保持原文不动——超过上下文窗口临界值的
-   * 历史也保留、不裁剪、不丢弃（发起时按消息条数超 1000 才裁剪 20 轮，见 trimHistoryIfTooLong）。
+   * 历史也保留、不裁剪、不丢弃（用户发起新任务时已按最近 20 轮裁剪，见 trimHistoryToRecentTurns）。
    * 判断依据：lastUsageTotalTokens（最后一次 LLM 返回的真实 usage.total_tokens），不是本地估算。
    * @param force true 时跳过判断直接压缩（网关已返回 400 超限时的兜底强制压缩）；若当前轮尚无可压缩步骤且非 force，则保留原样返回（不裁剪历史）。 */
   private async maybeCompact(messages: ChatMessage[], force = false): Promise<ChatMessage[]> {
@@ -670,11 +662,8 @@ const MAX_AUTO_RETRY = 5
 /** 自动重试初始退避时间（毫秒），指数增长（500ms → 1s → 2s → 4s） */
 const AUTO_RETRY_BACKOFF_MS = 500
 
-/** 发起新任务时，若上下文超窗口，则裁剪保留的对话回合数（20 轮任务：用户原始消息 + 最终 assistant 回复正文） */
+/** 用户发起新任务时（新发消息 / 编辑重发 / 点击重发）回放历史保留的最近对话回合数（20 轮：用户原始消息 + 最终 assistant 回复正文） */
 const MAX_HISTORY_TURNS = 20
-
-/** 发起新任务时，回放历史事件后，若消息条数超过该阈值，则裁剪保留最近 20 轮（避免上下文超限） */
-const MAX_HISTORY_MESSAGES = 1000
 
 /** 循环中上下文压缩触发临界值：最近一次真实 usage.total_tokens 达到窗口 70% 即触发（预留 30% 余量，用户设定） */
 const COMPACTION_THRESHOLD = 0.7

@@ -52,15 +52,31 @@ shanhai/
 └── docs/                         # 设计文档
 ```
 
-## 启动
+## 构建与打包
 
 ```bash
 pnpm install          # 安装依赖
 pnpm -r typecheck     # 全项目类型检查
 pnpm -r test          # 运行测试
-pnpm --filter @shanhai/desktop build   # 构建桌面端
-pnpm --filter @shanhai/desktop start   # 启动 Electron 应用
+
+# ── 桌面端（Electron）──
+pnpm --filter @shanhai/desktop build            # 构建桌面端（tsup + vite）
+pnpm --filter @shanhai/desktop start            # 启动 Electron 应用（开发运行）
+pnpm --filter @shanhai/desktop dist:mac:arm64   # 打包 macOS arm64（dmg + zip）
+pnpm --filter @shanhai/desktop dist:win         # 打包 Windows x64（nsis 安装包 + portable 便携版）
+
+# ── 手机端（Flutter，Android）──
+cd apps/mobile && flutter build apk --release   # 打包 Android release APK
 ```
+
+产物输出目录：
+
+- 桌面端：`apps/desktop/release/`
+  - mac：`Shanhai-<版本>-arm64.dmg`、`山海-<版本>-arm64-mac.zip`
+  - win：`Shanhai-<版本>-x64-setup.exe`、`Shanhai-<版本>-x64-portable.exe`
+- 手机端：`apps/mobile/build/app/outputs/flutter-apk/app-release.apk`
+
+> win 打包为「在 mac 上交叉打包」，首次需下载 win 版 electron；若 GitHub 下载慢，可先设 `ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/` 走镜像。
 
 ## 技术栈
 

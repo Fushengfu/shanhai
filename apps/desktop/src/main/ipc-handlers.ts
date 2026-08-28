@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { SUPERVISOR_ID } from '@shanhai/runtime'
 import { getRuntime } from './runtime'
 import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow, toggleMaximizeWindow, resizeDockWindow, hideSupervisorToBubble, showSupervisorFromBubble, moveSupervisorBubble, hideToSystemDesktop, getWindowType } from './window-manager'
+import { getPluginApp, listPluginApps } from './plugin-apps'
 import { getUiState, patchUiState, getWallpaper, setWallpaper, filterUiStateForWindow, type UiStoreState } from './ui-store'
 import { listSystemWallpapers, applySystemWallpaper } from './system-wallpaper'
 import { startRemoteServer, stopRemoteServer, getRemoteStatus, refreshPairingCode } from './remote-server'
@@ -84,6 +85,10 @@ export function registerIpc(): void {
   // —— 自修改（K5）——
   ipcMain.handle('selfmod:inspect', async (_e, sessionId?: string) => runtime.selfmodInspect(sessionId))
   ipcMain.handle('selfmod:respond', async (_e, requestId: string, approved: boolean) => runtime.respondClientRun(requestId, approved))
+
+  // —— 动态插件窗口应用（app 窗口打开时查询 client 半源码，new Function 编译渲染）——
+  ipcMain.handle('plugin-app:get', async (_e, appId: string) => getPluginApp(appId) ?? null)
+  ipcMain.handle('plugin-app:list', async () => listPluginApps())
 
   // —— 长期记忆 ——
   ipcMain.handle('memory:list', async (_e, sessionId: string) => runtime.listMemory(sessionId))

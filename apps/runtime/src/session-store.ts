@@ -10,7 +10,7 @@
  * ```
  *
  * 设计目标：
- * - 日志轮转：活跃段超过阈值（默认 SEGMENT_MAX_BYTES=1MB）时自动滚动，把活跃段整体
+ * - 日志轮转：活跃段超过阈值（默认 SEGMENT_MAX_BYTES=5MB）时自动滚动，把活跃段整体
  *   gzip 归档为 `events-<序号>.jsonl.gz` 并清空活跃段继续追加。活跃段始终保持在阈值内，
  *   追加保持 O(1)，不会随会话无限变大（根治 append-only 无上限导致的文件持续增长）。
  * - 压缩：历史段 gzip(level 9)，JSONL 文本压缩率约 3~10 倍，显著降低磁盘占用。
@@ -29,8 +29,8 @@ import { join } from 'node:path'
 import { gzip as gzipCb, gunzip as gunzipCb } from 'node:zlib'
 import { effectiveApprovalPolicy, effectiveModelId, type ApprovalPolicy, type SessionEvent } from '@shanhai/session'
 
-/** 活跃段滚动阈值（字节）：超过即归档为 gz 段，默认 1MB */
-export const SEGMENT_MAX_BYTES = 1 * 1024 * 1024
+/** 活跃段滚动阈值（字节）：超过即归档为 gz 段，默认 5MB */
+export const SEGMENT_MAX_BYTES = 5 * 1024 * 1024
 
 /** gzip 压缩（异步，不阻塞事件循环）；level 9 换取更小归档体积（归档一次性成本） */
 function gzip(buf: Buffer): Promise<Buffer> {
@@ -132,7 +132,7 @@ export async function rotateSessionEventsFile(dir: string, maxBytes = SEGMENT_MA
   return true
 }
 
-/** 追加写事件到活跃段 events.jsonl；活跃段超阈值自动轮转归档（默认 1MB） */
+/** 追加写事件到活跃段 events.jsonl；活跃段超阈值自动轮转归档（默认 5MB） */
 export async function appendSessionEventsFile(
   dir: string,
   events: SessionEvent[],

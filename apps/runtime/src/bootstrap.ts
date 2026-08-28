@@ -118,6 +118,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   ctx.pendingClientRuns = new Map<string, { resolve: (approved: boolean) => void; sessionId?: string }>()
   ctx.clientCodeCallbacks = new Set<(payload: { pkgId: string; name: string; code: string }) => void>()
   ctx.clientRemoveCallbacks = new Set<(pkgId: string) => void>()
+  ctx.openAppWindowCallbacks = new Set<(appId: string) => void>()
+  ctx.closeAppWindowCallbacks = new Set<(appId: string) => void>()
   ctx.pluginStore = new PluginStore(join(homedir(), '.shanhai', 'plugins'))
   ctx.skillService = new SkillService()
   ctx.mcpService = new McpService()
@@ -406,6 +408,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
     removeClient: async (pkgId: string) => {
       ctx.clientRemoveCallbacks.forEach((cb) => cb(pkgId))
+    },
+    openAppWindow: (appId: string) => {
+      ctx.openAppWindowCallbacks.forEach((cb) => cb(appId))
+    },
+    closeAppWindow: (appId: string) => {
+      ctx.closeAppWindowCallbacks.forEach((cb) => cb(appId))
     },
   }, ctx.pluginStore)
 
@@ -1153,6 +1161,28 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     onClientRemove(cb) {
       ctx.clientRemoveCallbacks.add(cb)
       return () => ctx.clientRemoveCallbacks.delete(cb)
+    },
+
+    async openPluginApp(appId) {
+      // 打开插件窗口应用：主进程订阅 openAppWindowCallbacks 后调 window-manager openApp（复用 app 窗口类型）
+      ctx.openAppWindowCallbacks.forEach((cb) => cb(appId))
+      return { ok: true }
+    },
+
+    onOpenPluginApp(cb) {
+      ctx.openAppWindowCallbacks.add(cb)
+      return () => ctx.openAppWindowCallbacks.delete(cb)
+    },
+
+    async closePluginApp(appId) {
+      // 关闭插件窗口应用：主进程订阅 closeAppWindowCallbacks 后调 window-manager closeApp（销毁对应 app 窗口）
+      ctx.closeAppWindowCallbacks.forEach((cb) => cb(appId))
+      return { ok: true }
+    },
+
+    onClosePluginApp(cb) {
+      ctx.closeAppWindowCallbacks.add(cb)
+      return () => ctx.closeAppWindowCallbacks.delete(cb)
     },
 
     listMemory(sessionId) {
