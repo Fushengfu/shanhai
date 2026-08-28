@@ -9,9 +9,8 @@
  * 现在收敛为 createSessionsModule(ctx, deps)。
  */
 import { promises as fs } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { Session, type ApprovalPolicy } from '@shanhai/session'
+import { Session, type ApprovalPolicy, type SessionEvent } from '@shanhai/session'
 import type { SuspendedSnapshot } from '@shanhai/agent'
 import type { ChatMessage } from '@shanhai/llm'
 import type { GatewayModel } from '@shanhai/auth'
@@ -20,12 +19,14 @@ import {
   writeSessionMetaFile,
   appendSessionEventsFile,
   rewriteSessionEventsFile,
+  appendAuditEventsFile,
+  rewriteAuditEventsFile,
   deleteSessionDir,
 } from './session-store'
 import { persistLastActiveSessionId } from './config'
 import { ensureSupervisorWorkspace, removeSessionLedger, SUPERVISOR_WORKSPACE } from './supervisor-workspace'
 import { SUPERVISOR_ID, type SessionStateSummary } from './supervisor'
-import type { RuntimeContext, SessionMeta } from './context'
+import { DEFAULT_WORK_DIR, type RuntimeContext, type SessionMeta } from './context'
 import type { TokenStatsModule } from './token-stats'
 import type { ModelProviderModule } from './model-provider'
 import type { DeepSeekBridgeModule } from './deepseek-bridge'
@@ -82,15 +83,30 @@ export function createSessionsModule(
       })
       // 2. events 增量追加（或截断/删除历史后全量重写）
       const session = meta.session
+      // 事件分流：assistant/delta 丢弃（流式增量中间态，最终 assistant/message 已含完整内容）；
+      // assistant/raw（模型输出带系统保留标签的原始完整输出）进独立审计文件 tagged-outputs.jsonl，不写 events.jsonl（保证主日志不含系统保留标签）。
+      const partition = (events: SessionEvent[]) => {
+        const raw: SessionEvent[] = []
+        const durable: SessionEvent[] = []
+        for (const e of events) {
+          if (e.type === 'assistant/delta') continue
+          if (e.type === 'assistant/raw') raw.push(e)
+          else durable.push(e)
+        }
+        return { raw, durable }
+      }
       if (session.requireRewrite()) {
-        // 只丢弃 assistant/delta（流式增量中间态，最终 assistant/message 已含完整内容，属去冗余而非丢数据）
-        const durable = session.list().filter((e) => e.type !== 'assistant/delta')
+        const { raw, durable } = partition(session.list())
         await rewriteSessionEventsFile(dir, durable)
+        await rewriteAuditEventsFile(dir, raw)
         session.markPersisted()
       } else {
-        const newEvents = session.slice(session.persistedCount).filter((e) => e.type !== 'assistant/delta')
-        if (newEvents.length > 0) {
-          await appendSessionEventsFile(dir, newEvents)
+        const { raw, durable } = partition(session.slice(session.persistedCount))
+        if (durable.length > 0) {
+          await appendSessionEventsFile(dir, durable)
+        }
+        if (raw.length > 0) {
+          await appendAuditEventsFile(dir, raw)
         }
         session.persistedCount = session.size
       }
@@ -127,7 +143,7 @@ export function createSessionsModule(
 
   const createSessionInternal = (title?: string, workDir?: string): string => {
     const id = `s-${Date.now()}-${Math.random().toString(36).slice(2)}`
-    const meta: SessionMeta = { id, title: title?.trim() || '新会话', session: new Session(), workDir: workDir ?? join(homedir(), 'shanhai', 'workspace'), lastActiveAt: Date.now(), isSupervisor: false }
+    const meta: SessionMeta = { id, title: title?.trim() || '新会话', session: new Session(), workDir: workDir ?? DEFAULT_WORK_DIR, lastActiveAt: Date.now(), isSupervisor: false }
     ctx.sessions.set(id, meta)
     void persistSession(meta)
     return id
@@ -165,7 +181,7 @@ export function createSessionsModule(
 
   const currentWorkDir = (): string => {
     const meta = ctx.currentSessionId ? ctx.sessions.get(ctx.currentSessionId) : undefined
-    return meta?.workDir ?? join(homedir(), 'shanhai', 'workspace')
+    return meta?.workDir ?? DEFAULT_WORK_DIR
   }
 
   const sessionApprovalPolicy = (sid?: string): ApprovalPolicy => {

@@ -89,7 +89,11 @@ export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
   }
   const handleRemoveModel = async (id: string): Promise<void> => {
     await window.shanhai?.removeCustomModel(id)
-    patchUiStore({ models: getUiStoreSnapshot().models.filter((m) => m.id !== id) })
+    const snap = getUiStoreSnapshot()
+    const models = snap.models.filter((m) => m.id !== id)
+    // 删除的是当前选中模型时，同步清空 selectedModel，避免 UI 选中态指向已删除的模型
+    const selectedModel = snap.selectedModel === id ? '' : snap.selectedModel
+    patchUiStore({ models, selectedModel })
   }
   const handleSelectModel = (id: string): void => {
     patchUiStore({ selectedModel: id })

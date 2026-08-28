@@ -51,7 +51,7 @@ export * from './types'
 
 import { createGatewayModel, modelSupportsVision } from './models'
 import { createHttpTraceStore } from './http-trace'
-import { sessionContext, type RuntimeContext, type SessionMeta, type TokenAccumulator, type RuntimeEnvironment } from './context'
+import { DEFAULT_WORK_DIR, sessionContext, type RuntimeContext, type SessionMeta, type TokenAccumulator, type RuntimeEnvironment } from './context'
 import { createTokenStatsModule } from './token-stats'
 import { createPromptsModule } from './prompts'
 import { createDeepSeekBridgeModule } from './deepseek-bridge'
@@ -64,6 +64,10 @@ import { spawnSay, createSystemVoiceService, gatewayAsrTranscribe } from './voic
 export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime> {
   // 初始化设备标识（远程连接多设备用）：读取/生成 deviceId + 设备名，早于任何 getDeviceInfo 调用
   await ensureDeviceInfo()
+
+  // 首次运行兜底：确保默认会话工作目录存在（打包分发后 ~/shanhai/workspace 可能不存在，
+  // 否则 run_command 的 spawn(cwd) 与文件工具相对路径会 ENOENT 失败）。统一在此创建一次，覆盖所有入口。
+  await fs.mkdir(DEFAULT_WORK_DIR, { recursive: true })
 
   // —— 状态容器：所有共享数据状态收敛到 ctx，各职责模块（model-provider / sessions / execution / supervisor / token-stats / prompts / deepseek-bridge）通过 ctx 访问 ——
   // 注：ctx.approval / ctx.selfmod / ctx.model / ctx.sessionRef 依赖运行时函数或 await，延后到各自声明处赋值（见下）。
@@ -163,7 +167,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   try {
     await fs.mkdir(ctx.sessionsDir, { recursive: true })
     const entries = await fs.readdir(ctx.sessionsDir, { withFileTypes: true })
-    const defaultWorkDir = join(homedir(), 'shanhai', 'workspace')
+    const defaultWorkDir = DEFAULT_WORK_DIR
     for (const entry of entries) {
       // 新格式：<会话id>/ 目录（含 meta.json + events.jsonl）
       if (entry.isDirectory()) {
@@ -652,7 +656,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
     getSessionWorkdir(id) {
       const meta = ctx.sessions.get(id ?? ctx.currentSessionId ?? '')
-      return meta?.workDir ?? join(homedir(), 'shanhai', 'workspace')
+      return meta?.workDir ?? DEFAULT_WORK_DIR
     },
     setSessionWorkdir(id, workdir) {
       sessionsModule.setSessionWorkdirInternal(id, workdir)
@@ -686,7 +690,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       // 传入 `${sid}:default`，create 会把冒号规范化为连字符 → `${sid}-default`（已存在则自动加 -2/-3），
       // 与 agent 终端技能的 terminalId 格式一致，会话级隔离。
       // 打开终端默认在当前会话工作目录（而非用户主目录），让用户直接在项目目录下操作。
-      const cwd = ctx.sessions.get(sid)?.workDir ?? join(homedir(), 'shanhai', 'workspace')
+      const cwd = ctx.sessions.get(sid)?.workDir ?? DEFAULT_WORK_DIR
       const terminalId = await ctx.terminalUse.create(`${sid}:default`, name, cwd)
       ctx.userTerminalSessionMap.set(terminalId, sid)
       return terminalId

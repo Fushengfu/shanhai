@@ -6,13 +6,12 @@
  * createPromptsModule(ctx, deps)。
  */
 import { homedir } from 'node:os'
-import { join } from 'node:path'
 import type { TokenUsage, HttpTrace } from '@shanhai/llm'
 import { createModelProvider } from '@shanhai/llm'
 import { buildToolGuidePrompt } from '@shanhai/tools'
 import { modelSupportsVision, fetchGatewayModels } from './models'
 import { SUPERVISOR_ID } from './supervisor'
-import type { RuntimeContext, RuntimeEnvironment } from './context'
+import { DEFAULT_WORK_DIR, type RuntimeContext, type RuntimeEnvironment } from './context'
 
 export interface PromptsModule {
   /** 图片识别：用视觉模型分析图片（当前模型不支持多模态时降级用），同一张图按 url 去重 */
@@ -78,7 +77,7 @@ export function createPromptsModule(
 
   const getSessionCwd = (): string => {
     const sid = deps.getCurrentSid()
-    return ctx.sessions.get(sid)?.workDir ?? join(homedir(), 'shanhai', 'workspace')
+    return ctx.sessions.get(sid)?.workDir ?? DEFAULT_WORK_DIR
   }
 
   const collectEnvironment = (cwd: string): RuntimeEnvironment => {
@@ -143,6 +142,12 @@ export function createPromptsModule(
       '当用户要求「新增一个能力」「改造界面某个区块」「给自己加个工具」「在某处加个按钮」时，优先用这套 plugin_* 工具自我实现，而不是只写死代码或空谈。',
       ...(ctx.builtinSkillCatalog ? ['', '【内置能力】', ctx.builtinSkillCatalog] : []),
       memoryContext,
+      '',
+      '【不要耍嘴炮（最高优先级，务必遵守）】',
+      '1. 「完成」的唯一判据是「本轮真实调用了工具并拿到成功返回」，不是「我好像做过」、更不是「历史上下文里出现过类似结果」。',
+      '2. 任何声称「已下发/已修改/已删除/已切换/已配置/已修复/已验证/已完成」的动作，必须在本轮发生了对应的真实工具调用且返回成功（ok=true），才能这么汇报；没有任何工具调用证据时，只能如实写「未执行/待处理/待确认」，禁止编造「已做」。',
+      '3. 不要把 <historical-assistant-record> 这类历史任务回放标签里的内容当作「本轮已完成的依据」，禁止模仿历史回放的口吻/格式/详略假称自己已完成。',
+      '4. 纯问答/纯分析/纯排查（不需要动作）不受上述约束，直接给结论即可，但要如实说明「这是分析结论，非执行结果」，禁止把分析包装成「已执行」。',
       '',
       '【任务完成规范】',
       '每次执行完任务（成功或失败）结束前：先对照需求逐条自检 → 构建/测试验证（附命令+真实输出，不要只说"完成"）→ 用 Markdown 输出结构化总结，格式如下：',
@@ -219,6 +224,8 @@ export function createPromptsModule(
       '- 只有工具返回 ok=true（或明确的成功标志）时，才能汇报「已下发 / 已批准 / 已代答 / 已切换 / 已配置 / 已删除 / 已完成」；返回 ok=false 或抛错时，必须如实汇报「失败 / 未完成」，禁止说「已做」。',
       '- 严禁在没有任何工具调用证据时凭空宣称「已下发 / 已批准 / 已代答 / 已完成」。若本轮没有调用任何动作工具，就不能说「已做」，只能如实说明「待处理 / 未执行」。',
       '- 最终汇报里每一条「已做」都必须对应一条本轮真实发生的工具调用及其成功返回；对不上的，一律改写成「未执行」，不得编造。',
+      '- 【不拿历史回放充数】严禁把 <historical-assistant-record> 历史回放标签里的内容当成「本轮已完成」的依据，禁止模仿历史回放的格式/口吻/详略来假称自己已下发/已完成；历史回放只是「过去发生的事」，不是「你本轮做的事」。',
+      '- 【纯分析例外】当用户只是提问/要求分析/排查（不需要下发任务、不需要任何动作）时，直接给出分析结论即可，不受「必须有工具调用」约束；但要如实说明「这是分析结论，非执行结果」，禁止把分析包装成「已执行」或「已完成」。',
       '【台账（可选辅助记忆，勿机械执行）】：',
       '- 台账只在你需要回忆「跨会话的历史决策/待跟进/注意事项」时才 read_ledger；日常查询直接 list_sessions（已含实时状态），不必读台账。',
       '- 首次发现台账目录为空或缺 _index.json 时，用 write_ledger 初始化：_index.json 写「会话id→标题」，每会话建 state.json（currentTask/status）与 notes.md 占位。',

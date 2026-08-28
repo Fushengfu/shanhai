@@ -24,6 +24,35 @@ function wrapHistoricalAssistant(content: string): string {
   return `${HISTORICAL_ASSISTANT_OPEN}\n${escapeHistoricalTag(content)}\n${HISTORICAL_ASSISTANT_CLOSE}`
 }
 
+/**
+ * 系统保留标签正则：匹配 <historical-assistant-record> / </historical-assistant-record> 以及形似 <xxx-record> 的系统内置标签。
+ * 只匹配「以 -record 结尾」的标签名（系统历史回放标签的命名约定），刻意不匹配通用 HTML/XML 标签（<div>/<span> 等）与转义文本（&lt;...&gt;），
+ * 避免误伤用户正常展示的内容。带 g 标志用于 replace 全量替换。
+ */
+const SYSTEM_RESERVED_TAG_RE = /<\/?[a-zA-Z][a-zA-Z0-9-]*-record\s*>/g
+
+/** 检测文本是否含系统保留标签（无 g 标志，避免 test 的 lastIndex 状态污染）。 */
+function hasSystemReservedTag(text: string): boolean {
+  return /<\/?[a-zA-Z][a-zA-Z0-9-]*-record\s*>/.test(text)
+}
+
+/** 剥离系统保留标签本身（<xxx-record> / </xxx-record>），正文原样保留。 */
+function stripSystemReservedTags(text: string): string {
+  return text.replace(SYSTEM_RESERVED_TAG_RE, '')
+}
+
+/**
+ * 内核硬校验：模型最终输出若含系统保留标签，则：
+ * 1. 把「原始带标签完整输出」落一条 assistant/raw 事件（审计用），由持久化层分流到独立审计文件，不写 events.jsonl；
+ * 2. 剥离标签本身、正文原样保留，返回清洗后的正文作为最终输出。
+ * 无标签则原样返回。只作用于「本轮模型新输出」（run/runConvergence 的最终 text），不回放历史、不处理 resumeRun 的历史段。
+ */
+function sanitizeModelOutput(raw: string, session: Session): string {
+  if (!hasSystemReservedTag(raw)) return raw
+  session.append('assistant/raw', { content: raw })
+  return stripSystemReservedTags(raw)
+}
+
 export interface AgentLoopOptions {
   maxSteps?: number
   systemPrompt?: string
@@ -35,6 +64,8 @@ export interface AgentLoopOptions {
   attachments?: ContentPart[]
   /** 发给模型的内容（可选）。图片降级等场景下：落盘仍保留原始 message + attachments，发给模型改用降级后的文字 */
   modelContent?: string
+  /** 历史回放保留的最近对话回合数（缺省 MAX_HISTORY_TURNS=20；管家等特殊会话可传入更大值） */
+  maxHistoryTurns?: number
 }
 
 /**
@@ -148,9 +179,9 @@ export class AgentLoop {
     // 从 session 事件日志回放历史（多轮对话 + 断点续跑：中断后历史仍在 session）
     this.replayHistory(messages)
 
-    // 用户发起的新任务（新发消息 / 编辑重发 / 点击重发）：始终按最近 20 轮对话回放（每轮只保留用户消息 + 最终 assistant 回复正文，
+    // 用户发起的新任务（新发消息 / 编辑重发 / 点击重发）：始终按最近 maxHistoryTurns（缺省 20）轮对话回放（每轮只保留用户消息 + 最终 assistant 回复正文，
     // 丢弃更早历史与工具执行过程），不再全量回放。断点续跑 resumeRun() 走独立路径，保留全量已执行历史。
-    this.trimHistoryToRecentTurns(messages)
+    this.trimHistoryToRecentTurns(messages, options?.maxHistoryTurns)
 
     // 追加当前消息（含多模态附件，附件一并写入事件日志，回放时还原）。
     // 落盘永远保留原始 message + attachments；发给模型的内容在有 modelContent 时用降级后的文字（如图片降级）
@@ -218,25 +249,26 @@ export class AgentLoop {
    * 工具执行过程，最大程度压缩体积同时保留对话主线。按 user 消息为回合边界，不切断「assistant(tool_calls) ↔ tool」配对
    * （这些过程整体丢弃，不会产生孤立 tool 消息）。历史不足 MAX_HISTORY_TURNS 轮时保留全部（等于未裁剪）。
    * 断点续跑 resumeRun() 不调用本方法，保留全量已执行历史。 */
-  private trimHistoryToRecentTurns(messages: ChatMessage[]): void {
-    const trimmed = this.buildTrimmedMessages(messages)
+  private trimHistoryToRecentTurns(messages: ChatMessage[], maxTurns?: number): void {
+    const trimmed = this.buildTrimmedMessages(messages, maxTurns)
     messages.length = 0
     messages.push(...trimmed)
   }
 
-  /** 裁剪 messages 到最近 MAX_HISTORY_TURNS 个对话回合，返回新数组：每回合只保留「用户原始消息 + 最终 assistant 回复正文」，
-   * 丢弃中间的 tool/call、tool/result、assistant(tool_calls) 工具执行过程（20 对 user/assistant 正文）。
+  /** 裁剪 messages 到最近 maxTurns（缺省 MAX_HISTORY_TURNS）个对话回合，返回新数组：每回合只保留「用户原始消息 + 最终 assistant 回复正文」，
+   * 丢弃中间的 tool/call、tool/result、assistant(tool_calls) 工具执行过程（maxTurns 对 user/assistant 正文）。
    * 调用方已确认需要裁剪，此处不再判断回合数是否超上限，始终只保留 user/assistant 正文。 */
-  private buildTrimmedMessages(messages: ChatMessage[]): ChatMessage[] {
+  private buildTrimmedMessages(messages: ChatMessage[], maxTurns?: number): ChatMessage[] {
+    const limit = maxTurns ?? MAX_HISTORY_TURNS
     const systemMsgs = messages.filter((m) => m.role === 'system')
     const rest = messages.filter((m) => m.role !== 'system')
     const userIndices: number[] = []
     rest.forEach((m, i) => {
       if (m.role === 'user') userIndices.push(i)
     })
-    // 保留最近 MAX_HISTORY_TURNS 个回合：每回合 = 用户原始消息 + 该回合最终 assistant 正文（无工具调用的最终回复）
+    // 保留最近 limit 个回合：每回合 = 用户原始消息 + 该回合最终 assistant 正文（无工具调用的最终回复）
     const kept: ChatMessage[] = []
-    const keptUserIndices = userIndices.slice(-MAX_HISTORY_TURNS) // 最近 20 个 user 消息在 rest 中的索引
+    const keptUserIndices = userIndices.slice(-limit) // 最近 limit 个 user 消息在 rest 中的索引
     keptUserIndices.forEach((userIdx, t) => {
       const userMsg = rest[userIdx]
       if (!userMsg) return
@@ -342,7 +374,7 @@ export class AgentLoop {
         }
         continue
       }
-      const text = response.text ?? ''
+      const text = sanitizeModelOutput(response.text ?? '', this.session)
       this.session.append('assistant/message', { content: text, reasoningContent: response.reasoningContent })
       this.session.append('turn/end', { turn: 1, text })
       // 兜底：最终回答轮期间用户仍可能插入消息（竞态窗口），此时任务已收尾、不再发起下一轮 LLM 请求，
@@ -379,7 +411,7 @@ export class AgentLoop {
       // 极端情况：模型仍坚持调用工具（如陷入死循环），保留保护性报错
       throw new Error(`agent loop did not converge within ${maxSteps} steps`)
     }
-    const text = final.text ?? ''
+    const text = sanitizeModelOutput(final.text ?? '', this.session)
     this.session.append('assistant/message', { content: text, reasoningContent: final.reasoningContent })
     this.session.append('turn/end', { turn: 1, text })
     return text

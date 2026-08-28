@@ -139,6 +139,32 @@ class _ChatViewState extends State<ChatView> {
     }
   }
 
+  /// 任务结束（完成/中断/报错）时：先拉取历史重建 _items（含 assistant 气泡），
+  /// 再一次性清空流式 + 置 busy=false，让「流式清空」与「最终气泡重建」落在同一批状态变更里，消除闪屏空窗。
+  Future<void> _finishTurn() async {
+    try {
+      final items = await widget.loadHistoryFn();
+      if (!mounted) return;
+      setState(() {
+        _items = items;
+        _streaming = '';
+        _streamingReasoning = '';
+        _busy = false;
+        _loading = false;
+      });
+      _scrollToBottom();
+    } catch (_) {
+      // 拉历史失败也要兜底清流式/置空闲，避免 busy 卡死
+      if (!mounted) return;
+      setState(() {
+        _streaming = '';
+        _streamingReasoning = '';
+        _busy = false;
+      });
+    }
+    _refreshIncompleteTurn();
+  }
+
   /// 滚回最新消息。列表采用 reverse 布局，offset 0 即最新消息（视觉底部），
   /// 用 jumpTo 瞬时定位，避开 animateTo 目标值在懒加载列表下被低估的问题。
   void _scrollToBottom() {
@@ -202,14 +228,9 @@ class _ChatViewState extends State<ChatView> {
               _pendingTools = [];
             });
           } else if (kind == 'end') {
-            setState(() {
-              _busy = false;
-              _streaming = '';
-              _streamingReasoning = '';
-            });
-            _loadHistory();
-            // 任务结束（完成或中断）后，重新查询未完成轮次，决定是否显示「继续执行」
-            _refreshIncompleteTurn();
+            // 闪屏修复：先异步拉历史重建 _items（含 assistant 气泡），再一次性清空流式 + 置 busy=false，
+            // 消除「先同步清流式、后异步重建 items」之间的空窗（正文消失→等一会→重现）。
+            _finishTurn();
           }
         }
         break;

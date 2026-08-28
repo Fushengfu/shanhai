@@ -16,7 +16,7 @@ import type { ToolContract } from '@shanhai/tools'
 import { AgentLoop } from '@shanhai/agent'
 import { ASK_CANCELLED, type AskRequest } from '@shanhai/ask'
 import type { ApprovalPolicy } from '@shanhai/session'
-import { createSupervisorTools, SUPERVISOR_ID, type SessionStateSummary } from './supervisor'
+import { createSupervisorTools, SUPERVISOR_ID, SUPERVISOR_MAX_HISTORY_TURNS, type SessionStateSummary } from './supervisor'
 import { createSupervisorLedgerTools } from './supervisor-workspace'
 import { modelSupportsVision } from './models'
 import { sessionContext, type RuntimeContext } from './context'
@@ -108,6 +108,8 @@ export function createExecutionModule(
           systemPrompt: isSupervisorRun ? prompts.buildSupervisorSystemPrompt(message) : prompts.buildSystemPrompt(meta.workDir, prompts.buildMemoryContext(message, meta.id)),
           attachments: opts?.attachments,
           modelContent,
+          // 管家历史回放轮数比普通会话多（30 vs 20），便于跨会话编排时保留更长上下文主线
+          maxHistoryTurns: isSupervisorRun ? SUPERVISOR_MAX_HISTORY_TURNS : undefined,
           onDelta: (text) => {
             if (ctx.stoppedSessions.has(sid)) throw new Error('__stopped__')
             ctx.deltaCallbacks.forEach((cb) => cb(sid, text))

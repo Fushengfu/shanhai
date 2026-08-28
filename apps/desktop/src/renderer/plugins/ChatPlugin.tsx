@@ -7,7 +7,7 @@ import { RetryPromptCard } from '../components/RetryPrompt'
 import { AssistantMessage } from '../components/AssistantMessage'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { makeMarkdownComponents, normalizeTreeBlocks } from '../components/Markdown'
+import { makeMarkdownComponents, normalizeTreeBlocks, stripWrappedRecordTag } from '../components/Markdown'
 import { ReasoningBlock } from '../components/ReasoningBlock'
 import { DiffBlock, StepStats, ToolStep, toolDisplayName, riskLevelLabel } from '../components/ToolStep'
 import { UserMessage } from '../components/UserMessage'
@@ -208,7 +208,7 @@ function ChatSlot(): React.JSX.Element {
                       {streaming.text && (
                         <div style={{ minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
                           <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents((url) => ctx.setPreviewImage(url))}>
-                            {normalizeTreeBlocks(streaming.text)}
+                            {normalizeTreeBlocks(stripWrappedRecordTag(streaming.text))}
                           </ReactMarkdown>
                           <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
                         </div>

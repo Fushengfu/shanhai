@@ -27,11 +27,17 @@ import type { BrowserUseService } from '@shanhai/browser-use'
 import type { TerminalService } from '@shanhai/terminal'
 import { SelfModifyRuntime } from '@shanhai/selfmod'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { HttpTraceStore } from './http-trace'
 import type { ToolTrace, TokenSnapshot, AppSettings, ApprovalOutcome } from './types'
 
 /** 并行会话的工具调用上下文：让全局工具包装层知道「当前工具属于哪个会话」 */
 export const sessionContext = new AsyncLocalStorage<string>()
+
+/** 默认会话工作目录（不带点的 ~/shanhai/workspace，区别于 ~/.shanhai 配置目录）。
+ *  首次运行由 bootstrap 启动阶段统一创建；所有「默认 cwd」入口复用此常量，避免硬编码散落。 */
+export const DEFAULT_WORK_DIR = join(homedir(), 'shanhai', 'workspace')
 
 /** 单个会话的内存元数据（持久化到 sessions/<id>/meta.json；管家超级会话 isSupervisor=true） */
 export interface SessionMeta {

@@ -11,6 +11,9 @@ export type AgentEventType =
   | 'user/message'
   | 'assistant/delta'
   | 'assistant/message'
+  /** 原始带系统内置标签的模型输出（审计用）：检测到模型输出含系统保留标签时的「原始完整输出」。
+   * 持久化层会把它分流到独立审计文件 tagged-outputs.jsonl，不写入主事件日志 events.jsonl（保证主日志不含标签）。 */
+  | 'assistant/raw'
   | 'tool/call'
   | 'tool/result'
   | 'usage/record'
@@ -37,6 +40,7 @@ export interface EventData {
   'user/message': { content: string; attachments?: unknown[]; injected?: boolean }
   'assistant/delta': { text: string }
   'assistant/message': { content: string; reasoningContent?: string }
+  'assistant/raw': { content: string }
   'tool/call': { callId: string; name: string; args: Record<string, unknown>; reasoningContent?: string }
   'tool/result': { callId: string; name: string; result?: unknown; error?: string }
   /** 模型每次调用返回的真实 token 用量（接口返回 usage.total_tokens，非本地估算），持久化用于断点续跑时恢复压缩判断与累计 token 统计 */

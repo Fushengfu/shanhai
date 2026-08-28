@@ -5,7 +5,7 @@ import { IconCopy, IconImage } from './icons'
 import { MessageActions, copyAssistantAsImage } from './MessageActions'
 import { ReasoningBlock } from './ReasoningBlock'
 import { StepStats, ToolStep } from './ToolStep'
-import { makeMarkdownComponents, normalizeTreeBlocks } from './Markdown'
+import { makeMarkdownComponents, normalizeTreeBlocks, stripWrappedRecordTag } from './Markdown'
 import { copyText, formatDuration } from './ui'
 import type { ToolTrace } from '../types'
 
@@ -16,6 +16,8 @@ export function AssistantMessage({ content, reasoningContent, toolSteps, turnDur
   const tools = toolSteps ?? []
   const hasReasoning = !!reasoningContent
   const hasTools = tools.length > 0
+  // 渲染前保守去壳：仅整段被系统内置标签包裹时剥标签，夹在正文中间/转义/普通 HTML 均不处理
+  const displayContent = stripWrappedRecordTag(content)
   return (
     <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
       <div
@@ -36,17 +38,17 @@ export function AssistantMessage({ content, reasoningContent, toolSteps, turnDur
           </div>
         )}
         {hasReasoning && <ReasoningBlock content={reasoningContent} />}
-        {content && (
+        {displayContent && (
           <div ref={contentRef} style={{ marginTop: hasTools ? 6 : 0, minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
             <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents(onPreviewImage)}>
-              {normalizeTreeBlocks(content)}
+              {normalizeTreeBlocks(displayContent)}
             </ReactMarkdown>
           </div>
         )}
       </div>
       <MessageActions
         actions={[
-          { key: 'copy', icon: <IconCopy />, label: '复制', run: () => copyText(content) },
+          { key: 'copy', icon: <IconCopy />, label: '复制', run: () => copyText(displayContent) },
           { key: 'copyImage', icon: <IconImage />, label: '复制为图片', run: () => copyAssistantAsImage(contentRef.current) },
         ]}
       />

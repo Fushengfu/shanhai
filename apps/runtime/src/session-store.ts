@@ -161,6 +161,29 @@ export async function rewriteSessionEventsFile(dir: string, events: SessionEvent
   }
 }
 
+/** 独立审计文件名：存「模型输出带系统内置标签的原始完整输出」，与主事件日志 events.jsonl 分开，
+ * 保证主日志不含系统保留标签（内核硬校验清洗后的正文才进 events.jsonl，原始带标签版本仅进此审计文件）。 */
+export const AUDIT_FILE_NAME = 'tagged-outputs.jsonl'
+
+/** 追加写审计事件到独立审计文件（不参与主事件日志轮转；会话删除时随目录一并删除） */
+export async function appendAuditEventsFile(dir: string, events: SessionEvent[]): Promise<void> {
+  if (events.length === 0) return
+  await fs.mkdir(dir, { recursive: true })
+  const path = join(dir, AUDIT_FILE_NAME)
+  const lines = `${events.map((e) => JSON.stringify(e)).join('\n')}\n`
+  await fs.appendFile(path, lines, { mode: 0o600 })
+}
+
+/** 全量重写审计文件（截断/删除历史时与 events.jsonl 一起全量重建，原子写） */
+export async function rewriteAuditEventsFile(dir: string, events: SessionEvent[]): Promise<void> {
+  await fs.mkdir(dir, { recursive: true })
+  const path = join(dir, AUDIT_FILE_NAME)
+  const tmp = `${path}.tmp`
+  const lines = events.length > 0 ? `${events.map((e) => JSON.stringify(e)).join('\n')}\n` : ''
+  await fs.writeFile(tmp, lines, { mode: 0o600 })
+  await fs.rename(tmp, path)
+}
+
 /**
  * 流式逐条读取会话事件（先归档段按序号升序，后活跃段），以 async generator 逐条 yield。
  * 调用方可逐条消费而不必一次性把全量事件驻留内存；损坏行/损坏段跳过，不阻断整体恢复。

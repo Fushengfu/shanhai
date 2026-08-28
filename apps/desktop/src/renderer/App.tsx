@@ -631,7 +631,12 @@ export function App() {
         patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}`, turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: Date.now() - startTs }] }))
       }
     } finally {
-      patchSession(sid, { streaming: '', streamingReasoning: '', busy: false })
+      // 闪屏修复：正常完成/中断/普通错误时，主进程 onSessionActivity('end') 会同步重建 items + 置 busy=false
+      // 并广播 ui:state；渲染进程不再本地抢跑置 busy（否则会与主进程广播形成「先清流式、后重建 items」的竞态闪屏）。
+      // 仅 retryExhausted（主进程 suspended=true、不广播 ui:state）时本地兜底置 busy=false。
+      if (retryExhausted) {
+        patchSession(sid, { streaming: '', streamingReasoning: '', busy: false })
+      }
       // 中断时保留「继续执行」入口；正常完成 / 报错才清除（失败重试耗尽时不显示「继续执行」，由弹窗承载）
       patchSession(sid, { incompleteTurn: interrupted })
       // 任务结束（成功/失败/中断/重试耗尽）同步会话列表：后端已把活跃时间更新为结束时间，这里重新拉取让侧边栏实时刷新

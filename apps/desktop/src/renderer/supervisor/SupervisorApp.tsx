@@ -8,7 +8,7 @@ import { AiOrb } from '../components/AiOrb'
 import { AssistantMessage } from '../components/AssistantMessage'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { makeMarkdownComponents, normalizeTreeBlocks } from '../components/Markdown'
+import { makeMarkdownComponents, normalizeTreeBlocks, stripWrappedRecordTag } from '../components/Markdown'
 import { ImagePreview } from '../components/ImagePreview'
 import { UserMessage } from '../components/UserMessage'
 import { ToolStep, StepStats, toolDisplayName, riskLevelLabel } from '../components/ToolStep'
@@ -738,7 +738,7 @@ export function SupervisorApp(): React.JSX.Element {
                   {streaming.text && (
                     <div style={{ minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
                       <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents((url) => setPreviewImage(url))}>
-                        {normalizeTreeBlocks(streaming.text)}
+                        {normalizeTreeBlocks(stripWrappedRecordTag(streaming.text))}
                       </ReactMarkdown>
                       <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
                     </div>

@@ -4,6 +4,9 @@ import type { ApprovalPolicy } from '@shanhai/session'
 /** 「会话管家」超级会话的固定 id（独立常驻窗口承载，作为主 Agent 监控/转发所有用户会话） */
 export const SUPERVISOR_ID = 'supervisor'
 
+/** 管家上下文历史回放保留的最近对话回合数（普通会话为 20，管家更多，便于跨会话编排时保留更长上下文主线） */
+export const SUPERVISOR_MAX_HISTORY_TURNS = 30
+
 /**
  * 会话管家（主 Agent）工具集。
  *

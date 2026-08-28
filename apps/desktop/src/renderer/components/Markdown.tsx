@@ -230,6 +230,22 @@ function hasTreeChar(line: string): boolean {
  * - 连续 ≥2 个含 box-drawing 字符的行（允许中间夹空行）视为一个树块，包裹成 ``` 代码块；
  * - 单个含 box-drawing 字符的行不作为树块处理（避免误伤 markdown 分隔线等）。
  */
+/** 系统内置标签（*-record 结尾）整段包裹检测：<prefix-record>…</suffix-record>，prefix 与 suffix 同一标签名 */
+const WRAPPED_RECORD_TAG_RE = /^<([a-zA-Z][a-zA-Z0-9-]*-record)\s*>([\s\S]*)<\/\1\s*>$/
+
+/**
+ * 渲染层保守去壳：仅当整段文本被「单个 *-record 标签」完整包裹（开头 <xxx-record>、结尾 </xxx-record>，
+ * 且是同一对标签）时，剥离外层标签返回中间正文；否则原样返回。
+ * 与内核层「任意出现即清洗到日志」不同，这里是「整段包裹才去壳」，避免误伤用户正常正文 / 转义文本 / 普通 HTML 标签。
+ */
+export function stripWrappedRecordTag(text: string): string {
+  if (!text) return text
+  const trimmed = text.trim()
+  const m = WRAPPED_RECORD_TAG_RE.exec(trimmed)
+  if (!m) return text
+  return m[2] ?? text
+}
+
 export function normalizeTreeBlocks(markdown: string): string {
   if (!markdown) return markdown
   const lines = markdown.split('\n')
