@@ -125,6 +125,8 @@ export interface DeepSeekOptions {
   userId?: string | number
   /** thinking 模式（reasoner 模型）：assistant 消息缺 reasoning_content 时回传占位符，避免 DeepSeek 400「must be passed back」 */
   supportsReasoning?: boolean
+  /** 采样温度（OpenAI 兼容语义 0~2；缺省不下发，由网关/上游用其默认值） */
+  temperature?: number
 }
 
 /** thinking 模式下 assistant 消息缺 reasoning_content 时的回传占位符。
@@ -257,6 +259,7 @@ export class DeepSeekProvider implements Model {
       })),
       // max_tokens 显式下发，让网关按模型真实配置预留 completion，而非用其默认预留值（否则 1M 窗口可能被默认预留压掉几十万，导致误判超限）
       ...(this.opts.maxTokens ? { max_tokens: this.opts.maxTokens } : {}),
+      ...(this.opts.temperature != null ? { temperature: this.opts.temperature } : {}),
       ...(effectiveUserId != null ? { user_id: effectiveUserId } : {}),
     }
     // 原始请求 = 最终提交给模型接口的完整 body（序列化前对象，含 model/messages/tools 全字段）
@@ -344,6 +347,7 @@ export class DeepSeekProvider implements Model {
       stream: true,
       // 请求网关在流末尾返回 usage（OpenAI 兼容；网关不支持时自动忽略，不影响流）
       stream_options: { include_usage: true },
+      ...(this.opts.temperature != null ? { temperature: this.opts.temperature } : {}),
       ...(effectiveUserId != null ? { user_id: effectiveUserId } : {}),
     }
     // 原始请求 = 最终提交给模型接口的完整 body（序列化前对象）
@@ -648,6 +652,8 @@ export interface AnthropicOptions {
   onUsage?: (usage: TokenUsage) => void
   /** 每次 HTTP 调用后回传原始请求/响应（排查问题用） */
   onTrace?: HttpTraceCallback
+  /** 采样温度（Anthropic 语义 0~1；缺省不下发，由上游用其默认值） */
+  temperature?: number
 }
 
 /** 模型调用协议：openai（OpenAI 兼容 /chat/completions，默认）或 anthropic（Anthropic 原生 /messages） */
@@ -667,6 +673,8 @@ export interface ProviderOptions {
   userId?: string | number
   /** thinking 模式（reasoner 模型）：assistant 消息缺 reasoning_content 时回传占位符，避免 DeepSeek 400 */
   supportsReasoning?: boolean
+  /** 采样温度（OpenAI 兼容 0~2 / Anthropic 0~1；缺省不下发，由上游用其默认值） */
+  temperature?: number
 }
 
 /** Anthropic 缺省最大输出 token（用户自定义模型未指定时兜底；Claude 3.5 系列上限 8192） */
@@ -681,7 +689,7 @@ export function createModelProvider(opts: ProviderOptions): Model {
   if (opts.protocol === 'anthropic') {
     return new AnthropicProvider(opts)
   }
-  return new DeepSeekProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, maxTokens: opts.maxTokens, onUsage: opts.onUsage, onTrace: opts.onTrace, userId: opts.userId, supportsReasoning: opts.supportsReasoning })
+  return new DeepSeekProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, maxTokens: opts.maxTokens, onUsage: opts.onUsage, onTrace: opts.onTrace, userId: opts.userId, supportsReasoning: opts.supportsReasoning, temperature: opts.temperature })
 }
 
 /**
@@ -863,6 +871,7 @@ export class AnthropicProvider implements Model {
     if (system) body.system = system
     const toolDefs = anthropicTools(tools)
     if (toolDefs.length > 0) body.tools = toolDefs
+    if (this.opts.temperature != null) body.temperature = this.opts.temperature
 
     this.opts.onTrace?.({ phase: 'request', url, method: 'POST', body })
     let res: Response
@@ -910,6 +919,7 @@ export class AnthropicProvider implements Model {
     if (system) body.system = system
     const toolDefs = anthropicTools(tools)
     if (toolDefs.length > 0) body.tools = toolDefs
+    if (this.opts.temperature != null) body.temperature = this.opts.temperature
 
     this.opts.onTrace?.({ phase: 'request', url, method: 'POST', body })
     let res: Response
