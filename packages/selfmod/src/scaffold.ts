@@ -62,7 +62,7 @@ module.exports = (ctx: PluginContext): (() => void) => {
   //    若 impl 是函数，client 半可通过 window.shanhaiPlugin.invokePluginService('<PLUGIN_ID>:getData', arg) 调用它（client → host RPC）。
   ctx.provide('<PLUGIN_ID>:getData', async (query: unknown) => ({ echo: String(query ?? ''), at: Date.now() }))
 
-  // 4) 注册全局工具示例（撤销时自动注销）—— 需要时取消注释
+  // 4) 注册插件工具示例（收集进插件工具 Registry，经 plugin_tool 按 action 分派调用；撤销时自动注销）—— 需要时取消注释
   // ctx.tools.register({
   //   name: '<PLUGIN_ID>_echo',
   //   description: '回声工具示例',

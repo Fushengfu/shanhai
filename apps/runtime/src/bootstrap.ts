@@ -390,14 +390,6 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     listServices: () => ['session', 'approval', 'agent', 'memory', 'voice', 'computerUse', 'browserUse', 'model', 'credentials'],
     listTools: (sessionId) => (sessionId === SUPERVISOR_ID ? ctx.supervisorLoopTools : ctx.tools).map((t) => t.name),
     listSlots: () => [...CORE_SLOTS],
-    registerTool: (rawTool) => {
-      const wrapped = wrapTool(rawTool)
-      ctx.tools.push(wrapped)
-      return () => {
-        const idx = ctx.tools.indexOf(wrapped)
-        if (idx >= 0) ctx.tools.splice(idx, 1)
-      }
-    },
     onEvent: (name, listener) => ctx.kernel.ctx.on(name, listener),
     requestClientRun: (pkg: DynamicPackage, sessionId: string) =>
       new Promise<boolean>((resolve) => {

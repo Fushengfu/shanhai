@@ -40,6 +40,18 @@ interface HostFacade {
   closeWindow(appId?: string): void
 }
 
+/**
+ * 插件注册的全局工具条目（集中存储于 SelfModifyRuntime.pluginTools Registry）。
+ * 插件 host 半 `ctx.tools.register(tool)` 不再直接把工具 push 进顶层工具表，而是收集到这里，
+ * 由统一调度工具 `plugin_tool` 按 action 分派执行（形如 computer-use 的 skill_run）。含来源插件/风险标记。
+ */
+interface PluginToolEntry {
+  name: string
+  tool: ToolContract
+  pkgId: string
+  pkgName: string
+}
+
 /** 自修改运行时对外的依赖注入点（由 bootstrap 装配，桥接到内核事件总线 / 工具注册表 / IPC） */
 export interface SelfModifyHooks {
   /** 系统已知的服务名（plugin_inspect 报告用） */
@@ -48,8 +60,6 @@ export interface SelfModifyHooks {
   listTools(sessionId?: string): string[]
   /** 当前可挂载/替换的 UI 插槽名（plugin_inspect 报告用，对齐内核 UI slot 表面） */
   listSlots(): string[]
-  /** 动态注册工具（host 半 tools.register），返回撤销函数 */
-  registerTool(tool: ToolContract): () => void
   /** 动态注册事件监听（host 半 ctx.on），返回撤销函数 */
   onEvent(name: string, listener: (...args: unknown[]) => unknown): () => void
   /** round-trip 审批：带 browser 半的 run 阻塞在这里，直到用户在页面 approve/reject */
@@ -146,6 +156,11 @@ export class SelfModifyRuntime {
   private readonly services = new Map<string, unknown>()
   /** 按「插件 id → 服务名 → impl」分组的 host 半服务表（client 半 RPC 用，见 invokeService）。与 services 并存：前者全局去重供 plugin_inspect 报告，后者按插件隔离供 RPC 调用。 */
   private readonly hostServices = new Map<string, Map<string, unknown>>()
+  /**
+   * 插件注册的全局工具 Registry：host 半 `ctx.tools.register(tool)` 收集到这里（按工具名索引），
+   * 不再直接 push 进顶层工具表。由统一调度工具 `plugin_tool` 按 action 分派执行。含来源插件/风险标记。
+   */
+  private readonly pluginTools = new Map<string, PluginToolEntry>()
   private readonly disposers = new Map<string, () => Promise<void>>()
 
   constructor(
@@ -159,6 +174,8 @@ export class SelfModifyRuntime {
     return {
       services: [...new Set([...this.hooks.listServices(), ...this.services.keys()])],
       tools: this.hooks.listTools(sessionId),
+      /** 插件注册的全局工具名（经 plugin_tool 分派，不直接进顶层工具表） */
+      pluginTools: this.listPluginTools(),
       packages: all.filter((p) => p.sessionId === sessionId && p.status !== 'installed'),
       installed: all.filter((p) => p.status === 'installed'),
       slots: this.hooks.listSlots(),
@@ -268,9 +285,11 @@ export class SelfModifyRuntime {
       },
       tools: {
         register: (tool) => {
-          const off = this.hooks.registerTool(tool)
+          // 插件工具统一收集进 Registry（不再 push 进顶层工具表），由 plugin_tool 按 action 分派。
+          this.pluginTools.set(tool.name, { name: tool.name, tool, pkgId: pkg.id, pkgName: pkg.name })
           stack.collect(() => {
-            off()
+            const cur = this.pluginTools.get(tool.name)
+            if (cur && cur.tool === tool) this.pluginTools.delete(tool.name)
           })
         },
       },
@@ -336,6 +355,45 @@ export class SelfModifyRuntime {
       throw new Error(`插件 "${appId}" 未注册可调用的 host 服务「${name}」（需在 host 半用 ctx.provide(name, fn) 注册）`)
     }
     return (impl as (...a: unknown[]) => unknown)(...args)
+  }
+
+  /** plugin_tool 统一分派：查 Registry 找到对应插件工具并执行（找不到给明确报错） */
+  async dispatchPluginTool(action: string, args: Record<string, unknown>): Promise<unknown> {
+    const entry = this.pluginTools.get(action)
+    if (!entry) {
+      const available = [...this.pluginTools.keys()]
+      throw new Error(
+        `插件工具不存在：${action}` +
+          (available.length > 0 ? `（当前已注册的插件工具：${available.join(', ')}）` : '（当前没有任何插件工具）') +
+          '。可先用 plugin_apps 或 plugin_inspect 查看可用工具清单',
+      )
+    }
+    return entry.tool.execute(args)
+  }
+
+  /** 列出插件注册的全局工具名（plugin_inspect / plugin_test_load 报告用，经 plugin_tool 分派） */
+  listPluginTools(): string[] {
+    return [...this.pluginTools.keys()]
+  }
+
+  /** plugin_apps：列出所有已安装插件（含窗口应用与纯工具插件），区分有无窗口 */
+  listPluginApps(): Array<Record<string, unknown>> {
+    return this.inventory
+      .list()
+      .filter((p) => p.status === 'installed')
+      .map((p) => {
+        const hasWindow = !!(p.entryHtml || p.client)
+        return {
+          id: p.id,
+          name: p.name,
+          purpose: p.purpose,
+          version: p.version,
+          hasWindow,
+          kind: hasWindow ? 'app' : 'tool',
+          services: [...(this.hostServices.get(p.id)?.keys() ?? [])],
+          tools: [...this.pluginTools.values()].filter((e) => e.pkgId === p.id).map((e) => e.name),
+        }
+      })
   }
 
   /** 计算持久化 id：name 转 kebab-case；空或含非法字符则报错 */
@@ -513,16 +571,11 @@ export class SelfModifyRuntime {
     const closeCalls: string[] = []
     const events: string[] = []
     const provided: string[] = []
-    const registeredTools: string[] = []
 
     const mockHooks: SelfModifyHooks = {
       listServices: () => [],
       listTools: () => [],
       listSlots: () => [],
-      registerTool: (tool) => {
-        registeredTools.push(tool.name)
-        return () => {}
-      },
       onEvent: (name) => {
         events.push(name)
         return () => {}
@@ -562,7 +615,7 @@ export class SelfModifyRuntime {
         closeWindowCalls: closeCalls,
         eventSubscriptions: events,
         serviceNames: provided,
-        registeredTools,
+        registeredTools: mock.listPluginTools(),
         clientDelivered,
       }
     } finally {
@@ -864,6 +917,45 @@ export class SelfModifyRuntime {
       execute: async (args) => this.verify(String(args.id ?? ''), args.projectDir ? String(args.projectDir) : undefined),
     }
 
-    return [inspectTool, defineTool, runTool, stopTool, undefineTool, testTool, installTool, uninstallTool, scaffoldTool, buildTool, testLoadTool, verifyTool]
+    const pluginToolTool: ToolContract = {
+      name: 'plugin_tool',
+      description:
+        '统一调度「插件注册的工具」。所有已安装插件通过 host 半 ctx.tools.register 注册的工具，都经此工具按 action 分派调用，不再作为顶层 function 暴露。' +
+        '先用 plugin_apps（列出插件与它们的工具名）或 plugin_inspect（pluginTools 字段）查到可用的插件工具名，再用 plugin_tool 调用。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', description: '要调用的插件工具名（= 插件 host 半 tools.register 时用的 name）' },
+          args: { type: 'object', description: '传给该插件工具的参数对象（按该工具的 inputSchema 填）' },
+        },
+        required: ['action'],
+      },
+      riskLevel: 'reversible',
+      /** 动态风险：按具体插件工具的 riskLevel / approvalRequired 决定审批粒度 */
+      resolveRisk: (args): { riskLevel: import('@shanhai/tools').RiskLevel; approvalRequired: boolean } => {
+        const name = String(args.action ?? '')
+        const entry = this.pluginTools.get(name)
+        if (!entry) return { riskLevel: 'reversible', approvalRequired: false }
+        return { riskLevel: entry.tool.riskLevel, approvalRequired: entry.tool.approvalRequired ?? false }
+      },
+      execute: async (args) => {
+        const action = String(args.action ?? '').trim()
+        if (!action) throw new Error('plugin_tool 缺少 action 参数（要调用的插件工具名）')
+        const a = args.args && typeof args.args === 'object' ? (args.args as Record<string, unknown>) : {}
+        return this.dispatchPluginTool(action, a)
+      },
+    }
+
+    const pluginAppsTool: ToolContract = {
+      name: 'plugin_apps',
+      description:
+        '列出所有已安装的插件应用（含「有窗口的应用插件」与「纯工具插件」），返回 id / 名称 / 描述 / 版本 / 有无窗口 / 注册的服务 / 注册的工具。' +
+        '拿到列表后：可用 plugin_tool 调用插件的工具，或对「有窗口的应用插件」用 computer_use / browser_use 做 UI 自动化操作。',
+      inputSchema: { type: 'object', properties: {} },
+      riskLevel: 'readonly',
+      execute: async () => ({ apps: this.listPluginApps() }),
+    }
+
+    return [inspectTool, defineTool, runTool, stopTool, undefineTool, testTool, installTool, uninstallTool, scaffoldTool, buildTool, testLoadTool, verifyTool, pluginToolTool, pluginAppsTool]
   }
 }

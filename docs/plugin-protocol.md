@@ -88,7 +88,7 @@ interface HostFacade {
 |------|------|------|--------------|
 | `ctx.on` | `(name, listener) => void` | 订阅内核事件总线，返回无（⚠️ 当前内核**不广播任何事件**，可订阅事件清单为空，见下） | ✅ 撤销时自动 off |
 | `ctx.provide` | `(name, impl) => void` | 注册命名服务。**若 `impl` 是函数，client 半可经 `window.shanhaiPlugin.invokePluginService(name, ...args)` 调用它（client→host RPC，见 §7）** | ✅ 撤销时自动删除 |
-| `ctx.tools.register` | `(tool: ToolContract) => void` | 向全局工具表注册一个 model-facing 工具 | ✅ 撤销时自动移除 |
+| `ctx.tools.register` | `(tool: ToolContract) => void` | 注册一个「插件工具」：收集进插件工具 Registry（**不再进顶层工具表**），由统一调度工具 `plugin_tool` 按 action 分派调用（见 §9） | ✅ 撤销时自动移除 |
 | `ctx.openWindow` | `(appId?: string) => void` | 打开本插件的窗口应用（`appId` 缺省 = 插件 id） | ✅ 撤销时自动关闭该窗口 |
 | `ctx.closeWindow` | `(appId?: string) => void` | 显式关闭本插件的窗口应用（`appId` 缺省 = 插件 id） | ❌ 主动关闭，不挂撤销 |
 
@@ -382,10 +382,29 @@ interface InstalledPackageMeta {
 5. **UI 插槽形态的 `slots` 只有 `register` 一个方法**。
 6. **窗口应用默认「不自动开窗」**，安装/加载后由用户点 Dock 图标主动打开（非自动弹出）。
 7. **host 半无 `effect()`**，cleanup 只走 4 条自动撤销路径。
-8. **`tools.register` 注册的是全局工具**（非会话隔离）。
+8. **`tools.register` 注册的是「插件工具」**：收集进插件工具 Registry，**不再作为顶层 function 暴露给模型**，由统一调度工具 `plugin_tool` 按 action 分派调用（先用 `plugin_apps` 或 `plugin_inspect` 的 `pluginTools` 字段查可用工具名，见 §9）。插件工具不再直接污染模型顶层工具表。
 9. **`provide` 的函数 impl 可被 client 半 `invokePluginService` 调用**（client→host RPC，见 §7）；非函数 impl 仅 `plugin_inspect` 报告用。
 10. **host 半编译产物必须自包含**，不得 external `electron` / `@shanhai/*`（越权审计拒绝加载）。
 11. **client 半源码字符串跨渲染进程传输**（序列化），主进程 `plugin-apps` 维护注册表，Dock 图标经 `plugin-apps:changed` 广播刷新。
 12. **`plugin_build` 产物在 workspace**，`plugin_install` 自动部署到 `plugins/<id>/dist/`（无需手动 cp）。
 13. **插件窗口主题跟随**：宿主桥 `window.shanhai.onThemeChange(cb)` 订阅主进程 `ui:theme` 广播（内置应用切换亮/暗时实时下发）。**回调签名写死为 `onThemeChange(cb: (theme: 'light' | 'dark') => void)`**：cb 收到的参数是**裸字符串** `'light' | 'dark'`（不是对象，主进程 `ipc-handlers.ts` 的 `safeSend(win, 'ui:theme', theme)` 塞的就是字符串），直接 `theme === 'dark'` 判断即可，不要按对象 `{ theme }` 解包。插件窗口挂载时读 `localStorage.getItem('shanhai-theme')` 得到初始主题，`document.documentElement.setAttribute('data-theme', theme)` 驱动 CSS 变量。脚手架模板的 `style.css` 已内嵌与内置应用一致的主题变量（`--bg-subtle`/`--text-muted`/`--accent` 等），AI 生成插件开箱即随主题切换。**AI 真机自验如何切主题**：主题切换入口是「聊天窗口顶栏右侧的月亮/太阳图标按钮」（无文字、hover 提示「切换到暗色/亮色模式」）或「会话管家窗口标题栏右侧的月亮/太阳按钮」，点一下即切换亮/暗并广播给所有窗口（含插件窗口）；**无快捷键**。
 14. **`ctx.on` 无可订阅内核事件**：内核事件总线零 `emit`，`ctx.on` 仅作占位能力保留。
+
+---
+
+## 9. 插件工具统一调度与插件应用列表
+
+插件 host 半用 `ctx.tools.register(tool)` 注册的工具，**不再作为顶层 function 暴露给模型**，而是统一收集进「插件工具 Registry」（按工具名索引，条目含 `name / tool / pkgId / pkgName`，即来源插件 + 风险标记）。模型通过两个专用工具访问：
+
+| 工具 | 用途 |
+|------|------|
+| `plugin_tool` | **统一调度入口**：`plugin_tool action=<插件工具名> args={...}`。查 Registry 找到对应插件工具并执行，返回其结果；找不到给明确报错（含当前已注册的插件工具清单）。**动态风险**：`resolveRisk` 按具体插件工具的 `riskLevel` / `approvalRequired` 转发，审批粒度与直接调用该工具一致。 |
+| `plugin_apps` | **列出所有已安装插件应用**：返回 `id / name / purpose / version / hasWindow / kind / services / tools`。`kind` 区分「有窗口的应用插件（`app`，`hasWindow=true`）」与「纯工具插件（`tool`，`hasWindow=false`）」。拿到列表后：用 `plugin_tool` 调插件的工具，或对「有窗口的应用插件」用 computer_use / browser_use 做 UI 自动化操作。 |
+
+**关键语义（避免 AI 搞错）：**
+
+1. **Registry 生命周期**：插件 `run` 时 `ctx.tools.register` 收集进 Registry，`plugin_stop` / `plugin_uninstall` / `plugin_undefine` / `plugin_test`（撤回阶段）时自动移除对应工具——卸载后 `plugin_tool` 再调它会报「插件工具不存在」。
+2. **不进顶层工具表**：插件工具不再 `push` 进全局 `ctx.tools`，模型顶层 function 里看不到 `kanban_export_markdown` 这类插件工具名，只能看到 `plugin_tool` / `plugin_apps`。已装插件越多，顶层工具表**不膨胀**（这是本机制的目的：把「每装一个插件顶层 +N 个工具」收敛为「固定 +2 个调度工具」）。
+3. **管家 vs 普通会话**：`plugin_tool` / `plugin_apps` 是普通会话工具（进 `ctx.tools`）；管家会话用 `supervisorLoopTools` 白名单，默认**不**含插件工具（如需管家也能调，需另确认）。
+4. **查询入口**：插件工具名经 `plugin_inspect` 的 `pluginTools` 字段、或 `plugin_apps` 的 `tools` 字段暴露，AI 调用前先查清单。
+

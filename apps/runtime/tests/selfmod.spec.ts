@@ -16,13 +16,6 @@ function makeHooks() {
       listServices: () => [...services.keys()],
       listTools: () => tools.map((t) => t.name),
       listSlots: () => ['shell.sidebar', 'dynamic-extension'],
-      registerTool: (tool: ToolContract) => {
-        tools.push(tool)
-        return () => {
-          const i = tools.indexOf(tool)
-          if (i >= 0) tools.splice(i, 1)
-        }
-      },
       onEvent: (name: string, listener: (...args: unknown[]) => unknown) => {
         const arr = events.get(name) ?? []
         arr.push(listener)

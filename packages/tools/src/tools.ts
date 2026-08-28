@@ -1,9 +1,8 @@
 import { promises as fs } from 'node:fs'
-import { exec as execCallback, execFile as execFileCallback } from 'node:child_process'
+import { execFile as execFileCallback, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import { resolve, isAbsolute, join, relative } from 'node:path'
 
-const exec = promisify(execCallback)
 const execFile = promisify(execFileCallback)
 
 /** run_command 命令执行超时（毫秒）：超时后 kill 子进程并返回错误，防止命令永久卡死堵塞任务循环（等机器类的兜底，区别于 ask_user 等「等用户」工具的不超时） */
@@ -200,6 +199,85 @@ async function getRunCommandEnv(): Promise<NodeJS.ProcessEnv> {
   } finally {
     commandEnvLoadingPromise = null
   }
+}
+
+/** run_command 输出缓冲上限（字节）：超出则判定命令产出异常（如死循环打印），终止进程组并报错，避免内存无界增长。 */
+const RUN_COMMAND_MAX_BUFFER = 10 * 1024 * 1024
+
+/**
+ * 执行 shell 命令，带「进程组级」超时与输出上限保护。
+ *
+ * 与 `exec(command, { timeout })` 的关键区别：exec 的 timeout 只向 shell 进程发 SIGTERM，
+ * shell 被 kill 后其派生的子进程（sleep / npm / node 等）会变成孤儿进程继续跑、残留不回收；
+ * 且这些孤儿进程仍持有 stdout/stderr 管道写端，管道不关闭。这里改用 spawn + detached（POSIX 进程组），
+ * 超时/超限时 `kill(-pid)` 杀整个进程组（shell + 全部子/孙进程），确保进程树被干净回收、promise 正常 settle。
+ */
+function runCommandWithTimeout(
+  command: string,
+  opts: { cwd: string; env: NodeJS.ProcessEnv; shell: string; timeout: number },
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    // detached: true（POSIX）让 shell 成为新进程组组长，超时后 kill(-pid) 能杀整组。
+    // Windows 无进程组语义，用 taskkill /T（树）兜底。
+    const child = spawn(command, {
+      cwd: opts.cwd,
+      env: opts.env,
+      shell: opts.shell,
+      detached: process.platform !== 'win32',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let overflow = false
+
+    const killTree = (): void => {
+      try {
+        if (process.platform === 'win32') {
+          // /T 杀整棵进程树，/F 强制
+          spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
+        } else {
+          // 负 pid = 进程组（含 shell 与其所有子进程）；SIGKILL 兜底（SIGTERM 可能被忽略）
+          process.kill(-child.pid!, 'SIGKILL')
+        }
+      } catch {
+        // 进程组可能已退出
+      }
+    }
+
+    const settle = (fn: () => void): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      fn()
+    }
+
+    const timer = setTimeout(() => {
+      if (settled) return
+      killTree()
+      settle(() => reject(new Error(`命令执行超时（${Math.round(opts.timeout / 1000)}s），已终止整个进程组`)))
+    }, opts.timeout)
+
+    child.stdout?.on('data', (d: Buffer) => {
+      stdout += d.toString()
+      if (!overflow && stdout.length + stderr.length > RUN_COMMAND_MAX_BUFFER) {
+        overflow = true
+        killTree()
+        settle(() => reject(new Error(`命令输出超过上限（${RUN_COMMAND_MAX_BUFFER / 1024 / 1024}MB），已终止进程组`)))
+      }
+    })
+    child.stderr?.on('data', (d: Buffer) => {
+      stderr += d.toString()
+      if (!overflow && stdout.length + stderr.length > RUN_COMMAND_MAX_BUFFER) {
+        overflow = true
+        killTree()
+        settle(() => reject(new Error(`命令输出超过上限（${RUN_COMMAND_MAX_BUFFER / 1024 / 1024}MB），已终止进程组`)))
+      }
+    })
+    child.on('error', (err) => settle(() => reject(err)))
+    child.on('close', (code, signal) => settle(() => resolve({ stdout, stderr })))
+  })
 }
 
 /**
@@ -517,8 +595,7 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
       // 显式指定 shell（等价于 Node 默认，但明确平台分支，便于后续扩展 Git Bash 兼容）：
       //   win32 用 ComSpec/cmd.exe（支持 &&、|、> 等），POSIX 用 /bin/sh。agent 在 Windows 上应写 cmd 兼容命令。
       const shell = process.platform === 'win32' ? (process.env.ComSpec ?? 'cmd.exe') : '/bin/sh'
-      const { stdout, stderr } = await exec(args.command, { cwd: getCwd(), env, shell, timeout: RUN_COMMAND_TIMEOUT_MS })
-      return { stdout, stderr }
+      return runCommandWithTimeout(args.command, { cwd: getCwd(), env, shell, timeout: RUN_COMMAND_TIMEOUT_MS })
     },
   }
 

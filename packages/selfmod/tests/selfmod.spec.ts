@@ -6,21 +6,13 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-function makeHooks(overrides: Partial<SelfModifyHooks> = {}): SelfModifyHooks & { registered: ToolContract[]; events: string[]; clients: string[] } {
-  const registered: ToolContract[] = []
+function makeHooks(overrides: Partial<SelfModifyHooks> = {}): SelfModifyHooks & { events: string[]; clients: string[] } {
   const events: string[] = []
   const clients: string[] = []
   return {
     listServices: () => ['session', 'llm'],
     listTools: () => ['read_file'],
     listSlots: () => ['shell.sidebar', 'dynamic-extension'],
-    registerTool: (tool) => {
-      registered.push(tool)
-      return () => {
-        const i = registered.indexOf(tool)
-        if (i >= 0) registered.splice(i, 1)
-      }
-    },
     onEvent: (name) => {
       events.push(name)
       return () => {}
@@ -34,7 +26,6 @@ function makeHooks(overrides: Partial<SelfModifyHooks> = {}): SelfModifyHooks & 
       if (i >= 0) clients.splice(i, 1)
     },
     ...overrides,
-    registered,
     events,
     clients,
   }
@@ -71,15 +62,15 @@ describe('SelfModifyRuntime', () => {
 
     const result = await rt.run(pkg.id, 's-a')
     expect(result.clientDelivered).toBe(false)
-    expect(hooks.registered.map((t) => t.name)).toEqual(['dyn_tool'])
+    expect(rt.listPluginTools()).toEqual(['dyn_tool'])
 
-    // inspect 应包含动态注册的服务（tools 列表来自 hooks.listTools，动态工具通过 registerTool 注册，见 hooks.registered 断言）
+    // inspect 应包含动态注册的服务（插件工具经 plugin_tool 分派，见 listPluginTools）
     const report = rt.inspect('s-a') as { services: string[]; tools: string[] }
     expect(report.services).toContain('dyn_svc')
-    expect(hooks.registered.map((t) => t.name)).toEqual(['dyn_tool'])
+    expect(rt.listPluginTools()).toEqual(['dyn_tool'])
 
     await rt.stop(pkg.id)
-    expect(hooks.registered).toHaveLength(0)
+    expect(rt.listPluginTools()).toHaveLength(0)
   })
 
   it('run 带 browser 半时走审批并投递', async () => {
@@ -104,8 +95,8 @@ describe('SelfModifyRuntime', () => {
     )
 
     await expect(rt.run(pkg.id, 's-a')).rejects.toThrow(/拒绝/)
-    // host 半被撤销（registerTool 未残留）
-    expect(hooks.registered).toHaveLength(0)
+    // host 半被撤销（插件工具 Registry 未残留）
+    expect(rt.listPluginTools()).toHaveLength(0)
   })
 
   it('session 隔离：跨会话 run 抛错', async () => {
@@ -134,7 +125,7 @@ describe('SelfModifyRuntime', () => {
 })
 
 describe('createTools', () => {
-  it('返回八个 plugin_* 工具，install/uninstall 需审批（run 工具不叠加顶层审批）', () => {
+  it('返回 plugin_* 工具（含 plugin_tool / plugin_apps），install/uninstall 需审批（run 工具不叠加顶层审批）', () => {
     const rt = new SelfModifyRuntime(makeHooks())
     const tools = rt.createTools(() => 's-a')
     expect(tools.map((t) => t.name)).toEqual([
@@ -146,6 +137,12 @@ describe('createTools', () => {
       'plugin_test',
       'plugin_install',
       'plugin_uninstall',
+      'plugin_scaffold',
+      'plugin_build',
+      'plugin_test_load',
+      'plugin_verify',
+      'plugin_tool',
+      'plugin_apps',
     ])
 
     const runTool = tools.find((t) => t.name === 'plugin_run')!
@@ -183,7 +180,7 @@ describe('SelfModifyRuntime 持久化（install / uninstall / restore）', () =>
       const result = await rt.test(pkg.id, 's-a')
       expect(result.ok).toBe(true)
       // 测试后已撤回：注册的工具被撤销
-      expect(hooks.registered).toHaveLength(0)
+      expect(rt.listPluginTools()).toHaveLength(0)
       // 未持久化
       expect(await store.list()).toHaveLength(0)
     } finally {
@@ -216,7 +213,7 @@ describe('SelfModifyRuntime 持久化（install / uninstall / restore）', () =>
       const rt2 = new SelfModifyRuntime(hooks2, store)
       const restored = await rt2.restoreAll()
       expect(restored).toBe(1)
-      expect(hooks2.registered.map((t) => t.name)).toEqual(['todo'])
+      expect(rt2.listPluginTools()).toEqual(['todo'])
 
       // 卸载：撤销 + 删除持久化
       await rt2.uninstall('todo-list')
