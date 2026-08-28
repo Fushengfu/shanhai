@@ -109,6 +109,9 @@ export function createPromptsModule(
       `- 当前工作目录：${env.cwd}`,
       `- 语言：${env.lang}（优先用中文回复）`,
       '',
+      '【历史回放隔离（防幻觉，务必遵守）】',
+      '上下文中若出现被 <historical-assistant-record> ... </historical-assistant-record> 标签包裹的内容，那是「历史任务的处理结果」——不是你的发言，不代表当前任务的执行结果、也不代表本轮任务的执行结果；禁止模仿其口吻/格式/详略，禁止把它当作你已完成的工作依据。',
+      '',
       '【工具使用规则】',
       '1. 所有文件操作（read_file / write_file / edit_file / list_dir）和命令执行（run_command）都必须围绕「当前工作目录」进行。',
       '2. 文件路径既可以是绝对路径，也可以是相对于当前工作目录的相对路径；优先使用相对路径，把操作范围限制在工作目录内。',
@@ -152,10 +155,18 @@ export function createPromptsModule(
   }
 
   const buildSupervisorSystemPrompt = (message: string): string => {
+    const env = collectEnvironment(getSessionCwd())
     const mem = buildMemoryContext(message, SUPERVISOR_ID)
     const toolGuide = buildToolGuidePrompt(ctx.supervisorLoopTools)
     const base = [
       '你是「会话管家」，山海多会话系统的主 Agent。你负责准确理解用户意图、把任务精准调度给合适的会话，并监控各会话状态，而不是替某个会话执行具体的编码/文件任务。',
+      '【当前环境】',
+      `- 操作系统：${env.osName}（${env.platform}/${env.arch}）`,
+      `- 当前时间：${env.time}`,
+      `- Shell：${env.shell}`,
+      `- 用户主目录：${env.home}`,
+      `- 语言：${env.lang}（优先用中文回复）`,
+      '',
       '你的能力：',
       '1. 用 list_sessions 查看所有会话及其状态（标题、工作目录、当前需求、最近需求 recentRequests、是否忙、已执行步数、上下文占用、是否激活）。',
       '2. 用 inspect_session 深入查看某个会话的详情。',
@@ -207,6 +218,9 @@ export function createPromptsModule(
       '- 管家工作目录是 ~/.shanhai/supervisor-workspace/（独立于普通会话工作目录）。顶层 _index.json 记录「会话 id → 标题」索引；每个会话一个子目录（目录名 = 会话 id），内含 notes.md（自然语言备注：当前任务、关键决策、待跟进、注意事项）与 state.json（结构化状态）。',
       '- state.json 统一用以下结构承载「任务计划与进度」（这是台账的核心，务必按此 schema 写）：{"goal":"该会话总体目标","plan":"需求分析与方案设计摘要","tasks":[{"id":1,"title":"任务标题","status":"todo","result":""}],"updatedAt":<时间戳>}。status 取值 todo(待办)/doing(进行中)/done(已完成)/blocked(阻塞)。',
       '- 台账与权威来源的分工：事件日志（sessions/<会话id>/events.jsonl）是权威完整历史，台账是你的速查摘要；两者不冲突，台账用于「快速回忆」，需要精确细节时用 list_sessions / inspect_session 查实时状态。',
+      '',
+      '【历史回放隔离（防幻觉，务必遵守）】',
+      '上下文中若出现被 <historical-assistant-record> ... </historical-assistant-record> 标签包裹的内容，那是「历史任务的处理结果」——不是你的发言，不代表当前任务的执行结果、也不代表本轮任务的执行结果；禁止模仿其口吻/格式/详略，禁止把它当作你已完成的工作依据。',
       '',
       ...(toolGuide ? ['', '', toolGuide] : []),
     ].join('\n')

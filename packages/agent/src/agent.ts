@@ -3,6 +3,27 @@ import { toolReasoningContext, type ToolContract } from '@shanhai/tools'
 import type { Session } from '@shanhai/session'
 import type { ApprovalService } from '@shanhai/approval'
 
+/**
+ * 历史 assistant 消息隔离标签：仅在事件日志回放（resumeRun 断点续跑 / run 全新任务执行）时，
+ * 把「历史助手的正文发言」包裹进这对标签，向模型声明这是「历史任务处理结果」而非当前模型的发言，
+ * 防三种幻觉（模仿历史口吻/格式/详略、语义延续、把历史旧结论误当当前任务真实状态）。
+ * 注意：只包裹 assistant 正文（assistant/message）；tool/call（工具调用）、tool/result（事实产物）保持原样。
+ */
+const HISTORICAL_ASSISTANT_OPEN = '<historical-assistant-record>'
+const HISTORICAL_ASSISTANT_CLOSE = '</historical-assistant-record>'
+
+/** 转义历史助手文本里可能出现的同款标签字符，防止模型分不清边界（穿模）。 */
+function escapeHistoricalTag(content: string): string {
+  return content
+    .replaceAll(HISTORICAL_ASSISTANT_OPEN, '&lt;historical-assistant-record&gt;')
+    .replaceAll(HISTORICAL_ASSISTANT_CLOSE, '&lt;/historical-assistant-record&gt;')
+}
+
+/** 把历史助手正文包裹进隔离标签（仅回放上下文用）。 */
+function wrapHistoricalAssistant(content: string): string {
+  return `${HISTORICAL_ASSISTANT_OPEN}\n${escapeHistoricalTag(content)}\n${HISTORICAL_ASSISTANT_CLOSE}`
+}
+
 export interface AgentLoopOptions {
   maxSteps?: number
   systemPrompt?: string
@@ -175,7 +196,13 @@ export class AgentLoop {
         }
       } else if (e.type === 'assistant/message') {
         const d = e.data as { content: string; reasoningContent?: string }
-        messages.push({ role: 'assistant', content: d.content, reasoningContent: d.reasoningContent })
+        // 历史 assistant 正文做标签隔离：声明这是「历史任务处理结果」而非当前模型发言，防模仿口吻/语义延续/状态误判三类幻觉。
+        // 只包裹正文；tool/call（工具调用）、tool/result（事实产物）保持原样。
+        messages.push({
+          role: 'assistant',
+          content: wrapHistoricalAssistant(d.content),
+          reasoningContent: d.reasoningContent,
+        })
       } else if (e.type === 'tool/call') {
         const d = e.data as { callId: string; name: string; args: Record<string, unknown>; reasoningContent?: string }
         messages.push({ role: 'assistant', content: '', toolCall: { id: d.callId, name: d.name, args: d.args }, reasoningContent: d.reasoningContent })

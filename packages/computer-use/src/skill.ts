@@ -32,6 +32,9 @@ export function createComputerUseSkill(service: ComputerUseService, uploadImage?
       '',
       'action 的坐标必须来自 screenshot + ocr 的结果，禁止猜测。',
       '注意：action（点击/输入/按键）为不可逆桌面操作，默认会请求用户确认。',
+      '',
+      '坐标换算（重要）：screencapture 截图是 Retina 物理像素（如 3600×2338 = 逻辑 1800×1169 × 2），OCR 返回的 x/y 是「截图像素坐标」，直接原样传给 action 即可，底层会自动 ÷ backingScaleFactor 换算成逻辑点坐标，不要手动 ÷2。',
+      'click 走真实鼠标事件（CGEvent），可点击 Electron 应用按钮；依赖「辅助功能」权限（系统设置 → 隐私与安全 → 辅助功能 勾选山海），若 click 无效先检查该权限。',
     ].join('\n'),
     actions,
   }

@@ -37,7 +37,13 @@ class _LoginPageState extends State<LoginPage> {
     _stateSub = _ws.stateStream.listen((s) {
       // 只有真正配对到具体 Host（paired）才进主页；connected 仅表示连上了网关，
       // 可能还处于「Host 离线」或「多设备待选」状态，此时不能进主页（否则 devices_list 会在跳转竞态中丢失）。
-      if (s == ConnState.paired) _maybeGoHome();
+      if (s == ConnState.paired) {
+        _maybeGoHome();
+      } else if (s == ConnState.connected && mounted) {
+        // 已连上网关但尚未配对到 Host：明确提示「等待桌面端上线」，
+        // 避免握手成功后、网关未下发任何事件时，文案一直卡在「登录成功，连接中…」。
+        setState(() => _status = '已连接网关，等待桌面端上线…');
+      }
     });
     _eventSub = _ws.events.listen((e) {
       if (e.event == 'error' && mounted) {

@@ -67,7 +67,7 @@ function actionTool(service: ComputerUseService): ToolContract {
   return {
     name: 'computer_action',
     description:
-      '执行一个桌面动作。action 取值：click（左键单击，需 x/y 屏幕坐标）、doubleClick（双击，需 x/y）、type（在当前焦点输入文字，需 text）、key（按下按键，如 enter/tab/space/escape/up/down 等，需 key）、scroll（滚动，direction 为 up/down，可选 amount 行数）。坐标必须先由 computer_screenshot + computer_ocr/视觉分析获得，禁止猜测。',
+      '执行一个桌面动作。action 取值：click（左键单击，需 x/y 屏幕坐标）、doubleClick（双击，需 x/y）、type（在当前焦点输入文字，需 text）、key（按下按键，如 enter/tab/space/escape/up/down 等，需 key）、scroll（滚动，direction 为 up/down，可选 amount 行数）。坐标必须先由 computer_screenshot + computer_ocr/视觉分析获得，禁止猜测。注意：截图是 Retina 物理像素，OCR 返回的 x/y 是像素坐标，直接原样传入即可（底层自动换算为逻辑点坐标），不要手动 ÷2。',
     inputSchema: {
       type: 'object',
       properties: {

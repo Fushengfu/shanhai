@@ -22,6 +22,7 @@ class _HomePageState extends State<HomePage> {
   bool _switchingDevice = false;
   bool _checkingUpdate = false;
   StreamSubscription<ServerEvent>? _eventSub;
+  StreamSubscription<ConnState>? _stateSub;
 
   @override
   void initState() {
@@ -34,6 +35,14 @@ class _HomePageState extends State<HomePage> {
         if (mounted && _hostOffline) setState(() => _hostOffline = false);
       } else if (e.event == 'devices_list' && mounted) {
         _showDevicePicker(e.payload['devices'] as List? ?? const []);
+      }
+    });
+    // 切换到其他设备并成功配对后，清除「离线」横幅。
+    // 之前 _hostOffline 只被 host_online 事件清除，而 switchDevice 配对成功走的是 paired 状态、
+    // 不触发 host_online 事件，导致「当前设备掉线后切到其他设备」时横幅仍显示「桌面端离线，等待重新连接…」。
+    _stateSub = widget.ws.stateStream.listen((s) {
+      if (s == ConnState.paired && mounted && _hostOffline) {
+        setState(() => _hostOffline = false);
       }
     });
     // 进入主页后静默检查一次版本更新（有更新才弹窗，无更新不打扰）
@@ -76,6 +85,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void dispose() {
     _eventSub?.cancel();
+    _stateSub?.cancel();
     super.dispose();
   }
 

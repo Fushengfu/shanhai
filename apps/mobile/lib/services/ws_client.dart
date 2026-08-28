@@ -52,19 +52,35 @@ class WsClient {
     if (!_stateCtrl.isClosed) _stateCtrl.add(s);
   }
 
+  /// 放弃当前连接（fire-and-forget，绝不 await）：
+  /// 握手卡住时 sink.close() 的 Future 永不 resolve，await 会把调用方永久卡死。
+  /// 这里只置空引用并异步关闭，忽略结果，保证超时/失败路径能立即继续。
+  void _abortChannel() {
+    final ch = _channel;
+    _channel = null;
+    if (ch != null) {
+      unawaited(ch.sink.close().catchError((_) {}));
+    }
+  }
+
   /// 连接并等待 WebSocket 握手完成
   Future<void> connect(String host, int port) async {
     _setState(ConnState.connecting);
     final uri = Uri.parse('ws://$host:$port');
     // 用 IOWebSocketChannel 并设 pingInterval：底层定期发协议层 ping 帧保活，
     // 对端（局域网 ws server / 网关）协议栈自动回 pong，不进入应用层消息解析。
-    _channel = IOWebSocketChannel.connect(uri, pingInterval: const Duration(seconds: 30));
+    _channel = IOWebSocketChannel.connect(
+      uri,
+      pingInterval: const Duration(seconds: 30),
+      connectTimeout: const Duration(seconds: 15),
+    );
     try {
-      await _channel!.ready.timeout(const Duration(seconds: 15));
+      await _channel!.ready;
     } catch (e) {
-      // 握手失败/超时：清理连接并抛出，由调用方（ConnectPage）展示错误，避免永久挂起
-      await _channel?.sink.close();
-      _channel = null;
+      // 握手失败/超时：清理连接并抛出，由调用方（ConnectPage）展示错误，避免永久挂起。
+      // 注意：不能 await sink.close()——连接握手卡住时 local.stream 监听尚未注册，
+      // close 的 Future 永不 resolve，会把这里永久卡死（见 _abortChannel）。
+      _abortChannel();
       _setState(ConnState.disconnected);
       rethrow;
     }
@@ -102,14 +118,19 @@ class WsClient {
     final uri = Uri.parse('$base$query');
     // 用 IOWebSocketChannel 并设 pingInterval：底层定期发协议层 ping 帧保活，
     // 网关协议栈自动回 pong，不进入应用层消息解析，因此不会被误转发、不会触发 host_offline 报错。
-    _channel = IOWebSocketChannel.connect(uri, pingInterval: const Duration(seconds: 30));
+    _channel = IOWebSocketChannel.connect(
+      uri,
+      pingInterval: const Duration(seconds: 30),
+      connectTimeout: const Duration(seconds: 15),
+    );
     try {
-      await _channel!.ready.timeout(const Duration(seconds: 15));
+      await _channel!.ready;
     } catch (e) {
       // 握手失败/超时：清理连接，通知 UI 并交给自动重连兜底，同时向上抛出让调用方感知首次失败。
       // 之前这里没 catch，导致「正在恢复登录」永久转圈且不重连（listen 尚未注册，onDone/onError 不会触发）。
-      await _channel?.sink.close();
-      _channel = null;
+      // 更不能 await sink.close()：握手卡住时 close 的 Future 永不 resolve，会把这里永久卡死，
+      // 进而使「正在恢复登录」永远不更新（error 事件发不出、rethrow 到不了 _restore 的 catch）。
+      _abortChannel();
       _setState(ConnState.disconnected);
       if (!_events.isClosed) {
         _events.add(ServerEvent('error', {'message': '连接网关失败：$e'}));
@@ -134,8 +155,7 @@ class WsClient {
     _targetDeviceId = deviceId;
     await _sub?.cancel();
     _sub = null;
-    await _channel?.sink.close();
-    _channel = null;
+    _abortChannel();
     if (_autoReconnect && _relayUrl != null && _relayToken != null) {
       try {
         await _doConnectRelay();
@@ -167,6 +187,11 @@ class WsClient {
           _setState(ConnState.paired);
         } else {
           _setState(ConnState.connected);
+          // Host 离线/未上线：通知 UI 展示「桌面端离线」，避免文案卡在「正在恢复登录 / 登录成功连接中」。
+          // 之前这里只 setState connected，startup/login 页收不到任何事件，_status 永远停在初始文案，用户以为卡死。
+          if (!_events.isClosed) {
+            _events.add(ServerEvent('host_offline', {'message': '桌面端离线，等待重新连接…'}));
+          }
         }
         break;
       case 'host_disconnected':
@@ -260,7 +285,7 @@ class WsClient {
   Future<void> dispose() async {
     _autoReconnect = false; // 主动销毁，停止自动重连
     await _sub?.cancel();
-    await _channel?.sink.close();
+    _abortChannel();
     await _events.close();
     await _stateCtrl.close();
   }
