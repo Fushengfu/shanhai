@@ -69,6 +69,16 @@ export function createSessionsModule(
 ): SessionsModule {
   const { getTokenStats, getModelProvider, getDeepSeekBridge, allModels } = deps
 
+  // 内核事件总线安全发射：host 半插件经 ctx.on 订阅内核事件（session:created / message / model:switched 等）。
+  // 单个插件监听器抛异常不能中断会话编排主流程，故 try-catch 吞掉（异常只影响该插件自己）。
+  const safeEmit = (name: string, payload: unknown): void => {
+    try {
+      ctx.kernel.ctx.emit(name, payload)
+    } catch {
+      // ignore：插件监听器异常不影响会话创建/模型切换/消息编排
+    }
+  }
+
   async function persistSessionInner(meta: SessionMeta): Promise<void> {
     try {
       const dir = sessionDirPath(ctx.sessionsDir, meta.id)
@@ -146,6 +156,7 @@ export function createSessionsModule(
     const meta: SessionMeta = { id, title: title?.trim() || '新会话', session: new Session(), workDir: workDir ?? DEFAULT_WORK_DIR, lastActiveAt: Date.now(), isSupervisor: false }
     ctx.sessions.set(id, meta)
     void persistSession(meta)
+    safeEmit('session:created', { sessionId: id, title: meta.title, isSupervisor: false })
     return id
   }
 
@@ -169,6 +180,7 @@ export function createSessionsModule(
     }
     ctx.sessions.set(SUPERVISOR_ID, meta)
     void persistSession(meta)
+    safeEmit('session:created', { sessionId: SUPERVISOR_ID, title: '会话管家', isSupervisor: true })
   }
 
   const touchSession = (id: string): void => {
@@ -279,6 +291,7 @@ export function createSessionsModule(
     meta.modelId = modelId
     void persistSession(meta)
     if (ctx.currentSessionId === sid) getModelProvider().applyModel(modelId)
+    safeEmit('model:switched', { sessionId: sid, modelId })
     return { ok: true, message: `已将会话「${meta.title}」(${sid}) 的模型切换为 ${modelId}` }
   }
 

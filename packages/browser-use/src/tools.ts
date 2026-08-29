@@ -1,7 +1,7 @@
 import type { ToolContract } from '@shanhai/tools'
 import type { BrowserCookie, BrowserUseService } from './browser-use'
 
-/** 截图上传回调：把 base64 上传到云存储，返回 https 公网链接；失败返回 null（调用方回退 base64） */
+/** 截图上传回调：把 base64 上传到云存储，返回 https 公网链接；失败返回 null 或抛异常（调用方返回失败原因，绝不回退 base64） */
 export type UploadImageFn = (imageBase64: string) => Promise<string | null>
 
 /**
@@ -142,15 +142,16 @@ function screenshotTool(service: BrowserUseService, uploadImage?: UploadImageFn)
       const buf = await service.screenshot(typeof args.appId === 'string' ? args.appId : undefined)
       const bytes = new Uint8Array(buf)
       const base64 = Buffer.from(bytes).toString('base64')
-      if (uploadImage) {
-        try {
-          const url = await uploadImage(base64)
-          if (url) return { imageUrl: url, byteLength: bytes.length }
-        } catch {
-          // 上传失败：回退 base64（保证截图功能不失效）
-        }
+      if (!uploadImage) {
+        return { ok: false, error: `截图已生成（${bytes.length} 字节），但未配置云存储上传，无法返回截图链接`, byteLength: bytes.length }
       }
-      return { imageBase64: base64, byteLength: bytes.length }
+      try {
+        const url = await uploadImage(base64)
+        if (url) return { imageUrl: url, byteLength: bytes.length }
+        return { ok: false, error: `截图已生成（${bytes.length} 字节），但上传云存储失败（未返回链接，可能未登录）`, byteLength: bytes.length }
+      } catch (err) {
+        return { ok: false, error: `截图已生成（${bytes.length} 字节），但上传云存储失败：${err instanceof Error ? err.message : String(err)}`, byteLength: bytes.length }
+      }
     },
   }
 }

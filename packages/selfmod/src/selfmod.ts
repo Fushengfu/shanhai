@@ -240,17 +240,27 @@ export class SelfModifyRuntime {
     }
 
     // —— host 半：优先 require 编译产物（entryHost），否则 vm 沙箱评估源码（code）。facade 只暴露五条能力 ——
-    if (pkg.entryHost && existsSync(pkg.entryHost)) {
-      const factory = loadHostEntry(pkg.entryHost)
-      // 卸载时清 require 缓存，避免重复加载/内存泄漏（stack 撤销时调用）
-      const entry = pkg.entryHost
-      stack.collect(() => unloadHostEntry(entry))
-      const ret = await factory(this.buildFacade(pkg, stack))
-      stack.collect(ret as () => void | Promise<void>)
-    } else if (pkg.code) {
-      const factory = evalHostCode(pkg.code)
-      const ret = await factory(this.buildFacade(pkg, stack))
-      stack.collect(ret as () => void | Promise<void>)
+    try {
+      if (pkg.entryHost && existsSync(pkg.entryHost)) {
+        const factory = loadHostEntry(pkg.entryHost)
+        // 卸载时清 require 缓存，避免重复加载/内存泄漏（stack 撤销时调用）
+        const entry = pkg.entryHost
+        stack.collect(() => unloadHostEntry(entry))
+        const ret = await factory(this.buildFacade(pkg, stack))
+        stack.collect(ret as () => void | Promise<void>)
+      } else if (pkg.code) {
+        const factory = evalHostCode(pkg.code)
+        const ret = await factory(this.buildFacade(pkg, stack))
+        stack.collect(ret as () => void | Promise<void>)
+      }
+    } catch (err) {
+      // host 半执行失败（越权审计拒绝 / factory 抛错）：撤销已收集的 disposer 与已投递的 client 半，
+      // 避免残留半注册状态（on/provide/tools.register/openWindow + 界面组件），再把错误抛给上层。
+      await stack.dispose()
+      if (clientDelivered) {
+        await this.hooks.removeClient(pkg.id).catch(() => undefined)
+      }
+      throw err
     }
 
     this.disposers.set(pkg.id, () => stack.dispose())

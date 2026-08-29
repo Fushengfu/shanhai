@@ -101,8 +101,18 @@ export function createExecutionModule(
     const loop = new AgentLoop(effModel, isSupervisorRun ? ctx.supervisorLoopTools : ctx.tools, targetSession, ctx.approval, sid, tokenStats.currentContextBudget(effModelId), visionCapable, tokenStats.currentApiKey(effModelId), modelProvider.resolveCompactModel())
     ctx.runningLoops.set(sid, loop)
     let suspended = false
+    // 内核事件总线：消息到达（用户消息提交 → assistant 回复完成）都广播给 host 半插件（ctx.on 订阅）。
+    // 单个插件监听器异常不影响会话编排主流程（try-catch 吞掉）。
+    const safeEmit = (name: string, payload: unknown): void => {
+      try {
+        ctx.kernel.ctx.emit(name, payload)
+      } catch {
+        // ignore：插件监听器异常不影响消息编排
+      }
+    }
+    safeEmit('message', { sessionId: sid, role: 'user', content: message })
     try {
-      return await sessionContext.run(sid, () =>
+      const result = await sessionContext.run(sid, () =>
         loop.run(message, {
           ...opts,
           systemPrompt: isSupervisorRun ? prompts.buildSupervisorSystemPrompt(message) : prompts.buildSystemPrompt(meta.workDir, prompts.buildMemoryContext(message, meta.id)),
@@ -110,6 +120,8 @@ export function createExecutionModule(
           modelContent,
           // 管家历史回放轮数比普通会话多（30 vs 20），便于跨会话编排时保留更长上下文主线
           maxHistoryTurns: isSupervisorRun ? SUPERVISOR_MAX_HISTORY_TURNS : undefined,
+          // 管家会话按事件完整回放历史（保留工具调用 tool/call + tool/result，保证后续决策有依据）；普通会话只回放 user + 最终 assistant 正文
+          preserveToolCalls: isSupervisorRun,
           onDelta: (text) => {
             if (ctx.stoppedSessions.has(sid)) throw new Error('__stopped__')
             ctx.deltaCallbacks.forEach((cb) => cb(sid, text))
@@ -119,6 +131,8 @@ export function createExecutionModule(
           },
         }),
       )
+      safeEmit('message', { sessionId: sid, role: 'assistant', content: result })
+      return result
     } catch (err) {
       if (err instanceof Error && err.message === '__stopped__') {
         return '（已中断，历史已保留，可点击「继续执行」续跑）'

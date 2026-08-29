@@ -39,6 +39,23 @@ export async function ensureSupervisorWorkspace(): Promise<void> {
 export async function removeSessionLedger(sessionId: string): Promise<void> {
   const dir = resolve(SUPERVISOR_WORKSPACE, sessionId)
   await fs.rm(dir, { recursive: true, force: true })
+
+  // 联动清理顶层 _index.json 里该会话的索引条目，避免「删除会话后索引残留指向已删会话」。
+  // _index.json 是模型维护的速查索引（结构 { updatedAt, sessions: { <id>: { title, tags } } }），
+  // 这里只删 sessions 下对应的 id 键，不重建结构、不更新 updatedAt，保持最小侵入。
+  const indexPath = join(SUPERVISOR_WORKSPACE, '_index.json')
+  try {
+    const raw = await fs.readFile(indexPath, 'utf8')
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && parsed.sessions && typeof parsed.sessions === 'object') {
+      if (Object.prototype.hasOwnProperty.call(parsed.sessions, sessionId)) {
+        delete parsed.sessions[sessionId]
+        await fs.writeFile(indexPath, JSON.stringify(parsed, null, 2) + '\n', 'utf8')
+      }
+    }
+  } catch {
+    // _index.json 不存在 / 损坏 / 结构异常时忽略：索引清理失败不应阻断删除会话主流程。
+  }
 }
 
 /**

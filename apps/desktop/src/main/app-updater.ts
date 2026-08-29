@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, shell } from 'electron'
 import type { MessageBoxOptions, MessageBoxReturnValue } from 'electron'
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import { promises as fs } from 'node:fs'
+import { promises as fs, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { safeSend } from './safe-send'
@@ -152,18 +152,29 @@ function compareVersion(a: string, b: string): number {
   return 0
 }
 
-function versionToBuildCode(version: string): number {
-  const parts = versionParts(version)
-  const a = parts[0] ?? 0
-  const b = parts[1] ?? 0
-  const c = parts[2] ?? 0
-  const d = parts[3] ?? 0
-  return a * 1_000_000_000 + b * 1_000_000 + c * 1_000 + d
-}
-
 function parseVersionCode(value: unknown): number {
   const numeric = Number.parseInt(String(value ?? '').replace(/[^\d]/g, ''), 10)
   return Number.isFinite(numeric) ? numeric : 0
+}
+
+/**
+ * 读取本地「递增 build code」（macOS 的 CFBundleVersion，由 electron-builder 的根配置 buildVersion 写入）。
+ * version_code 是网关维护的「递增发布序号」（查证：macOS version_code=54、Android version_code=1，均为整数递增），
+ * 与 version 字符串是「两个独立维度」，无法用「版本号加权」对齐量纲。
+ * 因此 build code 比较必须两端都用 version_code（递增整数）：本地 CFBundleVersion vs 网关 version_code。
+ * 未打包（开发态 electron .）/ 非 macOS / 读不到时返回空串 → 表示「本地无 build code」，退化为仅 version 字符串比较。
+ */
+function readCurrentBuildVersion(): string {
+  if (!app.isPackaged || process.platform !== 'darwin') return ''
+  try {
+    // <app>.app/Contents/MacOS/<exe> → 上两级 = <app>.app/Contents/Info.plist
+    const infoPlist = path.join(path.dirname(app.getPath('exe')), '..', 'Info.plist')
+    const plist = readFileSync(infoPlist, 'utf8')
+    const m = plist.match(/<key>CFBundleVersion<\/key>\s*<string>([^<]+)<\/string>/)
+    return m?.[1] ?? ''
+  } catch {
+    return ''
+  }
 }
 
 async function fetchVersionCheck(
@@ -391,6 +402,8 @@ async function downloadUpdatePackage(
                   actual: actualHash,
                 })
                 if (actualHash.toLowerCase() !== expectedSha256.toLowerCase()) {
+                  // 校验失败：删除已下载的损坏文件，避免残留污染 downloads 目录
+                  await fs.rm(finalPath, { force: true }).catch(() => undefined)
                   reject(new Error(`文件校验失败：SHA256 不匹配\n期望: ${expectedSha256}\n实际: ${actualHash}`))
                   return
                 }
@@ -480,11 +493,16 @@ export async function checkAndPromptForUpdate(
     const latest = await fetchVersionCheck(updateType, currentVersion)
     const latestVersion = String(latest.version ?? '').trim()
     const latestVersionCode = String(latest.version_code ?? '').trim()
-    const currentBuildCode = versionToBuildCode(currentVersion)
-    const remoteBuildCode = parseVersionCode(latest.version_code)
+    // build code 比较两端统一为「递增整数」（对齐手机端 _isNewer：优先 version_code 数字比较）：
+    // currentVersionCode 来自本地 CFBundleVersion（打包后写入），remoteVersionCode 来自网关 version_code。
+    // 任一缺失（返回 0）则退化到仅 version 字符串比较，不再出现「版本号加权 vs 递增整数」的量纲错位。
+    const currentVersionCode = parseVersionCode(readCurrentBuildVersion())
+    const remoteVersionCode = parseVersionCode(latest.version_code)
     const versionCmp = latestVersion ? compareVersion(latestVersion, currentVersion) : 0
     const hasUpdate = Boolean(
-      latestVersion && (versionCmp > 0 || (versionCmp === 0 && remoteBuildCode > currentBuildCode)),
+      latestVersion &&
+        (versionCmp > 0 ||
+          (versionCmp === 0 && remoteVersionCode > 0 && currentVersionCode > 0 && remoteVersionCode > currentVersionCode)),
     )
     const releaseNotes = String(latest.release_notes ?? latest.releaseNotes ?? '').trim()
     const downloadUrl = String(latest.download_url ?? latest.downloadUrl ?? '').trim()

@@ -66,6 +66,9 @@ export interface AgentLoopOptions {
   modelContent?: string
   /** 历史回放保留的最近对话回合数（缺省 MAX_HISTORY_TURNS=20；管家等特殊会话可传入更大值） */
   maxHistoryTurns?: number
+  /** 裁剪历史回合时是否保留回合内的工具调用事件（tool/call + tool/result + assistant(tool_calls)）。
+   * true=按事件完整回放（管家会话用，保证工具调用历史不丢失、后续决策有依据）；false/缺省=只保留 user + 最终 assistant 正文（普通会话用，压缩上下文体积）。 */
+  preserveToolCalls?: boolean
 }
 
 /**
@@ -181,7 +184,8 @@ export class AgentLoop {
 
     // 用户发起的新任务（新发消息 / 编辑重发 / 点击重发）：始终按最近 maxHistoryTurns（缺省 20）轮对话回放（每轮只保留用户消息 + 最终 assistant 回复正文，
     // 丢弃更早历史与工具执行过程），不再全量回放。断点续跑 resumeRun() 走独立路径，保留全量已执行历史。
-    this.trimHistoryToRecentTurns(messages, options?.maxHistoryTurns)
+    // preserveToolCalls=true 时（管家会话），每回合按事件完整回放、保留工具调用（tool/call + tool/result + assistant(tool_calls)）。
+    this.trimHistoryToRecentTurns(messages, options?.maxHistoryTurns, options?.preserveToolCalls)
 
     // 追加当前消息（含多模态附件，附件一并写入事件日志，回放时还原）。
     // 落盘永远保留原始 message + attachments；发给模型的内容在有 modelContent 时用降级后的文字（如图片降级）
@@ -249,16 +253,17 @@ export class AgentLoop {
    * 工具执行过程，最大程度压缩体积同时保留对话主线。按 user 消息为回合边界，不切断「assistant(tool_calls) ↔ tool」配对
    * （这些过程整体丢弃，不会产生孤立 tool 消息）。历史不足 MAX_HISTORY_TURNS 轮时保留全部（等于未裁剪）。
    * 断点续跑 resumeRun() 不调用本方法，保留全量已执行历史。 */
-  private trimHistoryToRecentTurns(messages: ChatMessage[], maxTurns?: number): void {
-    const trimmed = this.buildTrimmedMessages(messages, maxTurns)
+  private trimHistoryToRecentTurns(messages: ChatMessage[], maxTurns?: number, preserveToolCalls?: boolean): void {
+    const trimmed = this.buildTrimmedMessages(messages, maxTurns, preserveToolCalls)
     messages.length = 0
     messages.push(...trimmed)
   }
 
-  /** 裁剪 messages 到最近 maxTurns（缺省 MAX_HISTORY_TURNS）个对话回合，返回新数组：每回合只保留「用户原始消息 + 最终 assistant 回复正文」，
-   * 丢弃中间的 tool/call、tool/result、assistant(tool_calls) 工具执行过程（maxTurns 对 user/assistant 正文）。
-   * 调用方已确认需要裁剪，此处不再判断回合数是否超上限，始终只保留 user/assistant 正文。 */
-  private buildTrimmedMessages(messages: ChatMessage[], maxTurns?: number): ChatMessage[] {
+  /** 裁剪 messages 到最近 maxTurns（缺省 MAX_HISTORY_TURNS）个对话回合，返回新数组：
+   * - preserveToolCalls=true：每回合按事件完整保留（user → assistant(tool_calls) → tool → ... → 最终 assistant 正文），不丢弃工具调用；
+   * - preserveToolCalls=false/缺省：每回合只保留「用户原始消息 + 最终 assistant 回复正文」，丢弃中间的 tool/call、tool/result、assistant(tool_calls) 工具执行过程。
+   * 调用方已确认需要裁剪，此处不再判断回合数是否超上限，始终只保留最近 limit 个回合。 */
+  private buildTrimmedMessages(messages: ChatMessage[], maxTurns?: number, preserveToolCalls?: boolean): ChatMessage[] {
     const limit = maxTurns ?? MAX_HISTORY_TURNS
     const systemMsgs = messages.filter((m) => m.role === 'system')
     const rest = messages.filter((m) => m.role !== 'system')
@@ -266,14 +271,21 @@ export class AgentLoop {
     rest.forEach((m, i) => {
       if (m.role === 'user') userIndices.push(i)
     })
-    // 保留最近 limit 个回合：每回合 = 用户原始消息 + 该回合最终 assistant 正文（无工具调用的最终回复）
     const kept: ChatMessage[] = []
     const keptUserIndices = userIndices.slice(-limit) // 最近 limit 个 user 消息在 rest 中的索引
     keptUserIndices.forEach((userIdx, t) => {
+      const nextUserIdx = keptUserIndices[t + 1] ?? rest.length // 下一个 user 消息的位置（最后一个回合取 rest 末尾）
+      if (preserveToolCalls) {
+        // 按事件完整保留该回合：user → assistant(tool_calls) → tool/result → ... → 最终 assistant 正文
+        for (let i = userIdx; i < nextUserIdx; i++) {
+          const m = rest[i]
+          if (m) kept.push(m)
+        }
+        return
+      }
       const userMsg = rest[userIdx]
       if (!userMsg) return
       kept.push(userMsg) // 用户发的原始消息
-      const nextUserIdx = keptUserIndices[t + 1] ?? rest.length // 下一个 user 消息的位置（最后一个回合取 rest 末尾）
       // 在该回合内倒序找最后一条 assistant 正文（最终回复，无工具调用）；任务中止无正文时该回合只留 user 消息
       for (let i = nextUserIdx - 1; i > userIdx; i--) {
         const m = rest[i]
