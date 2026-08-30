@@ -16,12 +16,15 @@ class SupervisorPage extends StatelessWidget {
       title: '会话管家',
       isSupervisor: true,
       sendFn: (message) => ws.sendCommand('run_supervisor', {'message': message}),
-      loadHistoryFn: () async {
-        final r = await ws.sendCommand('get_supervisor_history');
-        if (r.ok && r.data is List) {
-          return (r.data as List).map((e) => HistoryItem.fromJson(e as Map<String, dynamic>)).toList();
+      loadHistoryFn: ({int? sinceTurnSeq, int? beforeTurnSeq}) async {
+        final payload = <String, dynamic>{};
+        if (sinceTurnSeq != null) payload['sinceTurnSeq'] = sinceTurnSeq;
+        if (beforeTurnSeq != null) payload['beforeTurnSeq'] = beforeTurnSeq;
+        final r = await ws.sendCommand('get_supervisor_history', payload);
+        if (r.ok && r.data is Map) {
+          return HistoryResponse.fromJson(r.data as Map<String, dynamic>);
         }
-        return [];
+        return HistoryResponse.empty;
       },
     );
   }

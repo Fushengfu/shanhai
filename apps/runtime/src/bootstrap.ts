@@ -61,6 +61,10 @@ import { createExecutionModule } from './execution'
 import { withConfigFile, ensureDeviceInfo, persistSelectedModel, persistLastActiveSessionId, readLastActiveSessionId, readSettings, writeSettings, getDeviceInfoState, setDeviceInfoName } from './config'
 import { spawnSay, createSystemVoiceService, gatewayAsrTranscribe } from './voice'
 
+/** 插件模型调用（modelCall）限流：每插件每分钟最多 N 次（简单时间窗口，按插件 id 分组）。 */
+const PLUGIN_MODEL_CALL_MAX_PER_MINUTE = 20
+const pluginModelCallWindows = new Map<string, number[]>()
+
 export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime> {
   // 初始化设备标识（远程连接多设备用）：读取/生成 deviceId + 设备名，早于任何 getDeviceInfo 调用
   await ensureDeviceInfo()
@@ -1145,6 +1149,35 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
 
     invokePluginService(appId, name, args) {
       return ctx.selfmod.invokeService(appId, name, args)
+    },
+
+    async invokeModelForPlugin(appId, input) {
+      const prompt = typeof input?.prompt === 'string' ? input.prompt : ''
+      if (!prompt.trim()) throw new Error('modelCall 缺少 prompt 参数')
+      // 输入长度上限：防止插件塞超长 prompt 撑爆上下文（prompt 8000 字符、systemPrompt 4000 字符）
+      if (prompt.length > 8000) throw new Error('modelCall 的 prompt 超长（上限 8000 字符）')
+      const systemPrompt = typeof input?.systemPrompt === 'string' ? input.systemPrompt.trim() : ''
+      if (systemPrompt.length > 4000) throw new Error('modelCall 的 systemPrompt 超长（上限 4000 字符）')
+      // 限流：每插件每分钟最多 N 次（简单时间窗口，按插件 id 分组）
+      const now = Date.now()
+      const recent = (pluginModelCallWindows.get(appId) ?? []).filter((t) => now - t < 60_000)
+      if (recent.length >= PLUGIN_MODEL_CALL_MAX_PER_MINUTE) {
+        throw new Error(`插件 "${appId}" 模型调用过于频繁（每分钟最多 ${PLUGIN_MODEL_CALL_MAX_PER_MINUTE} 次），请稍后再试`)
+      }
+      recent.push(now)
+      pluginModelCallWindows.set(appId, recent)
+      // 模型固定：只能调「当前选中的模型」，插件不能指定 modelId、无法切模型
+      const modelId = modelProviderModule.getCurrentModelId()
+      if (!modelId) throw new Error('当前没有选中的模型，无法调用 modelCall')
+      const provider = modelProviderModule.resolveProvider(modelId)
+      const messages: ChatMessage[] = []
+      if (systemPrompt) messages.push({ role: 'system', content: systemPrompt })
+      messages.push({ role: 'user', content: prompt })
+      const res = await provider.complete(messages, undefined, `plugin:${appId}`)
+      return {
+        text: res.text ?? '',
+        usage: res.usage ? { promptTokens: res.usage.promptTokens, completionTokens: res.usage.completionTokens, totalTokens: res.usage.totalTokens } : undefined,
+      }
     },
 
     onClientRunRequest(cb) {

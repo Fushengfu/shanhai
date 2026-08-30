@@ -15,8 +15,10 @@ class ChatView extends StatefulWidget {
   final String title;
   /// 发送消息回调（返回命令结果）
   final Future<CmdResult> Function(String message) sendFn;
-  /// 加载历史回调（返回历史消息列表）
-  final Future<List<HistoryItem>> Function() loadHistoryFn;
+  /// 加载历史回调（返回历史消息列表 + truncated 标记）。
+  /// [sinceTurnSeq] 增量：只返回该轮之后的新增轮次（任务结束时补拉，避免全量重拉）；
+  /// [beforeTurnSeq] 分页：加载该轮之前的更早历史（上滑「加载更早」时用）。
+  final Future<HistoryResponse> Function({int? sinceTurnSeq, int? beforeTurnSeq}) loadHistoryFn;
   /// 是否管家模式（决定停止按钮用哪个命令；管家模式无停止按钮）
   final bool isSupervisor;
   /// 进入页面时该会话是否存在未完成轮次（断点续跑入口的初始值，后续随事件查询刷新）
@@ -47,6 +49,8 @@ class _ChatViewState extends State<ChatView> {
   List<ToolTrace> _pendingTools = [];
   bool _busy = false;
   bool _loading = true;
+  /// 是否还有更早历史未加载（后端按「最近 20 轮」截断时返回 true），据此显示「加载更早」入口。
+  bool _truncated = false;
   /// 当前会话是否存在未完成轮次（断点续跑入口；对齐桌面端 hasIncompleteTurn）
   bool _incompleteTurn = false;
   StreamSubscription<ServerEvent>? _eventSub;
@@ -127,10 +131,11 @@ class _ChatViewState extends State<ChatView> {
 
   Future<void> _loadHistory() async {
     try {
-      final items = await widget.loadHistoryFn();
+      final resp = await widget.loadHistoryFn();
       if (!mounted) return;
       setState(() {
-        _items = items;
+        _items = resp.items;
+        _truncated = resp.truncated;
         _loading = false;
       });
       _scrollToBottom();
@@ -139,22 +144,63 @@ class _ChatViewState extends State<ChatView> {
     }
   }
 
-  /// 任务结束（完成/中断/报错）时：先拉取历史重建 _items（含 assistant 气泡），
-  /// 再一次性清空流式 + 置 busy=false，让「流式清空」与「最终气泡重建」落在同一批状态变更里，消除闪屏空窗。
+  /// 任务结束（完成/中断/报错）时：把流式气泡 + pending 工具落成最终气泡，不再全量重拉历史。
+  /// 若本地没有流式内容（可能错过了 delta 事件流），则用 sinceTurnSeq 增量补拉新增轮次兜底。
   Future<void> _finishTurn() async {
-    try {
-      final items = await widget.loadHistoryFn();
+    final hasLocal = _streaming.isNotEmpty || _streamingReasoning.isNotEmpty || _pendingTools.isNotEmpty;
+    if (hasLocal) {
+      _commitStreamingToItems();
       if (!mounted) return;
       setState(() {
-        _items = items;
-        _streaming = '';
-        _streamingReasoning = '';
+        _busy = false;
+        _loading = false;
+      });
+      _scrollToBottom();
+    } else {
+      // 本地无流式内容：增量补拉新增轮次（数据量小，非全量）
+      await _incrementalRefresh();
+    }
+    _refreshIncompleteTurn();
+  }
+
+  /// 把当前流式气泡 + pending 工具落成一个最终 assistant 气泡追加到 _items。
+  /// tool 步骤先作为 ToolItem 追加，_buildNodes 会自动聚合到紧随其后的 assistant 气泡内。
+  void _commitStreamingToItems() {
+    final hasContent = _streaming.isNotEmpty || _streamingReasoning.isNotEmpty || _pendingTools.isNotEmpty;
+    if (!hasContent) return;
+    for (final t in _pendingTools) {
+      _items.add(ToolItem(trace: t));
+    }
+    _items.add(AssistantItem(
+      content: _streaming,
+      reasoningContent: _streamingReasoning.isEmpty ? null : _streamingReasoning,
+      turnSeq: null,
+      turnDuration: null,
+    ));
+    _streaming = '';
+    _streamingReasoning = '';
+    _pendingTools = [];
+  }
+
+  /// 增量补拉：用「本地最大 turnSeq」作为 sinceTurnSeq，只拉新增轮次并追加（不重建全量）。
+  Future<void> _incrementalRefresh() async {
+    if (!mounted) return;
+    try {
+      int maxSeq = 0;
+      for (final it in _items) {
+        if (it is UserItem && it.turnSeq != null && it.turnSeq! > maxSeq) maxSeq = it.turnSeq!;
+        if (it is AssistantItem && it.turnSeq != null && it.turnSeq! > maxSeq) maxSeq = it.turnSeq!;
+      }
+      final resp = await widget.loadHistoryFn(sinceTurnSeq: maxSeq);
+      if (!mounted) return;
+      setState(() {
+        if (resp.items.isNotEmpty) _items.addAll(resp.items);
+        _truncated = resp.truncated;
         _busy = false;
         _loading = false;
       });
       _scrollToBottom();
     } catch (_) {
-      // 拉历史失败也要兜底清流式/置空闲，避免 busy 卡死
       if (!mounted) return;
       setState(() {
         _streaming = '';
@@ -162,7 +208,26 @@ class _ChatViewState extends State<ChatView> {
         _busy = false;
       });
     }
-    _refreshIncompleteTurn();
+  }
+
+  /// 加载更早历史：用「当前已加载的最早 turnSeq」作为 beforeTurnSeq，请求更早一轮分页，
+  /// 结果头插到 _items 前面（保持正序）。
+  Future<void> _loadEarlier() async {
+    if (!mounted || _busy) return;
+    int minSeq = 1 << 30;
+    for (final it in _items) {
+      if (it is UserItem && it.turnSeq != null && it.turnSeq! < minSeq) minSeq = it.turnSeq!;
+    }
+    try {
+      final resp = await widget.loadHistoryFn(beforeTurnSeq: minSeq == (1 << 30) ? null : minSeq);
+      if (!mounted) return;
+      setState(() {
+        if (resp.items.isNotEmpty) _items = [...resp.items, ..._items];
+        _truncated = resp.truncated;
+      });
+    } catch (_) {
+      // 静默忽略（下次上滑再试）
+    }
   }
 
   /// 滚回最新消息。列表采用 reverse 布局，offset 0 即最新消息（视觉底部），
@@ -679,64 +744,101 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
-  /// 正序构建消息节点列表：把连续的 tool 步骤聚合到紧随其后的 assistant 气泡内
-  /// （对齐桌面端 ChatPlugin 的 toolBuffer 聚合逻辑），user/assistant 独立成气泡。
-  List<Widget> _buildNodes() {
-    final nodes = <Widget>[];
-    var toolBuffer = <ToolTrace>[];
-    var userIdx = 0; // 第几条用户消息（0 起，对齐 resend 的 userMessageIndex）
-    void flushTools() {
-      if (toolBuffer.isEmpty) return;
-      nodes.add(Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [for (final t in toolBuffer) ToolStepWidget(trace: t)],
-      ));
-      toolBuffer = [];
-    }
-
+  /// 预计算「渲染块」索引（只记下标，不构建 Widget）：一轮聚合为一个块——
+  /// user 独立成块；连续的 tool 步骤与紧随其后的 assistant 合并成一个 assistant 块；
+  /// 尾部残留 tool（任务中断无收尾）独立成 tools 块。
+  /// 这样 ListView.builder 的 itemBuilder 按块惰性构建 Widget，避免一次性物化全部节点。
+  List<_Block> _buildBlocks() {
+    final blocks = <_Block>[];
+    var toolStart = -1; // 连续 tool 的起始下标
+    var userIdx = 0;
     for (var i = 0; i < _items.length; i++) {
       final item = _items[i];
       if (item is UserItem) {
-        flushTools();
-        // turnSeq 后端从 1 起，resend 的 userMessageIndex 从 0 起；乐观添加的消息 turnSeq 为 null，用顺序计数兜底
+        if (toolStart >= 0) {
+          blocks.add(_Block('tools', toolStart, i));
+          toolStart = -1;
+        }
         final msgIdx = item.turnSeq != null ? item.turnSeq! - 1 : userIdx;
-        nodes.add(UserBubble(
-          content: item.content,
-          onResend: () => _resend(msgIdx, null),
-          onEdit: (newContent) => _editAndResend(i, msgIdx, newContent),
-        ));
+        blocks.add(_Block('user', i, i + 1, msgIdx));
         userIdx++;
       } else if (item is AssistantItem) {
-        nodes.add(AssistantBubble(
-          content: item.content,
-          reasoning: item.reasoningContent,
-          toolSteps: List<ToolTrace>.of(toolBuffer),
-          turnDuration: item.turnDuration,
-        ));
-        toolBuffer = [];
+        blocks.add(_Block('assistant', toolStart >= 0 ? toolStart : i, i + 1));
+        toolStart = -1;
       } else if (item is ToolItem) {
-        toolBuffer.add(item.trace);
+        if (toolStart < 0) toolStart = i;
       }
     }
-    // 尾部残留 tool（如任务中断、无 assistant 收尾）：独立渲染为紧凑步骤
-    flushTools();
-    return nodes;
+    if (toolStart >= 0) blocks.add(_Block('tools', toolStart, _items.length));
+    return blocks;
+  }
+
+  /// 按块惰性构建单个 Widget（只在 itemBuilder 拉到可视区时调用）。
+  Widget _buildBlock(_Block b) {
+    switch (b.type) {
+      case 'user':
+        final item = _items[b.start] as UserItem;
+        return UserBubble(
+          content: item.content,
+          onResend: () => _resend(b.userMsgIdx, null),
+          onEdit: (newContent) => _editAndResend(b.start, b.userMsgIdx, newContent),
+        );
+      case 'assistant':
+        final item = _items[b.end - 1] as AssistantItem;
+        final tools = <ToolTrace>[
+          for (var i = b.start; i < b.end - 1; i++) (_items[i] as ToolItem).trace,
+        ];
+        return AssistantBubble(
+          content: item.content,
+          reasoning: item.reasoningContent,
+          toolSteps: tools,
+          turnDuration: item.turnDuration,
+        );
+      default: // tools
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            for (var i = b.start; i < b.end; i++) ToolStepWidget(trace: (_items[i] as ToolItem).trace),
+          ],
+        );
+    }
   }
 
   Widget _buildList() {
-    final nodes = _buildNodes();
+    final blocks = _buildBlocks();
+    final extraBusy = _busy ? 1 : 0;
+    final extraEarlier = _truncated ? 1 : 0;
+    final itemCount = blocks.length + extraBusy + extraEarlier;
     return ListView.builder(
       controller: _scrollCtrl,
       reverse: true,
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-      itemCount: nodes.length + (_busy ? 1 : 0),
+      itemCount: itemCount,
       itemBuilder: (ctx, i) {
-        // reverse 列表：i=0 是视觉底部（最新）。流式气泡固定在最底部，
-        // 历史消息按「新→旧」向上排列，进页天然停在最新位置，无需手动滚底。
+        // reverse 列表：i=0 是视觉底部（最新），i=itemCount-1 是视觉顶部（最早）。
+        // 流式气泡固定在底部；历史块按「新→旧」向上排列；「加载更早」入口在最顶部。
         if (_busy && i == 0) return _buildStreamingBubble();
-        final offset = _busy ? i - 1 : i;
-        return nodes[nodes.length - 1 - offset];
+        final blockIdx = i - extraBusy;
+        if (blockIdx < blocks.length) {
+          return _buildBlock(blocks[blocks.length - 1 - blockIdx]);
+        }
+        return _buildLoadEarlierBar();
       },
+    );
+  }
+
+  /// 「加载更早」入口：当后端按「最近 20 轮」截断（truncated=true）时，在列表顶部显示，
+  /// 点击用 beforeTurnSeq 分页拉取更早历史。
+  Widget _buildLoadEarlierBar() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Center(
+        child: TextButton.icon(
+          onPressed: _loadEarlier,
+          icon: const Icon(Icons.expand_less, size: 16, color: Color(0xFF808080)),
+          label: const Text('加载更早历史', style: TextStyle(fontSize: 12, color: Color(0xFF808080))),
+        ),
+      ),
     );
   }
 
@@ -810,6 +912,16 @@ class _ChatViewState extends State<ChatView> {
       ),
     );
   }
+}
+
+/// 渲染块：只记录在 _items 中的下标区间，不持有 Widget。
+/// type: 'user'（单个用户气泡）/ 'assistant'（一个 assistant 气泡，含前面聚合的 tool 步骤）/ 'tools'（尾部残留工具步骤）。
+class _Block {
+  final String type;
+  final int start; // 在 _items 中的起始下标（含）
+  final int end; // 在 _items 中的结束下标（不含）
+  final int userMsgIdx; // user 块的 resend 序号（对齐 userMessageIndex）
+  const _Block(this.type, this.start, this.end, [this.userMsgIdx = 0]);
 }
 
 /// 提问弹窗内「AI 为什么问你」折叠区（对齐桌面端 AskCard 的 reasoning details）

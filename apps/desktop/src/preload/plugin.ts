@@ -79,6 +79,12 @@ export interface ShanhaiPluginBridge {
    * 默认放行（无需 permissions 声明）；只能调「本插件」的服务，无法越权调其它插件/内核。
    */
   invokePluginService(name: string, ...args: unknown[]): Promise<unknown>
+  /**
+   * 模型调用（受控单次文本生成）：用「当前选中的模型」生成一次文本。
+   * 需显式声明 permissions: ["modelCall"]；不能指定模型 id、不能切模型，单次 maxTokens 上限由主进程固定。
+   * 入参 { prompt: 必填用户提示词, systemPrompt?: 可选系统提示词 }，返回 { text, usage? }。
+   */
+  modelCall(input: { prompt: string; systemPrompt?: string }): Promise<{ text: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }>
 }
 
 /** 统一入口：所有能力走主进程 plugin:invoke 双层校验 */
@@ -99,6 +105,7 @@ const pluginBridge: ShanhaiPluginBridge = {
   getWallpaper: () => invoke('getWallpaper') as Promise<string | null>,
   getTokenStats: (sessionId) => invoke('getTokenStats', sessionId) as Promise<unknown>,
   invokePluginService: (name, ...rest) => invoke('invokePluginService', name, rest) as Promise<unknown>,
+  modelCall: (input) => invoke('modelCall', input) as Promise<{ text: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }>,
 }
 
 contextBridge.exposeInMainWorld('shanhaiPlugin', pluginBridge)

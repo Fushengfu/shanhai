@@ -143,6 +143,25 @@ sealed class HistoryItem {
   }
 }
 
+/// get_history / get_supervisor_history 的返回体：items + truncated（是否还有更早历史未返回）。
+/// 后端按「最近 20 轮」截断，truncated=true 表示可上滑加载更早历史。
+class HistoryResponse {
+  final List<HistoryItem> items;
+  final bool truncated;
+  const HistoryResponse({required this.items, required this.truncated});
+
+  factory HistoryResponse.fromJson(Map<String, dynamic> j) {
+    return HistoryResponse(
+      items: ((j['items'] as List?) ?? const [])
+          .map((e) => HistoryItem.fromJson(e as Map<String, dynamic>))
+          .toList(),
+      truncated: (j['truncated'] ?? false) as bool,
+    );
+  }
+
+  static const empty = HistoryResponse(items: [], truncated: false);
+}
+
 class UserItem extends HistoryItem {
   final String content;
   final List<dynamic> attachments;

@@ -1,24 +1,14 @@
 # 山海插件协议规范（权威版）
 
 > 本文是山海 AI「插件（selfmod / K5 自修改）」的**权威、唯一、机器可读**协议规范。
-> 它由源码真实契约梳理而成，AI 开发插件前**必须先读本文，禁止靠猜或试错**。
-> 若本文与工具描述文字冲突，以本文为准；若本文与源码实现冲突，以源码为准并回读本文修正。
+> AI 开发插件前**必须先读本文，禁止靠猜或试错**。
+> 若本文与工具描述文字冲突，以本文为准；本文未说明的内容，如实标注「协议未说明」，禁止自行猜测或翻源码求证。
 >
-> 内置同步：本文是**唯一权威源**。`packages/skills/src/plugin-protocol.generated.ts` 由
-> `packages/skills/scripts/gen-plugin-protocol.mjs` 从本文自动生成，`skill.ts` 的内置技能 `plugin-protocol`（instructions）引用它。
-> 改协议**只改本文**，再跑 `pnpm --filter @shanhai/skills gen:protocol`（`build` 前会自动执行）即可同步。
-> 打包分发后 AI 通过 `skill_list` / `skill_read('plugin-protocol')` 即可读到本规范（无需读仓库源码）。
+> 内置同步：本文是**唯一权威源**，打包时自动生成内置技能 `plugin-protocol`（instructions）。
+> 维护者改协议**只改本文**，再跑 `pnpm --filter @shanhai/skills gen:protocol`（`build` 前会自动执行）即可同步。
+> 打包分发后 AI 通过 `skill_list` / `skill_read('plugin-protocol')` 即可读到本规范。
 
-- 源码锚点（grep 定位用）：
-  - `packages/selfmod/src/selfmod.ts` —— host 半契约 `HostFacade`、生命周期 `SelfModifyRuntime`、插件工具链
-  - `packages/selfmod/src/build.ts` —— `plugin_build` 进程内构建器、越权审计
-  - `packages/selfmod/src/scaffold.ts` —— `plugin_scaffold` 内置模板
-  - `packages/kernel/src/selfmod/inventory.ts` —— `DynamicPackage`、`InstalledPackageMeta`、`PluginStore`（落盘）
-  - `packages/kernel/src/runtime/dispose.ts` —— `DisposerStack`（disposer 收集/撤销）
-  - `apps/desktop/src/preload/plugin.ts` —— 插件专用 preload（`window.shanhaiPlugin` 白名单桥）
-  - `apps/desktop/src/main/ipc-handlers.ts` —— `plugin:invoke` 统一入口 + `PLUGIN_CAPABILITIES` 白名单
-  - `apps/desktop/src/main/plugin-apps.ts` / `push.ts` —— 窗口应用注册表 + Dock 图标广播
-  - `apps/runtime/src/bootstrap.ts` —— `SelfModifyHooks` 的实现装配
+> ⚠️ **终端用户环境无源码仓库**（只有打包产物 + 本协议 + 事件日志）。插件开发查资料**只有一条路**：`skill_read('plugin-protocol')` 读本协议；本协议未说明的，如实标注「协议未说明」，禁止翻源码 / 凭印象猜。
 
 ---
 
@@ -78,7 +68,7 @@ interface HostFacade {
 
 > ⚠️ **坑 9（`ctx.on` 无可订阅内核事件）**：`ctx.on` 桥接到内核事件总线 `kernel.ctx.on`，但当前内核**零 `emit` 调用**——没有内核事件会广播，可订阅事件清单**为空**。插件 `ctx.on('任意名字', ...)` 只是挂一个永远不会被触发的监听器（除非未来内核广播事件，或插件间协作，但 facade 也未暴露 emit）。开发时**不要依赖 `ctx.on` 接收内核事件**；它仅作为「未来内核事件 + 插件自定义协作」的占位能力保留。
 
-`ctx.tools.register` 的 `ToolContract`（`packages/tools/src/tools.ts`）：
+`ctx.tools.register` 的 `ToolContract`：
 
 ```ts
 interface ToolContract {
@@ -117,7 +107,7 @@ client 半运行在浏览器渲染进程，**唯一形态**：窗口应用（配
 
 - 窗口内容由 `dist/client.html` + `dist/assets/*`（vite 完整 React bundle）渲染，**可用完整 React + JSX + 任意依赖 + 复杂 UI**。
 - 该入口挂**插件专用 preload**（`plugin.cjs`），暴露两个桥：
-  - `window.shanhaiPlugin`（白名单桥，12 项能力，见 §6）—— 插件调山海公开接口的**唯一**通道；
+  - `window.shanhaiPlugin`（白名单桥，13 项能力，见 §6）—— 插件调山海公开接口的**唯一**通道；
   - `window.shanhai`（宿主桥，**极度缩小**：仅 `windowType`/`platform`/`windowAppId`/`getPluginApp`/`closeApp`/`minimizeWindow`/`toggleMaximizeWindow`，无任何危险接口）。
 - 构建配置要求：`base: './'`（Electron `loadFile(file://)` 下资源必须相对路径）。
 
@@ -170,7 +160,7 @@ client 半运行在浏览器渲染进程，**唯一形态**：窗口应用（配
 - 因此 `plugin_stop` / `plugin_uninstall` / `plugin_test`（撤回）时，**已打开窗口自动关闭**。
 - `ctx.closeWindow(appId?)`：只主动关闭、不挂撤销。
 - 窗口打开是**惰性**的：`openApp` 已有则聚焦、否则创建；`closeApp` 真正 `destroy()` 窗口。
-- 窗口应用注册表（主进程 `plugin-apps.ts`）：`appId → { name, entryHtml, icon, ... }`。
+- 窗口应用注册表：`appId → { name, entryHtml, icon, ... }`（由 `plugin_apps` 工具 / Dock 图标体现）。
 
 > ⚠️ **坑 1**：窗口应用默认「**不自动开窗**」——脚手架模板的 host 半**不**直接调 `ctx.openWindow()`，安装/加载后由用户点 Dock 图标主动打开（`openApp → loadFile dist/client.html`）。只有插件作者**主动**在事件回调里调 `ctx.openWindow()` 才会立即开窗（会打断用户当前工作，不推荐）。
 
@@ -229,9 +219,9 @@ interface InstalledPackageMeta {
 - `closeApp`（关闭自身窗口）：「appId 由窗口反查、无法越权关其它窗口」的无害能力，避免漏声明导致窗口无法关闭。
 - `invokePluginService`（client→host RPC）：只能调「本插件」host 半注册的服务（appId 反查 + host 服务按插件 id 分组隔离），无法越权调其它插件/内核服务，属插件内部前后端通信。
 
-**危险接口（`auth:*` / `chat:run` / `supervisor:*` / `model:switch` / `model:addCustom` / `remote:disable` / `approval:setPolicy` / `session:delete` / `settings:set` / `wallpaper:set` 等）永不进白名单，物理拿不到。**
+**危险接口（`auth:*` / `chat:run` / `supervisor:*` / `model:switch` / `model:addCustom` / `model:updateCustom` / `model:removeCustom` / `remote:disable` / `approval:setPolicy` / `session:delete` / `settings:set` / `wallpaper:set` 等）永不进白名单，物理拿不到。** 注意：`chat:run` 是「完整多轮 agent 循环」（带工具调用/审批/多轮），插件**永远拿不到**；插件若需要模型能力，只能用下方 §6 新增的 `modelCall`（受控单次文本生成，见「模型调用」小节）。
 
-## 6. 白名单能力清单（12 项）
+## 6. 白名单能力清单（13 项）
 
 | 能力 | 说明 |
 |------|------|
@@ -247,8 +237,30 @@ interface InstalledPackageMeta {
 | `getWallpaper` | 读取桌面壁纸 |
 | `getTokenStats` | token 用量快照（只读） |
 | `invokePluginService` | 调用本插件 host 半注册的自定义服务（client→host RPC，见 §1.2 `ctx.provide`）。入参：服务名 + 可变参数，返回值须 JSON 可序列化。**默认放行**：无需 `permissions` 声明 |
+| `modelCall` | **模型调用**：用「当前选中的模型」做一次单次文本生成（受控，见下「模型调用」小节）。**需显式声明** `permissions: ["modelCall"]` |
 
-> 完整可声明清单即上述 12 项；`permissions` 缺省 = 空数组 = 最小权限。
+> 完整可声明清单即上述 13 项；`permissions` 缺省 = 空数组 = 最小权限。
+
+### 6.1 模型调用（`modelCall`）
+
+插件窗口内「一键生成」场景（如 AI 短剧插件的「生成剧本」）需要直连山海模型。`modelCall` 提供**受控单次文本生成**，与 `chat:run`（完整 agent 循环）严格区分。
+
+**调用方式**（client 半 `window.shanhaiPlugin.modelCall(...)`）：
+```ts
+const res = await window.shanhaiPlugin.modelCall({
+  prompt: '把下面这段扩写成 200 字短剧分镜：……',   // 必填：用户提示词
+  systemPrompt: '你是专业短剧编剧。',             // 可选：系统提示词
+})
+// res = { text: '...', usage?: { promptTokens, completionTokens, totalTokens } }
+```
+
+**安全规则（写死，插件不可突破）**：
+1. **模型固定**：插件**不能指定模型 id**——只能调「当前会话选中的模型」（用户已登录并选好的模型，如 deepseek-v4-pro），不暴露任何 modelId 参数；无法切模型、无法换模型。
+2. **危险接口隔离**：`modelCall` 与 `model:switch` / `model:addCustom` / `chat:run` / `supervisor:*` 完全隔离，插件依然物理拿不到这些接口。
+3. **maxTokens 固定上限**：主进程固定单次生成最大 token（默认 4096），插件不可传、不可改。
+4. **非流式**：单次同步返回完整文本，不提供流式接口（避免长时间占用连接）。
+5. **需显式声明**：`permissions: ["modelCall"]`（**非默认放行**），install 顶层审批时一并批准。
+6. **限流**：主进程按「插件 id」做简单频率限制（默认每插件每分钟 20 次），超限抛错；token 用量计入全局配额（`getTokenStats` 可见）。
 
 ---
 
@@ -259,9 +271,9 @@ interface InstalledPackageMeta {
 3. **`tools.register` 注册的是「插件工具」**：收集进插件工具 Registry，**不再作为顶层 function 暴露给模型**，由统一调度工具 `plugin_tool` 按 action 分派调用（先用 `plugin_apps` 或 `plugin_inspect` 的 `pluginTools` 字段查可用工具名，见 §8）。插件工具不再直接污染模型顶层工具表。
 4. **`provide` 的函数 impl 可被 client 半 `invokePluginService` 调用**（client→host RPC，见 §6）；非函数 impl 仅 `plugin_inspect` 报告用。
 5. **host 半编译产物必须自包含**，不得 external `electron` / `@shanhai/*`（越权审计拒绝加载）。
-6. **窗口应用注册表**：主进程 `plugin-apps` 维护窗口应用注册表（`appId → name / entryHtml / icon`），Dock 图标经 `plugin-apps:changed` 广播刷新。
+6. **窗口应用注册表**：由内核维护窗口应用注册表（`appId → name / entryHtml / icon`），Dock 图标经 `plugin-apps:changed` 广播刷新。
 7. **`plugin_build` 产物在 workspace**，`plugin_install` 自动部署到 `plugins/<id>/dist/`（无需手动 cp）；**icon 也随 install 自动部署**：workspace 根级的 `icon.svg` / `icon.png` 会自动复制到 `plugins/<id>/`，且 `plugin_define` 未显式声明 icon 时 install 自动探测声明（优先 `icon.svg`），Dock 图标据此渲染。
-8. **插件窗口主题跟随**：宿主桥 `window.shanhai.onThemeChange(cb)` 订阅主进程 `ui:theme` 广播（内置应用切换亮/暗时实时下发）。**回调签名写死为 `onThemeChange(cb: (theme: 'light' | 'dark') => void)`**：cb 收到的参数是**裸字符串** `'light' | 'dark'`（不是对象，主进程 `ipc-handlers.ts` 的 `safeSend(win, 'ui:theme', theme)` 塞的就是字符串），直接 `theme === 'dark'` 判断即可，不要按对象 `{ theme }` 解包。插件窗口挂载时读 `localStorage.getItem('shanhai-theme')` 得到初始主题，`document.documentElement.setAttribute('data-theme', theme)` 驱动 CSS 变量。脚手架模板的 `style.css` 已内嵌与内置应用一致的主题变量（`--bg-subtle`/`--text-muted`/`--accent` 等），AI 生成插件开箱即随主题切换。**AI 真机自验如何切主题**：主题切换入口是「聊天窗口顶栏右侧的月亮/太阳图标按钮」（无文字、hover 提示「切换到暗色/亮色模式」）或「会话管家窗口标题栏右侧的月亮/太阳按钮」，点一下即切换亮/暗并广播给所有窗口（含插件窗口）；**无快捷键**。
+8. **插件窗口主题跟随**：宿主桥 `window.shanhai.onThemeChange(cb)` 订阅主进程 `ui:theme` 广播（内置应用切换亮/暗时实时下发）。**回调签名写死为 `onThemeChange(cb: (theme: 'light' | 'dark') => void)`**：cb 收到的参数是**裸字符串** `'light' | 'dark'`（不是对象，宿主桥下发时塞的就是字符串），直接 `theme === 'dark'` 判断即可，不要按对象 `{ theme }` 解包。插件窗口挂载时读 `localStorage.getItem('shanhai-theme')` 得到初始主题，`document.documentElement.setAttribute('data-theme', theme)` 驱动 CSS 变量。脚手架模板的 `style.css` 已内嵌与内置应用一致的主题变量（`--bg-subtle`/`--text-muted`/`--accent` 等），AI 生成插件开箱即随主题切换。**AI 真机自验如何切主题**：主题切换入口是「聊天窗口顶栏右侧的月亮/太阳图标按钮」（无文字、hover 提示「切换到暗色/亮色模式」）或「会话管家窗口标题栏右侧的月亮/太阳按钮」，点一下即切换亮/暗并广播给所有窗口（含插件窗口）；**无快捷键**。
 9. **`ctx.on` 无可订阅内核事件**：内核事件总线零 `emit`，`ctx.on` 仅作占位能力保留。
 
 ---

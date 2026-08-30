@@ -120,8 +120,9 @@ export function createExecutionModule(
           modelContent,
           // 管家历史回放轮数比普通会话多（30 vs 20），便于跨会话编排时保留更长上下文主线
           maxHistoryTurns: isSupervisorRun ? SUPERVISOR_MAX_HISTORY_TURNS : undefined,
-          // 管家会话按事件完整回放历史（保留工具调用 tool/call + tool/result，保证后续决策有依据）；普通会话只回放 user + 最终 assistant 正文
-          preserveToolCalls: isSupervisorRun,
+          // 管家历史回放与普通会话一致：只回放 user + 最终 assistant 正文，不保留工具调用过程（tool/call + tool/result）。
+          // 曾用 preserveToolCalls: isSupervisorRun 完整回放工具调用，但会把历史里反复出现的重复工具调用（如 write_ledger 反复写 _index.json）
+          // 回放给模型、强化重复行为，诱发「连续几十次写同一台账文件」的死循环，故取消（走缺省 false）。
           onDelta: (text) => {
             if (ctx.stoppedSessions.has(sid)) throw new Error('__stopped__')
             ctx.deltaCallbacks.forEach((cb) => cb(sid, text))

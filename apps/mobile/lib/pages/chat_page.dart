@@ -17,12 +17,15 @@ class ChatPage extends StatelessWidget {
       title: session.title,
       initialIncompleteTurn: session.hasIncompleteTurn,
       sendFn: (message) => ws.sendCommand('send_message', {'sessionId': session.id, 'message': message, 'mode': 'insert'}),
-      loadHistoryFn: () async {
-        final r = await ws.sendCommand('get_history', {'sessionId': session.id});
-        if (r.ok && r.data is List) {
-          return (r.data as List).map((e) => HistoryItem.fromJson(e as Map<String, dynamic>)).toList();
+      loadHistoryFn: ({int? sinceTurnSeq, int? beforeTurnSeq}) async {
+        final payload = <String, dynamic>{'sessionId': session.id};
+        if (sinceTurnSeq != null) payload['sinceTurnSeq'] = sinceTurnSeq;
+        if (beforeTurnSeq != null) payload['beforeTurnSeq'] = beforeTurnSeq;
+        final r = await ws.sendCommand('get_history', payload);
+        if (r.ok && r.data is Map) {
+          return HistoryResponse.fromJson(r.data as Map<String, dynamic>);
         }
-        return [];
+        return HistoryResponse.empty;
       },
     );
   }

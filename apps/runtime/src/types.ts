@@ -362,6 +362,8 @@ export interface Runtime {
   onClosePluginApp(cb: (appId: string) => void): () => void
   /** client 半 → host 半自定义 RPC：按「插件 id + 服务名」调用 host 半 provide() 注册的服务（仅限本插件，无法越权） */
   invokePluginService(appId: string, name: string, args: unknown[]): Promise<unknown>
+  /** 插件模型调用（受控单次文本生成）：用「当前选中的模型」生成一次文本；插件不能指定模型 id、不能切模型，maxTokens 上限固定 */
+  invokeModelForPlugin(appId: string, input: { prompt: string; systemPrompt?: string }): Promise<{ text: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }>
   /** 列出长期记忆（按会话隔离，仅返回当前会话的记忆） */
   listMemory(sessionId: string): Array<{ id: number; scope: string; key: string; value: unknown; source: string; confidence: number; timestamp: number; sessionId?: string }>
   /** 删除一条长期记忆（按 id） */

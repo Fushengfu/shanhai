@@ -273,7 +273,7 @@ export function registerIpc(): void {
   const PLUGIN_CAPABILITIES = new Set([
     'getVersion', 'clipboardWriteText', 'clipboardReadText', 'speak', 'selectDirectory',
     'listSessions', 'listMemory', 'getUiState', 'closeApp', 'getWallpaper', 'getTokenStats',
-    'invokePluginService',
+    'invokePluginService', 'modelCall',
   ])
   ipcMain.handle('plugin:invoke', async (e, capability: string, ...args: unknown[]) => {
     const win = BrowserWindow.fromWebContents(e.sender)
@@ -329,6 +329,9 @@ export function registerIpc(): void {
       case 'invokePluginService':
         // client → host 自定义 RPC：appId 反查窗口 → 插件 id，只调「本插件」host 半注册的服务（无法越权）
         return runtime.invokePluginService(appId, String(args[0] ?? ''), Array.isArray(args[1]) ? args[1] : [])
+      case 'modelCall':
+        // 受控单次文本生成：用「当前选中的模型」生成，插件不能指定模型 id；maxTokens 上限由 runtime 固定。
+        return runtime.invokeModelForPlugin(appId, args[0] as { prompt: string; systemPrompt?: string })
       default:
         throw new Error(`未实现的插件能力: ${capability}`)
     }

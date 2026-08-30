@@ -16,6 +16,66 @@ import { removeApprovalRequest, removeAskRequest } from './ui-store'
 /** 工具结果 / 历史 tool-result 转发前的截断长度（控制传输量，完整内容仍由桌面端磁盘持久化） */
 export const MAX_RESULT_CHARS = 4000
 
+/**
+ * 同步历史的最大轮数（一轮 = 一次用户输入到该轮完整回复结束，含其中所有工具调用与结果）。
+ * 超出只返回最近 MAX_HISTORY_TURNS 轮，控制单次同步传输量——避免事件日志变大后，
+ * 手机端一次性渲染全部历史导致卡死/超时/白屏。
+ */
+export const MAX_HISTORY_TURNS = 20
+
+/**
+ * 按「轮次」截断历史：一轮以 user 消息为边界（getSessionHistory 里 user 消息带 turnSeq，从 1 起递增，
+ * 该轮后续的 assistant/tool 消息都归属这轮）。保留最近 maxTurns 个完整轮次，返回 { items, truncated }。
+ */
+export function sliceHistoryByTurns(
+  items: unknown[],
+  maxTurns: number,
+): { items: unknown[]; truncated: boolean } {
+  // 收集所有 user 消息的下标（turn 边界）
+  const userIdx: number[] = []
+  for (let i = 0; i < items.length; i++) {
+    if ((items[i] as { kind?: string }).kind === 'user') userIdx.push(i)
+  }
+  if (userIdx.length <= maxTurns) return { items, truncated: false }
+  const start = userIdx[userIdx.length - maxTurns]!
+  return { items: items.slice(start), truncated: true }
+}
+
+/**
+ * 增量过滤：只保留 turnSeq > sinceTurnSeq 的轮次（新轮次起点必为 user 消息，从该起点截到末尾）。
+ * sinceTurnSeq <= 0 时返回全量。
+ */
+export function sliceHistorySinceTurn(items: unknown[], sinceTurnSeq: number): unknown[] {
+  if (sinceTurnSeq <= 0) return items
+  const idx = items.findIndex((it) => {
+    const turnSeq = (it as { turnSeq?: number }).turnSeq
+    return turnSeq != null && turnSeq > sinceTurnSeq
+  })
+  if (idx < 0) return []
+  return items.slice(idx)
+}
+
+/**
+ * 加载更早历史：返回 turnSeq < beforeTurnSeq 的轮次，再保留其中最近 maxTurns 轮。
+ * 客户端上滑到最早消息时，用「当前已加载的最早 turnSeq」作为 beforeTurnSeq 请求更早。
+ */
+export function sliceHistoryBeforeTurn(items: unknown[], beforeTurnSeq: number, maxTurns: number): { items: unknown[]; truncated: boolean } {
+  if (beforeTurnSeq <= 0) return sliceHistoryByTurns(items, maxTurns)
+  // 找到第一个 turnSeq >= beforeTurnSeq 的 item 下标，其之前的都是「更早」历史
+  const cutIdx = items.findIndex((it) => {
+    const turnSeq = (it as { turnSeq?: number }).turnSeq
+    return turnSeq != null && turnSeq >= beforeTurnSeq
+  })
+  const earlier = cutIdx < 0 ? items : items.slice(0, cutIdx)
+  return sliceHistoryByTurns(earlier, maxTurns)
+}
+
+/** get_history / get_supervisor_history 的统一返回体 */
+export interface HistoryPayload {
+  items: unknown[]
+  truncated: boolean
+}
+
 export interface IncomingCmd {
   type: 'cmd'
   id: number
@@ -95,6 +155,25 @@ export function listSessionsFull(): unknown[] {
     })
 }
 
+/** 构建 get_history / get_supervisor_history 的返回体：默认保留最近 MAX_HISTORY_TURNS 轮，
+ * 支持 sinceTurnSeq 增量（只返回新增轮次）与 beforeTurnSeq 分页（加载更早历史）。 */
+function buildHistoryPayload(sessionId: string, payload: Record<string, unknown>): HistoryPayload {
+  const runtime = getRuntime()
+  const history = sanitizeHistory(runtime.getSessionHistory(sessionId))
+  const sinceTurnSeq = Number(payload.sinceTurnSeq ?? 0) || 0
+  const beforeTurnSeq = Number(payload.beforeTurnSeq ?? 0) || 0
+  if (sinceTurnSeq > 0) {
+    // 增量：只返回 sinceTurnSeq 之后的新轮次（数据量小，不额外截断）
+    return { items: sliceHistorySinceTurn(history, sinceTurnSeq), truncated: false }
+  }
+  if (beforeTurnSeq > 0) {
+    // 分页：加载 beforeTurnSeq 之前的更早历史（受 MAX_HISTORY_TURNS 上限保护）
+    return sliceHistoryBeforeTurn(history, beforeTurnSeq, MAX_HISTORY_TURNS)
+  }
+  // 默认：保留最近 MAX_HISTORY_TURNS 轮
+  return sliceHistoryByTurns(history, MAX_HISTORY_TURNS)
+}
+
 /** 处理一条命令，结果通过 send 回调返回（send 由调用方注入：局域网 socket 或网关连接） */
 export async function handleCommand(send: (obj: unknown) => void, msg: IncomingCmd): Promise<void> {
   const runtime = getRuntime()
@@ -106,10 +185,10 @@ export async function handleCommand(send: (obj: unknown) => void, msg: IncomingC
         data = listSessionsFull()
         break
       case 'get_history':
-        data = sanitizeHistory(runtime.getSessionHistory(payload.sessionId as string))
+        data = buildHistoryPayload(payload.sessionId as string, payload)
         break
       case 'get_supervisor_history':
-        data = sanitizeHistory(runtime.getSessionHistory(SUPERVISOR_ID))
+        data = buildHistoryPayload(SUPERVISOR_ID, payload)
         break
       case 'run_supervisor':
         data = await runtime.runSupervisor(String(payload.message ?? ''))
