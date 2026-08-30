@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { getUiStoreSnapshot, patchUiStore, useUiStore } from '../store-client'
 import { getAppManifest } from '../apps/registry'
 import { MemoryPanel } from '../components/MemoryPanel'
@@ -9,35 +9,6 @@ import { CustomModelDrawer } from '../components/CustomModelDrawer'
 import { TerminalPanel } from '../components/TerminalPanel'
 import { WallpaperPanel } from '../components/WallpaperPanel'
 import { useThemeSync } from '../theme'
-
-/**
- * 动态插件窗口内容组件：用 client 半源码 new Function 编译成窗口组件。
- * 契约：function(React, helpers){ return 组件函数 }（helpers = { close, appId, name }），
- * 必须 return 一个 React 组件函数（不能 return 对象 / 箭头函数返回对象）；返回非函数则显示「未提供窗口界面」占位。
- * app 窗口是独立渲染进程，看不到聊天窗口的 SlotRegistry，故经主进程「plugin-app:get」拿 clientCode 后在此编译渲染。
- */
-function DynamicPluginWindow({ appId, name, clientCode, onClose }: { appId: string; name: string; clientCode: string; onClose: () => void }): React.JSX.Element {
-  const Component = useMemo(() => {
-    try {
-      const factory = new Function('React', 'helpers', clientCode) as (ReactNs: typeof React, helpers: unknown) => unknown
-      const result = factory(React, { close: onClose, appId, name })
-      if (typeof result === 'function') return result as React.ComponentType
-      return null
-    } catch (err) {
-      console.error('[plugin-app] 窗口组件编译失败:', err)
-      return null
-    }
-  }, [clientCode, onClose, appId, name])
-
-  if (!Component) {
-    return (
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', color: 'var(--text-muted)', fontSize: 13 }}>
-        插件「{name}」未提供窗口界面（client 半需返回 React 组件）
-      </div>
-    )
-  }
-  return <Component />
-}
 
 /**
  * 插件应用窗口（多窗口桌面系统的独立应用）。
@@ -100,18 +71,6 @@ export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
     void window.shanhai?.switchModel(id)
   }
 
-  // 动态插件窗口：查询主进程动态 app 清单（appId = 插件持久化 id，install 时 client 半源码已注册进主进程）
-  const [pluginApp, setPluginApp] = useState<{ appId: string; name: string; clientCode: string } | null | undefined>(undefined)
-  useEffect(() => {
-    let mounted = true
-    void window.shanhai?.getPluginApp(appId).then((r) => {
-      if (mounted) setPluginApp(r ?? null)
-    })
-    return () => {
-      mounted = false
-    }
-  }, [appId])
-
   switch (appId) {
     case 'memory':
       return <MemoryPanel variant="window" onClose={close} />
@@ -145,17 +104,6 @@ export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
     case 'wallpaper':
       return <WallpaperPanel variant="window" onClose={close} />
     default:
-      if (pluginApp === undefined) {
-        // 查询动态插件 app 中
-        return (
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', color: 'var(--text-muted)', fontSize: 13 }}>
-            加载中…
-          </div>
-        )
-      }
-      if (pluginApp) {
-        return <DynamicPluginWindow appId={appId} name={pluginApp.name} clientCode={pluginApp.clientCode} onClose={close} />
-      }
       return (
         <div
           style={{

@@ -1,4 +1,4 @@
-import type { ToolContract } from '@shanhai/tools'
+import { sanitizeBinaryOutput, type ToolContract } from '@shanhai/tools'
 import type { TerminalService } from './terminal'
 
 /**
@@ -89,7 +89,8 @@ function runTool(service: TerminalService): ToolContract {
         command,
         typeof args.timeoutMs === 'number' ? args.timeoutMs : undefined,
       )
-      return { ok: true, ...result }
+      // 清洗命令输出：拦截图片 / base64 / 二进制大块数据，避免撑爆上下文
+      return { ok: true, ...result, output: sanitizeBinaryOutput(result.output) }
     },
   }
 }

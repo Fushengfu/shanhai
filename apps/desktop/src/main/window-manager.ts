@@ -445,8 +445,7 @@ export async function openApp(appId: string): Promise<boolean> {
     return true
   }
   const win = createWindow({ type: 'app', appId, width: 980, height: 720, isPlugin: isPluginApp(appId) })
-  // 插件窗口：优先加载编译产物 dist/client.html（独立渲染入口，支持完整 React + JSX + 依赖 + 复杂 UI）；
-  // 无编译产物（快速原型链路）则降级走统一 renderer/index.html → AppWindow → DynamicPluginWindow new Function。
+  // 插件窗口：加载编译产物 dist/client.html（独立渲染入口，支持完整 React + JSX + 依赖 + 复杂 UI）。
   // 内置 app 窗口（terminal/trace/memory/models 等）保持统一 renderer 不变。
   const pluginEntry = isPluginApp(appId) ? resolvePluginEntryHtml(appId) : undefined
   if (pluginEntry) {

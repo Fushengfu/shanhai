@@ -284,12 +284,14 @@ declare global {
       openApp(appId: string): Promise<boolean>
       /** 关闭一个插件应用窗口 */
       closeApp(appId: string): Promise<void>
-      /** 查询动态插件窗口应用（appId = 插件持久化 id），返回 { appId, name, clientCode, icon? } 或 null */
-      getPluginApp(appId: string): Promise<{ appId: string; name: string; clientCode: string; icon?: string } | null>
+      /** 查询动态插件窗口应用（appId = 插件持久化 id），返回 { appId, name, icon? } 或 null */
+      getPluginApp(appId: string): Promise<{ appId: string; name: string; icon?: string } | null>
       /** 列出所有已安装的动态插件窗口应用（供桌面壳 Dock 渲染应用图标） */
-      listPluginApps(): Promise<Array<{ appId: string; name: string; clientCode: string; icon?: string }>>
+      listPluginApps(): Promise<Array<{ appId: string; name: string; icon?: string }>>
+      /** 读取插件的图标 data URL（主进程读 manifest.icon 文件转 base64）；无 icon / 读取失败返回 null */
+      getPluginIcon(appId: string): Promise<string | null>
       /** 订阅动态插件窗口应用清单变化（安装/卸载时主进程广播完整清单） */
-      onPluginAppsChanged(cb: (apps: Array<{ appId: string; name: string; clientCode: string; icon?: string }>) => void): () => void
+      onPluginAppsChanged(cb: (apps: Array<{ appId: string; name: string; icon?: string }>) => void): () => void
       /** 桌面被点击时，把聊天/应用窗口带回桌面之上（fire-and-forget） */
       restoreAboveDesktop(): void
       /** 隐藏聊天窗口（自定义关闭按钮，聊天窗口常驻不销毁） */
@@ -421,7 +423,7 @@ declare global {
       onClientRunRequest(cb: (req: ClientRunRequest) => void): () => void
       respondClientRun(requestId: string, approved: boolean): Promise<void>
       onClientRunResolved(cb: (requestId: string) => void): () => void
-      onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
+      onClientCode(cb: (payload: { pkgId: string; name: string; permissions?: string[]; entryHtml?: string; icon?: string }) => void): () => void
       onClientRemove(cb: (pkgId: string) => void): () => void
       listMemory(sessionId: string): Promise<MemoryEntry[]>
       removeMemory(id: number): Promise<void>
@@ -457,6 +459,8 @@ export interface GlobalUiState {
   username: string | null
   /** 登录弹窗是否打开（跨窗口共享：Dock 点击「登录」后聊天窗口据此弹出登录框） */
   loginOpen: boolean
+  /** 应用菜单面板是否打开（跨窗口共享：Dock 点击「应用菜单」入口后，桌面壳窗口据此在顶部弹出应用列表） */
+  appMenuOpen: boolean
   currentSessionId: string
   sessions: SessionListItem[]
   models: GatewayModel[]

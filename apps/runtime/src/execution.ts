@@ -241,6 +241,12 @@ export function createExecutionModule(
     'plugin_test',
     'plugin_install',
     'plugin_uninstall',
+    'plugin_scaffold',
+    'plugin_build',
+    'plugin_test_load',
+    'plugin_verify',
+    'plugin_apps',
+    'plugin_tool',
   ])
 
   const buildSupervisorLoopTools = (): ToolContract[] => [

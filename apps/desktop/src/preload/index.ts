@@ -179,12 +179,14 @@ export interface ShanhaiBridge {
   openApp(appId: string): Promise<boolean>
   /** 关闭一个插件应用窗口 */
   closeApp(appId: string): Promise<void>
-  /** 查询动态插件窗口应用（appId = 插件持久化 id），返回 { appId, name, clientCode, icon? } 或 null */
-  getPluginApp(appId: string): Promise<{ appId: string; name: string; clientCode: string; icon?: string } | null>
+  /** 查询动态插件窗口应用（appId = 插件持久化 id），返回 { appId, name, icon? } 或 null */
+  getPluginApp(appId: string): Promise<{ appId: string; name: string; icon?: string } | null>
   /** 列出所有已安装的动态插件窗口应用（appId = 插件持久化 id），供桌面壳 Dock 渲染应用图标 */
-  listPluginApps(): Promise<Array<{ appId: string; name: string; clientCode: string; icon?: string }>>
+  listPluginApps(): Promise<Array<{ appId: string; name: string; icon?: string }>>
+  /** 读取插件的图标 data URL（主进程读 manifest.icon 文件转 base64）；无 icon / 读取失败返回 null，渲染层降级占位图标 */
+  getPluginIcon(appId: string): Promise<string | null>
   /** 订阅动态插件窗口应用清单变化（安装/卸载时主进程广播完整清单，Dock 据此增删图标） */
-  onPluginAppsChanged(cb: (apps: Array<{ appId: string; name: string; clientCode: string; icon?: string }>) => void): () => void
+  onPluginAppsChanged(cb: (apps: Array<{ appId: string; name: string; icon?: string }>) => void): () => void
   /** 桌面被点击时，把聊天/应用窗口带回桌面之上（fire-and-forget） */
   restoreAboveDesktop(): void
   /** 隐藏聊天窗口（自定义关闭按钮，聊天窗口常驻不销毁） */
@@ -333,7 +335,7 @@ export interface ShanhaiBridge {
   onClientRunRequest(cb: (req: { requestId: string; sessionId: string; pkgId: string; name: string; purpose: string }) => void): () => void
   respondClientRun(requestId: string, approved: boolean): Promise<void>
   onClientRunResolved(cb: (requestId: string) => void): () => void
-  onClientCode(cb: (payload: { pkgId: string; name: string; code: string }) => void): () => void
+  onClientCode(cb: (payload: { pkgId: string; name: string; permissions?: string[]; entryHtml?: string; icon?: string }) => void): () => void
   onClientRemove(cb: (pkgId: string) => void): () => void
   listMemory(sessionId: string): Promise<MemoryEntry[]>
   removeMemory(id: number): Promise<void>
@@ -427,8 +429,9 @@ const bridge: ShanhaiBridge = {
   closeApp: (appId) => ipcRenderer.invoke('window:closeApp', appId),
   getPluginApp: (appId) => ipcRenderer.invoke('plugin-app:get', appId),
   listPluginApps: () => ipcRenderer.invoke('plugin-app:list'),
+  getPluginIcon: (appId) => ipcRenderer.invoke('plugin-app:icon', appId),
   onPluginAppsChanged: (cb) => {
-    const listener = (_e: unknown, apps: Array<{ appId: string; name: string; clientCode: string }>) => cb(apps)
+    const listener = (_e: unknown, apps: Array<{ appId: string; name: string; icon?: string }>) => cb(apps)
     ipcRenderer.on('plugin-apps:changed', listener)
     return () => ipcRenderer.removeListener('plugin-apps:changed', listener)
   },
@@ -585,7 +588,7 @@ const bridge: ShanhaiBridge = {
     return () => ipcRenderer.removeListener('selfmod:client-run-resolved', listener)
   },
   onClientCode: (cb) => {
-    const listener = (_e: unknown, payload: { pkgId: string; name: string; code: string }) => cb(payload)
+    const listener = (_e: unknown, payload: { pkgId: string; name: string; permissions?: string[]; entryHtml?: string; icon?: string }) => cb(payload)
     ipcRenderer.on('selfmod:client-code', listener)
     return () => ipcRenderer.removeListener('selfmod:client-code', listener)
   },

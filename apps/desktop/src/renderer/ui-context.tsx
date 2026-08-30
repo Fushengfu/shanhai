@@ -12,7 +12,6 @@ import type {
   SessionUIState,
   TokenSnapshot,
 } from './types'
-import type { SlotComponent } from './slots'
 
 /**
  * UI 上下文（框架派生 props 的载体）：shell（App）持有应用状态，通过 UIContext 派生给各 slot 插件组件，
@@ -58,7 +57,6 @@ export interface UIContextValue {
 
   // —— shell.chat ——
   incompleteTurn: boolean
-  dynamicExtensions: SlotComponent[]
   curApproval: ApprovalRequest | null
   curAsk: AskRequest | null
   curClientRunRequest: ClientRunRequest | null

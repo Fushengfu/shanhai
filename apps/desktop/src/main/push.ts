@@ -4,6 +4,7 @@ import { getRuntime } from './runtime'
 import { getUiState, subscribeUiState, filterUiStateForWindow, windowConsumesUiState } from './ui-store'
 import { getWindowType, openApp, closeApp } from './window-manager'
 import { registerPluginApp, unregisterPluginApp, listPluginApps } from './plugin-apps'
+import { refreshDockMenu } from './dock-menu'
 
 /**
  * 主进程 → 渲染进程 事件推送（广播到所有窗口）。
@@ -33,19 +34,23 @@ export function registerPush(): void {
   // 投递确认被决策（用户手动点或管家 resolve_client_run）后广播「已解决」，UI 据此关闭对应弹窗（跨端同步）
   runtime.onClientRunResolved((requestId) => broadcast('selfmod:client-run-resolved', requestId))
   runtime.onClientCode((payload) => {
-    // 动态插件窗口应用：把 client 半源码 + 权限清单 + client 编译产物（entryHtml）注册进主进程清单
-    // （app 窗口渲染时查询 + plugin:invoke 校验），再广播给聊天窗口 slots。
-    // 纯编译产物插件（无 clientCode 只有 entryHtml）也在此注册，使 Dock 图标 + isPluginApp + loadFile 生效。
-    registerPluginApp(payload.pkgId, payload.name, payload.code, payload.permissions ?? [], payload.entryHtml, payload.icon)
+    // 动态插件窗口应用：把 client 半编译产物（entryHtml）+ 权限清单注册进主进程清单
+    // （app 窗口 loadFile 渲染 + plugin:invoke 校验），再广播给聊天窗口 slots。
+    // 纯编译产物插件（只有 entryHtml）也在此注册，使 Dock 图标 + isPluginApp + loadFile 生效。
+    registerPluginApp(payload.pkgId, payload.name, payload.permissions ?? [], payload.entryHtml, payload.icon)
     broadcast('selfmod:client-code', payload)
     // 通知桌面壳 Dock 刷新动态插件应用图标
     broadcast('plugin-apps:changed', listPluginApps())
+    // 刷新 macOS Dock 菜单（插件列表动态更新）
+    refreshDockMenu()
   })
   runtime.onClientRemove((pkgId) => {
     unregisterPluginApp(pkgId)
     broadcast('selfmod:client-remove', pkgId)
     // 通知桌面壳 Dock 移除动态插件应用图标
     broadcast('plugin-apps:changed', listPluginApps())
+    // 刷新 macOS Dock 菜单（插件列表动态更新）
+    refreshDockMenu()
   })
   // 插件窗口应用：host 半 ctx.openWindow → runtime.openAppWindow → 主进程 openApp（复用 app 窗口类型）
   runtime.onOpenPluginApp((appId) => void openApp(appId))

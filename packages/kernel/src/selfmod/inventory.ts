@@ -9,17 +9,15 @@ export interface DynamicPackage {
   id: string
   name: string
   purpose: string
-  code?: string
-  client?: string
   version?: string
   status: DynamicPackageStatus
   sessionId: string
   capabilities?: Capability
   /** 插件声明的权限清单（plugin:invoke 白名单能力名，install 时随 manifest 落盘并审批）。缺省 = 空数组 = 最小权限 */
   permissions?: string[]
-  /** host 半编译产物绝对路径（dist/host.cjs，第 3 步起支持；install 时探测填充，替代 node:vm 源码字符串） */
+  /** host 半编译产物绝对路径（dist/host.cjs，第 3 步起支持；install 时探测填充） */
   entryHost?: string
-  /** client 半编译产物绝对路径（dist/client.html，第 2 步起支持；install 时探测填充，替代 new Function 源码字符串） */
+  /** client 半编译产物绝对路径（dist/client.html，第 2 步起支持；install 时探测填充） */
   entryHtml?: string
   /** 图标相对路径（相对插件目录，如 icon.png / assets/icon.png；第 4 步起支持，供 Dock 图标渲染用） */
   icon?: string
@@ -38,7 +36,7 @@ export interface InspectReport {
  * 动态插件清单（K5 自修改）。
  *
  * 对应 DSH extensions 机制的 plugin_inspect / plugin_define / plugin_stop / plugin_undefine：
- * 只读报告、记录 package、撤回、遗忘。plugin_run 的 vm 沙箱评估在 runtime 层集成审批后执行。
+ * 只读报告、记录 package、撤回、遗忘。plugin_run 在 runtime 层集成审批后执行。
  */
 export class PluginInventory {
   private readonly packages = new Map<string, DynamicPackage>()
@@ -48,8 +46,6 @@ export class PluginInventory {
   define(def: {
     name: string
     purpose: string
-    code?: string
-    client?: string
     version?: string
     sessionId: string
     id?: string
@@ -64,8 +60,6 @@ export class PluginInventory {
       id,
       name: def.name,
       purpose: def.purpose,
-      code: def.code,
-      client: def.client,
       version: def.version,
       status: 'defined',
       sessionId: def.sessionId,
@@ -127,8 +121,6 @@ export interface InstalledPackageMeta {
   name: string
   purpose: string
   version?: string
-  code?: string
-  client?: string
   installedAt: number
   /** 已审批的权限清单（plugin:invoke 白名单能力名，install 时随 manifest 落盘） */
   permissions?: string[]
@@ -142,8 +134,8 @@ export interface InstalledPackageMeta {
   assets?: string[]
   /** 依赖声明（包名 → 版本，仅供工程化插件的 package.json 参考/审计，运行时不自解析依赖） */
   dependencies?: Record<string, string>
-  /** 落盘形态：source=快速原型（仅 code/client 源码字符串），bundled=工程化（含 dist 编译产物）。缺省按字段推断 */
-  kind?: 'source' | 'bundled'
+  /** 落盘形态：bundled=工程化（含 dist 编译产物） */
+  kind?: 'bundled'
 }
 
 /**

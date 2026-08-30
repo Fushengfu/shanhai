@@ -126,6 +126,8 @@ export interface UiStoreState {
   username: string | null
   /** 登录弹窗是否打开（跨窗口共享：Dock 点击「登录」后聊天窗口据此弹出登录框） */
   loginOpen: boolean
+  /** 应用菜单面板是否打开（跨窗口共享：Dock 点击「应用菜单」入口后，桌面壳窗口据此在顶部弹出应用列表） */
+  appMenuOpen: boolean
   currentSessionId: string
   sessions: SessionListItem[]
   sessionMap: Record<string, SessionUIState>
@@ -154,6 +156,7 @@ const INITIAL_STATE: UiStoreState = {
   loggedIn: false,
   username: null,
   loginOpen: false,
+  appMenuOpen: false,
   currentSessionId: '',
   sessions: [],
   sessionMap: {},
@@ -212,10 +215,10 @@ export function getUiState(): UiStoreState {
 export function filterUiStateForWindow(type: WindowType | undefined, s: UiStoreState): UiStoreState {
   switch (type) {
     case 'desktop':
-      return { ...INITIAL_STATE, loggedIn: s.loggedIn, username: s.username, wallpaper: s.wallpaper }
+      return { ...INITIAL_STATE, loggedIn: s.loggedIn, username: s.username, wallpaper: s.wallpaper, appMenuOpen: s.appMenuOpen }
     case 'dock':
-      // Dock 需要登录态（显示登录状态 + 登录入口）与 loginOpen，但不消费消息流等重数据
-      return { ...INITIAL_STATE, loggedIn: s.loggedIn, username: s.username, loginOpen: s.loginOpen }
+      // Dock 需要登录态（显示登录状态 + 登录入口）、loginOpen 与 appMenuOpen（应用菜单入口开关），但不消费消息流等重数据
+      return { ...INITIAL_STATE, loggedIn: s.loggedIn, username: s.username, loginOpen: s.loginOpen, appMenuOpen: s.appMenuOpen }
     case 'supervisor-bubble':
       return { ...INITIAL_STATE }
     case 'chat':

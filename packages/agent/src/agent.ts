@@ -4,39 +4,54 @@ import type { Session } from '@shanhai/session'
 import type { ApprovalService } from '@shanhai/approval'
 
 /**
- * 历史 assistant 消息隔离标签：仅在事件日志回放（resumeRun 断点续跑 / run 全新任务执行）时，
+ * 历史 assistant 消息隔离标签（replay-assistant）：仅在事件日志回放（resumeRun 断点续跑 / run 全新任务执行）时，
  * 把「历史助手的正文发言」包裹进这对标签，向模型声明这是「历史任务处理结果」而非当前模型的发言，
  * 防三种幻觉（模仿历史口吻/格式/详略、语义延续、把历史旧结论误当当前任务真实状态）。
  * 注意：只包裹 assistant 正文（assistant/message）；tool/call（工具调用）、tool/result（事实产物）保持原样。
  */
-const HISTORICAL_ASSISTANT_OPEN = '<historical-assistant-record>'
-const HISTORICAL_ASSISTANT_CLOSE = '</historical-assistant-record>'
+const REPLAY_ASSISTANT_OPEN = '<replay-assistant>'
+const REPLAY_ASSISTANT_CLOSE = '</replay-assistant>'
 
-/** 转义历史助手文本里可能出现的同款标签字符，防止模型分不清边界（穿模）。 */
-function escapeHistoricalTag(content: string): string {
+/**
+ * 历史 user 提问标记标签（replay-user，来源标记，非隔离）：仅在事件日志回放时把「历史用户问过的问题」包裹进这对标签，
+ * 向模型声明这是「历史用户提问（来源）」而非「本轮刚下的新指令」，用于对齐目标/理解背景，避免把历史旧问题误当当前指令执行。
+ * 注意：只包裹历史回放里的 user/message；本轮任务内的用户消息不经过 replayHistory、保持原样不包裹。
+ */
+const REPLAY_USER_OPEN = '<replay-user>'
+const REPLAY_USER_CLOSE = '</replay-user>'
+
+/** 转义历史文本里可能出现的同款系统保留标签字符，防止模型分不清边界（穿模）。 */
+function escapeReplayTag(content: string): string {
   return content
-    .replaceAll(HISTORICAL_ASSISTANT_OPEN, '&lt;historical-assistant-record&gt;')
-    .replaceAll(HISTORICAL_ASSISTANT_CLOSE, '&lt;/historical-assistant-record&gt;')
+    .replaceAll(REPLAY_ASSISTANT_OPEN, '&lt;replay-assistant&gt;')
+    .replaceAll(REPLAY_ASSISTANT_CLOSE, '&lt;/replay-assistant&gt;')
+    .replaceAll(REPLAY_USER_OPEN, '&lt;replay-user&gt;')
+    .replaceAll(REPLAY_USER_CLOSE, '&lt;/replay-user&gt;')
 }
 
 /** 把历史助手正文包裹进隔离标签（仅回放上下文用）。 */
-function wrapHistoricalAssistant(content: string): string {
-  return `${HISTORICAL_ASSISTANT_OPEN}\n${escapeHistoricalTag(content)}\n${HISTORICAL_ASSISTANT_CLOSE}`
+function wrapReplayAssistant(content: string): string {
+  return `${REPLAY_ASSISTANT_OPEN}\n${escapeReplayTag(content)}\n${REPLAY_ASSISTANT_CLOSE}`
+}
+
+/** 把历史用户提问包裹进来源标记标签（仅回放上下文用）。 */
+function wrapReplayUser(content: string): string {
+  return `${REPLAY_USER_OPEN}\n${escapeReplayTag(content)}\n${REPLAY_USER_CLOSE}`
 }
 
 /**
- * 系统保留标签正则：匹配 <historical-assistant-record> / </historical-assistant-record> 以及形似 <xxx-record> 的系统内置标签。
- * 只匹配「以 -record 结尾」的标签名（系统历史回放标签的命名约定），刻意不匹配通用 HTML/XML 标签（<div>/<span> 等）与转义文本（&lt;...&gt;），
- * 避免误伤用户正常展示的内容。带 g 标志用于 replace 全量替换。
+ * 系统保留标签正则：匹配 <replay-assistant> / </replay-assistant>、<replay-user> / </replay-user> 以及形似 <replay-xxx> 的系统内置标签。
+ * 用「replay-」前缀按命名约定泛化匹配（覆盖 replay-assistant / replay-user / 未来 replay-* 的历史回放标签）。
+ * 刻意不匹配通用 HTML/XML 标签（<div>/<span> 等）与转义文本（&lt;...&gt;），避免误伤用户正常展示内容。带 g 标志用于 replace 全量替换。
  */
-const SYSTEM_RESERVED_TAG_RE = /<\/?[a-zA-Z][a-zA-Z0-9-]*-record\s*>/g
+const SYSTEM_RESERVED_TAG_RE = /<\/?replay-[a-zA-Z][a-zA-Z0-9-]*\s*>/g
 
 /** 检测文本是否含系统保留标签（无 g 标志，避免 test 的 lastIndex 状态污染）。 */
 function hasSystemReservedTag(text: string): boolean {
-  return /<\/?[a-zA-Z][a-zA-Z0-9-]*-record\s*>/.test(text)
+  return /<\/?replay-[a-zA-Z][a-zA-Z0-9-]*\s*>/.test(text)
 }
 
-/** 剥离系统保留标签本身（<xxx-record> / </xxx-record>），正文原样保留。 */
+/** 剥离系统保留标签本身（<replay-xxx> / </replay-xxx>），正文原样保留。 */
 function stripSystemReservedTags(text: string): string {
   return text.replace(SYSTEM_RESERVED_TAG_RE, '')
 }
@@ -221,13 +236,15 @@ export class AgentLoop {
         if (this.supportsVision) {
           // 多模态模型：历史用户消息统一用数组结构（重发 https 附件），与当前消息结构保持一致；
           // 非视觉模型仍走 replayUserContent 的占位符（避免 400 / 重复计费）。
+          // 历史 user 正文包裹 <replay-user> 来源标记（非隔离），声明这是「历史用户提问」而非本轮新指令。
           const parts: ContentPart[] = []
-          if (d.content) parts.push({ type: 'text', text: d.content })
+          if (d.content) parts.push({ type: 'text', text: wrapReplayUser(d.content) })
           if (d.attachments && d.attachments.length > 0) parts.push(...d.attachments)
-          messages.push({ role: 'user', content: parts.length > 0 ? parts : [{ type: 'text', text: '' }] })
+          messages.push({ role: 'user', content: parts.length > 0 ? parts : [{ type: 'text', text: wrapReplayUser('') }] })
         } else {
           // 历史附件只回放占位符，不重新发送 base64（避免请求体巨大 / 非视觉模型 400 / 重复计费）
-          messages.push({ role: 'user', content: replayUserContent(d.content, d.attachments) })
+          // 历史 user 正文包裹 <replay-user> 来源标记（非隔离），声明这是「历史用户提问」而非本轮新指令。
+          messages.push({ role: 'user', content: wrapReplayUser(replayUserContent(d.content, d.attachments)) })
         }
       } else if (e.type === 'assistant/message') {
         const d = e.data as { content: string; reasoningContent?: string }
@@ -235,7 +252,7 @@ export class AgentLoop {
         // 只包裹正文；tool/call（工具调用）、tool/result（事实产物）保持原样。
         messages.push({
           role: 'assistant',
-          content: wrapHistoricalAssistant(d.content),
+          content: wrapReplayAssistant(d.content),
           reasoningContent: d.reasoningContent,
         })
       } else if (e.type === 'tool/call') {

@@ -8,6 +8,7 @@ import { startRemoteRelay } from './remote-relay'
 import { startRemoteServer } from './remote-server'
 import { createWindow, loadWindowContent, showChatWindow, toggleChatWindow, ensureDesktopLayer, ICON_PATH } from './window-manager'
 import { scheduleStartupUpdateCheck } from './app-updater'
+import { refreshDockMenu } from './dock-menu'
 
 /** 全局唤起/隐藏主窗口的快捷键（macOS 上 CommandOrControl 即 ⌘，避开 Spotlight 的 ⌘+Space） */
 const TOGGLE_SHORTCUT = 'CommandOrControl+Shift+Space'
@@ -104,6 +105,8 @@ if (!gotSingleInstanceLock) {
     } catch (err) {
       console.warn('[山海] 设置 Dock 图标失败：', err)
     }
+    // Dock 菜单：列出「打开主窗口」+ 已安装插件应用列表（点某项打开对应插件窗口）。在 restore 之后调用，确保插件清单已填充
+    refreshDockMenu()
 
     // 托盘：失败只告警，不影响主窗口使用
     try {

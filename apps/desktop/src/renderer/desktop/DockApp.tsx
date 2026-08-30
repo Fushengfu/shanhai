@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 import { APP_REGISTRY } from '../apps/registry'
 import { useThemeSync } from '../theme'
 import { useUiStore, patchUiStore } from '../store-client'
-import { IconAvatar, IconMonitor, IconCode } from '../components/icons'
+import { IconAvatar, IconMonitor, IconGrid } from '../components/icons'
+import { PluginAppIcon } from '../components/PluginAppIcon'
 
 /**
  * Dock 窗口（多窗口桌面系统的底部应用图标栏）。
@@ -21,7 +22,7 @@ export function DockApp(): React.JSX.Element {
   const [authMenuOpen, setAuthMenuOpen] = useState(false)
 
   // 动态插件窗口应用图标（AI 自研插件 install 后桌面壳 Dock 显示，点击 openApp 打开）
-  const [pluginApps, setPluginApps] = useState<Array<{ appId: string; name: string; clientCode: string }>>([])
+  const [pluginApps, setPluginApps] = useState<Array<{ appId: string; name: string }>>([])
   useEffect(() => {
     let mounted = true
     void window.shanhai?.listPluginApps().then((apps) => {
@@ -109,6 +110,38 @@ export function DockApp(): React.JSX.Element {
           width: 'max-content',
         }}
       >
+        {/* 应用菜单入口（靠左，类似开始菜单，点击在桌面顶部弹出已安装应用列表） */}
+        <button
+          data-dock-icon
+          onClick={() => patchUiStore({ appMenuOpen: !ui.appMenuOpen })}
+          title="应用菜单（已安装的应用列表）"
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 6,
+            width: 72,
+            padding: '10px 4px 8px',
+            borderRadius: 14,
+            border: '1px solid var(--border-soft)',
+            background: ui.appMenuOpen ? 'var(--bg-panel)' : 'var(--bg-sidebar)',
+            color: 'var(--text)',
+            cursor: 'pointer',
+            transition: 'transform 0.12s ease',
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.transform = 'translateY(-4px)'
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.transform = 'translateY(0)'
+          }}
+        >
+          <span style={{ transform: 'scale(1.6)', display: 'inline-flex' }}>
+            <IconGrid />
+          </span>
+          <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>应用</span>
+        </button>
+
         {APP_REGISTRY.map((app) => (
           <button
             key={app.id}
@@ -171,9 +204,7 @@ export function DockApp(): React.JSX.Element {
               e.currentTarget.style.transform = 'translateY(0)'
             }}
           >
-            <span style={{ transform: 'scale(1.6)', display: 'inline-flex' }}>
-              <IconCode />
-            </span>
+            <PluginAppIcon appId={app.appId} size={28} />
             <span style={{ fontSize: 11, color: 'var(--text-secondary)', maxWidth: 64, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {app.name}
             </span>

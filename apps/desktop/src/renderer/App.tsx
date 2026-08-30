@@ -19,8 +19,8 @@ import type {
 } from './types'
 import { EMPTY_SESSION } from './types'
 import { formatBytes, readFileAsDataUrl } from './components/ui'
-import { registerSlot, SlotView, useSlotComponents } from './slots'
-import { UIContext, useUIContext, type UIContextValue } from './ui-context'
+import { SlotView } from './slots'
+import { UIContext, type UIContextValue } from './ui-context'
 import { patchUiStore, useUiStore, getUiStoreSnapshot } from './store-client'
 import { AiOrb } from './components/AiOrb'
 import './plugins/WelcomePlugin'
@@ -166,13 +166,8 @@ export function App() {
   const [queueCount, setQueueCount] = useState(0)
   // 语音播报中标记：true 时聊天窗口显示 3D AI 特效（声波波纹 + 加速呼吸），播报结束自动复位
   const [isSpeaking, setIsSpeaking] = useState(false)
-  // 自修改（K5）：browser 半动态注册的 UI 组件统一走 slots.ts 的 SlotRegistry（对齐 K3 模块系统），此处不再维护 clientComponents state
   // 自修改（K5）：browser 半投递的 round-trip 审批请求队列（按会话隔离）
   const [clientRunRequests, setClientRunRequests] = useState<Record<string, ClientRunRequest[]>>({})
-  // 每个动态包的 browser 半 disposer（factory 返回值），卸载时调用
-  const clientDisposers = useRef<Map<string, () => void>>(new Map())
-  // 每个动态包通过 slots.register 注册的组件注销函数（unmount 时逆序撤销）
-  const clientSlotDisposers = useRef<Map<string, Array<() => void>>>(new Map())
 
   // 顶部状态栏（header + 浏览器标签条）实际高度：侧滑面板顶部从它下方开始，避免覆盖状态栏区域
   const headerWrapRef = useRef<HTMLDivElement>(null)
@@ -196,53 +191,6 @@ export function App() {
   const curAsk = (askQueues[currentSessionId] ?? [])[0] ?? null
   // 当前会话的 browser 半投递审批请求
   const curClientRunRequest = (clientRunRequests[currentSessionId] ?? [])[0] ?? null
-  // 自修改（K5）动态扩展区：订阅 dynamic-extension slot 的组件（统一走 SlotRegistry）
-  const dynamicExtensions = useSlotComponents('dynamic-extension')
-
-  /** 执行 browser 半代码：注入 React + slots（按 pkgId 隔离），注册动态组件到指定 slot */
-  const mountClientCode = (pkgId: string, code: string): void => {
-    try {
-      const slotDisposers: Array<() => void> = []
-      const slotsForPkg = {
-        register: (reg: { slot: string; id: string; component: React.ComponentType }) => {
-          const fullId = `${pkgId}:${reg.id}`
-          const dispose = registerSlot(reg.slot, fullId, pkgId, reg.component)
-          slotDisposers.push(dispose)
-          return dispose
-        },
-      }
-      const factory = new Function('React', 'slots', 'useUIContext', code) as (ReactNs: typeof React, slots: unknown, useUIContext: () => UIContextValue) => unknown
-      const disposer = factory(React, slotsForPkg, useUIContext)
-      if (typeof disposer === 'function') clientDisposers.current.set(pkgId, disposer as () => void)
-      clientSlotDisposers.current.set(pkgId, slotDisposers)
-    } catch (err) {
-      console.error('[selfmod] browser 半代码执行失败:', err)
-    }
-  }
-
-  /** 卸载某个动态包：调用其 browser 半 disposer + 逆序撤销其注册的所有 slot 组件 */
-  const unmountClientCode = (pkgId: string): void => {
-    const disposer = clientDisposers.current.get(pkgId)
-    try {
-      disposer?.()
-    } catch (err) {
-      console.error('[selfmod] browser 半 disposer 失败:', err)
-    }
-    clientDisposers.current.delete(pkgId)
-    const slotDisposers = clientSlotDisposers.current.get(pkgId)
-    if (slotDisposers) {
-      for (let i = slotDisposers.length - 1; i >= 0; i--) {
-        const dispose = slotDisposers[i]
-        if (!dispose) continue
-        try {
-          dispose()
-        } catch (err) {
-          console.error('[selfmod] slot 注销失败:', err)
-        }
-      }
-      clientSlotDisposers.current.delete(pkgId)
-    }
-  }
 
   const systemModels = models.filter((m) => !m.custom)
   const customModels = models.filter((m) => m.custom)
@@ -331,19 +279,11 @@ export function App() {
         return changed ? next : prev
       })
     })
-    const offClientCode = api.onClientCode((payload) => {
-      mountClientCode(payload.pkgId, payload.code)
-    })
-    const offClientRemove = api.onClientRemove((pkgId) => {
-      unmountClientCode(pkgId)
-    })
     void api.getApprovalPolicy().then((p) => setApprovalPolicyState(p)).catch(() => undefined)
     return () => {
       offModelsChanged()
       offClientRun()
       offClientRunResolved()
-      offClientCode()
-      offClientRemove()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [patchSession, refreshModelsList])
@@ -1128,7 +1068,6 @@ export function App() {
     closeBrowserWindow,
     // chat
     incompleteTurn,
-    dynamicExtensions,
     curApproval,
     curAsk,
     curClientRunRequest,

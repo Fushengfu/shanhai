@@ -205,6 +205,24 @@ async function getRunCommandEnv(): Promise<NodeJS.ProcessEnv> {
 const RUN_COMMAND_MAX_BUFFER = 10 * 1024 * 1024
 
 /**
+ * 命令行输出清洗：把图片 / base64 / 二进制大块数据替换为短占位符，
+ * 防止「cat image.png」「base64 x.png」等命令吐出的大块数据原样返回给 LLM、把请求体撑爆（context deadline exceeded）。
+ * 只拦截「图片 / base64 / 二进制大块数据」，不误伤正常短文本、路径、URL、hash、token。
+ * 阈值设定说明：连续 512+ 无空白 base64 字符（远超单条 hash/token 长度）、连续 64+ 不可打印字符（远超普通文本），均为「大块数据」的强特征。
+ */
+export function sanitizeBinaryOutput(text: string): string {
+  if (!text) return text
+  let out = text
+  // 1. data URI 图片：data:image/...;base64,...
+  out = out.replace(/data:image\/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=\r\n]+/g, '[图片 base64 已省略]')
+  // 2. 超长连续 base64 字符块（base64 命令输出 / 内联 base64 大块）
+  out = out.replace(/[A-Za-z0-9+/=]{512,}/g, (m) => `[base64 数据已省略（${m.length} 字符）]`)
+  // 3. 连续不可打印字符块（cat 二进制文件吐出的乱码）
+  out = out.replace(/[^\x20-\x7E\n\r\t]{64,}/g, '[二进制数据已省略]')
+  return out
+}
+
+/**
  * 执行 shell 命令，带「进程组级」超时与输出上限保护。
  *
  * 与 `exec(command, { timeout })` 的关键区别：exec 的 timeout 只向 shell 进程发 SIGTERM，
@@ -595,7 +613,9 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
       // 显式指定 shell（等价于 Node 默认，但明确平台分支，便于后续扩展 Git Bash 兼容）：
       //   win32 用 ComSpec/cmd.exe（支持 &&、|、> 等），POSIX 用 /bin/sh。agent 在 Windows 上应写 cmd 兼容命令。
       const shell = process.platform === 'win32' ? (process.env.ComSpec ?? 'cmd.exe') : '/bin/sh'
-      return runCommandWithTimeout(args.command, { cwd: getCwd(), env, shell, timeout: RUN_COMMAND_TIMEOUT_MS })
+      const result = await runCommandWithTimeout(args.command, { cwd: getCwd(), env, shell, timeout: RUN_COMMAND_TIMEOUT_MS })
+      // 清洗命令输出：拦截图片 / base64 / 二进制大块数据，避免撑爆上下文（context deadline exceeded）
+      return { stdout: sanitizeBinaryOutput(result.stdout), stderr: sanitizeBinaryOutput(result.stderr) }
     },
   }
 

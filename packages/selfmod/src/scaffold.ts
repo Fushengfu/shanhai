@@ -707,6 +707,22 @@ client 半在独立窗口渲染（完整 React + JSX + 任意依赖），并通�
     与 window.shanhai（宿主桥，仅 getPluginApp/closeApp），没有 chat 窗口的 useUIContext。
 `
 
+/** 默认插件应用图标（SVG，时钟占位主题）：scaffold 默认生成 icon.svg，install 时随产物自动部署到 plugins/<id>/icon.svg */
+const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f8cff"/>
+      <stop offset="1" stop-color="#7c5cff"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#g)"/>
+  <circle cx="64" cy="64" r="40" fill="none" stroke="#ffffff" stroke-width="8"/>
+  <line x1="64" y1="64" x2="64" y2="40" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
+  <line x1="64" y1="64" x2="80" y2="72" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="64" cy="64" r="5" fill="#ffffff"/>
+</svg>
+`
+
 /** 脚手架模板文件清单（权威源；与 apps/desktop/plugin-template/ 保持一致） */
 export const SCAFFOLD_FILES: ScaffoldFile[] = [
   { path: 'src/host.ts', content: HOST_TS },
@@ -718,6 +734,7 @@ export const SCAFFOLD_FILES: ScaffoldFile[] = [
   { path: 'vite.config.ts', content: VITE_CONFIG },
   { path: 'tsconfig.json', content: TSCONFIG_JSON },
   { path: 'package.json', content: PACKAGE_JSON },
+  { path: 'icon.svg', content: ICON_SVG },
   { path: 'README.md', content: README_MD },
 ]
 

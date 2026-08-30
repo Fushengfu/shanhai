@@ -1,6 +1,8 @@
 import { useUiStore } from '../store-client'
 import { AiOrb } from '../components/AiOrb'
 import { useThemeSync } from '../theme'
+import { PluginAppsPanel } from '../plugins/PluginAppsPanel'
+import { AppMenuPanel } from './AppMenuPanel'
 
 /**
  * 桌面壳窗口（多窗口桌面系统的「桌面」背景层）。
@@ -61,8 +63,14 @@ export function DesktopApp(): React.JSX.Element {
         <AiOrb />
       </div>
 
+      {/* 已安装插件应用图标区（悬浮在壁纸上，点击打开插件窗口） */}
+      <PluginAppsPanel />
+
       {/* 底部占位（应用 Dock 已拆到独立 dock 窗口） */}
       <div style={{ height: 128 }} />
+
+      {/* 顶部应用菜单面板：Dock 入口点击（ui.appMenuOpen）后在此弹出已安装应用列表 */}
+      {ui.appMenuOpen && <AppMenuPanel />}
     </div>
   )
 }

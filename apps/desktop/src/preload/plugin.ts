@@ -26,8 +26,8 @@ const windowType: 'app' = 'app'
 const windowAppId: string | undefined = readArg('--shanhai-app-id=')
 
 /**
- * 宿主桥：AppWindow 渲染 client 半所需的最小能力。
- * getPluginApp 拉取 clientCode（只读）、closeApp 关闭自身窗口、minimizeWindow/toggleMaximizeWindow
+ * 宿主桥：插件窗口所需的最小能力。
+ * getPluginApp 拉取插件应用元信息（只读）、closeApp 关闭自身窗口、minimizeWindow/toggleMaximizeWindow
  * 操作自身窗口（主进程按 sender 反查，无法越权操作其它窗口），均无害；危险接口不在此暴露。
  */
 const hostBridge = {

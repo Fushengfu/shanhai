@@ -237,12 +237,6 @@ function ChatSlot(): React.JSX.Element {
             )}
           </>
         )}
-        {/* 自修改（K5）动态扩展区：browser 半通过 slots.register 注册的组件渲染在这里（UI 热更新落点） */}
-        {ctx.dynamicExtensions.map((reg) => (
-          <div key={reg.id} style={{ marginBottom: 8, width: '100%' }}>
-            <reg.Component />
-          </div>
-        ))}
       </div>
 
       {/* 追加型扩展点：消息流下方（agent 往这里追加组件，不替换核心消息流） */}

@@ -122,7 +122,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   ctx.clientRunCallbacks = new Set<(req: { requestId: string; sessionId: string; pkgId: string; name: string; purpose: string }) => void>()
   ctx.pendingClientRuns = new Map<string, { resolve: (approved: boolean) => void; sessionId?: string }>()
   ctx.clientRunResolvedCallbacks = new Set<(requestId: string) => void>()
-  ctx.clientCodeCallbacks = new Set<(payload: { pkgId: string; name: string; code: string; permissions?: string[]; entryHtml?: string }) => void>()
+  ctx.pluginAppCallbacks = new Set<(payload: { pkgId: string; name: string; permissions?: string[]; entryHtml?: string; icon?: string }) => void>()
   ctx.clientRemoveCallbacks = new Set<(pkgId: string) => void>()
   ctx.openAppWindowCallbacks = new Set<(appId: string) => void>()
   ctx.closeAppWindowCallbacks = new Set<(appId: string) => void>()
@@ -407,7 +407,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         }
       }),
     deliverClient: async (pkg: DynamicPackage) => {
-      ctx.clientCodeCallbacks.forEach((cb) => cb({ pkgId: pkg.id, name: pkg.name, code: pkg.client ?? '', permissions: pkg.permissions ?? [], entryHtml: pkg.entryHtml, icon: pkg.icon }))
+      ctx.pluginAppCallbacks.forEach((cb) => cb({ pkgId: pkg.id, name: pkg.name, permissions: pkg.permissions ?? [], entryHtml: pkg.entryHtml, icon: pkg.icon }))
     },
     removeClient: async (pkgId: string) => {
       ctx.clientRemoveCallbacks.forEach((cb) => cb(pkgId))
@@ -1168,8 +1168,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
 
     onClientCode(cb) {
-      ctx.clientCodeCallbacks.add(cb)
-      return () => ctx.clientCodeCallbacks.delete(cb)
+      ctx.pluginAppCallbacks.add(cb)
+      return () => ctx.pluginAppCallbacks.delete(cb)
     },
 
     onClientRemove(cb) {

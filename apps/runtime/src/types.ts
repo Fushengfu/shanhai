@@ -348,9 +348,9 @@ export interface Runtime {
   respondClientRun(requestId: string, approved: boolean): void
   /** browser 半投递确认被管家决策 resolve 后回调（requestId 定位，UI 据此关闭对应弹窗） */
   onClientRunResolved(cb: (requestId: string) => void): () => void
-  /** browser 半代码投递回调（UI 收到后 slots 注册渲染）；entryHtml 为 client 半编译产物绝对路径（第 2/3 步，无源码时窗口应用仍可注册） */
-  onClientCode(cb: (payload: { pkgId: string; name: string; code: string; permissions?: string[]; entryHtml?: string; icon?: string }) => void): () => void
-  /** browser 半卸载回调（UI 移除组件） */
+  /** 动态插件窗口应用投递回调（主进程收到后注册窗口应用清单）；entryHtml 为 client 半编译产物绝对路径（dist/client.html，openApp 时 loadFile 渲染） */
+  onClientCode(cb: (payload: { pkgId: string; name: string; permissions?: string[]; entryHtml?: string; icon?: string }) => void): () => void
+  /** browser 半卸载回调（主进程移除窗口应用注册） */
   onClientRemove(cb: (pkgId: string) => void): () => void
   /** 打开插件窗口应用（appId = 插件持久化 id，主进程 openApp 复用 app 窗口类型承载） */
   openPluginApp(appId: string): Promise<{ ok: boolean }>
