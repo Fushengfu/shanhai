@@ -80,11 +80,24 @@ export interface ShanhaiPluginBridge {
    */
   invokePluginService(name: string, ...args: unknown[]): Promise<unknown>
   /**
-   * 模型调用（受控单次文本生成）：用「当前选中的模型」生成一次文本。
-   * 需显式声明 permissions: ["modelCall"]；不能指定模型 id、不能切模型，单次 maxTokens 上限由主进程固定。
-   * 入参 { prompt: 必填用户提示词, systemPrompt?: 可选系统提示词 }，返回 { text, usage? }。
+   * 模型调用（受控单次文本生成）：可指定 modelId（须在 listModels() 可用列表内），缺省用当前选中模型。
+   * 需显式声明 permissions: ["modelCall"]；不能切模型（model:switch 仍物理隔离），单次 maxTokens 上限由主进程固定。
+   * 入参 { prompt: 必填用户提示词, systemPrompt?: 可选系统提示词, modelId?: 可选模型 id }，返回 { text, usage? }。
    */
-  modelCall(input: { prompt: string; systemPrompt?: string }): Promise<{ text: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }>
+  modelCall(input: { prompt: string; systemPrompt?: string; modelId?: string }): Promise<{ text: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }>
+  /** 列出可用模型（精简 id + 展示名，隔离 apiKey/baseUrl 等敏感字段）。需显式声明 permissions: ["listModels"] */
+  listModels(): Promise<Array<{ id: string; name: string }>>
+  /**
+   * 流式模型调用（边生成边推送分片，适合长文本避免一次性返回超时）。
+   * 需显式声明 permissions: ["modelCallStream"]；modelId 受控（须在 listModels 可用列表内）。
+   * 入参 input { prompt, systemPrompt?, modelId? } + handlers { onChunk, onUsage, onDone, onError }，返回 { cancel }。
+   */
+  modelCallStream(input: { prompt: string; systemPrompt?: string; modelId?: string }, handlers: {
+    onChunk?: (text: string) => void
+    onUsage?: (usage: { promptTokens: number; completionTokens: number; totalTokens: number }) => void
+    onDone?: () => void
+    onError?: (error: Error) => void
+  }): { cancel: () => void }
 }
 
 /** 统一入口：所有能力走主进程 plugin:invoke 双层校验 */
@@ -106,6 +119,24 @@ const pluginBridge: ShanhaiPluginBridge = {
   getTokenStats: (sessionId) => invoke('getTokenStats', sessionId) as Promise<unknown>,
   invokePluginService: (name, ...rest) => invoke('invokePluginService', name, rest) as Promise<unknown>,
   modelCall: (input) => invoke('modelCall', input) as Promise<{ text: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }>,
+  listModels: () => invoke('listModels') as Promise<Array<{ id: string; name: string }>>,
+  modelCallStream: (input, handlers) => {
+    const callId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const listener = (_e: unknown, payload: { callId?: string; type?: string; text?: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number }; error?: string }) => {
+      if (!payload || payload.callId !== callId) return
+      if (payload.type === 'chunk') handlers.onChunk?.(payload.text ?? '')
+      else if (payload.type === 'usage') handlers.onUsage?.(payload.usage as { promptTokens: number; completionTokens: number; totalTokens: number })
+      else if (payload.type === 'done') { cleanup(); handlers.onDone?.() }
+      else if (payload.type === 'error') { cleanup(); handlers.onError?.(new Error(payload.error ?? 'modelCallStream 失败')) }
+    }
+    const cleanup = () => ipcRenderer.removeListener('plugin:model-stream-event', listener)
+    ipcRenderer.on('plugin:model-stream-event', listener)
+    invoke('modelCallStream', { callId, ...input }).catch((err) => {
+      cleanup()
+      handlers.onError?.(err instanceof Error ? err : new Error(String(err)))
+    })
+    return { cancel: cleanup }
+  },
 }
 
 contextBridge.exposeInMainWorld('shanhaiPlugin', pluginBridge)

@@ -715,7 +715,7 @@ export class SelfModifyRuntime {
         properties: {
           name: { type: 'string', description: '包名' },
           purpose: { type: 'string', description: '用途说明（一句话）' },
-          permissions: { type: 'array', items: { type: 'string' }, description: '可选：插件声明的白名单能力名清单（窗口应用形态才需要，用于调 window.shanhaiPlugin 桥）。完整可声明清单：getVersion / clipboardWriteText / clipboardReadText / speak / selectDirectory / listSessions / listMemory / getUiState(精简版) / closeApp(仅自身) / getWallpaper / getTokenStats / modelCall(受控单次模型调用，需显式声明)。缺省=空数组=最小权限；install 时随 manifest 落盘并审批' },
+          permissions: { type: 'array', items: { type: 'string' }, description: '可选：插件声明的白名单能力名清单（窗口应用形态才需要，用于调 window.shanhaiPlugin 桥）。完整可声明清单：getVersion / clipboardWriteText / clipboardReadText / speak / selectDirectory / listSessions / listMemory / getUiState(精简版) / closeApp(仅自身) / getWallpaper / getTokenStats / listModels(可用模型列表，需显式声明) / modelCall(受控单次模型调用，需显式声明) / modelCallStream(受控流式模型调用，需显式声明)。缺省=空数组=最小权限；install 时随 manifest 落盘并审批' },
           icon: { type: 'string', description: '可选：图标相对路径（相对插件目录，如 icon.png / assets/icon.png），供 Dock 图标渲染用；需该文件已放在 ~/.shanhai/plugins/<id>/ 下' },
           dependencies: { type: 'object', description: '可选：依赖声明（包名→版本），仅供工程化插件的 package.json 参考/审计，运行时不自解析依赖' },
           version: { type: 'string', description: '可选：插件版本号（如 2.0.0），install 时随 manifest.json 落盘；覆盖升级时用于标识版本' },

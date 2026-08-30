@@ -534,6 +534,46 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     }
   })
 
+  // —— 插件模型调用：限流 + 模型 id 解析（listModelsForPlugin / modelCall / modelCallStream 共用）——
+  const checkPluginModelCallRate = (appId: string): void => {
+    const now = Date.now()
+    const recent = (pluginModelCallWindows.get(appId) ?? []).filter((t) => now - t < 60_000)
+    if (recent.length >= PLUGIN_MODEL_CALL_MAX_PER_MINUTE) {
+      throw new Error(`插件 "${appId}" 模型调用过于频繁（每分钟最多 ${PLUGIN_MODEL_CALL_MAX_PER_MINUTE} 次），请稍后再试`)
+    }
+    recent.push(now)
+    pluginModelCallWindows.set(appId, recent)
+  }
+
+  /** 校验插件模型调用入参：prompt/systemPrompt 长度 + 限流 + 解析 modelId（可指定但须在可用列表内，缺省用当前选中模型） */
+  const preparePluginModelCall = (appId: string, input: { prompt?: unknown; systemPrompt?: unknown; modelId?: unknown }): { prompt: string; systemPrompt: string; modelId: string; provider: Model } => {
+    const prompt = typeof input?.prompt === 'string' ? input.prompt : ''
+    if (!prompt.trim()) throw new Error('modelCall 缺少 prompt 参数')
+    if (prompt.length > 8000) throw new Error('modelCall 的 prompt 超长（上限 8000 字符）')
+    const systemPrompt = typeof input?.systemPrompt === 'string' ? input.systemPrompt.trim() : ''
+    if (systemPrompt.length > 4000) throw new Error('modelCall 的 systemPrompt 超长（上限 4000 字符）')
+    checkPluginModelCallRate(appId)
+    // 模型 id：插件可指定，但必须落在「可用模型列表」内（不能任意指定、不能切到危险模型）；缺省用当前选中模型
+    const requested = typeof input?.modelId === 'string' ? input.modelId.trim() : ''
+    let modelId: string
+    if (requested) {
+      const available = allModels()
+      if (!available.some((m) => m.id === requested)) {
+        throw new Error(`modelCall 指定的模型 "${requested}" 不在可用模型列表中`)
+      }
+      modelId = requested
+    } else {
+      const current = modelProviderModule.getCurrentModelId()
+      if (!current) throw new Error('当前没有选中的模型，无法调用 modelCall')
+      modelId = current
+    }
+    return { prompt, systemPrompt, modelId, provider: modelProviderModule.resolveProvider(modelId) }
+  }
+
+  /** 插件可用模型列表（精简：id + 展示名，隔离 apiKey/baseUrl 等敏感字段） */
+  const listModelsForPlugin = async (): Promise<Array<{ id: string; name: string }>> =>
+    allModels().map((m) => ({ id: m.id, name: m.displayName ?? m.name ?? m.id }))
+
   return {
     kernel: ctx.kernel,
     session: ctx.sessionRef,
@@ -1152,24 +1192,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
 
     async invokeModelForPlugin(appId, input) {
-      const prompt = typeof input?.prompt === 'string' ? input.prompt : ''
-      if (!prompt.trim()) throw new Error('modelCall 缺少 prompt 参数')
-      // 输入长度上限：防止插件塞超长 prompt 撑爆上下文（prompt 8000 字符、systemPrompt 4000 字符）
-      if (prompt.length > 8000) throw new Error('modelCall 的 prompt 超长（上限 8000 字符）')
-      const systemPrompt = typeof input?.systemPrompt === 'string' ? input.systemPrompt.trim() : ''
-      if (systemPrompt.length > 4000) throw new Error('modelCall 的 systemPrompt 超长（上限 4000 字符）')
-      // 限流：每插件每分钟最多 N 次（简单时间窗口，按插件 id 分组）
-      const now = Date.now()
-      const recent = (pluginModelCallWindows.get(appId) ?? []).filter((t) => now - t < 60_000)
-      if (recent.length >= PLUGIN_MODEL_CALL_MAX_PER_MINUTE) {
-        throw new Error(`插件 "${appId}" 模型调用过于频繁（每分钟最多 ${PLUGIN_MODEL_CALL_MAX_PER_MINUTE} 次），请稍后再试`)
-      }
-      recent.push(now)
-      pluginModelCallWindows.set(appId, recent)
-      // 模型固定：只能调「当前选中的模型」，插件不能指定 modelId、无法切模型
-      const modelId = modelProviderModule.getCurrentModelId()
-      if (!modelId) throw new Error('当前没有选中的模型，无法调用 modelCall')
-      const provider = modelProviderModule.resolveProvider(modelId)
+      const { prompt, systemPrompt, provider } = preparePluginModelCall(appId, input)
       const messages: ChatMessage[] = []
       if (systemPrompt) messages.push({ role: 'system', content: systemPrompt })
       messages.push({ role: 'user', content: prompt })
@@ -1178,6 +1201,28 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         text: res.text ?? '',
         usage: res.usage ? { promptTokens: res.usage.promptTokens, completionTokens: res.usage.completionTokens, totalTokens: res.usage.totalTokens } : undefined,
       }
+    },
+
+    listModelsForPlugin,
+
+    async invokeModelForPluginStream(appId, input, emit) {
+      const { prompt, systemPrompt, provider } = preparePluginModelCall(appId, input)
+      const messages: ChatMessage[] = []
+      if (systemPrompt) messages.push({ role: 'system', content: systemPrompt })
+      messages.push({ role: 'user', content: prompt })
+      // 该模型 provider 不支持流式时，回退非流式一次性产出（保证功能可用）
+      if (typeof provider.stream !== 'function') {
+        const res = await provider.complete(messages, undefined, `plugin:${appId}`)
+        emit({ type: 'chunk', text: res.text ?? '' })
+        if (res.usage) emit({ type: 'usage', usage: { promptTokens: res.usage.promptTokens, completionTokens: res.usage.completionTokens, totalTokens: res.usage.totalTokens } })
+        emit({ type: 'done' })
+        return
+      }
+      for await (const chunk of provider.stream(messages, undefined, `plugin:${appId}`)) {
+        if (chunk.text) emit({ type: 'chunk', text: chunk.text })
+        if (chunk.usage) emit({ type: 'usage', usage: { promptTokens: chunk.usage.promptTokens, completionTokens: chunk.usage.completionTokens, totalTokens: chunk.usage.totalTokens } })
+      }
+      emit({ type: 'done' })
     },
 
     onClientRunRequest(cb) {

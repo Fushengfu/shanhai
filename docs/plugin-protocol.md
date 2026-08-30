@@ -107,7 +107,7 @@ client 半运行在浏览器渲染进程，**唯一形态**：窗口应用（配
 
 - 窗口内容由 `dist/client.html` + `dist/assets/*`（vite 完整 React bundle）渲染，**可用完整 React + JSX + 任意依赖 + 复杂 UI**。
 - 该入口挂**插件专用 preload**（`plugin.cjs`），暴露两个桥：
-  - `window.shanhaiPlugin`（白名单桥，13 项能力，见 §6）—— 插件调山海公开接口的**唯一**通道；
+  - `window.shanhaiPlugin`（白名单桥，15 项能力，见 §6）—— 插件调山海公开接口的**唯一**通道；
   - `window.shanhai`（宿主桥，**极度缩小**：仅 `windowType`/`platform`/`windowAppId`/`getPluginApp`/`closeApp`/`minimizeWindow`/`toggleMaximizeWindow`，无任何危险接口）。
 - 构建配置要求：`base: './'`（Electron `loadFile(file://)` 下资源必须相对路径）。
 
@@ -219,9 +219,9 @@ interface InstalledPackageMeta {
 - `closeApp`（关闭自身窗口）：「appId 由窗口反查、无法越权关其它窗口」的无害能力，避免漏声明导致窗口无法关闭。
 - `invokePluginService`（client→host RPC）：只能调「本插件」host 半注册的服务（appId 反查 + host 服务按插件 id 分组隔离），无法越权调其它插件/内核服务，属插件内部前后端通信。
 
-**危险接口（`auth:*` / `chat:run` / `supervisor:*` / `model:switch` / `model:addCustom` / `model:updateCustom` / `model:removeCustom` / `remote:disable` / `approval:setPolicy` / `session:delete` / `settings:set` / `wallpaper:set` 等）永不进白名单，物理拿不到。** 注意：`chat:run` 是「完整多轮 agent 循环」（带工具调用/审批/多轮），插件**永远拿不到**；插件若需要模型能力，只能用下方 §6 新增的 `modelCall`（受控单次文本生成，见「模型调用」小节）。
+**危险接口（`auth:*` / `chat:run` / `supervisor:*` / `model:switch` / `model:addCustom` / `model:updateCustom` / `model:removeCustom` / `remote:disable` / `approval:setPolicy` / `session:delete` / `settings:set` / `wallpaper:set` 等）永不进白名单，物理拿不到。** 注意：`chat:run` 是「完整多轮 agent 循环」（带工具调用/审批/多轮），插件**永远拿不到**；插件若需要模型能力，只能用下方 §6 新增的 `listModels` / `modelCall` / `modelCallStream`（受控模型能力，见「模型调用」小节）。
 
-## 6. 白名单能力清单（13 项）
+## 6. 白名单能力清单（15 项）
 
 | 能力 | 说明 |
 |------|------|
@@ -237,30 +237,61 @@ interface InstalledPackageMeta {
 | `getWallpaper` | 读取桌面壁纸 |
 | `getTokenStats` | token 用量快照（只读） |
 | `invokePluginService` | 调用本插件 host 半注册的自定义服务（client→host RPC，见 §1.2 `ctx.provide`）。入参：服务名 + 可变参数，返回值须 JSON 可序列化。**默认放行**：无需 `permissions` 声明 |
-| `modelCall` | **模型调用**：用「当前选中的模型」做一次单次文本生成（受控，见下「模型调用」小节）。**需显式声明** `permissions: ["modelCall"]` |
+| `modelCall` | **模型调用（非流式）**：用「当前选中的模型」或「listModels 可用列表里指定的模型」做一次单次文本生成（受控，见 §6.1）。**需显式声明** `permissions: ["modelCall"]` |
+| `listModels` | **列出可用模型**：返回山海网关可用模型列表（精简 `{ id, name }`，隔离 apiKey/baseUrl）。**需显式声明** `permissions: ["listModels"]` |
+| `modelCallStream` | **流式模型调用**：边生成边推送分片，适合长文本避免一次性返回超时（受控，见 §6.3）。**需显式声明** `permissions: ["modelCallStream"]` |
 
-> 完整可声明清单即上述 13 项；`permissions` 缺省 = 空数组 = 最小权限。
+> 完整可声明清单即上述 15 项；`permissions` 缺省 = 空数组 = 最小权限。
 
-### 6.1 模型调用（`modelCall`）
+### 6.1 模型调用（`modelCall` / `modelCallStream` / `listModels`）
 
-插件窗口内「一键生成」场景（如 AI 短剧插件的「生成剧本」）需要直连山海模型。`modelCall` 提供**受控单次文本生成**，与 `chat:run`（完整 agent 循环）严格区分。
+插件窗口内「一键生成」场景（如 AI 短剧插件的「生成剧本」）需要直连山海模型。山海提供**三个受控模型能力**，与 `chat:run`（完整 agent 循环）严格区分：
 
-**调用方式**（client 半 `window.shanhaiPlugin.modelCall(...)`）：
+| 能力 | 形态 | 用途 | permissions |
+|------|------|------|-------------|
+| `listModels` | 一次性 | 列出可用模型（下拉框数据源） | `["listModels"]` |
+| `modelCall` | 非流式（兜底） | 单次同步返回完整文本 | `["modelCall"]` |
+| `modelCallStream` | **流式（推荐）** | 边生成边推送分片，长文本避免超时 | `["modelCallStream"]` |
+
+**① 列出可用模型 `listModels()`**：
+```ts
+const models = await window.shanhaiPlugin.listModels()
+// models = [ { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' }, ... ]
+```
+返回山海网关返回的可用模型列表（**精简 `{ id, name }`**，隔离 apiKey/baseUrl 等敏感字段）。插件下拉框据此渲染，用户选中某个 `id` 后传给 `modelCall` / `modelCallStream` 的 `modelId`。
+
+**② 非流式 `modelCall()`（兜底）**：
 ```ts
 const res = await window.shanhaiPlugin.modelCall({
   prompt: '把下面这段扩写成 200 字短剧分镜：……',   // 必填：用户提示词
   systemPrompt: '你是专业短剧编剧。',             // 可选：系统提示词
+  modelId: 'deepseek-v4-pro',                     // 可选：模型 id（须在 listModels 列表内；缺省用当前选中模型）
 })
 // res = { text: '...', usage?: { promptTokens, completionTokens, totalTokens } }
 ```
 
-**安全规则（写死，插件不可突破）**：
-1. **模型固定**：插件**不能指定模型 id**——只能调「当前会话选中的模型」（用户已登录并选好的模型，如 deepseek-v4-pro），不暴露任何 modelId 参数；无法切模型、无法换模型。
-2. **危险接口隔离**：`modelCall` 与 `model:switch` / `model:addCustom` / `chat:run` / `supervisor:*` 完全隔离，插件依然物理拿不到这些接口。
+**③ 流式 `modelCallStream()`（推荐，长文本用这个）**：
+```ts
+const stream = window.shanhaiPlugin.modelCallStream(
+  { prompt, systemPrompt, modelId },   // 同 modelCall 入参
+  {
+    onChunk: (text) => { /* 增量文本，边收边显示 */ },
+    onUsage: (usage) => { /* 结束时返回的 token 用量 */ },
+    onDone: () => { /* 流正常结束 */ },
+    onError: (err) => { /* 断流/异常，已收到的部分文本仍可用 */ },
+  },
+)
+// stream.cancel()  // 可选：主动取消
+```
+分片顺序固定：若干 `onChunk(text 增量)` → 一个 `onUsage(usage)` → 一个 `onDone()`；异常时 `onError(error)`（前面已收到的 `onChunk` 文本仍可保留展示，属部分结果）。
+
+**安全规则（三者共用，写死，插件不可突破）**：
+1. **模型受限**：`modelId` **只能填 `listModels()` 返回列表里的 id**——主进程校验，不在列表则抛错拒绝；缺省用「当前选中的模型」。插件**不能切模型**（`model:switch` 仍物理隔离），不能任意指定任意模型、不能切到危险模型。
+2. **危险接口隔离**：`modelCall` / `modelCallStream` / `listModels` 与 `model:switch` / `model:addCustom` / `chat:run` / `supervisor:*` 完全隔离，插件依然物理拿不到这些接口。
 3. **maxTokens 固定上限**：主进程固定单次生成最大 token（默认 4096），插件不可传、不可改。
-4. **非流式**：单次同步返回完整文本，不提供流式接口（避免长时间占用连接）。
-5. **需显式声明**：`permissions: ["modelCall"]`（**非默认放行**），install 顶层审批时一并批准。
-6. **限流**：主进程按「插件 id」做简单频率限制（默认每插件每分钟 20 次），超限抛错；token 用量计入全局配额（`getTokenStats` 可见）。
+4. **需显式声明**：三个能力都要显式声明（**非默认放行**），install 顶层审批时一并批准。
+5. **限流**：主进程按「插件 id」做简单频率限制（默认每插件每分钟 20 次），超限抛错；token 用量计入全局配额（`getTokenStats` 可见）。
+6. **流式兜底**：若所选模型 provider 不支持流式，`modelCallStream` 自动回退为「一次 `onChunk` 输出全文 + `onUsage` + `onDone`」，前端无需区分；断流/网络异常走 `onError`，已收到的 `onChunk` 部分文本仍可用。
 
 ---
 

@@ -33,6 +33,12 @@ export interface ToolTrace {
 
 export type ApprovalOutcome = 'allowed-once' | 'rejected'
 
+/** 插件流式模型调用事件（主进程 → 插件窗口逐条推送） */
+export type PluginModelStreamEvent =
+  | { type: 'chunk'; text: string }
+  | { type: 'usage'; usage: { promptTokens: number; completionTokens: number; totalTokens: number } }
+  | { type: 'done' }
+
 
 /** token 用量快照（UI 底部状态栏展示：累计 / 本轮 / 上下文占比） */
 export interface TokenSnapshot {
@@ -362,8 +368,12 @@ export interface Runtime {
   onClosePluginApp(cb: (appId: string) => void): () => void
   /** client 半 → host 半自定义 RPC：按「插件 id + 服务名」调用 host 半 provide() 注册的服务（仅限本插件，无法越权） */
   invokePluginService(appId: string, name: string, args: unknown[]): Promise<unknown>
-  /** 插件模型调用（受控单次文本生成）：用「当前选中的模型」生成一次文本；插件不能指定模型 id、不能切模型，maxTokens 上限固定 */
-  invokeModelForPlugin(appId: string, input: { prompt: string; systemPrompt?: string }): Promise<{ text: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }>
+  /** 插件模型调用（受控单次文本生成）：可指定 modelId（须在 listModelsForPlugin 可用列表内），缺省用当前选中模型；maxTokens 上限固定 */
+  invokeModelForPlugin(appId: string, input: { prompt: string; systemPrompt?: string; modelId?: string }): Promise<{ text: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }>
+  /** 插件可用模型列表（精简：id + 展示名，隔离 apiKey/baseUrl 等敏感字段） */
+  listModelsForPlugin(): Promise<Array<{ id: string; name: string }>>
+  /** 插件流式模型调用：边生成边经 emit 推送分片；modelId 受控（须在可用列表内），限流/配额沿用 modelCall */
+  invokeModelForPluginStream(appId: string, input: { prompt: string; systemPrompt?: string; modelId?: string }, emit: (ev: PluginModelStreamEvent) => void): Promise<void>
   /** 列出长期记忆（按会话隔离，仅返回当前会话的记忆） */
   listMemory(sessionId: string): Array<{ id: number; scope: string; key: string; value: unknown; source: string; confidence: number; timestamp: number; sessionId?: string }>
   /** 删除一条长期记忆（按 id） */

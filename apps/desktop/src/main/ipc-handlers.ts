@@ -273,7 +273,7 @@ export function registerIpc(): void {
   const PLUGIN_CAPABILITIES = new Set([
     'getVersion', 'clipboardWriteText', 'clipboardReadText', 'speak', 'selectDirectory',
     'listSessions', 'listMemory', 'getUiState', 'closeApp', 'getWallpaper', 'getTokenStats',
-    'invokePluginService', 'modelCall',
+    'invokePluginService', 'modelCall', 'listModels', 'modelCallStream',
   ])
   ipcMain.handle('plugin:invoke', async (e, capability: string, ...args: unknown[]) => {
     const win = BrowserWindow.fromWebContents(e.sender)
@@ -330,8 +330,25 @@ export function registerIpc(): void {
         // client → host 自定义 RPC：appId 反查窗口 → 插件 id，只调「本插件」host 半注册的服务（无法越权）
         return runtime.invokePluginService(appId, String(args[0] ?? ''), Array.isArray(args[1]) ? args[1] : [])
       case 'modelCall':
-        // 受控单次文本生成：用「当前选中的模型」生成，插件不能指定模型 id；maxTokens 上限由 runtime 固定。
-        return runtime.invokeModelForPlugin(appId, args[0] as { prompt: string; systemPrompt?: string })
+        // 受控单次文本生成：modelId 可选（须在 listModelsForPlugin 可用列表内），缺省用当前选中模型；maxTokens 上限由 runtime 固定。
+        return runtime.invokeModelForPlugin(appId, args[0] as { prompt: string; systemPrompt?: string; modelId?: string })
+      case 'listModels':
+        // 可用模型列表（精简 id + 展示名，隔离 apiKey/baseUrl 等敏感字段）
+        return runtime.listModelsForPlugin()
+      case 'modelCallStream': {
+        // 受控流式文本生成：边生成边经 webContents 推送分片（chunk/usage/done/error），避免长文本一次性返回超时
+        const payload = args[0] as { callId: string; prompt: string; systemPrompt?: string; modelId?: string }
+        void (async () => {
+          try {
+            await runtime.invokeModelForPluginStream(appId, payload, (ev) => {
+              e.sender.send('plugin:model-stream-event', { callId: payload.callId, ...ev })
+            })
+          } catch (err) {
+            e.sender.send('plugin:model-stream-event', { callId: payload.callId, type: 'error', error: err instanceof Error ? err.message : String(err) })
+          }
+        })()
+        return { ok: true, callId: payload.callId }
+      }
       default:
         throw new Error(`未实现的插件能力: ${capability}`)
     }
