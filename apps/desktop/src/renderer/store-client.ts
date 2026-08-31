@@ -106,11 +106,16 @@ function ensureInit(): void {
   })
   window.shanhai?.onUiState((s) => {
     snapshot = s as unknown as SharedState
-    // 会话结束（busy=false）时清空该会话的流式累加（items 已重建，streaming 切换为最终正文）
+    // 流式累加缓存清理：① 会话结束（busy=false）时清空；② 会话已从 sessionMap 移除（被删除/切出）时清空残留，
+    // 避免切换/删除会话后 streamingCache 长期持有无用增量文本（内存持续增长）。遍历 streamingCache 键（会话数级）。
     const sm = (s as unknown as SharedState).sessionMap ?? {}
-    for (const sid of Object.keys(sm)) {
+    for (const sid of Object.keys(streamingCache)) {
       const sess = sm[sid]
-      if (sess && !sess.busy) {
+      if (!sess) {
+        delete streamingCache[sid]
+        continue
+      }
+      if (!sess.busy) {
         const cur = streamingCache[sid]
         if (cur && (cur.text || cur.reasoning)) delete streamingCache[sid]
       }

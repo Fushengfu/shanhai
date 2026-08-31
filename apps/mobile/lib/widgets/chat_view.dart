@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import '../theme.dart';
 import '../services/ws_client.dart';
 import '../models/protocol.dart';
 import 'message_bubbles.dart';
@@ -418,16 +419,17 @@ class _ChatViewState extends State<ChatView> {
   // —— 审批弹窗 ——
   /// 风险等级 → 标签颜色（高危红 / 可逆琥珀 / 只读绿 / 其他灰）
   Color _riskColor(String level) {
+    final c = context.appColors;
     switch (level) {
       case 'high':
       case 'irreversible':
-        return const Color(0xFFEF4444);
+        return c.riskHigh;
       case 'reversible':
-        return const Color(0xFFF59E0B);
+        return c.riskWarn;
       case 'readonly':
-        return const Color(0xFF34D399);
+        return c.riskOk;
       default:
-        return const Color(0xFF9CA3AF);
+        return c.riskGray;
     }
   }
 
@@ -518,7 +520,7 @@ class _ChatViewState extends State<ChatView> {
                 ],
               ),
               const SizedBox(height: 12),
-              approvalArgsWidget(req.toolName, req.args),
+              approvalArgsWidget(context.appColors, req.toolName, req.args),
             ],
           ),
         ),
@@ -830,13 +832,14 @@ class _ChatViewState extends State<ChatView> {
   /// 「加载更早」入口：当后端按「最近 20 轮」截断（truncated=true）时，在列表顶部显示，
   /// 点击用 beforeTurnSeq 分页拉取更早历史。
   Widget _buildLoadEarlierBar() {
+    final c = context.appColors;
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
       child: Center(
         child: TextButton.icon(
           onPressed: _loadEarlier,
-          icon: const Icon(Icons.expand_less, size: 16, color: Color(0xFF808080)),
-          label: const Text('加载更早历史', style: TextStyle(fontSize: 12, color: Color(0xFF808080))),
+          icon: Icon(Icons.expand_less, size: 16, color: c.textMuted),
+          label: Text('加载更早历史', style: TextStyle(fontSize: 12, color: c.textMuted)),
         ),
       ),
     );
@@ -844,18 +847,19 @@ class _ChatViewState extends State<ChatView> {
 
   /// 「继续执行」提示条：任务中断后显示，点击从断点续跑（对齐桌面端 continue 入口）。
   Widget _buildResumeBar() {
+    final c = context.appColors;
     return SafeArea(
       top: false,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
         child: Row(
           children: [
-            const Icon(Icons.play_circle_outline, size: 18, color: Color(0xFF22D3EE)),
+            Icon(Icons.play_circle_outline, size: 18, color: c.running),
             const SizedBox(width: 8),
-            const Expanded(
+            Expanded(
               child: Text(
                 '任务已中断，可继续执行',
-                style: TextStyle(fontSize: 13, color: Color(0xFFE0E0E0)),
+                style: TextStyle(fontSize: 13, color: c.textPrimary),
               ),
             ),
             FilledButton.tonal(
@@ -878,6 +882,7 @@ class _ChatViewState extends State<ChatView> {
   }
 
   Widget _buildComposer() {
+    final c = context.appColors;
     return SafeArea(
       top: false,
       child: Padding(
@@ -893,9 +898,9 @@ class _ChatViewState extends State<ChatView> {
                 onSubmitted: (_) => _send(_inputCtrl.text),
                 decoration: InputDecoration(
                   hintText: widget.isSupervisor ? '对管家说…' : '发送消息…',
-                  hintStyle: TextStyle(fontSize: 14, color: Colors.grey.shade600),
+                  hintStyle: TextStyle(fontSize: 14, color: c.textMuted),
                   filled: true,
-                  fillColor: const Color(0xFF1A1A24),
+                  fillColor: c.cardBg,
                   contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                   border: OutlineInputBorder(borderRadius: BorderRadius.circular(22), borderSide: BorderSide.none),
                 ),

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ToolTrace } from '../types'
 import { AskCard } from '../components/AskCard'
 import { SessionPicker } from '../components/SessionPicker'
@@ -19,7 +19,10 @@ import { useStreaming } from '../store-client'
 
 /** AI 回复气泡通用底样（思考 + 工具步骤 + 正文聚合，与 AssistantMessage 保持一致） */
 const AI_BUBBLE_STYLE: React.CSSProperties = {
-  maxWidth: '85%',
+  width: '85%',
+  // 气泡宽度上限兜底：无论窗口如何缩放、内容 min-content 多宽，气泡都不会超过消息容器（≤ 容器 ≤ 窗口），避免右侧溢出
+  // maxWidth: '100%',
+  boxSizing: 'border-box',
   padding: '10px 14px',
   borderRadius: 16,
   borderTopLeftRadius: 4,
@@ -74,6 +77,33 @@ function ChatSlot(): React.JSX.Element {
   // 之前的实现每次内容更新都重算 nearBottom，流式内容一次性增长超过阈值时会被误判为「用户已上翻」而停止跟随。
   const atBottomRef = useRef(true)
 
+  // —— 卡顿优化：稳定历史消息交互回调引用。原先直接把不稳定的 ctx.resendMessage / ctx.editResend
+  //     放进 history useMemo 依赖，导致每次 ui:state 广播（工具步骤等）都重新创建引用 → 全量重建历史列表。
+  //     这里用 useRef 持最新回调 + useCallback 包装稳定引用，只让「确实新增/修改消息」才重建 history。
+  const resendMsgRef = useRef(ctx.resendMessage)
+  const editResendRef = useRef(ctx.editResend)
+  resendMsgRef.current = ctx.resendMessage
+  editResendRef.current = ctx.editResend
+  const handleResend = useCallback((userIndex: number) => resendMsgRef.current(userIndex), [])
+  const handleEditResend = useCallback((userIndex: number, newContent: string) => editResendRef.current(userIndex, newContent), [])
+  const handlePreview = useCallback((url: string) => ctx.setPreviewImage(url), [ctx.setPreviewImage])
+
+  // —— 流式当前气泡 markdown 节流：streaming.text 每帧都在变，逐帧全量解析 ReactMarkdown 很费；
+  //     这里每 120ms 才把最新文本写入 state 渲染一次（长回复流中显著减少解析 / 重绘次数）。
+  const textRef = useRef(streaming.text)
+  textRef.current = streaming.text
+  const lastRenderedTextRef = useRef('')
+  const [streamedText, setStreamedText] = useState('')
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (textRef.current !== lastRenderedTextRef.current) {
+        lastRenderedTextRef.current = textRef.current
+        setStreamedText(textRef.current)
+      }
+    }, 120)
+    return () => clearInterval(iv)
+  }, [])
+
   // 审批弹窗 / 提问卡片的折叠状态（默认展开；新请求到来时自动展开）
   const [approvalCollapsed, setApprovalCollapsed] = useState(false)
   useEffect(() => {
@@ -113,7 +143,7 @@ function ChatSlot(): React.JSX.Element {
       const tools = toolBuffer
       toolBuffer = []
       nodes.push(
-        <div key={`tools-${keyBase}`}>
+        <div key={`tools-${keyBase}`} style={{ minWidth: 0, maxWidth: '100%' }}>
           {tools.map((t) => (
             <ToolStep key={t.callId} trace={t} />
           ))}
@@ -135,9 +165,9 @@ function ChatSlot(): React.JSX.Element {
             userIndex={idx}
             busy={ctx.cur.busy}
             pending={it.pending}
-            onResend={ctx.resendMessage}
-            onEditResend={ctx.editResend}
-            onPreviewImage={(url) => ctx.setPreviewImage(url)}
+            onResend={handleResend}
+            onEditResend={handleEditResend}
+            onPreviewImage={handlePreview}
           />
         )
       } else if (it.kind === 'assistant') {
@@ -150,7 +180,7 @@ function ChatSlot(): React.JSX.Element {
             reasoningContent={it.reasoningContent}
             toolSteps={tools}
             turnDuration={it.turnDuration}
-            onPreviewImage={(url) => ctx.setPreviewImage(url)}
+            onPreviewImage={handlePreview}
           />
         )
       } else {
@@ -160,7 +190,7 @@ function ChatSlot(): React.JSX.Element {
     // 非 busy 时残留的 tool（如任务中断）直接渲染；busy 时残留 tool 归入「正在生成」气泡
     if (!ctx.cur.busy) flushTools('tail')
     return { nodes, pendingTools: toolBuffer }
-  }, [ctx.cur.items, ctx.cur.busy, ctx.resendMessage, ctx.editResend, ctx.setPreviewImage])
+  }, [ctx.cur.items, ctx.cur.busy, handleResend, handleEditResend, handlePreview])
 
   return (
     <>
@@ -170,7 +200,24 @@ function ChatSlot(): React.JSX.Element {
         style={
           ctx.isEmpty
             ? { flex: '0 0 auto', minHeight: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '36px 16px 4px', overflow: 'hidden' }
-            : { flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: 16, background: 'var(--bg-sidebar)' }
+            : {
+                flex: 1,
+                minHeight: 0,
+                // 消息列表容器宽度约束：显式占满父级（≤ 窗口 - 侧边栏）、上限 100%、内边距不撑破，且用列 flex 让每条消息占满整行，
+                // 配合 `minWidth: 0`，任何宽内容（长代码/nowrap 表格/长 URL）都不能把容器推宽 → 从根上杜绝「气泡右侧超出窗口」
+                width: '100%',
+                maxWidth: '100%',
+                minWidth: 0,
+                boxSizing: 'border-box',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'stretch',
+                overflowY: 'auto',
+                overflowX: 'hidden',
+                padding: 16,
+                background: 'var(--bg-sidebar)',
+                contain: 'layout',
+              }
         }
       >
         {ctx.isEmpty ? (
@@ -204,11 +251,11 @@ function ChatSlot(): React.JSX.Element {
                       )}
                       {/* 思考过程折叠块：显示在正文之前，流式展开显示完整思考 */}
                       {streaming.reasoning && <ReasoningBlock content={streaming.reasoning} streaming />}
-                      {/* 正式回答：只显示最终正文（流式实时按 Markdown 渲染，与历史气泡一致） */}
-                      {streaming.text && (
+                      {/* 正式回答：只显示最终正文（流式实时按 Markdown 渲染，与历史气泡一致；已节流 120ms 渲染，避免逐帧全量解析） */}
+                      {streamedText && (
                         <div style={{ minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
-                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents((url) => ctx.setPreviewImage(url))}>
-                            {normalizeTreeBlocks(stripWrappedRecordTag(streaming.text))}
+                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents(handlePreview)}>
+                            {normalizeTreeBlocks(stripWrappedRecordTag(streamedText))}
                           </ReactMarkdown>
                           <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
                         </div>

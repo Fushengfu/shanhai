@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import '../theme.dart';
 import '../services/auth_service.dart';
 import '../services/token_store.dart';
 import '../services/ws_client.dart';
@@ -244,7 +245,7 @@ class _LoginPageState extends State<LoginPage> {
             hintText: hint,
             hintStyle: TextStyle(fontSize: 13, color: Colors.grey.shade600),
             filled: true,
-            fillColor: const Color(0xFF1A1A24),
+            fillColor: context.appColors.cardBg,
             contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
           ),

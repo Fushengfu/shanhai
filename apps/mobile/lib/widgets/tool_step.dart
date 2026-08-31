@@ -2,21 +2,16 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../models/protocol.dart';
+import '../theme.dart';
 
 /// 工具执行步骤渲染：紧凑单行摘要 + 折叠的类型化结果卡片（对齐桌面端 ToolStep.tsx）。
 /// 桌面端核心特征：无边框无卡片、图标（状态色）+ 粗体标题 + 「·」+ 摘要 + 状态标签；
 /// 展开后左侧竖线缩进，结果按工具类型渲染（终端/文件行号/git diff/树形/截图/纯文本）。
+/// 颜色统一走 AppColors（亮/暗主题切换自动刷新）；终端/代码块保持深色终端样式（与桌面端一致）。
 
-// —— 语义色（对齐桌面端暗色主题 theme.css）——
-const Color _cRunning = Color(0xFF22D3EE); // 执行中（accent 等价物，桌面端暗色 accent 为蓝，手机端用青 secondary）
-const Color _cSuccess = Color(0xFF34D399); // 成功
-const Color _cError = Color(0xFFF87171); // 失败
-const Color _cPending = Color(0xFFF59E0B); // 待确认
-const Color _cText = Color(0xFFE0E0E0); // 主文字
-const Color _cTextMuted = Color(0xFF808080); // 次要文字
-const Color _cTextFaint = Color(0xFF5A5A5A); // 弱文字
-const Color _cBorder = Color(0xFF3A3A3C); // 边框
-const Color _cCodeBg = Color(0xFF14141C); // 代码块背景
+// 终端深色块固定色（亮暗主题下终端都保持深色终端样式）
+const Color _kTerminalOutText = Color(0xFFD4D4D4); // 终端输出正文
+const Color _kTerminalErrText = Color(0xFFF48771); // 终端 stderr（红）
 
 /// 工具名 → 中文显示名（对齐桌面端 TOOL_META，避免暴露英文原始名）
 const Map<String, String> _toolNameMap = {
@@ -112,14 +107,14 @@ const Map<String, String> _skillActionNameMap = {
   'browser-use:clear_cookies': '清除 Cookie',
 };
 
-/// 工具名 → 中文显示名（skill_run 按 skillId+action 细分，未知名回退为原英文名）
+/// 工具名 → 中文显示名（skill_run 按 skillId+action 细分，未知名回退「工具操作」）
 String friendlyToolName(String name, Map<String, dynamic>? args) {
   if (name == 'skill_run') {
     final skillId = args?['skillId']?.toString() ?? '';
     final action = args?['action']?.toString() ?? '';
     return _skillActionNameMap['$skillId:$action'] ?? '执行技能';
   }
-  return _toolNameMap[name] ?? (name.isEmpty ? '工具操作' : name);
+  return _toolNameMap[name] ?? '工具操作';
 }
 
 /// 工具名 → 图标（Material Icons 映射桌面端语义图标）
@@ -218,7 +213,7 @@ String _skillRunSummary(Map<String, dynamic> args) {
 String toolSummary(String name, Map<String, dynamic>? args) {
   if (args == null) return '';
   if (name == 'skill_run') return _skillRunSummary(args);
-  if (name == 'read_file' || name == 'write_file') return args['path']?.toString() ?? '';
+  if (name == 'read_file' || name == 'write_file' || name == 'edit_file' || name == 'rollback_file') return args['path']?.toString() ?? '';
   if (name == 'run_command') return args['command']?.toString() ?? '';
   if (name == 'list_dir') return args['path']?.toString() ?? '当前目录';
   if (name == 'image_analyze') {
@@ -382,8 +377,8 @@ List<_DiffLine> _computeDiff(String before, String after) {
 
 // ===== 类型化结果渲染 =====
 
-/// 终端结果卡片（对齐桌面端 TerminalBlock）
-Widget _terminalBlock(String command, String stdout, String stderr) {
+/// 终端结果卡片（对齐桌面端 TerminalBlock；终端块保持深色终端样式）
+Widget _terminalBlock(AppColors c, String command, String stdout, String stderr) {
   return Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
@@ -391,11 +386,11 @@ Widget _terminalBlock(String command, String stdout, String stderr) {
         Container(
           width: double.infinity,
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          color: const Color(0xFF282C34),
+          color: c.terminalBg,
           child: Text.rich(
             TextSpan(children: [
-              TextSpan(text: '\$ ', style: const TextStyle(color: Color(0xFF7F848E))),
-              TextSpan(text: command, style: const TextStyle(color: Color(0xFF61AFEF))),
+              TextSpan(text: '\$ ', style: TextStyle(color: c.terminalPrompt)),
+              TextSpan(text: command, style: TextStyle(color: c.terminalCmd)),
             ]),
             style: const TextStyle(fontFamily: 'monospace', fontSize: 12, height: 1.5),
           ),
@@ -405,12 +400,12 @@ Widget _terminalBlock(String command, String stdout, String stderr) {
           width: double.infinity,
           constraints: const BoxConstraints(maxHeight: 280),
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          color: const Color(0xFF1E1E1E),
+          color: c.terminalOut,
           child: SingleChildScrollView(
             child: Text.rich(
               TextSpan(children: [
-                TextSpan(text: stdout, style: const TextStyle(color: Color(0xFFD4D4D4))),
-                if (stderr.isNotEmpty) TextSpan(text: stderr, style: const TextStyle(color: Color(0xFFF48771))),
+                TextSpan(text: stdout, style: const TextStyle(color: _kTerminalOutText)),
+                if (stderr.isNotEmpty) TextSpan(text: stderr, style: const TextStyle(color: _kTerminalErrText)),
               ]),
               style: const TextStyle(fontFamily: 'monospace', fontSize: 12, height: 1.5),
             ),
@@ -421,7 +416,7 @@ Widget _terminalBlock(String command, String stdout, String stderr) {
 }
 
 /// 文件结果卡片：带行号的只读窗口，超 200 行折叠（对齐桌面端 FileBlock）
-Widget _fileBlock(String content, String path) {
+Widget _fileBlock(AppColors c, String content, String path) {
   final lines = content.split('\n');
   const max = 200;
   final shown = lines.length > max ? lines.sublist(0, max) : lines;
@@ -432,12 +427,12 @@ Widget _fileBlock(String content, String path) {
         Container(
           width: double.infinity,
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-          decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: _cBorder))),
+          decoration: BoxDecoration(border: Border(bottom: BorderSide(color: c.border))),
           child: Text(
             '$path · ${lines.length} 行',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 11, color: _cTextMuted),
+            style: TextStyle(fontSize: 11, color: c.textMuted),
           ),
         ),
       ConstrainedBox(
@@ -453,18 +448,18 @@ Widget _fileBlock(String content, String path) {
                   children: [
                     SizedBox(
                       width: 40,
-                      child: Text('${i + 1}', textAlign: TextAlign.right, style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: _cTextFaint)),
+                      child: Text('${i + 1}', textAlign: TextAlign.right, style: TextStyle(fontFamily: 'monospace', fontSize: 12, color: c.textFaint)),
                     ),
                     const SizedBox(width: 10),
                     Expanded(
-                      child: Text(shown[i].isEmpty ? ' ' : shown[i], style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: _cText, height: 1.5)),
+                      child: Text(shown[i].isEmpty ? ' ' : shown[i], style: TextStyle(fontFamily: 'monospace', fontSize: 12, color: c.textPrimary, height: 1.5)),
                     ),
                   ],
                 ),
               if (lines.length > max)
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  child: Text('… 共 ${lines.length} 行，仅显示前 $max 行', style: const TextStyle(fontSize: 11, color: _cTextMuted)),
+                  child: Text('… 共 ${lines.length} 行，仅显示前 $max 行', style: TextStyle(fontSize: 11, color: c.textMuted)),
                 ),
             ],
           ),
@@ -475,7 +470,7 @@ Widget _fileBlock(String content, String path) {
 }
 
 /// 文件变更卡片：git diff 风格（- 红 / + 绿 / 上下文灰）
-Widget _diffBlock(String before, String after, String path, bool isNew) {
+Widget _diffBlock(AppColors c, String before, String after, String path, bool isNew) {
   final treatAsNew = isNew || before.isEmpty;
   final diffLines = treatAsNew
       ? [for (int i = 0; i < after.split('\n').length; i++) _DiffLine(_DiffLineType.add, after.split('\n')[i], newLine: i + 1)]
@@ -490,12 +485,12 @@ Widget _diffBlock(String before, String after, String path, bool isNew) {
         Container(
           width: double.infinity,
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-          decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: _cBorder))),
+          decoration: BoxDecoration(border: Border(bottom: BorderSide(color: c.border))),
           child: Text(
             '$path · ${treatAsNew ? '新建文件，+$addCount' : '+$addCount −$delCount'}',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 11, color: _cTextMuted),
+            style: TextStyle(fontSize: 11, color: c.textMuted),
           ),
         ),
       ConstrainedBox(
@@ -504,7 +499,7 @@ Widget _diffBlock(String before, String after, String path, bool isNew) {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              for (final l in diffLines) _diffLineRow(l),
+              for (final l in diffLines) _diffLineRow(c, l),
             ],
           ),
         ),
@@ -513,21 +508,21 @@ Widget _diffBlock(String before, String after, String path, bool isNew) {
   );
 }
 
-Widget _diffLineRow(_DiffLine l) {
+Widget _diffLineRow(AppColors c, _DiffLine l) {
   if (l.type == _DiffLineType.fold) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
-      color: const Color(0xFF232325),
-      child: Text(l.text, textAlign: TextAlign.center, style: const TextStyle(fontSize: 11, color: _cTextMuted)),
+      color: c.diffFoldBg,
+      child: Text(l.text, textAlign: TextAlign.center, style: TextStyle(fontSize: 11, color: c.textMuted)),
     );
   }
   final isAdd = l.type == _DiffLineType.add;
   final isDel = l.type == _DiffLineType.del;
-  final bg = isAdd ? const Color(0xFF1F2E1F) : isDel ? const Color(0xFF332022) : Colors.transparent;
+  final bg = isAdd ? c.diffAddBg : isDel ? c.diffDelBg : Colors.transparent;
   final sign = isAdd ? '+' : isDel ? '−' : ' ';
-  final signColor = isAdd ? _cSuccess : isDel ? _cError : _cTextFaint;
-  final textColor = isDel ? _cError : isAdd ? _cSuccess : _cText;
+  final signColor = isAdd ? c.success : isDel ? c.error : c.textFaint;
+  final textColor = isDel ? c.error : isAdd ? c.success : c.textPrimary;
   return Container(
     width: double.infinity,
     color: bg,
@@ -537,12 +532,12 @@ Widget _diffLineRow(_DiffLine l) {
       children: [
         SizedBox(
           width: 34,
-          child: Text(l.oldLine?.toString() ?? '', textAlign: TextAlign.right, style: const TextStyle(fontFamily: 'monospace', fontSize: 11, color: _cTextFaint)),
+          child: Text(l.oldLine?.toString() ?? '', textAlign: TextAlign.right, style: TextStyle(fontFamily: 'monospace', fontSize: 11, color: c.textFaint)),
         ),
         const SizedBox(width: 8),
         SizedBox(
           width: 34,
-          child: Text(l.newLine?.toString() ?? '', textAlign: TextAlign.right, style: const TextStyle(fontFamily: 'monospace', fontSize: 11, color: _cTextFaint)),
+          child: Text(l.newLine?.toString() ?? '', textAlign: TextAlign.right, style: TextStyle(fontFamily: 'monospace', fontSize: 11, color: c.textFaint)),
         ),
         const SizedBox(width: 8),
         Text(sign, style: TextStyle(fontFamily: 'monospace', fontSize: 12, color: signColor, fontWeight: FontWeight.w600)),
@@ -591,56 +586,58 @@ Widget _imageBlock(String src) {
 }
 
 Widget _imageErrorBuilder(BuildContext context, Object error, StackTrace? stackTrace) {
-  return const Padding(
-    padding: EdgeInsets.all(12),
-    child: Text('图片加载失败', style: TextStyle(fontSize: 12, color: _cTextMuted)),
+  final c = context.appColors;
+  return Padding(
+    padding: const EdgeInsets.all(12),
+    child: Text('图片加载失败', style: TextStyle(fontSize: 12, color: c.textMuted)),
   );
 }
 
 /// 纯文本块（脱敏 + 截断）
-Widget _textBlock(String text) {
+Widget _textBlock(AppColors c, String text) {
   return Container(
     width: double.infinity,
     constraints: const BoxConstraints(maxHeight: 320),
     padding: const EdgeInsets.all(10),
-    color: _cCodeBg,
+    color: c.codeBg,
     child: SingleChildScrollView(
-      child: Text(text, style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: _cText, height: 1.5)),
+      child: Text(text, style: TextStyle(fontFamily: 'monospace', fontSize: 12, color: c.textPrimary, height: 1.5)),
     ),
   );
 }
 
-Widget _successBlock(String text) {
+Widget _successBlock(AppColors c, String text) {
   return Padding(
     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-    child: Text(text, style: const TextStyle(fontSize: 12, color: _cSuccess)),
+    child: Text(text, style: TextStyle(fontSize: 12, color: c.success)),
   );
 }
 
-Widget _errorBlock(String error) {
+Widget _errorBlock(AppColors c, String error) {
   return Padding(
     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-    child: Text(redactSecret(error), style: const TextStyle(fontSize: 12, color: _cError, height: 1.5)),
+    child: Text(redactSecret(error), style: TextStyle(fontSize: 12, color: c.error, height: 1.5)),
   );
 }
 
 /// 按工具类型渲染结果（对齐桌面端 renderToolResult）
-Widget? renderToolResult(String name, dynamic result, String? error, Map<String, dynamic>? args) {
-  if (error != null && error.isNotEmpty) return _errorBlock(error);
+Widget? renderToolResult(AppColors c, String name, dynamic result, String? error, Map<String, dynamic>? args) {
+  if (error != null && error.isNotEmpty) return _errorBlock(c, error);
   if (result == null) return null;
   if (name == 'run_command') {
     final r = _asMap(result) ?? <String, dynamic>{};
     return _terminalBlock(
+      c,
       args?['command']?.toString() ?? '',
       r['stdout']?.toString() ?? '',
       r['stderr']?.toString() ?? '',
     );
   }
   if (name == 'list_dir') {
-    return _textBlock(result.toString());
+    return _textBlock(c, result.toString());
   }
   if (name == 'read_file') {
-    return _fileBlock(result.toString(), args?['path']?.toString() ?? '');
+    return _fileBlock(c, result.toString(), args?['path']?.toString() ?? '');
   }
   if (name == 'skill_run' && args?['action'] == 'screenshot') {
     final src = _screenshotSrc(result);
@@ -653,18 +650,18 @@ Widget? renderToolResult(String name, dynamic result, String? error, Map<String,
   if (name == 'write_file') {
     final r = _asMap(result) ?? <String, dynamic>{};
     if (r['after'] is String) {
-      return _diffBlock(r['before']?.toString() ?? '', r['after'] as String, r['path']?.toString() ?? '', r['isNew'] == true);
+      return _diffBlock(c, r['before']?.toString() ?? '', r['after'] as String, r['path']?.toString() ?? '', r['isNew'] == true);
     }
-    return _successBlock('✓ 已写入 ${r['path'] ?? ''}');
+    return _successBlock(c, '✓ 已写入 ${r['path'] ?? ''}');
   }
   if (name == 'edit_file') {
     final r = _asMap(result) ?? <String, dynamic>{};
     if (r['after'] is String) {
-      return _diffBlock(r['before']?.toString() ?? '', r['after'] as String, r['path']?.toString() ?? '', false);
+      return _diffBlock(c, r['before']?.toString() ?? '', r['after'] as String, r['path']?.toString() ?? '', false);
     }
-    return _successBlock('✓ 已编辑 ${r['path'] ?? ''}');
+    return _successBlock(c, '✓ 已编辑 ${r['path'] ?? ''}');
   }
-  return _textBlock(redactSecret(truncateText(stringifyResult(result), 4000)));
+  return _textBlock(c, redactSecret(truncateText(stringifyResult(result), 4000)));
 }
 
 /// 工具步骤执行状态
@@ -701,27 +698,28 @@ class _ToolStepWidgetState extends State<ToolStepWidget> {
     return name;
   }
 
-  Color get _statusColor {
+  Color _statusColorOf(AppColors c) {
     switch (_status) {
       case ToolStepStatus.running:
-        return _cRunning;
+        return c.running;
       case ToolStepStatus.pendingApproval:
-        return _cPending;
+        return c.pending;
       case ToolStepStatus.error:
-        return _cError;
+        return c.error;
       case ToolStepStatus.done:
-        return _cSuccess;
+        return c.success;
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final c = context.appColors;
     final summary = toolSummary(trace.name, trace.args);
-    final resultBody = !_isCall ? renderToolResult(trace.name, trace.result, trace.error, trace.args) : null;
+    final resultBody = !_isCall ? renderToolResult(c, trace.name, trace.result, trace.error, trace.args) : null;
     final expandable = resultBody != null;
     final reasoning = trace.reasoning;
     final hasReasoning = reasoning != null && reasoning.isNotEmpty;
-    final stateColor = _statusColor;
+    final stateColor = _statusColorOf(c);
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 3),
@@ -729,7 +727,7 @@ class _ToolStepWidgetState extends State<ToolStepWidget> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // 思考信息：步骤上方，紧凑无边框（先思考、再执行）
-          if (hasReasoning) _buildReasoning(reasoning),
+          if (hasReasoning) _buildReasoning(c, reasoning),
           // 主行：图标 + 粗体标题 + 「·」+ 摘要 + 状态标签 + chevron
           InkWell(
             onTap: expandable ? () => setState(() => _expanded = !_expanded) : null,
@@ -745,28 +743,28 @@ class _ToolStepWidgetState extends State<ToolStepWidget> {
                       children: [
                         Flexible(
                           flex: 0,
-                          child: Text(_title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _cText)),
+                          child: Text(_title, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: c.textPrimary)),
                         ),
                         if (summary.isNotEmpty) ...[
-                          const Text(' · ', style: TextStyle(fontSize: 13, color: _cTextFaint)),
+                          Text(' · ', style: TextStyle(fontSize: 13, color: c.textFaint)),
                           Expanded(
-                            child: Text(summary, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13, color: _cTextMuted)),
+                            child: Text(summary, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 13, color: c.textMuted)),
                           ),
                         ],
                       ],
                     ),
                   ),
                   if (_status == ToolStepStatus.running)
-                    const Padding(
-                      padding: EdgeInsets.only(left: 6),
-                      child: Text('执行中…', style: TextStyle(fontSize: 12, color: _cRunning)),
+                    Padding(
+                      padding: const EdgeInsets.only(left: 6),
+                      child: Text('执行中…', style: TextStyle(fontSize: 12, color: c.running)),
                     ),
                   if (_isCall && trace.approvalRequired)
                     Container(
                       margin: const EdgeInsets.only(left: 6),
                       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                      decoration: BoxDecoration(color: const Color(0xFF332B1A), borderRadius: BorderRadius.circular(4)),
-                      child: const Text('待确认', style: TextStyle(fontSize: 11, color: _cPending)),
+                      decoration: BoxDecoration(color: c.approvalTagBg, borderRadius: BorderRadius.circular(4)),
+                      child: Text('待确认', style: TextStyle(fontSize: 11, color: c.pending)),
                     ),
                   if (expandable)
                     Padding(
@@ -774,7 +772,7 @@ class _ToolStepWidgetState extends State<ToolStepWidget> {
                       child: AnimatedRotation(
                         turns: _expanded ? 0.5 : 0,
                         duration: const Duration(milliseconds: 150),
-                        child: const Icon(Icons.expand_more, size: 16, color: _cTextFaint),
+                        child: Icon(Icons.expand_more, size: 16, color: c.textFaint),
                       ),
                     ),
                 ],
@@ -786,7 +784,7 @@ class _ToolStepWidgetState extends State<ToolStepWidget> {
             Container(
               margin: const EdgeInsets.only(top: 3, left: 18),
               padding: const EdgeInsets.only(left: 0),
-              decoration: const BoxDecoration(border: Border(left: BorderSide(color: _cBorder, width: 2))),
+              decoration: BoxDecoration(border: Border(left: BorderSide(color: c.border, width: 2))),
               child: resultBody,
             ),
         ],
@@ -794,7 +792,7 @@ class _ToolStepWidgetState extends State<ToolStepWidget> {
     );
   }
 
-  Widget _buildReasoning(String reasoning) {
+  Widget _buildReasoning(AppColors c, String reasoning) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 3),
       child: Column(
@@ -807,10 +805,10 @@ class _ToolStepWidgetState extends State<ToolStepWidget> {
                 AnimatedRotation(
                   turns: _reasoningOpen ? 0 : -0.25,
                   duration: const Duration(milliseconds: 150),
-                  child: const Icon(Icons.expand_more, size: 15, color: _cTextFaint),
+                  child: Icon(Icons.expand_more, size: 15, color: c.textFaint),
                 ),
                 const SizedBox(width: 2),
-                const Text('思考', style: TextStyle(fontSize: 12, color: _cTextFaint)),
+                Text('思考', style: TextStyle(fontSize: 12, color: c.textFaint)),
               ],
             ),
           ),
@@ -818,10 +816,10 @@ class _ToolStepWidgetState extends State<ToolStepWidget> {
             Container(
               margin: const EdgeInsets.only(top: 2),
               padding: const EdgeInsets.only(left: 10),
-              decoration: const BoxDecoration(border: Border(left: BorderSide(color: _cBorder, width: 2))),
+              decoration: BoxDecoration(border: Border(left: BorderSide(color: c.border, width: 2))),
               constraints: const BoxConstraints(maxHeight: 200),
               child: SingleChildScrollView(
-                child: Text(reasoning, style: const TextStyle(fontSize: 12, color: _cTextMuted, height: 1.6)),
+                child: Text(reasoning, style: TextStyle(fontSize: 12, color: c.textMuted, height: 1.6)),
               ),
             ),
         ],
@@ -861,9 +859,9 @@ String riskLevelLabel(String level) {
 /// 审批弹窗参数友好渲染（对齐桌面端 renderApprovalDetail 的精简版）：
 /// 命令→终端块、写/编辑文件→路径 + 变更规模、其余→友好键值对（长值截断），
 /// 避免把整个 args map 直接 dump 出来撑大弹窗。
-Widget approvalArgsWidget(String name, Map<String, dynamic> args) {
+Widget approvalArgsWidget(AppColors c, String name, Map<String, dynamic> args) {
   if (args.isEmpty) {
-    return const Text('（无参数）', style: TextStyle(fontSize: 12, color: _cTextMuted));
+    return Text('（无参数）', style: TextStyle(fontSize: 12, color: c.textMuted));
   }
   // 执行命令：完整显示命令（通常一行，是审批的关键信息）
   if (name == 'run_command') {
@@ -872,11 +870,11 @@ Widget approvalArgsWidget(String name, Map<String, dynamic> args) {
       return Container(
         width: double.infinity,
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        decoration: BoxDecoration(color: const Color(0xFF282C34), borderRadius: BorderRadius.circular(6)),
+        decoration: BoxDecoration(color: c.terminalBg, borderRadius: BorderRadius.circular(6)),
         child: Text.rich(
           TextSpan(children: [
-            const TextSpan(text: '\$ ', style: TextStyle(color: Color(0xFF7F848E))),
-            TextSpan(text: cmd, style: const TextStyle(color: Color(0xFF61AFEF))),
+            TextSpan(text: '\$ ', style: TextStyle(color: c.terminalPrompt)),
+            TextSpan(text: cmd, style: TextStyle(color: c.terminalCmd)),
           ]),
           style: const TextStyle(fontFamily: 'monospace', fontSize: 12, height: 1.4),
         ),
@@ -894,14 +892,14 @@ Widget approvalArgsWidget(String name, Map<String, dynamic> args) {
     final head = path.isNotEmpty
         ? '$path · ${isNew ? '新建，+$addLines 行' : '+$addLines −$delLines 行'}'
         : (isNew ? '新建文件，+$addLines 行' : '+$addLines −$delLines 行');
-    return Text(head, maxLines: 3, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12, color: _cText, fontFamily: 'monospace', height: 1.4));
+    return Text(head, maxLines: 3, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 12, color: c.textPrimary, fontFamily: 'monospace', height: 1.4));
   }
   // 其余：友好键值对，长值截断
-  return _argsKvWidget(args);
+  return _argsKvWidget(c, args);
 }
 
-/// 友好键值对（对齐桌面端 formatArgs）：key 灰、value 白，长值截断
-Widget _argsKvWidget(Map<String, dynamic> args) {
+/// 友好键值对（对齐桌面端 formatArgs）：key 灰、value 主色，长值截断
+Widget _argsKvWidget(AppColors c, Map<String, dynamic> args) {
   final entries = args.entries.toList();
   return Column(
     mainAxisSize: MainAxisSize.min,
@@ -912,8 +910,8 @@ Widget _argsKvWidget(Map<String, dynamic> args) {
           padding: const EdgeInsets.symmetric(vertical: 1.5),
           child: Text.rich(
             TextSpan(children: [
-              TextSpan(text: '${e.key}：', style: const TextStyle(color: _cTextMuted)),
-              TextSpan(text: _prettyArg(e.value), style: const TextStyle(color: _cText)),
+              TextSpan(text: '${e.key}：', style: TextStyle(color: c.textMuted)),
+              TextSpan(text: _prettyArg(e.value), style: TextStyle(color: c.textPrimary)),
             ]),
             style: const TextStyle(fontSize: 12, height: 1.5),
           ),

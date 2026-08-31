@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@shanhai/kernel": "workspace:*",
+    "@shanhai/skills": "workspace:*",
     "@shanhai/tools": "workspace:*"
   },
   "devDependencies": {

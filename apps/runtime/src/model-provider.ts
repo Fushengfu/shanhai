@@ -64,6 +64,14 @@ function toTemperature(v: string | number | undefined): number | undefined {
   return n
 }
 
+/** 把网关/自定义模型的 reasoningEffort（string|undefined）安全归一；空串/非法返回 undefined（不下发，用模型默认）。档位规范化（medium/xhigh→high 等）在 provider 层按协议处理 */
+function toReasoningEffort(v: string | undefined): string | undefined {
+  if (v == null) return undefined
+  const s = String(v).trim()
+  if (!s) return undefined
+  return s
+}
+
 export function createModelProviderModule(
   ctx: RuntimeContext,
   deps: {
@@ -83,7 +91,7 @@ export function createModelProviderModule(
     if (target?.source === 'deepseek-bridge') {
       provider = createDeepSeekModel({ chat: deepSeekBridge.deepSeekChat, getWorkspace: currentWorkDir })
     } else if (target?.baseUrl) {
-      provider = createModelProvider({ apiKey: target.apiKey, baseUrl: target.baseUrl, model: target.model ?? target.id, protocol: target.protocol, maxTokens: target.maxTokens, onUsage: tokenStats.onUsage, onTrace: tokenStats.onHttpTrace, supportsReasoning: target.supportsReasoning, temperature: toTemperature(target.temperature) })
+      provider = createModelProvider({ apiKey: target.apiKey, baseUrl: target.baseUrl, model: target.model ?? target.id, protocol: target.protocol, maxTokens: target.maxTokens, onUsage: tokenStats.onUsage, onTrace: tokenStats.onHttpTrace, supportsReasoning: target.supportsReasoning, temperature: toTemperature(target.temperature), reasoningEffort: toReasoningEffort(target.reasoningEffort) })
     }
     ctx.modelProviders.set(modelId, provider)
     return provider
@@ -251,7 +259,7 @@ export function createModelProviderModule(
     if (target?.source === 'deepseek-bridge') {
       ctx.model = createDeepSeekModel({ chat: deepSeekBridge.deepSeekChat, getWorkspace: currentWorkDir })
     } else if (target?.baseUrl) {
-      ctx.model = createModelProvider({ apiKey: target.apiKey, baseUrl: target.baseUrl, model: target.model ?? target.id, protocol: target.protocol, maxTokens: target.maxTokens, onUsage: tokenStats.onUsage, onTrace: tokenStats.onHttpTrace, supportsReasoning: target.supportsReasoning, temperature: toTemperature(target.temperature) })
+      ctx.model = createModelProvider({ apiKey: target.apiKey, baseUrl: target.baseUrl, model: target.model ?? target.id, protocol: target.protocol, maxTokens: target.maxTokens, onUsage: tokenStats.onUsage, onTrace: tokenStats.onHttpTrace, supportsReasoning: target.supportsReasoning, temperature: toTemperature(target.temperature), reasoningEffort: toReasoningEffort(target.reasoningEffort) })
     } else {
       ctx.model = await createGatewayModel(tokenStats.onUsage, tokenStats.onHttpTrace)
     }

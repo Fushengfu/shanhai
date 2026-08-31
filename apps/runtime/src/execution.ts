@@ -121,7 +121,7 @@ export function createExecutionModule(
           // 管家历史回放轮数比普通会话多（30 vs 20），便于跨会话编排时保留更长上下文主线
           maxHistoryTurns: isSupervisorRun ? SUPERVISOR_MAX_HISTORY_TURNS : undefined,
           // 管家历史回放与普通会话一致：只回放 user + 最终 assistant 正文，不保留工具调用过程（tool/call + tool/result）。
-          // 曾用 preserveToolCalls: isSupervisorRun 完整回放工具调用，但会把历史里反复出现的重复工具调用（如 write_ledger 反复写 _index.json）
+          // 曾用 preserveToolCalls: isSupervisorRun 完整回放工具调用，但会把历史里反复出现的重复工具调用（如 ledger(write) 反复写 _index.json）
           // 回放给模型、强化重复行为，诱发「连续几十次写同一台账文件」的死循环，故取消（走缺省 false）。
           onDelta: (text) => {
             if (ctx.stoppedSessions.has(sid)) throw new Error('__stopped__')
@@ -230,24 +230,15 @@ export function createExecutionModule(
     if (next) void sendMessageToSession(sid, next, 'queue')
   }
 
+  // 管家会话工具白名单：基础工具只保留少量，插件类能力统一收敛到 plugin（统一入口，10 个 action：list / inspect / scaffold / build / test-load / verify / install / publish / uninstall / tool）。
+  // 原「plugin_inspect / plugin_define / plugin_scaffold / plugin_build / plugin_install / ...」等 plugin_* 顶层工具，
+  // 以及 plugin_manage / plugin_list / plugin_tool 三个入口，均已收敛（见 selfmod.createPluginTool），故白名单只需放行这一个入口。
+  // 管家只做会话调度与监控，不执行具体任务，因此不暴露技能调度工具（skill_list / skill_read / skill_run）。
   const SUPERVISOR_ALLOWED_BASE_TOOL_NAMES = new Set([
     'ask_user',
     'remember',
     'recall_memory',
-    'plugin_inspect',
-    'plugin_define',
-    'plugin_run',
-    'plugin_stop',
-    'plugin_undefine',
-    'plugin_test',
-    'plugin_install',
-    'plugin_uninstall',
-    'plugin_scaffold',
-    'plugin_build',
-    'plugin_test_load',
-    'plugin_verify',
-    'plugin_apps',
-    'plugin_tool',
+    'plugin',
   ])
 
   const buildSupervisorLoopTools = (): ToolContract[] => [
@@ -259,7 +250,7 @@ export function createExecutionModule(
           .map((s) => sessions.describeSession(s.id))
           .filter((s): s is SessionStateSummary => s !== null),
       inspectSession: (sid) => sessions.describeSession(sid),
-      listModels: () => allModels().map((m) => ({ id: m.id, name: m.displayName ?? m.name ?? m.id })),
+      listModels: () => allModels().map((m) => ({ id: m.id, name: m.displayName ?? m.name ?? m.id, modelType: m.modelType })),
       sendMessage: (sid, message, mode) => sendMessageToSession(sid, message, mode),
       switchSession: (sid) => sessions.switchSessionInternal(sid),
       setSessionModel: (sid, modelId) => sessions.setSessionModelInternal(sid, modelId),
@@ -339,7 +330,7 @@ export function createExecutionModule(
         // 断点续跑：resume 从事件日志回放已执行历史、从断点继续（不新增用户消息、不篡改历史对话），
         // 工具执行时的审批判断仍从该会话事件日志回放 approval/policy，即仍受该会话安全模式（approvalPolicy）约束。
         void resume(sid).catch((err) => {
-          console.error('[supervisor] resume_session 续跑失败:', err instanceof Error ? err.message : err)
+          console.error('[supervisor] session(resume) 续跑失败:', err instanceof Error ? err.message : err)
         })
         return { ok: true, message: `已恢复会话「${meta.title}」(${sid}) 从断点继续执行` }
       },
@@ -429,7 +420,7 @@ export function createExecutionModule(
       `【任务回传】会话「${title}」(${sid}) 的任务执行${error ? '失败' : '完成'}。\n` +
       `结果：${body}\n\n` +
       `请按【任务编排】流程接力处理：\n` +
-      `1. 若该会话在台账里有任务清单（state.json 的 tasks），read_ledger 读取后，把刚完成的任务 status 改为 done（失败改 blocked）并回填 result，同步 _index.json。\n` +
+      `1. 若该会话在台账里有任务清单（state.json 的 tasks），ledger({ action: "read" }) 读取后，把刚完成的任务 status 改为 done（失败改 blocked）并回填 result，同步 _index.json。\n` +
       `2. 若清单里还有 status=todo 的后续任务，用 send_message 把下一个任务下发给该会话（继续推进流水线）。\n` +
       `3. 若清单已全部 done、或该会话本就没有任务清单（只是简单转发），更新必要状态后结束本轮，不要重复下发、不要空转。`
     ctx.supervisorWakeQueue.push(prompt)

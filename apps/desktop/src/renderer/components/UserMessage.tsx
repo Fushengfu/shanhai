@@ -1,10 +1,10 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import { IconClock, IconCopy, IconEdit, IconRefresh } from './icons'
 import { MessageActions } from './MessageActions'
 import { copyText } from './ui'
 
 /** 用户消息气泡：右对齐，气泡下方常显「编辑 / 复制 / 重新发送」；编辑为内联编辑（Enter 确认 / Esc 取消，参考 taco） */
-export function UserMessage({ content, images, userIndex, busy, pending, onResend, onEditResend, onPreviewImage }: {
+export const UserMessage = memo(function UserMessage({ content, images, userIndex, busy, pending, onResend, onEditResend, onPreviewImage }: {
   content: string
   images?: string[]
   userIndex: number
@@ -81,4 +81,4 @@ export function UserMessage({ content, images, userIndex, busy, pending, onResen
       ) : null}
     </div>
   )
-}
+})

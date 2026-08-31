@@ -195,7 +195,9 @@ export class AgentLoop {
     if (options?.systemPrompt) messages.push({ role: 'system', content: options.systemPrompt })
 
     // 从 session 事件日志回放历史（多轮对话 + 断点续跑：中断后历史仍在 session）
-    this.replayHistory(messages)
+    // includeReasoning=false：上下文回放（近轮数裁剪、供模型使用）剔除 reasoning_content，避免思维链撑爆上下文、触发超时；
+    // 仅 preserveToolCalls=true（按事件完整回放，保留工具调用）时才视为完整事件回放，保留 reasoning_content。
+    this.replayHistory(messages, options?.preserveToolCalls === true)
 
     // 用户发起的新任务（新发消息 / 编辑重发 / 点击重发）：始终按最近 maxHistoryTurns（缺省 20）轮对话回放（每轮只保留用户消息 + 最终 assistant 回复正文，
     // 丢弃更早历史与工具执行过程），不再全量回放。断点续跑 resumeRun() 走独立路径，保留全量已执行历史。
@@ -228,8 +230,11 @@ export class AgentLoop {
     return this.runLoop(messages, 0, maxSteps, onDelta, onReasoning)
   }
 
-  /** 回放会话事件日志到 messages（user/assistant/tool 三类；delta/turn/usage/retry-snapshot 等中间态或元数据事件忽略）。 */
-  private replayHistory(messages: ChatMessage[]): void {
+  /** 回放会话事件日志到 messages（user/assistant/tool 三类；delta/turn/usage/retry-snapshot 等中间态或元数据事件忽略）。
+   * includeReasoning：是否把历史 assistant 消息的 reasoning_content（思维链）带回 messages。
+   * - 上下文回放（run() 近轮数裁剪、供模型使用）默认传 false：剔除 reasoning_content，避免思维链撑爆上下文、触发超时；
+   * - 完整事件回放（resumeRun 断点续跑 / preserveToolCalls=true 按事件完整回放）传 true：保留 reasoning_content。 */
+  private replayHistory(messages: ChatMessage[], includeReasoning = true): void {
     for (const e of this.session.list()) {
       if (e.type === 'user/message') {
         const d = e.data as { content: string; attachments?: ContentPart[] }
@@ -253,11 +258,11 @@ export class AgentLoop {
         messages.push({
           role: 'assistant',
           content: wrapReplayAssistant(d.content),
-          reasoningContent: d.reasoningContent,
+          reasoningContent: includeReasoning ? d.reasoningContent : undefined,
         })
       } else if (e.type === 'tool/call') {
         const d = e.data as { callId: string; name: string; args: Record<string, unknown>; reasoningContent?: string }
-        messages.push({ role: 'assistant', content: '', toolCall: { id: d.callId, name: d.name, args: d.args }, reasoningContent: d.reasoningContent })
+        messages.push({ role: 'assistant', content: '', toolCall: { id: d.callId, name: d.name, args: d.args }, reasoningContent: includeReasoning ? d.reasoningContent : undefined })
       } else if (e.type === 'tool/result') {
         const d = e.data as { callId: string; result?: unknown; error?: string }
         messages.push({ role: 'tool', content: JSON.stringify(d.result ?? d.error ?? ''), toolCallId: d.callId })

@@ -16,7 +16,7 @@ import type { VoiceService } from '@shanhai/voice'
 import { createComputerUseSkill, createPlatformComputerUseService, type ComputerUseService } from '@shanhai/computer-use'
 import { createBrowserUseSkill, createMockBrowserUseService, type BrowserUseService } from '@shanhai/browser-use'
 import { createTerminalSkill, createMockTerminalService, type TerminalService, type TerminalInfo } from '@shanhai/terminal'
-import { uploadImageToCloud } from '@shanhai/storage'
+import { uploadImageToCloud, uploadFileToCloud } from '@shanhai/storage'
 import { createSupervisorTools, SUPERVISOR_ID, type SessionStateSummary } from './supervisor'
 import { createSupervisorLedgerTools, ensureSupervisorWorkspace, removeSessionLedger, SUPERVISOR_WORKSPACE } from './supervisor-workspace'
 import {
@@ -44,6 +44,9 @@ import type {
   CustomModelInput,
   BootstrapOptions,
   Runtime,
+  PluginVideoGenInput,
+  PluginImageGenInput,
+  PluginTtsInput,
 } from './types'
 
 export type { AskRequest } from '@shanhai/ask'
@@ -454,9 +457,17 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     if (!ctx.memberToken) return null
     return uploadImageToCloud({ imageBase64, token: ctx.memberToken, mimeType })
   }
+  // 通用文件上传（插件素材 / 任意文件）：走登录账号上传体系（memberToken），直传复用 uploadToQiniu（含跨区域自愈）
+  const uploadFile = async (dataBase64: string, mimeType?: string, fileName?: string): Promise<string | null> => {
+    if (!ctx.memberToken) return null
+    return uploadFileToCloud({ dataBase64, token: ctx.memberToken, mimeType, fileName })
+  }
   ctx.skillService.registerExecutable(createComputerUseSkill(ctx.computerUse, uploadImage))
   ctx.skillService.registerExecutable(createBrowserUseSkill(ctx.browserUse, uploadImage))
   ctx.skillService.registerExecutable(createTerminalSkill(ctx.terminalUse))
+  // 插件统一入口 plugin（顶层工具，10 个 action：list / inspect / scaffold / build / test-load / verify / install / publish / uninstall / tool）。
+  // 插件 host 半注册的工具不再注入顶层工具表，收敛到 plugin 的 list / tool 两个 action（见 selfmod.createPluginTool）。
+  const pluginTool = ctx.selfmod.createPluginTool(() => sessionContext.getStore() ?? ctx.currentSessionId ?? '')
   const skillTools: ToolContract[] = createSkillTools(ctx.skillService)
   // 预热技能缓存 + 生成「内置可执行技能目录」注入系统提示词（第三方技能不注入，AI 按需 skill_list 查）
   ctx.builtinSkillCatalog = await ctx.skillService.builtinExecutableCatalog()
@@ -468,7 +479,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     ...askTools,
     ...skillTools,
     ...mcpTools,
-    ...ctx.selfmod.createTools(() => sessionContext.getStore() ?? ctx.currentSessionId ?? ''),
+    pluginTool,
   ]
   ctx.tools.push(...baseTools.map(wrapTool))
 
@@ -570,9 +581,60 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     return { prompt, systemPrompt, modelId, provider: modelProviderModule.resolveProvider(modelId) }
   }
 
-  /** 插件可用模型列表（精简：id + 展示名，隔离 apiKey/baseUrl 等敏感字段） */
-  const listModelsForPlugin = async (): Promise<Array<{ id: string; name: string }>> =>
-    allModels().map((m) => ({ id: m.id, name: m.displayName ?? m.name ?? m.id }))
+  /** 插件可用模型列表（精简：id + 展示名 + 类型，隔离 apiKey/baseUrl 等敏感字段） */
+  const listModelsForPlugin = async (): Promise<Array<{ id: string; name: string; modelType?: string }>> =>
+    allModels().map((m) => ({ id: m.id, name: m.displayName ?? m.name ?? m.id, modelType: m.modelType }))
+
+  // —— 插件媒体生成（videoGen/imageGen/tts）：直接转发网关，统一鉴权 + 登录校验 + 超时（复用 modelCall 的 apiKey 鉴权，不新造）——
+  /** 网关 HTTP 请求 helper：Bearer apiKey 鉴权 + 60s 超时 + 错误转义；返回 JSON（或纯文本）。 */
+  const gatewayRequest = async (path: string, opts: { method?: string; body?: unknown } = {}): Promise<unknown> => {
+    if (!ctx.gatewayApiKey || !ctx.gatewayBaseUrl) {
+      throw new Error('未登录或缺少网关凭证，无法调用该能力')
+    }
+    // 拼接去重：config 的 gateway.baseUrl 带 /api/v1 后缀（如 https://aigateway.bjctykj.com/api/v1），
+    // 而媒体桥 path 是 /api/v1/... 全路径，直接拼会出双 /api/v1 → 404。这里在 baseUrl 以 /api/v1 结尾
+    // 且 path 以 /api/v1 开头时去掉 baseUrl 的尾巴；若 baseUrl 不带后缀则保持原样（天然正确）。
+    let base = ctx.gatewayBaseUrl.replace(/\/+$/, '')
+    const p = path.startsWith('/') ? path : `/${path}`
+    if (base.endsWith('/api/v1') && p.startsWith('/api/v1')) {
+      base = base.slice(0, -'/api/v1'.length)
+    }
+    const url = `${base}${p}`
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 60_000)
+    try {
+      const res = await fetch(url, {
+        method: opts.method ?? (opts.body !== undefined ? 'POST' : 'GET'),
+        headers: {
+          Authorization: `Bearer ${ctx.gatewayApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
+        signal: controller.signal,
+      })
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '')
+        throw new Error(`HTTP ${res.status}: ${errText.slice(0, 200)}`)
+      }
+      const text = await res.text()
+      if (!text) return null
+      try {
+        return JSON.parse(text)
+      } catch {
+        return text
+      }
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /** 校验插件媒体生成提交入参：必须有 prompt + 限流（复用 modelCall 的每分钟 20 次窗口） */
+  const preparePluginMediaGen = (appId: string, input: unknown): { prompt: string } => {
+    const prompt = typeof (input as { prompt?: unknown })?.prompt === 'string' ? (input as { prompt: string }).prompt : ''
+    if (!prompt.trim()) throw new Error('缺少 prompt 参数')
+    checkPluginModelCallRate(appId)
+    return { prompt }
+  }
 
   return {
     kernel: ctx.kernel,
@@ -716,6 +778,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
     async uploadImage(imageBase64, mimeType) {
       return uploadImage(imageBase64, mimeType)
+    },
+    async uploadFile(dataBase64, mimeType, fileName) {
+      return uploadFile(dataBase64, mimeType, fileName)
     },
     async listBrowserWindows(sessionId) {
       const sid = sessionId ?? ctx.currentSessionId ?? ''
@@ -1187,6 +1252,14 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       return ctx.selfmod.restoreAll()
     },
 
+    installMarketPlugin(id) {
+      return ctx.selfmod.installFromDisk(id)
+    },
+
+    getGatewayApiKey() {
+      return ctx.gatewayApiKey
+    },
+
     invokePluginService(appId, name, args) {
       return ctx.selfmod.invokeService(appId, name, args)
     },
@@ -1223,6 +1296,42 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         if (chunk.usage) emit({ type: 'usage', usage: { promptTokens: chunk.usage.promptTokens, completionTokens: chunk.usage.completionTokens, totalTokens: chunk.usage.totalTokens } })
       }
       emit({ type: 'done' })
+    },
+
+    async invokeVideoGen(appId, input) {
+      // 视频生成提交：透传网关 POST /api/v1/video/generations（真实接口已存在），返回 { taskId }。鉴权复用网关 apiKey，限流复用 modelCall 窗口。
+      preparePluginMediaGen(appId, input)
+      const res = (await gatewayRequest('/api/v1/video/generations', { body: input })) as { taskId?: string } | null
+      if (!res || typeof res.taskId !== 'string') {
+        throw new Error('视频生成提交失败：网关未返回 taskId')
+      }
+      return { taskId: res.taskId }
+    },
+
+    async invokeVideoGenQuery(appId, input) {
+      // 视频生成查询：透传网关 GET /api/v1/video/generations/{taskId}（真实接口已存在）。查询只读，不加限流。
+      const taskId = typeof (input as { taskId?: unknown })?.taskId === 'string' ? (input as { taskId: string }).taskId.trim() : ''
+      if (!taskId) throw new Error('videoGenQuery 缺少 taskId 参数')
+      return (await gatewayRequest(`/api/v1/video/generations/${encodeURIComponent(taskId)}`)) as { status: string; progress?: number; errorMessage?: string }
+    },
+
+    async invokeImageGen(appId, input) {
+      // 图片生成提交：透传网关 POST /api/v1/image/generations（网关尚未实现，桥已预留）。
+      preparePluginMediaGen(appId, input)
+      return gatewayRequest('/api/v1/image/generations', { body: input })
+    },
+
+    async invokeImageGenQuery(appId, input) {
+      // 图片生成查询：透传网关 GET /api/v1/image/generations/{taskId}（网关尚未实现，桥已预留）。
+      const taskId = typeof (input as { taskId?: unknown })?.taskId === 'string' ? (input as { taskId: string }).taskId.trim() : ''
+      if (!taskId) throw new Error('imageGenQuery 缺少 taskId 参数')
+      return gatewayRequest(`/api/v1/image/generations/${encodeURIComponent(taskId)}`)
+    },
+
+    async invokeTts(appId, input) {
+      // 语音合成提交：透传网关 POST /api/v1/audio/tts（网关尚未实现，桥已预留）。
+      preparePluginMediaGen(appId, input)
+      return gatewayRequest('/api/v1/audio/tts', { body: input })
     },
 
     onClientRunRequest(cb) {

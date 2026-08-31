@@ -85,8 +85,8 @@ export interface ShanhaiPluginBridge {
    * 入参 { prompt: 必填用户提示词, systemPrompt?: 可选系统提示词, modelId?: 可选模型 id }，返回 { text, usage? }。
    */
   modelCall(input: { prompt: string; systemPrompt?: string; modelId?: string }): Promise<{ text: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }>
-  /** 列出可用模型（精简 id + 展示名，隔离 apiKey/baseUrl 等敏感字段）。需显式声明 permissions: ["listModels"] */
-  listModels(): Promise<Array<{ id: string; name: string }>>
+  /** 列出可用模型（精简 id + 展示名 + 类型，隔离 apiKey/baseUrl 等敏感字段）。需显式声明 permissions: ["listModels"] */
+  listModels(): Promise<Array<{ id: string; name: string; modelType?: string }>>
   /**
    * 流式模型调用（边生成边推送分片，适合长文本避免一次性返回超时）。
    * 需显式声明 permissions: ["modelCallStream"]；modelId 受控（须在 listModels 可用列表内）。
@@ -98,6 +98,25 @@ export interface ShanhaiPluginBridge {
     onDone?: () => void
     onError?: (error: Error) => void
   }): { cancel: () => void }
+  /**
+   * 视频生成（提交）：透传网关 POST /api/v1/video/generations，返回 { taskId }。需显式声明 permissions: ["videoGen"]。
+   * 入参契约（严格对齐网关）：{ model?, prompt, duration, resolution?, ratio?, audio?, firstFrame?, referenceImages?, seed?, promptExtend?, watermark? }。
+   */
+  videoGen(input: { model?: string; prompt: string; duration: string | number; resolution?: string; ratio?: string; audio?: boolean | string; firstFrame?: { url?: string; base64?: string }; referenceImages?: Array<{ url?: string; base64?: string }>; seed?: number; promptExtend?: boolean; watermark?: boolean }): Promise<{ taskId: string }>
+  /** 视频生成查询：透传网关 GET /api/v1/video/generations/{taskId}，返回 { status, progress?, errorMessage? }。需显式声明 permissions: ["videoGenQuery"]。 */
+  videoGenQuery(input: { taskId: string }): Promise<{ status: string; progress?: number; errorMessage?: string }>
+  /** 图片生成（提交）：透传网关 POST /api/v1/image/generations（网关尚未实现，桥已预留）。需显式声明 permissions: ["imageGen"]。 */
+  imageGen(input: { model?: string; prompt: string; [key: string]: unknown }): Promise<unknown>
+  /** 图片生成查询：透传网关 GET /api/v1/image/generations/{taskId}（网关尚未实现，桥已预留）。需显式声明 permissions: ["imageGenQuery"]。 */
+  imageGenQuery(input: { taskId: string }): Promise<unknown>
+  /** 语音合成（提交）：透传网关 POST /api/v1/audio/tts（网关尚未实现，桥已预留）。需显式声明 permissions: ["tts"]。 */
+  tts(input: { model?: string; text: string; [key: string]: unknown }): Promise<unknown>
+  /**
+   * 上传文件到七牛云，返回 https 公网 URL（供素材/图片直传，拿到公网链接后转给 videoGen 等）。
+   * 凭证由主进程持有（登录账号 memberToken），插件只传文件 base64 + 可选 mimeType/fileName，拿不到 token/key。
+   * 需显式声明 permissions: ["uploadFile"]；未登录返回错误。
+   */
+  uploadFile(input: { dataBase64: string; mimeType?: string; fileName?: string }): Promise<string>
 }
 
 /** 统一入口：所有能力走主进程 plugin:invoke 双层校验 */
@@ -119,7 +138,7 @@ const pluginBridge: ShanhaiPluginBridge = {
   getTokenStats: (sessionId) => invoke('getTokenStats', sessionId) as Promise<unknown>,
   invokePluginService: (name, ...rest) => invoke('invokePluginService', name, rest) as Promise<unknown>,
   modelCall: (input) => invoke('modelCall', input) as Promise<{ text: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }>,
-  listModels: () => invoke('listModels') as Promise<Array<{ id: string; name: string }>>,
+  listModels: () => invoke('listModels') as Promise<Array<{ id: string; name: string; modelType?: string }>>,
   modelCallStream: (input, handlers) => {
     const callId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     const listener = (_e: unknown, payload: { callId?: string; type?: string; text?: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number }; error?: string }) => {
@@ -137,6 +156,12 @@ const pluginBridge: ShanhaiPluginBridge = {
     })
     return { cancel: cleanup }
   },
+  videoGen: (input) => invoke('videoGen', input) as Promise<{ taskId: string }>,
+  videoGenQuery: (input) => invoke('videoGenQuery', input) as Promise<{ status: string; progress?: number; errorMessage?: string }>,
+  imageGen: (input) => invoke('imageGen', input) as Promise<unknown>,
+  imageGenQuery: (input) => invoke('imageGenQuery', input) as Promise<unknown>,
+  tts: (input) => invoke('tts', input) as Promise<unknown>,
+  uploadFile: (input) => invoke('uploadFile', input) as Promise<string>,
 }
 
 contextBridge.exposeInMainWorld('shanhaiPlugin', pluginBridge)

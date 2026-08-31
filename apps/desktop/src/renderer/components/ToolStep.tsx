@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { memo, useMemo, useState } from 'react'
 import type { ToolTrace } from '../types'
 import { IconActivity, IconAvatar, IconChevronDown, IconClock, IconCode, IconEdit, IconFile, IconGlobe, IconImage, IconMonitor, IconPlus, IconRefresh, IconSend, IconShield, IconTerminal, IconTrash, IconTree, IconUsers, IconWrench } from './icons'
 import { redactSecret, stringifyResult, truncate } from './ui'
@@ -39,26 +39,12 @@ export const TOOL_META: Record<string, { title: string; icon: React.ReactNode }>
   rollback_file: { title: '回滚文件', icon: <IconEdit /> },
   remember: { title: '保存记忆', icon: <IconClock /> },
   recall_memory: { title: '召回记忆', icon: <IconClock /> },
-  plugin_inspect: { title: '查看自修改', icon: <IconCode /> },
-  plugin_define: { title: '定义动态包', icon: <IconCode /> },
-  plugin_run: { title: '运行动态包', icon: <IconCode /> },
-  plugin_stop: { title: '停止动态包', icon: <IconCode /> },
-  plugin_undefine: { title: '删除动态包', icon: <IconCode /> },
-  plugin_test: { title: '测试动态包', icon: <IconCode /> },
-  plugin_install: { title: '安装动态包', icon: <IconCode /> },
-  plugin_uninstall: { title: '卸载动态包', icon: <IconCode /> },
+  plugin: { title: '插件', icon: <IconCode /> },
   // 会话管家（主 Agent）专属工具：用于审批弹窗展示可读名称，避免暴露英文原始名
-  list_sessions: { title: '查看会话列表', icon: <IconUsers /> },
-  inspect_session: { title: '查看会话详情', icon: <IconUsers /> },
+  session: { title: '管理会话', icon: <IconUsers /> },
   list_models: { title: '查看可用模型', icon: <IconActivity /> },
-  switch_session: { title: '切换激活会话', icon: <IconRefresh /> },
   send_message: { title: '给会话下发任务', icon: <IconSend /> },
   inject_message: { title: '给会话追加需求', icon: <IconSend /> },
-  set_session_model: { title: '切换会话模型', icon: <IconActivity /> },
-  set_session_approval: { title: '配置会话安全模式', icon: <IconShield /> },
-  create_session: { title: '新建会话', icon: <IconPlus /> },
-  rename_session: { title: '重命名会话', icon: <IconEdit /> },
-  delete_session: { title: '删除会话', icon: <IconTrash /> },
   mcp_list_tools: { title: '查看 MCP 工具', icon: <IconWrench /> },
   mcp_call: { title: '调用 MCP 工具', icon: <IconWrench /> },
   skill_list: { title: '查看技能列表', icon: <IconWrench /> },
@@ -67,10 +53,7 @@ export const TOOL_META: Record<string, { title: string; icon: React.ReactNode }>
   terminal_run: { title: '终端执行命令', icon: <IconTerminal /> },
   terminal_list: { title: '列出终端', icon: <IconTerminal /> },
   terminal_close: { title: '关闭终端', icon: <IconTerminal /> },
-  list_ledger: { title: '查看台账目录', icon: <IconFile /> },
-  read_ledger: { title: '读取台账', icon: <IconFile /> },
-  write_ledger: { title: '写入台账', icon: <IconFile /> },
-  edit_ledger: { title: '编辑台账', icon: <IconFile /> },
+  ledger: { title: '管家台账', icon: <IconFile /> },
   answer_ask: { title: '代答提问', icon: <IconSend /> },
   resolve_approval: { title: '决策审批', icon: <IconShield /> },
 }
@@ -102,10 +85,65 @@ function skillActionMeta(skillId: string, action: string): { title: string; icon
   return map[`${skillId}:${action}`] ?? { title: '执行技能', icon: <IconWrench /> }
 }
 
+/** plugin 顶层工具（插件统一入口）的 action → 中文标题 + 图标 */
+function pluginActionMeta(action: string): { title: string; icon: React.ReactNode } {
+  const map: Record<string, { title: string; icon: React.ReactNode }> = {
+    list: { title: '列出已装插件', icon: <IconCode /> },
+    inspect: { title: '查看插件运行时表', icon: <IconCode /> },
+    scaffold: { title: '生成插件项目', icon: <IconCode /> },
+    build: { title: '编译插件', icon: <IconCode /> },
+    'test-load': { title: '插件干跑加载', icon: <IconCode /> },
+    verify: { title: '验证插件产物', icon: <IconCode /> },
+    install: { title: '安装插件', icon: <IconCode /> },
+    publish: { title: '打包共享插件', icon: <IconCode /> },
+    uninstall: { title: '卸载插件', icon: <IconCode /> },
+    tool: { title: '调用插件工具', icon: <IconWrench /> },
+  }
+  return map[action] ?? { title: '插件', icon: <IconCode /> }
+}
+
+/** ledger 顶层工具（管家台账统一入口）的 action → 中文标题 + 图标 */
+function ledgerActionMeta(action: string): { title: string; icon: React.ReactNode } {
+  const map: Record<string, { title: string; icon: React.ReactNode }> = {
+    list: { title: '查看台账目录', icon: <IconFile /> },
+    read: { title: '读取台账', icon: <IconFile /> },
+    write: { title: '写入台账', icon: <IconFile /> },
+    edit: { title: '编辑台账', icon: <IconFile /> },
+  }
+  return map[action] ?? { title: '管家台账', icon: <IconFile /> }
+}
+
+/** session 顶层工具（会话实体管理统一入口）的 action → 中文标题 + 图标 */
+function sessionActionMeta(action: string): { title: string; icon: React.ReactNode } {
+  const map: Record<string, { title: string; icon: React.ReactNode }> = {
+    list: { title: '查看会话列表', icon: <IconUsers /> },
+    inspect: { title: '查看会话详情', icon: <IconUsers /> },
+    switch: { title: '切换激活会话', icon: <IconRefresh /> },
+    create: { title: '新建会话', icon: <IconPlus /> },
+    rename: { title: '重命名会话', icon: <IconEdit /> },
+    set_workdir: { title: '设置会话工作目录', icon: <IconEdit /> },
+    delete: { title: '删除会话', icon: <IconTrash /> },
+    set_model: { title: '切换会话模型', icon: <IconActivity /> },
+    set_approval: { title: '配置会话安全模式', icon: <IconShield /> },
+    choose: { title: '选择会话', icon: <IconUsers /> },
+    resume: { title: '续跑会话', icon: <IconRefresh /> },
+  }
+  return map[action] ?? { title: '管理会话', icon: <IconUsers /> }
+}
+
 /** 工具名 → 中文显示名（用于审批弹窗等需要展示工具名的场景，不暴露英文原始名） */
 export function toolDisplayName(name: string, args?: Record<string, unknown>): string {
   if (name === 'skill_run') {
     return skillActionMeta(String(args?.skillId ?? ''), String(args?.action ?? '')).title
+  }
+  if (name === 'plugin') {
+    return pluginActionMeta(String(args?.action ?? '')).title
+  }
+  if (name === 'ledger') {
+    return ledgerActionMeta(String(args?.action ?? '')).title
+  }
+  if (name === 'session') {
+    return sessionActionMeta(String(args?.action ?? '')).title
   }
   return TOOL_META[name]?.title ?? '工具操作'
 }
@@ -143,6 +181,17 @@ export function toolSummary(name: string, args?: Record<string, unknown>): strin
   if (!args) return ''
   const a = args
   if (name === 'skill_run') return skillRunSummary(args)
+  if (name === 'plugin') {
+    const action = String(a.action ?? '')
+    const inner = a.args && typeof a.args === 'object' ? (a.args as Record<string, unknown>) : {}
+    if (action === 'install' || action === 'uninstall' || action === 'scaffold' || action === 'build' || action === 'test-load' || action === 'verify') return String(inner.id ?? '')
+    if (action === 'publish') return String(inner.pluginDir ?? inner.id ?? '')
+    if (action === 'tool') return `${String(a.pluginId ?? '')}/${String(a.tool ?? '')}`
+    if (action === 'list') return ''
+    return ''
+  }
+  if (name === 'ledger') return String(a.path ?? '')
+  if (name === 'session') return String(a.sessionId ?? '')
   if (name === 'read_file' || name === 'write_file' || name === 'edit_file' || name === 'rollback_file') return String(a.path ?? '')
   if (name === 'run_command') return String(a.command ?? '')
   if (name === 'list_dir') return a.path ? String(a.path) : '当前目录'
@@ -279,11 +328,16 @@ function computeDiff(before: string, after: string): DiffLine[] {
 }
 
 /** 文件变更卡片：git diff 风格（- 红 / + 绿 / 上下文灰），新建与修改文件都适用 */
-export function DiffBlock({ before, after, path, isNew }: { before: string; after: string; path?: string; isNew?: boolean }) {
+export const DiffBlock = memo(function DiffBlock({ before, after, path, isNew }: { before: string; after: string; path?: string; isNew?: boolean }) {
   const treatAsNew = isNew || before === ''
-  const diffLines: DiffLine[] = treatAsNew
-    ? after.split('\n').map((t, i): DiffLine => ({ type: 'add', text: t, newLine: i + 1 }))
-    : computeDiff(before, after)
+  // 卡顿优化：diff 计算（含 O(n·m) 的 lcsDiff）用 useMemo 缓存，仅在 before/after/是否新建变化时重算，
+  // 避免编辑/写入文件工具结果在历史消息被反复重渲染时重复做昂贵的行级 diff。
+  const diffLines: DiffLine[] = useMemo(
+    () => (treatAsNew
+      ? after.split('\n').map((t, i): DiffLine => ({ type: 'add', text: t, newLine: i + 1 }))
+      : computeDiff(before, after)),
+    [before, after, treatAsNew],
+  )
   const addCount = diffLines.filter((l) => l.type === 'add').length
   const delCount = diffLines.filter((l) => l.type === 'del').length
   return (
@@ -318,7 +372,7 @@ export function DiffBlock({ before, after, path, isNew }: { before: string; afte
       </div>
     </div>
   )
-}
+})
 
 /** 文件结果卡片：带行号的只读文件窗口（超长折叠） */
 function FileBlock({ content, path }: { content: string; path?: string }) {
@@ -413,7 +467,7 @@ export function renderToolResult(name: string, result: unknown, error: string | 
 }
 
 /** 工具执行步骤（DSH ToolRow 风格）：单行摘要（中文标题 + 摘要）+ 折叠的类型卡片 */
-export function ToolStep({ trace }: { trace: ToolTrace }) {
+export const ToolStep = memo(function ToolStep({ trace }: { trace: ToolTrace }) {
   // 机制类工具（如 ask_user 提问）已有专用交互卡片，这里不再渲染工具步骤，避免暴露内部工具名
   if (HIDDEN_STEP_TOOLS.has(trace.name)) return null
   const [expanded, setExpanded] = useState(false)
@@ -421,7 +475,13 @@ export function ToolStep({ trace }: { trace: ToolTrace }) {
   const isCall = trace.kind === 'tool-call'
   const meta = trace.name === 'skill_run'
     ? skillActionMeta(String(trace.args?.skillId ?? ''), String(trace.args?.action ?? ''))
-    : TOOL_META[trace.name] ?? { title: '工具操作', icon: <IconWrench /> }
+    : trace.name === 'plugin'
+      ? pluginActionMeta(String(trace.args?.action ?? ''))
+      : trace.name === 'ledger'
+        ? ledgerActionMeta(String(trace.args?.action ?? ''))
+        : trace.name === 'session'
+          ? sessionActionMeta(String(trace.args?.action ?? ''))
+          : TOOL_META[trace.name] ?? { title: '工具操作', icon: <IconWrench /> }
   const state = isCall ? 'running' : trace.error ? 'error' : 'ok'
   const summary = toolSummary(trace.name, trace.args)
   const resultBody = !isCall ? renderToolResult(trace.name, trace.result, trace.error, trace.args) : null
@@ -478,7 +538,7 @@ export function ToolStep({ trace }: { trace: ToolTrace }) {
       )}
     </div>
   )
-}
+})
 
 /** 统计工具步骤执行情况（合并后的 ToolTrace 数组：每项为一次工具调用） */
 export function toolStepStats(tools: ToolTrace[]): { total: number; success: number; failed: number; running: number } {

@@ -59,13 +59,26 @@ export function registerPush(): void {
 
   // 全局 UI 共享状态变化 → 广播快照（按窗口类型过滤：dock/supervisor-bubble 不消费共享状态直接跳过；
   // desktop 只收登录态+壁纸精简快照；chat/supervisor/app 收完整快照。避免把含所有会话完整历史的重快照发给不消费的窗口）
-  subscribeUiState(() => {
-    const full = getUiState()
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (win.isDestroyed()) continue
-      const type = getWindowType(win)
-      if (!windowConsumesUiState(type)) continue
-      safeSend(win, 'ui:state', filterUiStateForWindow(type, full))
-    }
-  })
+  // —— 高频触发源（onToolTrace 每个工具步骤 / onTokenStats / onSessionActivity / onUserMessage / onCurrentSessionChanged
+  //     等）每次 mutate 都同步触发本回调，而广播的是「含所有会话完整历史」的完整快照（safeSend=IPC structured-clone
+  //     深序列化整棵树）。密集任务下（单次执行几十上百个工具步骤）会产生同量级的全量序列化 + IPC 往返，
+  //     内存/GC 压力与 IPC 放大到极限（注释里已记录曾导致 swap 打满）。故这里合并到同一 16ms 窗口只广播一次最终快照，
+  //     显著降频（从「每次工具步骤一次」→「每 16ms 一次」），审批/登录态等低频即时状态最多延迟 16ms，无感知。
+  let uiStatePending = false
+  const broadcastUiState = (): void => {
+    if (uiStatePending) return
+    uiStatePending = true
+    const timer = setTimeout(() => {
+      uiStatePending = false
+      const full = getUiState()
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (win.isDestroyed()) continue
+        const type = getWindowType(win)
+        if (!windowConsumesUiState(type)) continue
+        safeSend(win, 'ui:state', filterUiStateForWindow(type, full))
+      }
+    }, 16)
+    timer.unref?.()
+  }
+  subscribeUiState(broadcastUiState)
 }

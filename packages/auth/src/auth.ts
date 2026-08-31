@@ -18,6 +18,18 @@ export interface GatewayModel {
   temperature?: string
   supportsVision?: boolean
   supportsReasoning?: boolean
+  /**
+   * 推理档位能力/默认档位（reasoning_effort）：模型支持的可选档位或默认档位（如 low/high/max），
+   * 网关从上游下发或按模型能力标记。设置后，支持思考的模型会在请求 body 带 reasoning_effort（DeepSeek/OpenAI 兼容）
+   * 或 reasoning.effort（Anthropic），并进入「思考模式」（思考模式下屏蔽 temperature 等采样参数）。未设置则不启用思考强度控制。
+   */
+  reasoningEffort?: string
+  /**
+   * 支持的 reasoning_effort 档位枚举（如 ['low','high','max']）。
+   * 网关模型列表不下发时，山海侧用内置表按模型名补（见 resolveBuiltinReasoningEffort）。
+   * 供模型设置 UI 选档；默认档位见 reasoningEffort。
+   */
+  reasoningEfforts?: string[]
   /** 模型真实提供商（deepseek/alibaba/ollama/mimo/moonshot/minimax/custom） */
   provider?: string
   /**
@@ -29,8 +41,38 @@ export interface GatewayModel {
   sortOrder?: number
   description?: string
   source?: string
+  /** 模型类型：chat=对话（缺省） / video=视频生成 / image=图片生成 / tts=语音合成。网关下发后透传，用于界面/插件按类型分组 */
+  modelType?: string
   /** 是否为用户自定义模型（true 自定义 / false 或 undefined 系统内置） */
   custom?: boolean
+}
+
+export interface BuiltinReasoningEffort {
+  efforts: string[]
+  defaultEffort: string
+}
+
+/**
+ * 内置「模型族 → reasoning_effort 档位枚举」表（山海侧自维护）。
+ * 当网关模型列表接口（/api/v1/models、/api/member/models）不下发 reasoningEffort 时，按模型名匹配补默认档位 + 档位枚举。
+ * 未匹配到内置表的模型不注入（保持网关原样）。
+ */
+const BUILTIN_REASONING_EFFORT_MAP: Array<{ pattern: RegExp; efforts: string[]; defaultEffort: string }> = [
+  // DeepSeek 推理系（v4 flash/pro 等）→ ['low','high','max']，默认最高档 max
+  { pattern: /deepseek-v4|deepseek-reasoner/i, efforts: ['low', 'high', 'max'], defaultEffort: 'max' },
+  // OpenAI 推理系 o1/o3/o4 系列 → ['low','medium','high']，默认最高档 high
+  { pattern: /(^|[^a-z0-9])o[134]([^a-z0-9]|$)/i, efforts: ['low', 'medium', 'high'], defaultEffort: 'high' },
+  // Anthropic（thinking 机制）→ ['low','high','max']，默认最高档 high
+  { pattern: /anthropic|claude/i, efforts: ['low', 'high', 'max'], defaultEffort: 'high' },
+]
+
+/** 按模型名/id 匹配内置推理档位；未匹配返回 undefined（不注入，保持网关原样） */
+export function resolveBuiltinReasoningEffort(idOrModel: string): BuiltinReasoningEffort | undefined {
+  const lower = String(idOrModel ?? '').toLowerCase()
+  for (const row of BUILTIN_REASONING_EFFORT_MAP) {
+    if (row.pattern.test(lower)) return { efforts: row.efforts, defaultEffort: row.defaultEffort }
+  }
+  return undefined
 }
 
 export interface AuthSession {
@@ -180,6 +222,11 @@ export class AuthService {
     return list.map((m) => {
       const id = String(m.id ?? '')
       const name = String(m.displayName ?? m.name ?? id)
+      // 仅在「网关未下发 effort 且模型支持思考(supportsReasoning=true)」时用内置表补档；否则保持网关原样（不注入）
+      const builtinEffort =
+        m.reasoningEffort != null || m.supportsReasoning !== true
+          ? undefined
+          : resolveBuiltinReasoningEffort(id)
       return {
         id,
         name,
@@ -193,11 +240,14 @@ export class AuthService {
         temperature: m.temperature != null ? String(m.temperature) : undefined,
         supportsVision: m.supportsVision === true,
         supportsReasoning: m.supportsReasoning === true,
+        reasoningEffort: m.reasoningEffort != null ? String(m.reasoningEffort) : builtinEffort?.defaultEffort,
+        reasoningEfforts: builtinEffort?.efforts,
         provider: m.provider != null ? String(m.provider) : undefined,
         protocol: m.protocol === 'anthropic' || m.provider === 'anthropic' ? 'anthropic' : undefined,
         sortOrder: typeof m.sortOrder === 'number' ? m.sortOrder : undefined,
         description: m.description != null ? String(m.description) : undefined,
         source: m.source != null ? String(m.source) : undefined,
+        modelType: m.modelType != null ? String(m.modelType) : undefined,
       }
     })
   }

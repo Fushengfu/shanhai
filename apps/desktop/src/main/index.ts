@@ -8,6 +8,7 @@ import { startRemoteRelay } from './remote-relay'
 import { startRemoteServer } from './remote-server'
 import { createWindow, loadWindowContent, showChatWindow, toggleChatWindow, ensureDesktopLayer, ICON_PATH } from './window-manager'
 import { scheduleStartupUpdateCheck } from './app-updater'
+import { reportDeviceStartup } from './device-report'
 import { refreshDockMenu } from './dock-menu'
 
 /** 全局唤起/隐藏主窗口的快捷键（macOS 上 CommandOrControl 即 ⌘，避开 Spotlight 的 ⌘+Space） */
@@ -69,6 +70,10 @@ if (!gotSingleInstanceLock) {
     setRuntime(await bootHost())
     initUiStore(getRuntime())
     registerIpc()
+
+    // 启动上报：匿名 POST 设备信息 + 版本到山海后台（AI 网关）。fire-and-forget，
+    // 失败静默、不阻塞启动，这里不 await（否则拖慢窗口创建）。
+    void reportDeviceStartup()
 
     // 启动时若已登录（本地凭证已恢复），自动开启远程连接（外网中继 + 局域网）。
     // 未登录则不开启，登录后由 auth:login 触发开启；退出登录由 auth:logout 自动关闭。

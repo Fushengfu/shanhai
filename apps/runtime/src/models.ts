@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { createMockModel, createModelProvider } from '@shanhai/llm'
 import type { Model, TokenUsage, HttpTraceCallback } from '@shanhai/llm'
+import { resolveBuiltinReasoningEffort } from '@shanhai/auth'
 import type { GatewayModel, ModelTier } from '@shanhai/auth'
 
 /** 从本地凭证装配真实网关模型；无凭证则 mock 兜底 */
@@ -64,31 +65,43 @@ export async function fetchGatewayModels(apiKey: string, baseUrl: string): Promi
           provider?: string
           supportsVision?: boolean
           supportsReasoning?: boolean
+          reasoningEffort?: string
           sortOrder?: number
           description?: string
           source?: string
+          modelType?: string
         }>
       }
     }
     const list = data.data?.data ?? []
-    return list.map((m) => ({
-      id: m.id,
-      name: m.displayName ?? m.name ?? m.id,
-      displayName: m.displayName != null ? String(m.displayName) : undefined,
-      model: m.model != null ? String(m.model) : undefined,
-      tier: inferTier(m.id),
-      apiKey,
-      baseUrl: m.baseUrl ?? baseUrl,
-      contextLength: typeof m.contextLength === 'number' ? m.contextLength : undefined,
-      maxTokens: m.maxTokens != null ? Number(m.maxTokens) : undefined,
-      temperature: m.temperature != null ? String(m.temperature) : undefined,
-      provider: m.provider != null ? String(m.provider) : undefined,
-      supportsVision: m.supportsVision === true,
-      supportsReasoning: m.supportsReasoning === true,
-      sortOrder: typeof m.sortOrder === 'number' ? m.sortOrder : undefined,
-      description: m.description != null ? String(m.description) : undefined,
-      source: m.source != null ? String(m.source) : undefined,
-    }))
+    return list.map((m) => {
+      // 仅在「网关未下发 effort 且模型支持思考(supportsReasoning=true)」时用内置表补档；否则保持网关原样（不注入）
+      const builtinEffort =
+        m.reasoningEffort != null || m.supportsReasoning !== true
+          ? undefined
+          : resolveBuiltinReasoningEffort(String(m.id ?? m.model ?? ''))
+      return {
+        id: m.id,
+        name: m.displayName ?? m.name ?? m.id,
+        displayName: m.displayName != null ? String(m.displayName) : undefined,
+        model: m.model != null ? String(m.model) : undefined,
+        tier: inferTier(m.id),
+        apiKey,
+        baseUrl: m.baseUrl ?? baseUrl,
+        contextLength: typeof m.contextLength === 'number' ? m.contextLength : undefined,
+        maxTokens: m.maxTokens != null ? Number(m.maxTokens) : undefined,
+        temperature: m.temperature != null ? String(m.temperature) : undefined,
+        provider: m.provider != null ? String(m.provider) : undefined,
+        supportsVision: m.supportsVision === true,
+        supportsReasoning: m.supportsReasoning === true,
+        reasoningEffort: m.reasoningEffort != null ? String(m.reasoningEffort) : builtinEffort?.defaultEffort,
+        reasoningEfforts: builtinEffort?.efforts,
+        sortOrder: typeof m.sortOrder === 'number' ? m.sortOrder : undefined,
+        description: m.description != null ? String(m.description) : undefined,
+        source: m.source != null ? String(m.source) : undefined,
+        modelType: m.modelType != null ? String(m.modelType) : undefined,
+      }
+    })
   } catch {
     return []
   }

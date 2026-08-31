@@ -22,7 +22,8 @@ void main() {
           sessionId: 's1',
           title: '测试会话',
           sendFn: (_) async => CmdResult(true, null, null),
-          loadHistoryFn: () async => items,
+          loadHistoryFn: ({int? sinceTurnSeq, int? beforeTurnSeq}) async =>
+              HistoryResponse(items: items, truncated: false),
         ),
       ),
     );

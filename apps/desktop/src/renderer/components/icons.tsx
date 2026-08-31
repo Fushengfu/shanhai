@@ -352,6 +352,16 @@ export function IconUsers() {
   )
 }
 
+export function IconStore() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <path d="M6 7V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v2" />
+      <path d="M3 7l1.2 12.1a2 2 0 0 0 2 1.9h11.6a2 2 0 0 0 2-1.9L21 7" />
+      <path d="M9 7a3 3 0 0 1 6 0" />
+    </svg>
+  )
+}
+
 export function IconChat() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>

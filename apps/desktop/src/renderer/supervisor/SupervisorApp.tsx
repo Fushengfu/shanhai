@@ -27,7 +27,7 @@ const SUPERVISOR_SID = 'supervisor'
 
 /** AI 回复气泡通用底样（与 ChatPlugin 保持一致） */
 const AI_BUBBLE_STYLE: React.CSSProperties = {
-  maxWidth: '85%',
+  width: '85%',
   padding: '10px 14px',
   borderRadius: 16,
   borderTopLeftRadius: 4,

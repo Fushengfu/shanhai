@@ -59,6 +59,42 @@ export interface MobileApkInfo {
   version?: string
 }
 
+/** 插件市场条目（渲染层） */
+export interface MarketPluginPreload {
+  id: string
+  name: string
+  purpose: string
+  version?: string
+  author?: string
+  hasUI?: boolean
+  categories?: string[]
+  iconUrl?: string
+  fileSha256?: string
+  fileSize?: number
+  installed?: boolean
+}
+
+/** 「我已安装」插件条目（渲染层，含自研标记与网关提交状态） */
+export interface MyPluginPreload {
+  id: string
+  name: string
+  purpose?: string
+  /** 本地版本：自研工程 package.json version 优先，否则已安装 manifest version */
+  version?: string
+  /** 是否自研（plugins-workspace 下存在同 id 工程） */
+  selfMade: boolean
+  /** 是否已安装 */
+  installed: boolean
+  /** 网关是否有该 plugin_id 的提交记录 */
+  submitted: boolean
+  /** 网关最新版本 */
+  gatewayVersion?: string
+  /** 网关最新状态 */
+  gatewayStatus?: string
+  /** 网关是否有已审批版本 */
+  hasApproved?: boolean
+}
+
 export interface ApprovalRequest {
   id: string
   sessionId?: string
@@ -249,13 +285,21 @@ export interface ShanhaiBridge {
   onUpdateAvailable(cb: (result: AppUpdateCheckResult) => void): () => void
   /** 获取手机端（Android）APK 下载信息（下载地址 + 版本号），失败返回 null */
   getMobileApkInfo(packageName: string): Promise<MobileApkInfo | null>
+  /** 插件市场：拉取公开插件列表（接口未就绪时返回 ok=false + error） */
+  listMarketPlugins(params?: { keyword?: string; category?: string; hasUI?: boolean | ''; page?: number; pageSize?: number }): Promise<{ ok: boolean; plugins: MarketPluginPreload[]; total: number; error?: string }>
+  /** 插件市场：下载并安装指定插件（下载 zip → X-SHA256 校验 → 解包还原 → 激活 + Dock 刷新） */
+  installMarketPlugin(pluginId: string): Promise<{ ok: boolean; id?: string; name?: string; message?: string }>
+  /** 插件市场：打包本地自研插件并提交到市场（网关 APIKey 鉴权） */
+  submitPluginToMarket(pluginDirOrId: string, categories?: string[]): Promise<{ ok: boolean; message: string; zipPath?: string; data?: unknown }>
+  /** 插件市场：列出「我已安装」插件（含自研标记 + 网关提交状态） */
+  listMyPlugins(): Promise<{ ok: boolean; plugins: MyPluginPreload[]; mineError?: string }>
   // 认证
   status(): Promise<{ loggedIn: boolean; username: string | null }>
   login(username: string, password: string): Promise<{ username: string; nickname?: string }>
   register(username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string }>
   logout(): Promise<void>
-  listModels(): Promise<Array<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean }>>
-  refreshModels(): Promise<Array<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean }>>
+  listModels(): Promise<Array<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean; modelType?: string }>>
+  refreshModels(): Promise<Array<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean; modelType?: string }>>
   onModelsChanged(cb: () => void): () => void
   addCustomModel(model: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }): Promise<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean; contextLength?: number; supportsVision?: boolean }>
   updateCustomModel(id: string, model: { name: string; baseUrl: string; apiKey: string; model: string; protocol?: 'openai' | 'anthropic'; contextLength?: number; supportsVision?: boolean }): Promise<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean; contextLength?: number; supportsVision?: boolean }>
@@ -478,6 +522,10 @@ const bridge: ShanhaiBridge = {
     return () => ipcRenderer.removeListener('app:update-available', listener)
   },
   getMobileApkInfo: (packageName) => ipcRenderer.invoke('mobile:get-apk-info', packageName),
+  listMarketPlugins: (params) => ipcRenderer.invoke('market:list', params),
+  installMarketPlugin: (pluginId) => ipcRenderer.invoke('market:install', pluginId),
+  submitPluginToMarket: (pluginDirOrId, categories) => ipcRenderer.invoke('market:submit', pluginDirOrId, categories),
+  listMyPlugins: () => ipcRenderer.invoke('market:mine'),
   status: () => ipcRenderer.invoke('auth:status'),
   login: (u, p) => ipcRenderer.invoke('auth:login', u, p),
   register: (u, p, nickname, phone, email) => ipcRenderer.invoke('auth:register', u, p, nickname, phone, email),

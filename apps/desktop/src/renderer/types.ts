@@ -154,6 +154,8 @@ export interface GatewayModel {
   contextLength?: number
   /** 是否支持视觉（多模态）输入 */
   supportsVision?: boolean
+  /** 模型类型：chat=对话（缺省）/ video=视频生成 / image=图片生成 / tts=语音合成（网关下发后透传，用于界面/插件按类型分组） */
+  modelType?: string
 }
 
 export interface ContentPart {
@@ -348,6 +350,14 @@ declare global {
       onUpdateAvailable(cb: (result: AppUpdateCheckResult) => void): () => void
       /** 获取手机端（Android）APK 下载信息（下载地址 + 版本号），失败返回 null */
       getMobileApkInfo(packageName: string): Promise<MobileApkInfo | null>
+      /** 插件市场：拉取公开插件列表（接口未就绪时返回 ok=false + error） */
+      listMarketPlugins(params?: { keyword?: string; category?: string; hasUI?: boolean | ''; page?: number; pageSize?: number }): Promise<{ ok: boolean; plugins: Array<{ id: string; name: string; purpose: string; version?: string; author?: string; hasUI?: boolean; categories?: string[]; iconUrl?: string; fileSha256?: string; fileSize?: number; installed?: boolean }>; total: number; error?: string }>
+      /** 插件市场：下载并安装指定插件（下载 zip → X-SHA256 校验 → 解包还原 → 激活 + Dock 刷新） */
+      installMarketPlugin(pluginId: string): Promise<{ ok: boolean; id?: string; name?: string; message?: string }>
+      /** 插件市场：打包本地自研插件并提交到市场（网关 APIKey 鉴权） */
+      submitPluginToMarket(pluginDirOrId: string, categories?: string[]): Promise<{ ok: boolean; message: string; zipPath?: string; data?: unknown }>
+      /** 插件市场：列出「我已安装」插件（含自研标记 + 网关提交状态） */
+      listMyPlugins(): Promise<{ ok: boolean; plugins: Array<{ id: string; name: string; purpose?: string; version?: string; selfMade: boolean; installed: boolean; submitted: boolean; gatewayVersion?: string; gatewayStatus?: string; hasApproved?: boolean }>; mineError?: string }>
       /** 读取全局 UI 共享状态快照 */
       getUiState(): Promise<GlobalUiState>
       /** 订阅全局 UI 共享状态变化 */

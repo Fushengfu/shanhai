@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import '../theme.dart';
 import '../services/update_service.dart';
 import '../services/ws_client.dart';
 import '../widgets/device_picker.dart';
@@ -94,14 +95,37 @@ class _HomePageState extends State<HomePage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('山海', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
-        backgroundColor: const Color(0xFF16161F),
-        foregroundColor: Colors.white,
-        elevation: 0,
         actions: [
           IconButton(
             tooltip: '检查更新',
             icon: const Icon(Icons.system_update_alt),
             onPressed: () => _checkUpdate(silent: false),
+          ),
+          // 主题切换入口：跟随系统 / 亮色 / 暗色（与桌面端主题机制对齐）
+          ValueListenableBuilder<AppThemeMode>(
+            valueListenable: ThemeController.instance,
+            builder: (context, mode, _) => PopupMenuButton<AppThemeMode>(
+              tooltip: '主题',
+              icon: Icon(mode.icon),
+              onSelected: (m) => ThemeController.instance.setMode(m),
+              itemBuilder: (_) => [
+                for (final m in AppThemeMode.values)
+                  PopupMenuItem(
+                    value: m,
+                    child: Row(
+                      children: [
+                        Icon(m.icon, size: 18),
+                        const SizedBox(width: 10),
+                        Text(m.label, style: const TextStyle(fontSize: 14)),
+                        if (m == mode) ...[
+                          const SizedBox(width: 8),
+                          const Icon(Icons.check, size: 16, color: Color(0xFF8B5CF6)),
+                        ],
+                      ],
+                    ),
+                  ),
+              ],
+            ),
           ),
           IconButton(
             tooltip: '切换设备',
@@ -144,8 +168,6 @@ class _HomePageState extends State<HomePage> {
       bottomNavigationBar: NavigationBar(
         selectedIndex: _index,
         onDestinationSelected: (i) => setState(() => _index = i),
-        backgroundColor: const Color(0xFF16161F),
-        indicatorColor: const Color(0xFF2A2A3A),
         destinations: const [
           NavigationDestination(icon: Icon(Icons.forum_outlined), selectedIcon: Icon(Icons.forum), label: '会话'),
           NavigationDestination(icon: Icon(Icons.supervisor_account_outlined), selectedIcon: Icon(Icons.supervisor_account), label: '管家'),

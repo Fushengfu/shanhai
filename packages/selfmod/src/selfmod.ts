@@ -6,6 +6,7 @@ import { dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { scaffoldPlugin, SCAFFOLD_WORKSPACE_DIR } from './scaffold'
 import { buildPlugin, verifyBuildArtifacts, type PluginBuildResult } from './build'
+import { packagePluginShare, PACKAGE_SHARE_CATEGORIES } from './share-pack'
 
 // 主进程 require 上下文（加载 host 半编译产物 host.cjs；selfmod 被 desktop/runtime bundle 成 ESM，故用 createRequire 拿 CJS require）
 const nodeRequire = createRequire(import.meta.url)
@@ -42,7 +43,7 @@ interface HostFacade {
 /**
  * 插件注册的全局工具条目（集中存储于 SelfModifyRuntime.pluginTools Registry）。
  * 插件 host 半 `ctx.tools.register(tool)` 不再直接把工具 push 进顶层工具表，而是收集到这里，
- * 由统一调度工具 `plugin_tool` 按 action 分派执行（形如 computer-use 的 skill_run）。含来源插件/风险标记。
+ * 由统一调度工具 `plugin(tool)` 按 action 分派执行（形如 computer-use 的 skill_run）。含来源插件/风险标记。
  */
 interface PluginToolEntry {
   name: string
@@ -139,10 +140,10 @@ export class SelfModifyRuntime {
   /** 按「插件 id → 服务名 → impl」分组的 host 半服务表（client 半 RPC 用，见 invokeService）。与 services 并存：前者全局去重供 plugin_inspect 报告，后者按插件隔离供 RPC 调用。 */
   private readonly hostServices = new Map<string, Map<string, unknown>>()
   /**
-   * 插件注册的全局工具 Registry：host 半 `ctx.tools.register(tool)` 收集到这里（按工具名索引），
-   * 不再直接 push 进顶层工具表。由统一调度工具 `plugin_tool` 按 action 分派执行。含来源插件/风险标记。
+   * 插件注册的全局工具 Registry（双键：插件 id → 工具名 → 条目）：host 半 `ctx.tools.register(tool)` 收集到这里，
+   * 不再直接 push 进顶层工具表。由统一调度工具 `plugin(tool)` 按 (pluginId, tool) 双键分派执行。含来源插件/风险标记。
    */
-  private readonly pluginTools = new Map<string, PluginToolEntry>()
+  private readonly pluginTools = new Map<string, Map<string, PluginToolEntry>>()
   private readonly disposers = new Map<string, () => Promise<void>>()
 
   constructor(
@@ -156,10 +157,11 @@ export class SelfModifyRuntime {
     return {
       services: [...new Set([...this.hooks.listServices(), ...this.services.keys()])],
       tools: this.hooks.listTools(sessionId),
-      /** 插件注册的全局工具名（经 plugin_tool 分派，不直接进顶层工具表） */
+      /** 插件注册的全局工具名（经 tool action 分派，不直接进顶层工具表） */
       pluginTools: this.listPluginTools(),
       packages: all.filter((p) => p.sessionId === sessionId && p.status !== 'installed'),
       installed: all.filter((p) => p.status === 'installed'),
+      apps: this.listPluginApps(),
       slots: this.hooks.listSlots(),
     }
   }
@@ -271,11 +273,19 @@ export class SelfModifyRuntime {
       },
       tools: {
         register: (tool) => {
-          // 插件工具统一收集进 Registry（不再 push 进顶层工具表），由 plugin_tool 按 action 分派。
-          this.pluginTools.set(tool.name, { name: tool.name, tool, pkgId: pkg.id, pkgName: pkg.name })
+          // 插件工具统一收集进 Registry（双键：插件 id → 工具名），由 plugin(tool) 按 (pluginId, tool) 分派。
+          let byTool = this.pluginTools.get(pkg.id)
+          if (!byTool) {
+            byTool = new Map()
+            this.pluginTools.set(pkg.id, byTool)
+          }
+          byTool.set(tool.name, { name: tool.name, tool, pkgId: pkg.id, pkgName: pkg.name })
           stack.collect(() => {
-            const cur = this.pluginTools.get(tool.name)
-            if (cur && cur.tool === tool) this.pluginTools.delete(tool.name)
+            const m = this.pluginTools.get(pkg.id)
+            if (m && m.get(tool.name)?.tool === tool) {
+              m.delete(tool.name)
+              if (m.size === 0) this.pluginTools.delete(pkg.id)
+            }
           })
         },
       },
@@ -309,26 +319,6 @@ export class SelfModifyRuntime {
     this.inventory.setStatus(id, 'stopped')
   }
 
-  /** plugin_undefine：停止并遗忘定义 */
-  async undefine(id: string): Promise<void> {
-    await this.stop(id)
-    this.inventory.remove(id)
-  }
-
-  /** plugin_test：临时运行 + 立即撤回，返回验证结果（不持久化、不影响正式安装） */
-  async test(id: string, sessionId: string): Promise<{ ok: boolean; clientDelivered: boolean }> {
-    const pkg = this.inventory.get(id)
-    if (!pkg) throw new Error(`动态包不存在: ${id}`)
-    if (pkg.sessionId !== sessionId && pkg.sessionId !== '*') {
-      throw new Error(`动态包 "${pkg.name}" 属于其他会话，无权测试`)
-    }
-    // 幂等：无论之前什么状态，都「撤回 → 运行 → 撤回」走一遍
-    if (pkg.status === 'running') await this.stop(id)
-    const { clientDelivered } = await this.run(id, sessionId)
-    await this.stop(id)
-    return { ok: true, clientDelivered }
-  }
-
   /**
    * client 半 → host 半自定义 RPC：按「插件 id + 服务名」调用 host 半 provide() 注册的服务。
    * 由主进程 plugin:invoke 的 invokePluginService 能力反查窗口 appId → 插件 id 后调用。
@@ -343,23 +333,30 @@ export class SelfModifyRuntime {
     return (impl as (...a: unknown[]) => unknown)(...args)
   }
 
-  /** plugin_tool 统一分派：查 Registry 找到对应插件工具并执行（找不到给明确报错） */
-  async dispatchPluginTool(action: string, args: Record<string, unknown>): Promise<unknown> {
-    const entry = this.pluginTools.get(action)
+  /** plugin(tool) 统一分派：按 (pluginId, tool) 双键查 Registry 找到对应插件工具并执行（找不到给明确报错） */
+  async dispatchPluginTool(pluginId: string, toolName: string, args: Record<string, unknown>): Promise<unknown> {
+    const byTool = pluginId ? this.pluginTools.get(pluginId) : undefined
+    const entry = byTool?.get(toolName)
     if (!entry) {
-      const available = [...this.pluginTools.keys()]
+      const available = this.listPluginTools()
+      const summary = available.length > 0 ? available.map((p) => `${p.pluginId}: [${p.tools.map((t) => t.name).join(', ')}]`).join('；') : '（无）'
       throw new Error(
-        `插件工具不存在：${action}` +
-          (available.length > 0 ? `（当前已注册的插件工具：${available.join(', ')}）` : '（当前没有任何插件工具）') +
-          '。可先用 plugin_apps 或 plugin_inspect 查看可用工具清单',
+        `插件工具不存在：${pluginId}/${toolName}（当前已注册的插件工具：${summary}）。可先用 plugin({ action: "list" }) 或 plugin({ action: "inspect" }) 查看可用工具清单`,
       )
     }
     return entry.tool.execute(args)
   }
 
-  /** 列出插件注册的全局工具名（plugin_inspect / plugin_test_load 报告用，经 plugin_tool 分派） */
-  listPluginTools(): string[] {
-    return [...this.pluginTools.keys()]
+  /** 列出插件注册的全局工具（按插件 id 分组，含工具名与描述；plugin(list) / plugin_inspect 报告用，经 plugin(tool) 双键分派） */
+  listPluginTools(): Array<{ pluginId: string; name: string; tools: Array<{ name: string; description: string }> }> {
+    return [...this.pluginTools.entries()].map(([pluginId, byTool]) => {
+      const entries = [...byTool.values()]
+      return {
+        pluginId,
+        name: entries[0]?.pkgName ?? pluginId,
+        tools: entries.map((e) => ({ name: e.name, description: e.tool.description })),
+      }
+    })
   }
 
   /** plugin_apps：列出所有已安装插件（含窗口应用与纯工具插件），区分有无窗口 */
@@ -377,14 +374,25 @@ export class SelfModifyRuntime {
           hasWindow,
           kind: hasWindow ? 'app' : 'tool',
           services: [...(this.hostServices.get(p.id)?.keys() ?? [])],
-          tools: [...this.pluginTools.values()].filter((e) => e.pkgId === p.id).map((e) => e.name),
+          tools: [...(this.pluginTools.get(p.id)?.values() ?? [])].map((e) => e.name),
         }
       })
   }
 
-  /** 计算持久化 id：name 转 kebab-case；空或含非法字符则报错 */
-  private static persistIdOf(pkg: DynamicPackage, explicit?: string): string {
-    return normalizePluginId(explicit ?? pkg.name)
+  /** 读工作区工程 package.json 的元信息（name / description / version），用于 install 自动 define 时兜底 */
+  private static readProjectMeta(id: string): { name?: string; purpose?: string; version?: string } {
+    try {
+      const pkgPath = join(SCAFFOLD_WORKSPACE_DIR, id, 'package.json')
+      if (!existsSync(pkgPath)) return {}
+      const raw = JSON.parse(readFileSync(pkgPath, 'utf8')) as Record<string, unknown>
+      return {
+        name: typeof raw.name === 'string' ? raw.name : undefined,
+        purpose: typeof raw.description === 'string' ? raw.description : undefined,
+        version: typeof raw.version === 'string' ? raw.version : undefined,
+      }
+    } catch {
+      return {}
+    }
   }
 
   /**
@@ -418,14 +426,33 @@ export class SelfModifyRuntime {
     }
   }
 
-  /** plugin_install：把验证通过的动态包持久化到内核并激活（跨会话、跨重启留存） */
-  async install(dynId: string, sessionId: string, persistId?: string): Promise<{ id: string; installed: boolean }> {
-    const pkg = this.inventory.get(dynId)
-    if (!pkg) throw new Error(`动态包不存在: ${dynId}`)
-    if (pkg.sessionId !== sessionId) throw new Error(`动态包 "${pkg.name}" 属于其他会话，无权安装`)
+  /** install（plugin-manage 的 install action）：把「项目 id」对应的工程化插件持久化安装进内核并激活（跨会话、跨重启留存） */
+  async install(
+    projectId: string,
+    sessionId: string,
+    opts: { persistId?: string; name?: string; purpose?: string; version?: string; permissions?: string[] } = {},
+  ): Promise<{ id: string; installed: boolean }> {
     if (!this.store) throw new Error('插件仓库未装配，无法安装')
 
-    const id = SelfModifyRuntime.persistIdOf(pkg, persistId)
+    const pid = normalizePluginId(projectId)
+    const id = normalizePluginId(opts.persistId ?? pid)
+
+    // 自动 define：读工作区 package.json 拿 name/purpose/version 兜底（入参可覆盖），permissions 由入参显式声明
+    const projectMeta = SelfModifyRuntime.readProjectMeta(pid)
+    const name = (opts.name ?? '').trim() || projectMeta.name || pid
+    const purpose = (opts.purpose ?? '').trim() || projectMeta.purpose || '山海插件应用'
+    const version = opts.version ?? projectMeta.version
+    const permissions = Array.isArray(opts.permissions) ? opts.permissions.map((x) => String(x)) : []
+
+    const pkg = this.inventory.define({
+      id,
+      name,
+      purpose,
+      version,
+      permissions,
+      sessionId,
+    })
+    this.inventory.setSession(id, '*')
 
     // 已存在同名已安装插件 → 视为升级：先卸载旧的（撤销运行 + 删除旧目录含旧 dist）。
     // 必须在 deployArtifacts 之前：否则旧 dist 会让 deployArtifacts「已有产物即跳过」→ 新产物不部署，
@@ -446,15 +473,9 @@ export class SelfModifyRuntime {
 
     // 至少要有一种可执行载体：host 编译产物 / client 编译产物
     if (!hasHost && !hasHtml) {
-      throw new Error(`动态包 "${pkg.name}" 没有可安装的产物（需 dist/host.cjs / dist/client.html 至少其一）`)
+      throw new Error(`插件 "${name}" 没有可安装的产物（需先 build 产出 dist/host.cjs / dist/client.html 至少其一）`)
     }
 
-    // 若已 running 先撤回（用旧 id 正确卸载 client），再以持久化 id 重新激活
-    if (pkg.status === 'running') {
-      await this.stop(dynId)
-    }
-    this.inventory.rename(dynId, id)
-    this.inventory.setSession(id, '*')
     // 把探测到的产物路径写回 package（run 阶段据此 require host.cjs / 注册 client.html 窗口应用）
     pkg.entryHost = hasHost ? entryHost : undefined
     pkg.entryHtml = hasHtml ? entryHtml : undefined
@@ -542,6 +563,58 @@ export class SelfModifyRuntime {
       }
     }
     return restored
+  }
+
+  /**
+   * 市场安装激活：给定「已还原落盘到 ~/.shanhai/plugins/<id>/」（manifest.json + dist/ 等已就位）的插件，
+   * 覆盖安装并激活（用户点「下载安装」按钮已授权，skipApproval 不再二次弹审批）。
+   *
+   * 与 plugin_install 的区别：这里没有动态包（dyn-<n>），插件目录由主进程下载/校验/解包后直接落盘，
+   * 本方法只负责「读 manifest → 撤销旧运行（保留已被覆盖的目录）→ define → run → 置 installed」。
+   *
+   * 覆盖升级语义：若同 id 已安装，先撤销旧 host 半运行 + 移除旧 client 半投递 + 清 inventory 记录，
+   * 但【不删目录】——目录内容已被主进程用新包覆盖，删了反而丢新文件。
+   */
+  async installFromDisk(id: string): Promise<{ id: string; installed: boolean }> {
+    if (!this.store) throw new Error('插件仓库未装配，无法安装')
+    const meta = await this.store.load(id)
+    if (!meta) throw new Error(`插件元数据缺失: ${id}（请确认 manifest.json 已落盘到 plugins/${id}/）`)
+
+    // 覆盖升级：撤销旧运行 + 清 inventory 旧记录（目录已由主进程覆盖为新包，不删）
+    const existing = this.inventory.list().find((p) => p.id === id)
+    if (existing) {
+      const disposer = this.disposers.get(id)
+      if (disposer) {
+        await disposer()
+        this.disposers.delete(id)
+      }
+      await this.hooks.removeClient(id)
+      this.inventory.remove(id)
+    }
+
+    const entryHost = this.store.entryFile(id, 'host')
+    const entryHtml = this.store.entryFile(id, 'client')
+    const hasHost = existsSync(entryHost)
+    const hasHtml = existsSync(entryHtml)
+    if (!hasHost && !hasHtml) {
+      throw new Error(`插件 "${id}" 没有可安装的产物（需 dist/host.cjs / dist/client.html 至少其一）`)
+    }
+
+    const pkg = this.inventory.define({
+      id,
+      name: meta.name,
+      purpose: meta.purpose,
+      version: meta.version,
+      sessionId: '*',
+      permissions: meta.permissions ?? [],
+      entryHost: hasHost ? entryHost : undefined,
+      entryHtml: hasHtml ? entryHtml : undefined,
+      icon: meta.icon,
+      dependencies: meta.dependencies,
+    })
+    await this.run(id, '*', { skipApproval: true })
+    this.inventory.setStatus(id, 'installed')
+    return { id, installed: true }
   }
 
   /**
@@ -679,153 +752,85 @@ export class SelfModifyRuntime {
     }
   }
 
-  /** 五个 model-facing 工具（plugin_inspect / define / run / stop / undefine） */
+  /** 八个 model-facing 工具（供 plugin 顶层工具按 action 分派：inspect / scaffold / build / test-load / verify / install / publish / uninstall） */
   createTools(getSessionId: () => string): ToolContract[] {
     const sid = (): string => getSessionId()
 
     const inspectTool: ToolContract = {
       name: 'plugin_inspect',
       description:
-        '查看当前可自我升级的运行时表面：已注册的服务、可用工具、动态插件包、已安装插件、UI 插槽。' +
-        '当你需要了解「能往哪里挂自定义 UI / 注册什么服务 / 有哪些工具可用 / 已安装了哪些插件」时使用。',
+        '查看当前可自我升级的运行时表面：已注册的服务、可用工具、动态插件包、已安装插件（含窗口应用与纯工具插件）、插件注册的全局工具、UI 插槽。' +
+        '当你需要了解「能往哪里挂自定义 UI / 注册什么服务 / 有哪些工具可用 / 已安装了哪些插件 / 插件注册了哪些工具」时使用。',
       inputSchema: {
         type: 'object',
         properties: {
-          what: { type: 'string', description: '可选：services | tools | packages | slots，不传返回全部' },
-          name: { type: 'string', description: '可选：进一步过滤的名称' },
+          what: { type: 'string', description: '可选：要返回的节（逗号分隔），可取 services / tools / pluginTools / packages / installed / apps / slots，不传返回全部' },
+          name: { type: 'string', description: '可选：进一步过滤的名称（对 apps / installed / packages / pluginTools 等列表节按 id/name 匹配）' },
         },
       },
       riskLevel: 'readonly',
-      execute: async () => this.inspect(sid()),
-    }
-
-    const defineTool: ToolContract = {
-      name: 'plugin_define',
-      description:
-        '开发插件前先 skill_read plugin-protocol 读完整规范。' +
-        '插件开发统一走「工程化独立应用」链路（源码字符串 code/client 快速原型已废弃移除）。' +
-        'plugin_define 只登记插件元信息（name/purpose/permissions/icon/version/dependencies），不产出代码；' +
-        '真正的插件产出走 plugin_scaffold（生成可编译项目）→ plugin_build（编译出 dist/ 产物）→ plugin_test_load（干跑加载）→ plugin_verify（等价验证）→ plugin_install（安装进内核）。' +
-        'host 半编译产物 dist/host.cjs（esbuild 自包含 bundle，require 加载、可 require 第三方依赖）；client 半窗口入口 dist/client.html（loadFile 加载）。' +
-        'host 半工厂契约 (ctx) => disposer，ctx 提供五条能力：on(name,listener) 订阅内核事件、provide(name,impl) 注册命名服务、tools.register(tool) 注册插件工具、openWindow(appId?) 打开本插件独立窗口、closeWindow(appId?) 关闭它；刻意不暴露 effect()，cleanup 只走前四条自动撤销路径。' +
-        'disposer 可为 函数 / null / Iterable / Promise（撤销时逆序调用，单个失败不阻断其余）。' +
-        '窗口应用默认「不自动开窗」——安装/加载后由用户点 Dock 图标主动打开（openApp → loadFile dist/client.html）；只有 host 半 factory 显式调 ctx.openWindow() 才会在 install 阶段立即开窗（会打断用户当前工作，不推荐）。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          name: { type: 'string', description: '包名' },
-          purpose: { type: 'string', description: '用途说明（一句话）' },
-          permissions: { type: 'array', items: { type: 'string' }, description: '可选：插件声明的白名单能力名清单（窗口应用形态才需要，用于调 window.shanhaiPlugin 桥）。完整可声明清单：getVersion / clipboardWriteText / clipboardReadText / speak / selectDirectory / listSessions / listMemory / getUiState(精简版) / closeApp(仅自身) / getWallpaper / getTokenStats / listModels(可用模型列表，需显式声明) / modelCall(受控单次模型调用，需显式声明) / modelCallStream(受控流式模型调用，需显式声明)。缺省=空数组=最小权限；install 时随 manifest 落盘并审批' },
-          icon: { type: 'string', description: '可选：图标相对路径（相对插件目录，如 icon.png / assets/icon.png），供 Dock 图标渲染用；需该文件已放在 ~/.shanhai/plugins/<id>/ 下' },
-          dependencies: { type: 'object', description: '可选：依赖声明（包名→版本），仅供工程化插件的 package.json 参考/审计，运行时不自解析依赖' },
-          version: { type: 'string', description: '可选：插件版本号（如 2.0.0），install 时随 manifest.json 落盘；覆盖升级时用于标识版本' },
-        },
-        required: ['name', 'purpose'],
-      },
-      riskLevel: 'readonly',
       execute: async (args) => {
-        const pkg = this.define(
-          {
-            name: String(args.name ?? ''),
-            purpose: String(args.purpose ?? ''),
-            permissions: Array.isArray(args.permissions) ? args.permissions.map((x) => String(x)) : undefined,
-            icon: args.icon ? String(args.icon) : undefined,
-            dependencies: args.dependencies && typeof args.dependencies === 'object' ? (args.dependencies as Record<string, string>) : undefined,
-            version: args.version ? String(args.version) : undefined,
-          },
-          sid(),
-        )
-        return { id: pkg.id, name: pkg.name, purpose: pkg.purpose, status: pkg.status, permissions: pkg.permissions }
+        const report = this.inspect(sid()) as Record<string, unknown>
+        const what = args?.what ? String(args.what).trim() : ''
+        const name = args?.name ? String(args.name).trim() : ''
+        const sections = what ? what.split(',').map((s) => s.trim()).filter(Boolean) : Object.keys(report)
+        const out: Record<string, unknown> = {}
+        for (const key of sections) {
+          if (!(key in report)) continue
+          let val = report[key]
+          if (name && Array.isArray(val)) {
+            val = val.filter((it) => {
+              if (typeof it === 'string') return it.includes(name)
+              if (it && typeof it === 'object') {
+                const o = it as Record<string, unknown>
+                return [o.id, o.name, o.appId, o.pluginId].filter(Boolean).some((h) => String(h).includes(name))
+              }
+              return false
+            })
+          }
+          out[key] = val
+        }
+        return out
       },
-    }
-
-    const runTool: ToolContract = {
-      name: 'plugin_run',
-      description:
-        '【已废弃】快速原型（源码字符串 code/client）路径已移除，插件统一走工程化独立应用。' +
-        '请改用 plugin_scaffold → plugin_build → plugin_test_load → plugin_verify → plugin_install 闭环，不再用 plugin_run 临时运行源码字符串包。',
-      inputSchema: {
-        type: 'object',
-        properties: { id: { type: 'string', description: '动态包 id（plugin_define 返回的 dyn-<n>）' } },
-        required: ['id'],
-      },
-      // 注意：不设 approvalRequired / 高危 riskLevel，避免与 browser 半投递审批（requestClientRun）叠加成双重确认。
-      // host 半以 require 编译产物执行、facade 仅暴露三条自动撤销路径，风险可控；真正的「投递 UI 到界面」已在 requestClientRun 单独审批。
-      riskLevel: 'reversible',
-      execute: async (args) => this.run(String(args.id ?? ''), sid()),
-    }
-
-    const stopTool: ToolContract = {
-      name: 'plugin_stop',
-      description: '撤回一个正在运行的动态插件包（host 半 + browser 半都撤销），定义保留，可再次 plugin_run。',
-      inputSchema: {
-        type: 'object',
-        properties: { id: { type: 'string', description: '动态包 id（dyn-<n>）' } },
-        required: ['id'],
-      },
-      riskLevel: 'readonly',
-      execute: async (args) => {
-        await this.stop(String(args.id ?? ''))
-        return { stopped: true }
-      },
-    }
-
-    const undefineTool: ToolContract = {
-      name: 'plugin_undefine',
-      description: '停止并永久遗忘一个动态插件包的定义。',
-      inputSchema: {
-        type: 'object',
-        properties: { id: { type: 'string', description: '动态包 id（dyn-<n>）' } },
-        required: ['id'],
-      },
-      riskLevel: 'readonly',
-      execute: async (args) => {
-        await this.undefine(String(args.id ?? ''))
-        return { undefined: true }
-      },
-    }
-
-    const testTool: ToolContract = {
-      name: 'plugin_test',
-      description:
-        '【已废弃】快速原型（源码字符串）路径已移除。工程化自测请改用 plugin_test_load（把 dist 产物复制到临时目录干跑加载），验证能跑 + 能卸载回收。',
-      inputSchema: {
-        type: 'object',
-        properties: { id: { type: 'string', description: '动态包 id（plugin_define 返回的 dyn-<n>）' } },
-        required: ['id'],
-      },
-      riskLevel: 'reversible',
-      execute: async (args) => this.test(String(args.id ?? ''), sid()),
     }
 
     const installTool: ToolContract = {
       name: 'plugin_install',
       description:
-        '把一个验证通过的动态插件包正式安装到系统内核：持久化落盘（~/.shanhai/plugins/）并激活，' +
-        '跨会话、跨重启留存，之后 AI 和用户都能持续使用。安装后返回持久化 id（用于 plugin_uninstall）。' +
-        '可选 persistId 指定稳定英文 id，缺省用插件 name 生成。安装前建议先 plugin_test_load / plugin_verify 验证产物。',
+        '把一个工程化插件项目正式安装到系统内核：持久化落盘（~/.shanhai/plugins/）并激活，跨会话、跨重启留存，之后 AI 和用户都能持续使用。' +
+        '入参 id = 项目 id（= 工作区目录名，如 todo-list），自动读工作区 package.json 拿 name/purpose/version（可选 name/purpose/version/permissions 覆盖），' +
+        'permissions 显式声明插件要调的白名单能力。安装后返回持久化 id（用于 uninstall）。安装前建议先 build → test-load → verify 验证产物。',
       inputSchema: {
         type: 'object',
         properties: {
-          id: { type: 'string', description: '动态包 id（plugin_define 返回的 dyn-<n>）' },
-          persistId: { type: 'string', description: '可选：稳定英文持久化 id（如 todo-list），缺省由 name 生成' },
+          id: { type: 'string', description: '插件英文短 id（项目目录 ~/.shanhai/plugins-workspace/<id>/，即 scaffold 用的 id；也作为持久化 id）' },
+          persistId: { type: 'string', description: '可选：覆盖持久化 id（缺省 = id）' },
+          name: { type: 'string', description: '可选：显示名（缺省读工作区 package.json name，再缺省 = id）' },
+          purpose: { type: 'string', description: '可选：用途说明（缺省读工作区 package.json description）' },
+          version: { type: 'string', description: '可选：版本号（缺省读工作区 package.json version）' },
+          permissions: { type: 'array', items: { type: 'string' }, description: '可选：插件声明的白名单能力名清单（窗口应用形态才需要，用于调 window.shanhaiPlugin 桥）。缺省 = 空数组 = 最小权限' },
         },
         required: ['id'],
       },
       riskLevel: 'reversible',
       approvalRequired: true,
       execute: async (args) =>
-        this.install(String(args.id ?? ''), sid(), args.persistId ? String(args.persistId) : undefined),
+        this.install(String(args.id ?? ''), sid(), {
+          persistId: args.persistId ? String(args.persistId) : undefined,
+          name: args.name ? String(args.name) : undefined,
+          purpose: args.purpose ? String(args.purpose) : undefined,
+          version: args.version ? String(args.version) : undefined,
+          permissions: Array.isArray(args.permissions) ? args.permissions.map((x) => String(x)) : undefined,
+        }),
     }
 
     const uninstallTool: ToolContract = {
       name: 'plugin_uninstall',
       description:
-        '卸载一个已安装的插件（撤销运行 + 删除持久化文件）。参数 id 是 plugin_install 返回的持久化 id。' +
-        '卸载后该插件不再跨会话/跨重启存在；会话内动态包请用 plugin_undefine 遗忘。',
+        '卸载一个已安装的插件（撤销运行 + 删除持久化文件）。参数 id 是 install 返回的持久化 id。卸载后该插件不再跨会话/跨重启存在。',
       inputSchema: {
         type: 'object',
-        properties: { id: { type: 'string', description: '持久化 id（plugin_install 返回的 id）' } },
+        properties: { id: { type: 'string', description: '持久化 id（install 返回的 id）' } },
         required: ['id'],
       },
       riskLevel: 'reversible',
@@ -838,7 +843,7 @@ export class SelfModifyRuntime {
       description:
         '从内置模板生成一个可编译的「插件应用」项目到 ~/.shanhai/plugins-workspace/<id>/（含 src/host.ts 主机半、' +
         'src/App.tsx + src/main.tsx + client.html 客户机半、package.json 依赖与 build 脚本、vite/esbuild 构建配置、tsconfig、README）。' +
-        '用于「工程化开发复杂插件界面」。这是流水线第 1 步，后续用 plugin_build（进程内编译，免 npm install）→ plugin_test_load → plugin_verify → plugin_install（自动部署产物）串成闭环，无需手动 npm install / cp。' +
+        '用于「工程化开发复杂插件界面」。这是流水线第 1 步，后续用 build（进程内编译，免 npm install）→ test-load → verify → install（自动部署产物）串成闭环，无需手动 npm install / cp。' +
         '模板随包分发（终端用户不读仓库源码也能拿到）。生成后返回 dir（项目绝对路径）、files（文件清单）、nextSteps（下一步操作）。',
       inputSchema: {
         type: 'object',
@@ -862,10 +867,10 @@ export class SelfModifyRuntime {
     const buildTool: ToolContract = {
       name: 'plugin_build',
       description:
-        '编译一个「插件应用」项目（由 plugin_scaffold 生成，位于 ~/.shanhai/plugins-workspace/<id>/）到其 dist/ 目录，' +
+        '编译一个「插件应用」项目（由 scaffold 生成，位于 ~/.shanhai/plugins-workspace/<id>/）到其 dist/ 目录，' +
         '产出 dist/host.cjs（esbuild 自包含 bundle）+ dist/client.html + dist/assets/*（vite 完整 React bundle）。' +
         '进程内构建：用山海自带的 esbuild/vite，不依赖用户手动 npm install / node。' +
-        '这是「编写 → 编译 → 测试加载 → 验证 → 安装」流水线的第 2 步（scaffold 之后）。返回 hostEntry/clientHtml/assets/warnings。',
+        '这是「scaffold → build → test-load → verify → install」流水线的第 2 步（scaffold 之后）。返回 hostEntry/clientHtml/assets/warnings。',
       inputSchema: {
         type: 'object',
         properties: {
@@ -879,12 +884,12 @@ export class SelfModifyRuntime {
     }
 
     const testLoadTool: ToolContract = {
-      name: 'plugin_test_load',
+      name: 'plugin_test-load',
       description:
         '把编译产物复制到临时目录（~/.shanhai/plugins-test/<id>/）做「干跑加载」：require dist/host.cjs + 调用 factory，' +
         '验证 host 半能跑起来、ctx 五条能力（on/provide/tools.register/openWindow/closeWindow）可用、能正常卸载回收（disposer + require.cache 清理）。' +
         '不污染正式 ~/.shanhai/plugins/、不注册 Dock 图标。返回 factoryCalled/hostLoaded/disposerCalled/requireCacheCleared/各 ctx 能力调用记录。' +
-        '流水线第 3 步（plugin_build 之后）。',
+        '流水线第 3 步（build 之后）。',
       inputSchema: {
         type: 'object',
         properties: {
@@ -915,45 +920,117 @@ export class SelfModifyRuntime {
       execute: async (args) => this.verify(String(args.id ?? ''), args.projectDir ? String(args.projectDir) : undefined),
     }
 
-    const pluginToolTool: ToolContract = {
-      name: 'plugin_tool',
+    const publishTool: ToolContract = {
+      name: 'plugin_publish',
       description:
-        '统一调度「插件注册的工具」。所有已安装插件通过 host 半 ctx.tools.register 注册的工具，都经此工具按 action 分派调用，不再作为顶层 function 暴露。' +
-        '先用 plugin_apps（列出插件与它们的工具名）或 plugin_inspect（pluginTools 字段）查到可用的插件工具名，再用 plugin_tool 调用。',
+        '把本地自研插件工程打包成「共享包」zip（供提交 AI 网关插件市场/分享给其他用户）。' +
+        '【安全】只允许打包 ~/.shanhai/plugins-workspace/<id>/ 下的自研工程（禁止从已安装目录 plugins/ 打包他人插件）。' +
+        '共享包 = 完整工程源码包（src/、package.json、tsconfig、vite 构建配置、README）+ 完整构建产物（dist/host.cjs、dist/client.html、dist/assets/*）+ manifest.json（根，含 name/purpose/version/icon/permissions + hasUI/categories 分类字段）+ icon。' +
+        '接收方拿到后既能直接安装运行（用 dist）、也能继续二次开发（用源码）。' +
+        'hasUI 按「有 dist/client.html」自动判定；categories 传行业分类（可选，多选，枚举：效率办公/内容创作/视频生成/设计/数据分析/生活工具/行业专属/其他），缺省 ["其他"]。' +
+        'version/name/permissions 优先取已安装的 manifest（如有），否则取工程 package.json。返回 zip 路径、manifest、zip 内条目清单。',
       inputSchema: {
         type: 'object',
         properties: {
-          action: { type: 'string', description: '要调用的插件工具名（= 插件 host 半 tools.register 时用的 name）' },
-          args: { type: 'object', description: '传给该插件工具的参数对象（按该工具的 inputSchema 填）' },
+          pluginDir: { type: 'string', description: '插件工程目录绝对路径（仅限 ~/.shanhai/plugins-workspace/ 下），或直接传工程 id（如 shortdrama）' },
+          categories: { type: 'array', items: { type: 'string' }, description: '可选：行业场景分类（多选，枚举：效率办公/内容创作/视频生成/设计/数据分析/生活工具/行业专属/其他），缺省 ["其他"]' },
+          outDir: { type: 'string', description: '可选：zip 输出目录（缺省 = ~/.shanhai/plugins-workspace/）' },
+        },
+        required: ['pluginDir'],
+      },
+      riskLevel: 'reversible',
+      execute: async (args) =>
+        packagePluginShare(String(args.pluginDir ?? ''), {
+          categories: Array.isArray(args.categories) ? args.categories.map((c) => String(c)) : undefined,
+          outDir: args.outDir ? String(args.outDir) : undefined,
+        }),
+    }
+
+    return [inspectTool, scaffoldTool, buildTool, testLoadTool, verifyTool, installTool, publishTool, uninstallTool]
+  }
+
+  /**
+   * 插件统一入口工具 plugin：把插件「管理 / 列出 / 调用」三类能力收敛成一个普通顶层工具，内部按 action 参数分派到 10 个动作。
+   * agent 直接调 plugin({ action, args })。10 个动作：list / inspect / scaffold / build / test-load / verify / install / publish / uninstall / tool。
+   * - list：列出所有已安装插件及其注册的功能工具（原 plugin(list)）
+   * - inspect / scaffold / build / test-load / verify / install / publish / uninstall：插件管理（原 plugin 的 8 个动作）
+   * - tool：双键分派调用插件注册的功能工具（原 plugin(tool)），入参 pluginId + tool + args
+   * 审批粒度：list/inspect/verify 只读免审批；scaffold/build/test-load/publish 可逆免审批；install/uninstall 可逆但需审批；tool 委托具体插件工具的 riskLevel/approvalRequired。
+   */
+  createPluginTool(getSessionId: () => string): ToolContract {
+    const actionTools = this.createTools(getSessionId)
+    const byAction = new Map<string, ToolContract>()
+    for (const t of actionTools) {
+      byAction.set(t.name.replace(/^plugin_/, ''), t)
+    }
+    const ACTION_ENUM = ['list', 'inspect', 'scaffold', 'build', 'test-load', 'verify', 'install', 'publish', 'uninstall', 'tool']
+    return {
+      name: 'plugin',
+      description:
+        '管理山海自身插件（selfmod / K5 自修改）的统一入口工具，按 action 分派到具体实现。' +
+        '支持 action：list（列出所有已安装插件及其注册的功能工具，含窗口应用与纯工具插件）、' +
+        'inspect（查看运行时表面：服务 / 工具 / 插件注册的全局工具 / 已装插件 / UI 插槽）、' +
+        'scaffold（从模板生成可编译插件项目）、build（进程内编译出 dist 产物）、test-load（临时目录干跑加载验证）、' +
+        'verify（产物等价校验）、install（安装进内核，入参 id = 项目 id，自动读工作区 package.json，落盘 ~/.shanhai/plugins/ 跨会话跨重启留存）、' +
+        'publish（打包共享包 zip 供提交创意空间）、uninstall（卸载已安装插件）、' +
+        'tool（双键分派调用插件注册的功能工具：入参 pluginId + tool + args，先用 list 查到可用的 (pluginId, tool) 组合）。' +
+        '开发插件前先 skill_read plugin-protocol 读完整规范。' +
+        '开发闭环：scaffold → build → test-load → verify → install → uninstall；发布：publish。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            description: '要执行的动作，可选：list / inspect / scaffold / build / test-load / verify / install / publish / uninstall / tool',
+          },
+          args: {
+            type: 'object',
+            description:
+              '传给该动作的参数对象。inspect:{what?,name?}；scaffold:{id,name?,purpose?}；build/test-load/verify:{id,projectDir?}；install:{id,persistId?,name?,purpose?,version?,permissions?}；publish:{pluginDir,categories?,outDir?}；uninstall:{id}；tool:{…传给插件工具的参数对象}',
+          },
+          pluginId: { type: 'string', description: '仅 action=tool 时必填：插件持久化 id（list 返回的 id 字段）' },
+          tool: { type: 'string', description: '仅 action=tool 时必填：要调用的插件工具名（= 插件 host 半 tools.register 时用的 name）' },
         },
         required: ['action'],
       },
       riskLevel: 'reversible',
-      /** 动态风险：按具体插件工具的 riskLevel / approvalRequired 决定审批粒度 */
-      resolveRisk: (args): { riskLevel: import('@shanhai/tools').RiskLevel; approvalRequired: boolean } => {
-        const name = String(args.action ?? '')
-        const entry = this.pluginTools.get(name)
-        if (!entry) return { riskLevel: 'reversible', approvalRequired: false }
-        return { riskLevel: entry.tool.riskLevel, approvalRequired: entry.tool.approvalRequired ?? false }
+      resolveRisk: async (
+        args,
+      ): Promise<{ riskLevel: import('@shanhai/tools').RiskLevel; approvalRequired: boolean }> => {
+        const action = String(args?.action ?? '').trim()
+        if (action === 'list') return { riskLevel: 'readonly', approvalRequired: false }
+        if (action === 'tool') {
+          const pluginId = String(args?.pluginId ?? '')
+          const toolName = String(args?.tool ?? '')
+          const entry = this.pluginTools.get(pluginId)?.get(toolName)
+          if (!entry) return { riskLevel: 'reversible', approvalRequired: false }
+          return { riskLevel: entry.tool.riskLevel, approvalRequired: entry.tool.approvalRequired ?? false }
+        }
+        const tool = byAction.get(action)
+        if (!tool) return { riskLevel: 'reversible', approvalRequired: false }
+        return { riskLevel: tool.riskLevel, approvalRequired: tool.approvalRequired ?? false }
       },
       execute: async (args) => {
-        const action = String(args.action ?? '').trim()
-        if (!action) throw new Error('plugin_tool 缺少 action 参数（要调用的插件工具名）')
-        const a = args.args && typeof args.args === 'object' ? (args.args as Record<string, unknown>) : {}
-        return this.dispatchPluginTool(action, a)
+        const action = String(args?.action ?? '').trim()
+        if (!action) {
+          throw new Error(`plugin 缺少 action 参数（可选：${ACTION_ENUM.join(' / ')}）`)
+        }
+        if (action === 'list') return this.listPluginApps()
+        if (action === 'tool') {
+          const pluginId = String(args?.pluginId ?? '').trim()
+          const toolName = String(args?.tool ?? '').trim()
+          if (!pluginId) throw new Error('plugin(tool) 缺少 pluginId 参数（插件持久化 id，见 plugin(list)）')
+          if (!toolName) throw new Error('plugin(tool) 缺少 tool 参数（要调用的插件工具名）')
+          const a = args?.args && typeof args.args === 'object' ? (args.args as Record<string, unknown>) : {}
+          return this.dispatchPluginTool(pluginId, toolName, a)
+        }
+        const tool = byAction.get(action)
+        if (!tool) {
+          throw new Error(`plugin 未知 action：${action}（可选：${ACTION_ENUM.join(' / ')}）`)
+        }
+        const a = args?.args && typeof args.args === 'object' ? (args.args as Record<string, unknown>) : {}
+        return tool.execute(a)
       },
     }
-
-    const pluginAppsTool: ToolContract = {
-      name: 'plugin_apps',
-      description:
-        '列出所有已安装的插件应用（含「有窗口的应用插件」与「纯工具插件」），返回 id / 名称 / 描述 / 版本 / 有无窗口 / 注册的服务 / 注册的工具。' +
-        '拿到列表后：可用 plugin_tool 调用插件的工具，或对「有窗口的应用插件」用 computer_use / browser_use 做 UI 自动化操作。',
-      inputSchema: { type: 'object', properties: {} },
-      riskLevel: 'readonly',
-      execute: async () => ({ apps: this.listPluginApps() }),
-    }
-
-    return [inspectTool, defineTool, runTool, stopTool, undefineTool, testTool, installTool, uninstallTool, scaffoldTool, buildTool, testLoadTool, verifyTool, pluginToolTool, pluginAppsTool]
   }
 }

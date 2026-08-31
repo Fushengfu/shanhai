@@ -56,6 +56,12 @@ export interface ShanhaiPluginBridge {
     onDone?: () => void
     onError?: (error: Error) => void
   }): { cancel: () => void }
+  /**
+   * 上传文件到七牛云，返回 https 公网 URL（供素材/图片直传，拿到公网链接后转给 videoGen 等）。
+   * 凭证由主进程持有（登录账号 memberToken），插件只传文件 base64 + 可选 mimeType/fileName，拿不到 token/key。
+   * 需显式声明 permissions: ["uploadFile"]；未登录返回错误。
+   */
+  uploadFile(input: { dataBase64: string; mimeType?: string; fileName?: string }): Promise<string>
 }
 
 declare global {

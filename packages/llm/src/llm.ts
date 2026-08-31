@@ -50,6 +50,8 @@ export interface ModelResponse {
   usage?: Usage
   /** thinking 模式思维链内容（回传用） */
   reasoningContent?: string
+  /** 结束原因（OpenAI: choices[0].finish_reason；Anthropic: stop_reason）。用于「stop 但空响应」的异常判定 */
+  finishReason?: string
 }
 
 export interface StreamChunk {
@@ -61,6 +63,8 @@ export interface StreamChunk {
   usage?: Usage
   /** thinking 模式思维链增量（回传用） */
   reasoningContent?: string
+  /** 结束原因（仅流末尾 chunk 携带，用于「stop 但空响应」的异常判定） */
+  finishReason?: string
 }
 
 /**
@@ -127,12 +131,86 @@ export interface DeepSeekOptions {
   supportsReasoning?: boolean
   /** 采样温度（OpenAI 兼容语义 0~2；缺省不下发，由网关/上游用其默认值） */
   temperature?: number
+  /**
+   * 推理档位（reasoning_effort）：仅当 supportsReasoning=true 且本字段有值时下发（DeepSeek: low/high/max，medium/xhigh 会归一为 high）。
+   * 设置后进入「思考模式」，思考模式下不再下发 temperature 等采样参数（DeepSeek 文档明确这些在思考模式不生效）。缺省不下发。
+   */
+  reasoningEffort?: string
+  /**
+   * 思考模式开关（thinking.type）：仅当 supportsReasoning=true 且本字段非 undefined 时下发。
+   * true→thinking:{type:'enabled'}（思考模式，屏蔽采样参数）；false→thinking:{type:'disabled'}（非思考，可下发采样参数）。缺省不下发（保持现状，不回归）。
+   */
+  thinking?: boolean
 }
 
-/** thinking 模式下 assistant 消息缺 reasoning_content 时的回传占位符。
+/** 思考模式下 assistant 消息缺 reasoning_content 时的回传占位符。
  * 网关在某些轮次（纯工具调用轮）会吞掉上游 reasoning_content 不转发，导致历史里该字段缺失；
  * DeepSeek reasoner 要求多轮回传 reasoning_content，缺失即 400。用非空占位符兜底（参考 taco 的「继续」）。 */
 const REASONING_FALLBACK = '继续'
+
+/** DeepSeek/OpenAI 兼容的推理档位归一：medium/xhigh → high（官方映射表只认 low/high/max），其余白名单直传，不识别返回 undefined（避免下发引发 400） */
+function normalizeReasoningEffort(v: string | undefined): string | undefined {
+  if (!v) return undefined
+  const s = String(v).trim().toLowerCase()
+  if (s === 'medium' || s === 'xhigh') return 'high'
+  if (s === 'low' || s === 'high' || s === 'max') return s
+  return undefined
+}
+
+/** Anthropic 的推理档位归一：只认 low/high/max，medium/xhigh → high，其余不识别返回 undefined */
+function mapAnthropicEffort(v: string | undefined): string | undefined {
+  if (!v) return undefined
+  const s = String(v).trim().toLowerCase()
+  if (s === 'medium' || s === 'xhigh') return 'high'
+  if (s === 'low' || s === 'high' || s === 'max') return s
+  return undefined
+}
+
+interface ReasoningControls {
+  /** 归一后的 reasoning_effort（仅支持思考的模型、且显式设置了档位时存在） */
+  reasoningEffort?: string
+  /** 归一后的 thinking.type（仅支持思考的模型、且显式设置了 thinking 开关时存在） */
+  thinkingType?: 'enabled' | 'disabled'
+  /** 是否处于思考模式（思考模式下不下发 temperature 等采样参数） */
+  thoughtMode: boolean
+}
+
+/**
+ * 计算 OpenAI 兼容 provider 的「思考控制」字段 + 是否思考模式。
+ * 规则（重点防回归）：
+ * - 仅当 supportsReasoning=true 才启用（避免对不支持思考的 OpenAI 兼容模型下发 reasoning_effort/thinking 导致 400 或无效）；
+ * - reasoningEffort 显式设置 → 下发 reasoning_effort，并视为思考模式（默认 thinking enabled）；
+ * - thinking 显式设置 → 下发 thinking:{type}，true=思考模式（屏蔽采样），false=非思考（可下发采样）；
+ * - 两者都未设置：
+ *     · DeepSeek 模型（model 名以 deepseek 开头，如 deepseek-v4-flash/pro）且 supportsReasoning=true → 默认推理档位为 max（需求：DeepSeek 推理档位默认 max），进入思考模式；
+ *     · 其它模型 → 不下发任何新字段、thoughtMode=false（保持现有行为，不回归）。
+ * 仅当 supportsReasoning=true 才启用（避免对不支持思考的模型下发导致 400/无效）；Anthropic 走 mapAnthropicEffort，本函数仅控 OpenAI 兼容（DeepSeek）。
+ */
+function resolveReasoningControls(opts: {
+  supportsReasoning?: boolean
+  reasoningEffort?: string
+  thinking?: boolean
+  model?: string
+}): ReasoningControls {
+  const supported = opts.supportsReasoning === true
+  const explicitEffort = opts.reasoningEffort != null
+  const explicitThinking = opts.thinking !== undefined
+  // 仅支持思考的 DeepSeek 模型（model 名以 deepseek 开头），且用户未显式设置档位/思考开关时默认 max（需求：DeepSeek 推理档位默认 max）
+  const isDeepSeek =
+    supported && typeof opts.model === 'string' && opts.model.toLowerCase().startsWith('deepseek')
+  let reasoningEffort = supported ? normalizeReasoningEffort(opts.reasoningEffort) : undefined
+  if (supported && isDeepSeek && !explicitEffort && !explicitThinking) {
+    reasoningEffort = 'max'
+  }
+  const thinkingType =
+    supported && opts.thinking !== undefined
+      ? (opts.thinking ? 'enabled' : 'disabled')
+      : reasoningEffort != null
+        ? 'enabled'
+        : undefined
+  const thoughtMode = reasoningEffort != null || thinkingType === 'enabled'
+  return { reasoningEffort, thinkingType, thoughtMode }
+}
 
 /** 网关响应 choice（网关包装在 { code, data } 里，兼容裸 OpenAI 格式） */
 interface GatewayChoice {
@@ -142,6 +220,8 @@ interface GatewayChoice {
     reasoning?: string
     tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>
   }
+  /** OpenAI 结束原因（stop / length / tool_calls / content_filter），用于「stop 但空响应」的异常判定 */
+  finish_reason?: string
 }
 
 /** 网关 usage（含 prompt_tokens_details.cached_tokens 缓存命中） */
@@ -250,6 +330,7 @@ export class DeepSeekProvider implements Model {
     const url = chatCompletionsUrl(this.opts.baseUrl)
     // user_id：优先用本次调用传入的（每个 agent 循环唯一），回退到 provider 静态配置
     const effectiveUserId = userId ?? this.opts.userId
+    const rc = resolveReasoningControls(this.opts)
     const body = {
       model: this.opts.model,
       messages: serializeMessages(messages, this.opts.supportsReasoning),
@@ -259,7 +340,10 @@ export class DeepSeekProvider implements Model {
       })),
       // max_tokens 显式下发，让网关按模型真实配置预留 completion，而非用其默认预留值（否则 1M 窗口可能被默认预留压掉几十万，导致误判超限）
       ...(this.opts.maxTokens ? { max_tokens: this.opts.maxTokens } : {}),
-      ...(this.opts.temperature != null ? { temperature: this.opts.temperature } : {}),
+      // 推理档位：仅支持思考的模型、且显式设置了档位时下发（medium/xhigh 已归一为 high）；思考模式下按 DeepSeek 文档屏蔽采样参数
+      ...(rc.reasoningEffort ? { reasoning_effort: rc.reasoningEffort } : {}),
+      ...(rc.thinkingType ? { thinking: { type: rc.thinkingType } } : {}),
+      ...(rc.thoughtMode ? {} : (this.opts.temperature != null ? { temperature: this.opts.temperature } : {})),
       ...(effectiveUserId != null ? { user_id: effectiveUserId } : {}),
     }
     // 原始请求 = 最终提交给模型接口的完整 body（序列化前对象，含 model/messages/tools 全字段）
@@ -322,14 +406,16 @@ export class DeepSeekProvider implements Model {
       args: safeParse(tc.function.arguments),
     }))
     const reasoningContent = message?.reasoning_content || message?.reasoning || undefined
+    const finishReason = payload.choices?.[0]?.finish_reason
     if (toolCalls.length > 0) {
       return {
         reasoningContent,
         toolCalls,
         toolCall: toolCalls[0],
+        finishReason,
       }
     }
-    return { text: message?.content ?? '', reasoningContent }
+    return { text: message?.content ?? '', reasoningContent, finishReason }
   }
 
   /** SSE 流式：逐行解析，累积工具调用 arguments 分片，产出 text 增量 + 完整 toolCall */
@@ -337,6 +423,7 @@ export class DeepSeekProvider implements Model {
     const url = chatCompletionsUrl(this.opts.baseUrl)
     // user_id：优先用本次调用传入的（每个 agent 循环唯一），回退到 provider 静态配置
     const effectiveUserId = userId ?? this.opts.userId
+    const rc = resolveReasoningControls(this.opts)
     const body = {
       model: this.opts.model,
       messages: serializeMessages(messages, this.opts.supportsReasoning),
@@ -347,7 +434,10 @@ export class DeepSeekProvider implements Model {
       stream: true,
       // 请求网关在流末尾返回 usage（OpenAI 兼容；网关不支持时自动忽略，不影响流）
       stream_options: { include_usage: true },
-      ...(this.opts.temperature != null ? { temperature: this.opts.temperature } : {}),
+      // 推理档位：仅支持思考的模型、且显式设置了档位时下发；思考模式下按 DeepSeek 文档屏蔽采样参数
+      ...(rc.reasoningEffort ? { reasoning_effort: rc.reasoningEffort } : {}),
+      ...(rc.thinkingType ? { thinking: { type: rc.thinkingType } } : {}),
+      ...(rc.thoughtMode ? {} : (this.opts.temperature != null ? { temperature: this.opts.temperature } : {})),
       ...(effectiveUserId != null ? { user_id: effectiveUserId } : {}),
     }
     // 原始请求 = 最终提交给模型接口的完整 body（序列化前对象）
@@ -408,6 +498,10 @@ export class DeepSeekProvider implements Model {
       const ev = parseSseLine(line)
       const out: StreamChunk[] = []
       if (!ev) return out
+      // 结束原因（如 stop）：透传给外层，用于「stop 但空响应」的异常判定
+      if (ev.finishReason !== undefined) {
+        out.push({ finishReason: ev.finishReason })
+      }
       // 文本增量：text 到来表示工具调用已结束，结算所有累积中的工具调用
       if (ev.text !== undefined) {
         completedToolCalls.push(...flushAll())
@@ -503,6 +597,8 @@ interface SseDeltaEvent {
   toolCall?: { index: number; id?: string; name?: string; argsDelta?: string }
   usage?: Usage
   reasoningContent?: string
+  /** OpenAI 流式结束原因（stop/length/tool_calls），仅末尾 chunk 携带，用于「stop 但空响应」异常判定 */
+  finishReason?: string
 }
 
 /** 解析单行 SSE `data: {...}`，返回 text 增量 / tool_calls 分片 / usage；网关返回 error 时抛错 */
@@ -521,6 +617,7 @@ function parseSseLine(line: string): SseDeltaEvent | null {
         reasoning?: string
         tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>
       }
+      finish_reason?: string
     }>
   }
   try {
@@ -544,8 +641,10 @@ function parseSseLine(line: string): SseDeltaEvent | null {
   // usage 可能与 text/toolCall 出现在同一条 chunk 里（某些 OpenAI 兼容端点如 poolside 每个 chunk 都带 usage），
   // 不能因为命中 usage 就丢弃文本，必须同时提取
   const usage = parsed.usage ? toTokenUsage(parsed.usage) : undefined
-  if (text === undefined && !toolCall && reasoningContent === undefined && !usage) return null
-  return { text, toolCall, reasoningContent, usage }
+  // 结束原因：流末尾 chunk 可能只带 finish_reason 无内容（OpenAI 规范如此），必须提取，不能因无内容就丢弃
+  const finishReason = parsed.choices?.[0]?.finish_reason
+  if (text === undefined && !toolCall && reasoningContent === undefined && !usage && finishReason === undefined) return null
+  return { text, toolCall, reasoningContent, usage, finishReason }
 }
 
 function safeParse(json: string): Record<string, unknown> {
@@ -654,6 +753,11 @@ export interface AnthropicOptions {
   onTrace?: HttpTraceCallback
   /** 采样温度（Anthropic 语义 0~1；缺省不下发，由上游用其默认值） */
   temperature?: number
+  /**
+   * 推理档位（Anthropic reasoning.effort）：low/high/max（medium/xhigh 归一为 high）。设置后下发 reasoning:{effort}；
+   * 思考档位下不再下发 temperature 采样参数（Anthropic 思考模式限制采样）。缺省不下发。
+   */
+  reasoningEffort?: string
 }
 
 /** 模型调用协议：openai（OpenAI 兼容 /chat/completions，默认）或 anthropic（Anthropic 原生 /messages） */
@@ -675,21 +779,89 @@ export interface ProviderOptions {
   supportsReasoning?: boolean
   /** 采样温度（OpenAI 兼容 0~2 / Anthropic 0~1；缺省不下发，由上游用其默认值） */
   temperature?: number
+  /**
+   * 推理档位（reasoning_effort / reasoning.effort）。仅当 supportsReasoning=true 且本字段有值时下发；
+   * DeepSeek/OpenAI 兼容 → reasoning_effort（low/high/max，medium/xhigh 归一为 high）；Anthropic → reasoning:{effort}（low/high/max）。
+   * 设置后进入思考模式，思考模式下不再下发 temperature 等采样参数。缺省不下发（不回归）。
+   */
+  reasoningEffort?: string
+  /**
+   * 思考模式开关（thinking.type，OpenAI 兼容）：仅当 supportsReasoning=true 且本字段非 undefined 时下发。
+   * true→thinking:{type:'enabled'}（思考模式）；false→thinking:{type:'disabled'}（非思考）。缺省不下发。
+   */
+  thinking?: boolean
 }
 
 /** Anthropic 缺省最大输出 token（用户自定义模型未指定时兜底；Claude 3.5 系列上限 8192） */
 const DEFAULT_ANTHROPIC_MAX_TOKENS = 8192
 
+/** 「finish_reason=stop 但空内容」自动重试的最大尝试次数（含首次） */
+const EMPTY_RESPONSE_MAX_RETRY = 3
+
+/** 判定「空内容异常」：仅当 text 与 reasoningContent 均为空、且无工具调用时才视为异常空响应。
+ *  思考模型边界（关键）：reasoningContent 有值（DeepSeek v4 / Anthropic thinking 只输出思考无正文）→ 不算异常，不重试；
+ *  toolCalls 存在（带 tool_calls 时 content 为 null 是 OpenAI 规范）→ 不算异常，不重试。
+ *  只有 finish_reason === 'stop' 且 text/reasoningContent 全空、无 toolCalls 才判异常。 */
+function isEmptyContentResponse(res: ModelResponse): boolean {
+  const hasText = typeof res.text === 'string' && res.text !== ''
+  const hasReasoning = typeof res.reasoningContent === 'string' && res.reasoningContent !== ''
+  const hasTool = (res.toolCalls && res.toolCalls.length > 0) || !!res.toolCall
+  if (hasText || hasReasoning || hasTool) return false
+  // content 与 reasoning_content 均为空、无工具调用：
+  // 明确 finish_reason === 'stop' 才判异常（需求触发条件）；finish_reason 缺失则保守不重试，避免误判（如非 thinking 端点不发 finish_reason）
+  return res.finishReason === 'stop'
+}
+
+/** 包一层「空内容异常自动重试」装饰器：对 complete / stream 均生效，覆盖非流式与流式。
+ *  流式采用「透传」策略：逐 chunk 实时 yield（保留流式实时性），同时累积 fullText/fullReasoning/toolCalls/finishReason，
+ *  仅在流结束且「整条流完全无产出（无 text/reasoningContent/toolCall）」时判定为异常空流并重新拉流重试。
+ *  关键：异常空流未产出任何内容给用户，重试对用户无感知；有内容的流实时透传、非空即结束，绝不重试（不破坏流式体验）。 */
+function withEmptyResponseRetry(inner: Model, maxRetry = EMPTY_RESPONSE_MAX_RETRY): Model {
+  return {
+    async complete(messages: ChatMessage[], tools?: ToolContract[], userId?: string): Promise<ModelResponse> {
+      for (let attempt = 1; attempt <= maxRetry; attempt++) {
+        const res = await inner.complete(messages, tools, userId)
+        if (!isEmptyContentResponse(res)) return res
+        // 空内容异常 → 该次请求作废，重新发起完整请求（下一次循环重新调 inner.complete）
+      }
+      throw new Error(`模型响应异常：finish_reason 为 stop 但 content 与 reasoning_content 均为空，重试 ${maxRetry} 次后仍失败`)
+    },
+    async *stream(messages: ChatMessage[], tools?: ToolContract[], userId?: string): AsyncIterable<StreamChunk> {
+      if (typeof inner.stream !== 'function') return
+      for (let attempt = 1; attempt <= maxRetry; attempt++) {
+        let fullText = ''
+        let fullReasoning = ''
+        const allToolCalls: ToolCall[] = []
+        let finishReason: string | undefined
+        for await (const c of inner.stream(messages, tools, userId)) {
+          if (c.text) fullText += c.text
+          if (c.reasoningContent) fullReasoning += c.reasoningContent
+          if (c.toolCalls) allToolCalls.push(...c.toolCalls)
+          else if (c.toolCall) allToolCalls.push(c.toolCall)
+          if (c.finishReason) finishReason = c.finishReason
+          yield c
+        }
+        // 流结束：判定异常。有 content/reasoningContent/toolCall 之一即为正常流，透传完毕即结束。
+        const isAbnormalEmpty = finishReason === 'stop' && fullText === '' && fullReasoning === '' && allToolCalls.length === 0
+        if (!isAbnormalEmpty) return
+        // 空流异常 → 重新拉流重试（该次流无任何产出，用户无感知）
+      }
+      throw new Error(`模型流式响应异常：finish_reason 为 stop 且 content/reasoning_content 均为空，重试 ${maxRetry} 次后仍失败`)
+    },
+  }
+}
+
 /**
  * 按协议创建模型 provider：
  * - anthropic → AnthropicProvider（Anthropic 原生 /messages）
  * - 其余（含缺省）→ DeepSeekProvider（OpenAI 兼容 /chat/completions，覆盖 DeepSeek/Qwen/GLM 等一切 OpenAI 兼容端点）
+ * 返回前统一包一层「空内容异常自动重试」，避免「finish_reason=stop 但 content 与 reasoning_content 均为空」的异常响应被静默当作成功。
  */
 export function createModelProvider(opts: ProviderOptions): Model {
   if (opts.protocol === 'anthropic') {
-    return new AnthropicProvider(opts)
+    return withEmptyResponseRetry(new AnthropicProvider(opts))
   }
-  return new DeepSeekProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, maxTokens: opts.maxTokens, onUsage: opts.onUsage, onTrace: opts.onTrace, userId: opts.userId, supportsReasoning: opts.supportsReasoning, temperature: opts.temperature })
+  return withEmptyResponseRetry(new DeepSeekProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, maxTokens: opts.maxTokens, onUsage: opts.onUsage, onTrace: opts.onTrace, userId: opts.userId, supportsReasoning: opts.supportsReasoning, temperature: opts.temperature, reasoningEffort: opts.reasoningEffort, thinking: opts.thinking }))
 }
 
 /**
@@ -852,8 +1024,9 @@ function parseAnthropicResponse(resp: AnthropicResponse, onUsage?: (u: TokenUsag
       toolCalls.push({ id: block.id, name: block.name, args: block.input ?? {} })
     }
   }
-  if (toolCalls.length > 0) return { toolCalls, toolCall: toolCalls[0] }
-  return { text }
+  const finishReason = resp.stop_reason
+  if (toolCalls.length > 0) return { toolCalls, toolCall: toolCalls[0], finishReason }
+  return { text, finishReason }
 }
 
 /** Anthropic provider：Anthropic 原生 /v1/messages（fetch），支持工具调用 + 多模态图片 */
@@ -871,7 +1044,13 @@ export class AnthropicProvider implements Model {
     if (system) body.system = system
     const toolDefs = anthropicTools(tools)
     if (toolDefs.length > 0) body.tools = toolDefs
-    if (this.opts.temperature != null) body.temperature = this.opts.temperature
+    // 推理档位（Anthropic reasoning.effort）：设置后进入思考档位，思考档位下不再下发 temperature 采样参数
+    const anthropicEffort = mapAnthropicEffort(this.opts.reasoningEffort)
+    if (anthropicEffort) {
+      body.reasoning = { effort: anthropicEffort }
+    } else if (this.opts.temperature != null) {
+      body.temperature = this.opts.temperature
+    }
 
     this.opts.onTrace?.({ phase: 'request', url, method: 'POST', body })
     let res: Response
@@ -919,7 +1098,13 @@ export class AnthropicProvider implements Model {
     if (system) body.system = system
     const toolDefs = anthropicTools(tools)
     if (toolDefs.length > 0) body.tools = toolDefs
-    if (this.opts.temperature != null) body.temperature = this.opts.temperature
+    // 推理档位（Anthropic reasoning.effort）：设置后进入思考档位，思考档位下不再下发 temperature 采样参数
+    const anthropicEffort = mapAnthropicEffort(this.opts.reasoningEffort)
+    if (anthropicEffort) {
+      body.reasoning = { effort: anthropicEffort }
+    } else if (this.opts.temperature != null) {
+      body.temperature = this.opts.temperature
+    }
 
     this.opts.onTrace?.({ phase: 'request', url, method: 'POST', body })
     let res: Response
@@ -988,6 +1173,9 @@ export class AnthropicProvider implements Model {
         }
         toolUseAcc = null
       } else if (type === 'message_delta') {
+        // Anthropic 结束原因（end_turn / max_tokens / tool_use / stop_sequence）在 message_delta 的 delta.stop_reason
+        const delta2 = (event.delta ?? {}) as { stop_reason?: string }
+        if (delta2.stop_reason) out.push({ finishReason: delta2.stop_reason })
         const usage = (event.usage ?? {}) as { output_tokens?: number }
         if (usage.output_tokens != null) {
           const full = {

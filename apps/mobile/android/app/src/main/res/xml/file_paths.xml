@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider 路径配置：暴露「应用外部私有目录」shanhai-update/ 中的升级 APK，
+     供系统安装器以 content:// URI 读取（仅本 provider 授权，exported=false）。
+     下载目录（Dart 侧）= getExternalStorageDirectory() = getExternalFilesDir(null)
+     = /storage/emulated/0/Android/data/<pkg>/files/shanhai-update/
+     external-files-path 与之精确匹配（无 /data/data vs /data/user/0 符号链接别名问题）。 -->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 主配置：外部应用私有目录（与 Dart 下载目录精确一致） -->
+    <external-files-path name="update_apk_ext" path="shanhai-update/"/>
+    <!-- 兼容保留：若将来下载目录回退到缓存目录也能被暴露 -->
+    <code-cache-path name="update_apk_code" path="shanhai-update/"/>
+    <cache-path name="update_apk" path="shanhai-update/"/>
+</paths>

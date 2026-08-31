@@ -91,6 +91,7 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
   const display = screen.getPrimaryDisplay()
   let shellBounds: Electron.Rectangle | undefined
   let supervisorBounds: Electron.Rectangle | undefined
+  let appBounds: Electron.Rectangle | undefined
   if (type === 'desktop') {
     shellBounds = { x: display.workArea.x, y: display.workArea.y, width: display.workArea.width, height: display.workArea.height }
   } else if (type === 'dock') {
@@ -122,10 +123,30 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
       width: bw,
       height: bh,
     }
+  } else if (type === 'app') {
+    // 应用/插件弹窗：贴 Dock 上方弹出（不顶到屏幕最顶部），水平居中。
+    // 取 Dock 窗口实际 bounds 对齐（Dock 尺寸随内容自适应），Dock 不可见时回退到工作区底部默认值。
+    const aw = opts.width ?? 980
+    const ah = opts.height ?? 720
+    const dockWin = findWindow('dock')
+    let dockTop: number
+    if (dockWin && !dockWin.win.isDestroyed() && dockWin.win.isVisible()) {
+      dockTop = dockWin.win.getBounds().y
+    } else {
+      // 回退：Dock 初始高 96，位于工作区底部上方 24px
+      dockTop = display.workArea.y + display.workArea.height - 96 - 24
+    }
+    const gap = 12
+    appBounds = {
+      x: display.workArea.x + Math.floor((display.workArea.width - aw) / 2),
+      y: Math.max(display.workArea.y, dockTop - gap - ah),
+      width: aw,
+      height: ah,
+    }
   }
 
   const win = new BrowserWindow({
-    ...(shellBounds ?? supervisorBounds ?? { width: opts.width ?? 1080, height: opts.height ?? 760 }),
+    ...(shellBounds ?? supervisorBounds ?? appBounds ?? { width: opts.width ?? 1080, height: opts.height ?? 760 }),
     // 所有窗口统一 frameless（frame:false），彻底去掉 macOS 系统红绿灯，标题栏/关闭由渲染层自定义组件承担。
     // desktop/dock 额外 focusable:false（不接受键盘焦点，点击不抢焦点，但仍可接收鼠标事件）。
     // supervisor 保持可聚焦（它是可交互的聊天窗口）。
@@ -134,6 +155,7 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
       ? { transparent: true, backgroundColor: '#00000000', hasShadow: false }
       : {}),
     ...(type === 'supervisor-bubble' ? { alwaysOnTop: true, resizable: false, minimizable: false, maximizable: false, skipTaskbar: true } : {}),
+    ...(type === 'app' ? { alwaysOnTop: true } : {}),
     fullscreen: shellBounds ? false : (opts.fullscreen ?? false),
     show: opts.show ?? true,
     icon: ICON_PATH,

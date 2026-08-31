@@ -8,6 +8,7 @@ import { TracePanel } from '../components/TracePanel'
 import { CustomModelDrawer } from '../components/CustomModelDrawer'
 import { TerminalPanel } from '../components/TerminalPanel'
 import { WallpaperPanel } from '../components/WallpaperPanel'
+import { PluginMarketApp } from '../apps/PluginMarketApp'
 import { useThemeSync } from '../theme'
 
 /**
@@ -103,6 +104,8 @@ export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
       return <TerminalPanel variant="window" sessionId={ui.currentSessionId} open={true} onClose={close} />
     case 'wallpaper':
       return <WallpaperPanel variant="window" onClose={close} />
+    case 'marketplace':
+      return <PluginMarketApp onClose={close} />
     default:
       return (
         <div

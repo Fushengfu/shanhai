@@ -61,7 +61,7 @@ export async function removeSessionLedger(sessionId: string): Promise<void> {
 /**
  * 把台账路径解析到管家台账目录内：相对路径拼到台账根目录、绝对路径原样解析，
  * 但两者都强校验必须落在台账目录内（前缀校验），越界一律抛错——台账工具不允许访问台账目录之外的任何文件。
- * 空串返回台账根目录（供 list_ledger 列出根）。
+ * 空串返回台账根目录（供 ledger(list) 列出根）。
  */
 function resolveLedgerPath(p: string): string {
   const base = resolve(SUPERVISOR_WORKSPACE)
@@ -116,114 +116,99 @@ function ledgerBase(): string {
 }
 
 /**
- * 构造管家台账工具集。四个工具全部：
+ * 构造管家台账工具集：收敛为单个顶层工具 ledger，内部用 action 分派（与 plugin_manage 同款收敛）。
+ * 所有 action 都：
  * - 锚定 + 强限制在 SUPERVISOR_WORKSPACE 内（越界抛错，绝对路径也无法逃逸）；
  * - 免审批（读写管家自己的台账无需用户确认，避免「管家等审批、审批等管家」死锁）。
+ * action 枚举：
+ * - list  ：树形列出台账目录（入参 path? / maxDepth?）
+ * - read  ：读台账文件（入参 path）
+ * - write ：覆盖写台账文件（入参 path / content）
+ * - edit  ：局部编辑台账文件（入参 path / oldText / newText / replaceAll?）
  */
 export function createSupervisorLedgerTools(): ToolContract[] {
   return [
     {
-      name: 'list_ledger',
+      name: 'ledger',
       description:
-        '以树形列出管家台账目录结构。台账位于管家私有工作目录，按会话 id 分子目录，每个会话目录内通常有 notes.md（自然语言备注）与 state.json（结构化状态），顶层 _index.json 是「会话 id → 标题」索引。' +
-        'path 缺省列台账根目录，可传相对路径列某个会话子目录；maxDepth 控制深度（默认 2）。只读，不改变任何状态。',
+        '管家台账工具（统一入口，用 action 分派）：维护持久化跨会话状态的速查记录，位于管家私有工作目录 ~/.shanhai/supervisor-workspace/，按会话 id 分子目录，每个会话目录内通常有 notes.md（自然语言备注）与 state.json（结构化状态），顶层 _index.json 是「会话 id → 标题」索引。只能访问台账目录内文件，越界一律拒绝。' +
+        'action 取值：' +
+        'list —— 以树形列出台账目录结构（入参 path 缺省列根目录、可传相对路径列某会话子目录；maxDepth 控制深度，默认 2）；' +
+        'read —— 读取台账文件内容（入参 path 为台账目录内相对路径，如 "某会话id/notes.md"）；' +
+        'write —— 写入（覆盖）台账文件，自动创建缺失父目录（入参 path 相对路径 + content 完整新内容）；' +
+        'edit —— 局部编辑台账文件，把 oldText 精确替换为 newText（入参 path + oldText + newText，oldText 多处命中时设 replaceAll=true 全部替换）。',
       inputSchema: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: '台账目录相对路径，缺省列根目录' },
-          maxDepth: { type: 'number', description: '递归深度，默认 2' },
+          action: {
+            type: 'string',
+            enum: ['list', 'read', 'write', 'edit'],
+            description: '要执行的动作：list 列目录 / read 读文件 / write 覆盖写 / edit 局部编辑',
+          },
+          path: { type: 'string', description: '台账目录内相对路径（list 时可省略列根目录；read/write/edit 必填指定文件）' },
+          content: { type: 'string', description: 'write 时：要写入的完整新内容' },
+          oldText: { type: 'string', description: 'edit 时：要被替换的原文本片段（必须精确匹配）' },
+          newText: { type: 'string', description: 'edit 时：替换后的新文本' },
+          replaceAll: { type: 'boolean', description: 'edit 时：是否替换全部命中，默认 false（只替换首个）' },
+          maxDepth: { type: 'number', description: 'list 时：递归深度，默认 2' },
         },
-      },
-      riskLevel: 'readonly',
-      execute: async (args) => {
-        const dir = resolveLedgerPath(String(args.path ?? ''))
-        const maxDepth = typeof args.maxDepth === 'number' ? Math.max(1, Math.floor(args.maxDepth)) : 2
-        return buildLedgerTree(dir, maxDepth)
-      },
-    },
-    {
-      name: 'read_ledger',
-      description:
-        '读取管家台账目录内的文件内容（如某会话的 notes.md / state.json / 顶层 _index.json）。' +
-        'path 为台账目录内的相对路径（如 "某个会话id/notes.md"）。只能读台账目录内文件，不能读台账目录之外。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: '台账文件相对路径（相对台账根目录）' },
-        },
-        required: ['path'],
-      },
-      riskLevel: 'readonly',
-      execute: async (args) => {
-        const p = resolveLedgerPath(String(args.path ?? ''))
-        if (p === ledgerBase()) throw new Error('read_ledger 请指定具体文件路径（不能读台账根目录本身）')
-        return fs.readFile(p, 'utf8')
-      },
-    },
-    {
-      name: 'write_ledger',
-      description:
-        '写入（覆盖）管家台账目录内的文件，用于更新某个会话的 state.json 或 notes.md。' +
-        'path 为台账目录内的相对路径；content 为完整新内容。会自动创建缺失的父目录。只能写台账目录内文件。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: '台账文件相对路径（相对台账根目录）' },
-          content: { type: 'string', description: '要写入的完整内容' },
-        },
-        required: ['path', 'content'],
+        required: ['action'],
       },
       riskLevel: 'reversible',
-      execute: async (args) => {
-        const p = resolveLedgerPath(String(args.path ?? ''))
-        if (p === ledgerBase()) throw new Error('write_ledger 请指定具体文件路径（不能覆盖台账根目录本身）')
-        await fs.mkdir(dirname(p), { recursive: true })
-        await fs.writeFile(p, String(args.content ?? ''), 'utf8')
-        return { ok: true, path: relative(ledgerBase(), p) }
+      resolveRisk: (args) => {
+        const action = String(args.action ?? '')
+        if (action === 'list' || action === 'read') {
+          return { riskLevel: 'readonly', approvalRequired: false, outsideWorkdir: false }
+        }
+        return { riskLevel: 'reversible', approvalRequired: false, outsideWorkdir: false }
       },
-    },
-    {
-      name: 'edit_ledger',
-      description:
-        '局部编辑管家台账目录内的文件：将 oldText 精确替换为 newText（只改片段，无需重传全文）。' +
-        'path 为台账目录内的相对路径。默认替换首次命中；oldText 多次出现时设 replaceAll=true 替换全部。只能编辑台账目录内文件。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: '台账文件相对路径（相对台账根目录）' },
-          oldText: { type: 'string', description: '要被替换的原文本（必须精确匹配）' },
-          newText: { type: 'string', description: '替换后的新文本' },
-          replaceAll: { type: 'boolean', description: '是否替换全部命中，默认 false' },
-        },
-        required: ['path', 'oldText', 'newText'],
-      },
-      riskLevel: 'reversible',
       execute: async (args) => {
-        const p = resolveLedgerPath(String(args.path ?? ''))
-        if (p === ledgerBase()) throw new Error('edit_ledger 请指定具体文件路径（不能编辑台账根目录本身）')
-        const oldText = String(args.oldText ?? '')
-        if (oldText === '') throw new Error('edit_ledger 缺少 oldText：请提供要被替换的原文本片段')
-        const newText = String(args.newText ?? '')
-        const replaceAll = args.replaceAll === true
+        const action = String(args.action ?? '')
+        if (action === 'list') {
+          const dir = resolveLedgerPath(String(args.path ?? ''))
+          const maxDepth = typeof args.maxDepth === 'number' ? Math.max(1, Math.floor(args.maxDepth)) : 2
+          return buildLedgerTree(dir, maxDepth)
+        }
+        if (action === 'read') {
+          const p = resolveLedgerPath(String(args.path ?? ''))
+          if (p === ledgerBase()) throw new Error('ledger(read) 请指定具体文件路径（不能读台账根目录本身）')
+          return fs.readFile(p, 'utf8')
+        }
+        if (action === 'write') {
+          const p = resolveLedgerPath(String(args.path ?? ''))
+          if (p === ledgerBase()) throw new Error('ledger(write) 请指定具体文件路径（不能覆盖台账根目录本身）')
+          await fs.mkdir(dirname(p), { recursive: true })
+          await fs.writeFile(p, String(args.content ?? ''), 'utf8')
+          return { ok: true, path: relative(ledgerBase(), p) }
+        }
+        if (action === 'edit') {
+          const p = resolveLedgerPath(String(args.path ?? ''))
+          if (p === ledgerBase()) throw new Error('ledger(edit) 请指定具体文件路径（不能编辑台账根目录本身）')
+          const oldText = String(args.oldText ?? '')
+          if (oldText === '') throw new Error('ledger(edit) 缺少 oldText：请提供要被替换的原文本片段')
+          const newText = String(args.newText ?? '')
+          const replaceAll = args.replaceAll === true
 
-        let before: string
-        try {
-          before = await fs.readFile(p, 'utf8')
-        } catch {
-          throw new Error(`edit_ledger 读取失败：${p} 不存在，请先用 read_ledger 确认实际内容`)
+          let before: string
+          try {
+            before = await fs.readFile(p, 'utf8')
+          } catch {
+            throw new Error(`ledger(edit) 读取失败：${p} 不存在，请先用 ledger(read) 确认实际内容`)
+          }
+          const count = before.split(oldText).length - 1
+          if (count === 0) {
+            throw new Error('ledger(edit) 未找到 oldText：文件中不存在该片段，请先用 ledger(read) 读取实际内容确保精确匹配')
+          }
+          if (!replaceAll && count > 1) {
+            throw new Error(`ledger(edit) 命中 ${count} 处：请提供更长的 oldText 精确定位，或设置 replaceAll=true`)
+          }
+          const after = replaceAll
+            ? before.split(oldText).join(newText)
+            : before.slice(0, before.indexOf(oldText)) + newText + before.slice(before.indexOf(oldText) + oldText.length)
+          await fs.writeFile(p, after, 'utf8')
+          return { ok: true, path: relative(ledgerBase(), p), occurrences: replaceAll ? count : 1 }
         }
-        const count = before.split(oldText).length - 1
-        if (count === 0) {
-          throw new Error('edit_ledger 未找到 oldText：文件中不存在该片段，请先用 read_ledger 读取实际内容确保精确匹配')
-        }
-        if (!replaceAll && count > 1) {
-          throw new Error(`edit_ledger 命中 ${count} 处：请提供更长的 oldText 精确定位，或设置 replaceAll=true`)
-        }
-        const after = replaceAll
-          ? before.split(oldText).join(newText)
-          : before.slice(0, before.indexOf(oldText)) + newText + before.slice(before.indexOf(oldText) + oldText.length)
-        await fs.writeFile(p, after, 'utf8')
-        return { ok: true, path: relative(ledgerBase(), p), occurrences: replaceAll ? count : 1 }
+        throw new Error(`ledger 未知 action "${action}"：只支持 list / read / write / edit`)
       },
     },
   ]

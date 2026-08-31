@@ -15,10 +15,16 @@ export const SUPERVISOR_MAX_HISTORY_TURNS = 30
  * - 向任意会话转发消息（等同用户手动切过去发消息，走正常队列/插入逻辑）；
  * - 切换任意会话使用的模型 / 安全模式（等同用户手动配置）。
  *
+ * 会话实体管理（list_sessions / inspect_session / switch_session / create_session / rename_session /
+ * set_session_workdir / delete_session / set_session_model / set_session_approval）已收敛为一个顶层工具
+ * session（内部用 action 分派）；会话选择（choose_session）与断点续跑（resume_session）也并入了
+ * session（action=choose / action=resume）；其余工具（list_models / choose_model / send_message /
+ * inject_message / resolve_approval / answer_ask / resolve_client_run）保持顶层独立。
+ *
  * 这些工具只注入管家会话，普通用户会话拿不到「管理所有会话」的能力。
  */
 
-/** 单个会话的状态摘要（管家 list_sessions / inspect_session 返回） */
+/** 单个会话的状态摘要（管家 session(list) / session(inspect) 返回） */
 export interface SessionStateSummary {
   id: string
   title: string
@@ -61,8 +67,8 @@ export interface SupervisorContext {
   listSessions(): SessionStateSummary[]
   /** 查询单个会话详情（不存在返回 null） */
   inspectSession(sessionId: string): SessionStateSummary | null
-  /** 列出可用模型（id + 显示名），供 set_session_model 选择 */
-  listModels(): Array<{ id: string; name: string }>
+  /** 列出可用模型（id + 显示名 + 类型），供 session(set_model) 选择 */
+  listModels(): Array<{ id: string; name: string; modelType?: string }>
   /** 向指定会话发消息（等同手动切过去发），mode=insert 追加 / queue 排队 */
   sendMessage(sessionId: string, message: string, mode: 'insert' | 'queue'): Promise<{ ok: boolean; message: string; result?: string }>
   /** 切换激活会话（等同用户在侧边栏点击切换，同步更新聊天窗口当前显示的会话） */
@@ -96,7 +102,13 @@ export interface SupervisorContext {
 const MODE_DESC =
   '发送模式：insert=目标会话执行中时追加需求（不打断当前任务，在下一轮模型调用前生效）；queue=目标会话执行中时排队等待当前任务结束后再执行。目标会话空闲时两种模式等价，都是直接作为新任务执行。默认 insert。'
 
-/** 构造管家工具集。所有工具免审批（等同用户手动操作：发消息、切模型、切安全模式本身不审批，副作用由目标会话自己的审批兜底）。 */
+/**
+ * 构造管家工具集。
+ *
+ * 会话实体管理收敛为单个顶层工具 session（内部 action 分派），其余工具保持顶层独立。
+ * 除 session(delete) 外，所有工具免审批（等同用户手动操作：发消息、切模型、切安全模式本身不审批，
+ * 副作用由目标会话自己的审批兜底）。session(delete) 是危险不可恢复操作，保留审批/确认语义。
+ */
 export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
   const toSummary = (s: SessionStateSummary): Record<string, unknown> => ({
     id: s.id,
@@ -117,94 +129,123 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
     hasRetrySnapshot: s.hasRetrySnapshot,
   })
 
-  return [
-    {
-      name: 'list_sessions',
-      description:
-        '列出所有用户会话及其当前执行状态：id、标题、是否忙（busy）、当前模型、安全模式、当前需求、已执行步数、上下文占用占比、是否可继续执行等。' +
-        '用于回答「现在有哪些会话在干活」「各会话进度如何」这类问题。只读，不改变任何状态。',
-      inputSchema: { type: 'object', properties: {} },
-      riskLevel: 'readonly',
-      execute: async () => ctx.listSessions().map(toSummary),
-    },
-    {
-      name: 'inspect_session',
-      description:
-        '查看单个会话的完整状态详情（含当前需求、已执行步数、上下文占用、待审批数等）。' +
-        'sessionId 来自 list_sessions 返回的 id。只读，不改变任何状态。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          sessionId: { type: 'string', description: '会话 id（来自 list_sessions）' },
+  // —— 会话实体管理统一入口：session（action 分派）——
+  // 把原 list_sessions / inspect_session / switch_session / create_session / rename_session /
+  // set_session_workdir / delete_session / set_session_model / set_session_approval 九个工具
+  // 收敛为一个顶层工具，action 枚举 + 入参在 inputSchema 完整说明。
+  const sessionTool: ToolContract = {
+    name: 'session',
+    description:
+      '会话实体管理工具（统一入口，用 action 分派）：管理用户会话的增删改查与配置。' +
+      'action 取值：' +
+      'list —— 列出所有用户会话及其当前执行状态（id、标题、是否忙、当前模型、安全模式、当前需求、已执行步数、上下文占用占比、是否可继续执行等），只读不改变任何状态（无需额外入参）；' +
+      'inspect —— 查看单个会话的完整状态详情（入参 sessionId，来自 list 返回的 id），只读；' +
+      'switch —— 切换激活会话（等同用户在侧边栏点击切换，聊天窗口同步切换；入参 sessionId）；' +
+      'create —— 创建新的用户会话（入参 title? 标题缺省「新会话」、workdir? 工作目录缺省用户默认），返回新会话 id，不抢占用户当前查看的会话；' +
+      'rename —— 重命名指定会话（入参 sessionId + title 新标题），管家会话不可重命名；' +
+      'set_workdir —— 设置指定会话的工作目录（入参 sessionId + workdir 绝对路径），只影响后续执行，管家会话不可修改；' +
+      'delete —— 删除指定会话（入参 sessionId），危险且不可恢复，执行前必须向用户确认目标会话 id 与标题；' +
+      'set_model —— 切换指定会话使用的模型（入参 sessionId + modelId 来自 list_models），只影响后续对话，不中断正在运行的任务；' +
+      'set_approval —— 配置指定会话的安全模式（入参 sessionId + policy 取值 ask=每次询问/workdir=工作目录内免审批/never=自动执行），持久化到该会话；' +
+      'choose —— 弹出会话选择器让用户选目标会话（阻塞等待，入参 question 选择目的说明），返回选中的 sessionId，禁止用文本反问用户；' +
+      'resume —— 断点续跑一个「有未完成轮次(hasIncompleteTurn=true)且空闲(busy=false)」的会话（入参 sessionId），从断点继续、不新增用户消息、不篡改历史；非法目标（不存在/正在执行/无未完成轮次/管家自身）会被拒绝。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'inspect', 'switch', 'create', 'rename', 'set_workdir', 'delete', 'set_model', 'set_approval', 'choose', 'resume'],
+          description:
+            '要执行的动作：list 列会话 / inspect 查详情 / switch 切换激活 / create 新建 / rename 重命名 / set_workdir 设工作目录 / delete 删除（危险不可恢复）/ set_model 切换模型 / set_approval 设安全模式 / choose 弹会话选择器 / resume 断点续跑',
         },
-        required: ['sessionId'],
+        sessionId: { type: 'string', description: '会话 id（list/choose 时不需要；inspect/switch/rename/set_workdir/delete/set_model/set_approval/resume 必填，来自 session(list) 返回的 id）' },
+        title: { type: 'string', description: 'create 时：会话标题缺省「新会话」；rename 时：新标题（必填）' },
+        workdir: { type: 'string', description: 'create 时：工作目录缺省用户默认；set_workdir 时：新的工作目录绝对路径（必填）' },
+        modelId: { type: 'string', description: 'set_model 时：模型 id（来自 list_models，必填）' },
+        policy: { type: 'string', enum: ['ask', 'workdir', 'never'], description: 'set_approval 时：安全模式（必填，ask=每次询问/workdir=工作目录内免审批/never=自动执行）' },
+        question: { type: 'string', description: 'choose 时：选择的目的说明（如「请选择要下发任务的会话」），必填' },
       },
-      riskLevel: 'readonly',
-      execute: async (args) => {
+      required: ['action'],
+    },
+    riskLevel: 'reversible',
+    resolveRisk: (args) => {
+      const action = String(args.action ?? '')
+      if (action === 'delete') {
+        // 删除会话是危险且不可恢复的操作，保留审批/确认语义（不能免审批）
+        return { riskLevel: 'irreversible', approvalRequired: true, outsideWorkdir: false }
+      }
+      if (action === 'list' || action === 'inspect' || action === 'choose') {
+        return { riskLevel: 'readonly', approvalRequired: false, outsideWorkdir: false }
+      }
+      // choose 是只读选择（弹选择器让用户选，不改状态）；resume 属可逆（断点续跑，从断点继续）→ 免审批
+      return { riskLevel: 'reversible', approvalRequired: false, outsideWorkdir: false }
+    },
+    execute: async (args) => {
+      const action = String(args.action ?? '')
+      if (action === 'list') {
+        return ctx.listSessions().map(toSummary)
+      }
+      if (action === 'inspect') {
         const s = ctx.inspectSession(String(args.sessionId ?? ''))
         if (!s) return { ok: false, message: `会话不存在: ${args.sessionId}` }
         return toSummary(s)
-      },
+      }
+      if (action === 'switch') {
+        return ctx.switchSession(String(args.sessionId ?? ''))
+      }
+      if (action === 'create') {
+        const title = args.title ? String(args.title) : undefined
+        const workdir = args.workdir ? String(args.workdir) : undefined
+        return ctx.createSession(title, workdir)
+      }
+      if (action === 'rename') {
+        return ctx.renameSession(String(args.sessionId ?? ''), String(args.title ?? ''))
+      }
+      if (action === 'set_workdir') {
+        return ctx.setSessionWorkdir(String(args.sessionId ?? ''), String(args.workdir ?? ''))
+      }
+      if (action === 'delete') {
+        return ctx.deleteSession(String(args.sessionId ?? ''))
+      }
+      if (action === 'set_model') {
+        return ctx.setSessionModel(String(args.sessionId ?? ''), String(args.modelId ?? ''))
+      }
+      if (action === 'set_approval') {
+        const policy = String(args.policy ?? '') as ApprovalPolicy
+        if (policy !== 'ask' && policy !== 'workdir' && policy !== 'never') {
+          return { ok: false, message: `无效的安全模式: ${args.policy}（应为 ask/workdir/never）` }
+        }
+        return ctx.setSessionApproval(String(args.sessionId ?? ''), policy)
+      }
+      if (action === 'choose') {
+        const question = String(args.question ?? '').trim() || '请选择要操作的会话'
+        const sessionId = await ctx.askSessionPicker(question)
+        if (!sessionId) return { ok: false, message: '用户取消了选择' }
+        return { ok: true, sessionId, message: `用户选择了会话 ${sessionId}` }
+      }
+      if (action === 'resume') {
+        const sid = String(args.sessionId ?? '')
+        if (!sid) return { ok: false, message: 'sessionId 不能为空' }
+        return ctx.resumeSession(sid)
+      }
+      throw new Error(`session 未知 action "${action}"：只支持 list / inspect / switch / create / rename / set_workdir / delete / set_model / set_approval / choose / resume`)
     },
+  }
+
+  return [
+    sessionTool,
     {
       name: 'list_models',
-      description: '列出当前系统可用的模型（id + 显示名），供 set_session_model 切换会话模型时选择。只读。',
+      description: '列出当前系统可用的模型（id + 显示名），供 session({ action: "set_model" }) 切换会话模型时选择。只读。',
       inputSchema: { type: 'object', properties: {} },
       riskLevel: 'readonly',
       execute: async () => ctx.listModels(),
     },
     {
-      name: 'switch_session',
-      description:
-        '切换激活会话（等同用户在侧边栏点击切换，聊天窗口会同步切换到该会话）。' +
-        'sessionId 来自 list_sessions。切换后汇报管家已激活该会话。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          sessionId: { type: 'string', description: '要激活的会话 id（来自 list_sessions）' },
-        },
-        required: ['sessionId'],
-      },
-      riskLevel: 'reversible',
-      execute: async (args) => ctx.switchSession(String(args.sessionId ?? '')),
-    },
-    {
-      name: 'choose_session',
-      description:
-        '当用户要下发任务/切换模型/配置/删除某个会话，但没有明确说是哪个会话时，【必须】调用本工具弹出会话选择器让用户从中选择，禁止用文本反问用户（阻塞等待用户选择）。' +
-        'question 是选择的目的说明（如「请选择要下发任务的会话」）。resolve 返回用户选中的会话 id，可直接用于后续 send_message / set_session_model 等工具。' +
-        '不要在能通过 list_sessions 唯一确定目标时滥用；仅当目标不明确时使用。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          question: { type: 'string', description: '选择的目的说明（如「请选择要下发任务的会话」）' },
-        },
-        required: ['question'],
-      },
-      riskLevel: 'readonly',
-      guide: {
-        usage: [
-          '当用户要下发任务/切换模型/配置/删除某个会话，但没有明确说是哪个会话时，必须调用本工具弹出会话选择器让用户选，禁止用文本反问。',
-          '仅在能通过 list_sessions 唯一确定目标时跳过；目标不明确时才用。',
-        ],
-        cautions: [
-          '用户取消选择时返回失败，不要继续用猜测的会话。',
-        ],
-      },
-      // 等用户选择：不设超时（用户思考/离开多久由用户决定，不该被 5 分钟统一兜底打断）
-      timeoutMs: Infinity,
-      execute: async (args) => {
-        const question = String(args.question ?? '').trim() || '请选择要操作的会话'
-        const sessionId = await ctx.askSessionPicker(question)
-        if (!sessionId) return { ok: false, message: '用户取消了选择' }
-        return { ok: true, sessionId, message: `用户选择了会话 ${sessionId}` }
-      },
-    },
-    {
       name: 'choose_model',
       description:
         '当用户要切换某个会话的模型，但没有明确说是哪个模型时，【必须】调用本工具弹出模型选择器让用户从中选择，禁止用文本反问用户（阻塞等待用户选择）。' +
-        'question 是选择的目的说明（如「请选择要切换到哪个模型」）。resolve 返回用户选中的模型 id，可直接用于后续 set_session_model。',
+        'question 是选择的目的说明（如「请选择要切换到哪个模型」）。resolve 返回用户选中的模型 id，可直接用于后续 session({ action: "set_model" })。',
       inputSchema: {
         type: 'object',
         properties: {
@@ -235,11 +276,11 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
       name: 'send_message',
       description:
         '向指定会话转发一条消息，效果等同于用户手动切换到该会话后输入并发送。' +
-        'sessionId 来自 list_sessions；content 是要转发的需求内容。' + MODE_DESC,
+        'sessionId 来自 session({ action: "list" })；content 是要转发的需求内容。' + MODE_DESC,
       inputSchema: {
         type: 'object',
         properties: {
-          sessionId: { type: 'string', description: '目标会话 id（来自 list_sessions）' },
+          sessionId: { type: 'string', description: '目标会话 id（来自 session(list)）' },
           content: { type: 'string', description: '要转发给该会话的需求/消息内容' },
           mode: { type: 'string', enum: ['insert', 'queue'], description: '发送模式，默认 insert' },
         },
@@ -249,7 +290,7 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
       guide: {
         usage: [
           '向指定会话转发消息（等同用户手动切过去发消息），用原样完整转发，不删减、不代办、不合并。',
-          'sessionId 来自 list_sessions；多需求时明确的先下发、不明确的单独求助。',
+          'sessionId 来自 session({ action: "list" })；多需求时明确的先下发、不明确的单独求助。',
         ],
         cautions: [
           '管家只负责调度转发，不替目标会话执行具体的编码/文件任务。',
@@ -282,165 +323,6 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
         const content = String(args.content ?? '')
         return ctx.sendMessage(sid, content, 'insert')
       },
-    },
-    {
-      name: 'resume_session',
-      description:
-        '断点续跑：恢复一个「有未完成轮次且空闲」的会话继续执行，等同用户在该会话点击「继续执行」按钮。' +
-        'sessionId 来自 list_sessions；仅当该会话 hasIncompleteTurn=true 且 busy=false（空闲）时有效。' +
-        '续跑从会话事件日志回放已执行历史、从断点继续，不新增用户消息、不篡改历史对话、不重新开始。' +
-        '非法目标（会话不存在 / 正在执行 / 无未完成轮次 / 管家自身）会被拒绝。' +
-        '这是唯一正确的断点续跑方式；用户要求「继续/恢复/续跑」某个中断的会话时必须用本工具，禁止用 send_message 发消息变通（那会新增一条用户消息、把续跑当成新需求）。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          sessionId: { type: 'string', description: '目标会话 id（来自 list_sessions，hasIncompleteTurn=true 且 busy=false）' },
-        },
-        required: ['sessionId'],
-      },
-      riskLevel: 'reversible',
-      guide: {
-        usage: [
-          '当用户要求「继续/恢复/续跑」某个中断（未完成轮次）的会话时，用本工具从断点继续，不要用 send_message 发消息变通。',
-          '先 list_sessions 确认目标会话 hasIncompleteTurn=true 且 busy=false，再调用。',
-        ],
-        cautions: [
-          '只对「有未完成轮次且空闲」的会话有效；正在执行或已完成轮次的会话会被拒绝。',
-          '续跑不新增用户消息、不篡改历史，恢复后仍受该会话安全模式（approvalPolicy）约束。',
-        ],
-      },
-      execute: async (args) => {
-        const sid = String(args.sessionId ?? '')
-        if (!sid) return { ok: false, message: 'sessionId 不能为空' }
-        return ctx.resumeSession(sid)
-      },
-    },
-    {
-      name: 'set_session_model',
-      description:
-        '切换指定会话使用的模型（等同用户手动在该会话切换模型）。' +
-        'sessionId 来自 list_sessions；modelId 来自 list_models。只影响该会话后续对话，不中断正在运行的任务。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          sessionId: { type: 'string', description: '目标会话 id' },
-          modelId: { type: 'string', description: '模型 id（来自 list_models）' },
-        },
-        required: ['sessionId', 'modelId'],
-      },
-      riskLevel: 'reversible',
-      execute: async (args) => ctx.setSessionModel(String(args.sessionId ?? ''), String(args.modelId ?? '')),
-    },
-    {
-      name: 'set_session_approval',
-      description:
-        '配置指定会话的安全模式（等同用户手动设置）。' +
-        'policy 取值：ask=每次询问、workdir=工作目录内免审批、never=自动执行。' +
-        'sessionId 来自 list_sessions。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          sessionId: { type: 'string', description: '目标会话 id' },
-          policy: { type: 'string', enum: ['ask', 'workdir', 'never'], description: '安全模式' },
-        },
-        required: ['sessionId', 'policy'],
-      },
-      riskLevel: 'reversible',
-      guide: {
-        usage: [
-          '用户希望某会话自动执行、不要每次危险操作都弹审批时，用本工具把该会话安全模式设为 never（全自动）或 workdir（工作目录内免审批）。',
-          '设置前说明目标会话与模式及后果；设置后该模式持久化到该会话，后续危险操作按新模式判断是否审批。',
-        ],
-        cautions: [
-          '用户没有明确要求时不要擅自把会话改成 never（全自动执行）。',
-          'policy 只能取 ask/workdir/never，其它值会报错。',
-        ],
-      },
-      execute: async (args) => {
-        const policy = String(args.policy ?? '') as ApprovalPolicy
-        if (policy !== 'ask' && policy !== 'workdir' && policy !== 'never') {
-          return { ok: false, message: `无效的安全模式: ${args.policy}（应为 ask/workdir/never）` }
-        }
-        return ctx.setSessionApproval(String(args.sessionId ?? ''), policy)
-      },
-    },
-    {
-      name: 'create_session',
-      description:
-        '创建一个新的用户会话（等同用户点击「新建会话」）。' +
-        'title 是会话标题（缺省「新会话」）；workdir 是工作目录（缺省用户默认工作目录）。' +
-        '创建后新会话会出现在会话列表，可继续用 send_message 给它下发任务。不抢占用户当前正在查看的会话。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          title: { type: 'string', description: '会话标题，缺省「新会话」' },
-          workdir: { type: 'string', description: '工作目录，缺省用户默认工作目录' },
-        },
-      },
-      riskLevel: 'reversible',
-      execute: async (args) => {
-        const title = args.title ? String(args.title) : undefined
-        const workdir = args.workdir ? String(args.workdir) : undefined
-        return ctx.createSession(title, workdir)
-      },
-    },
-    {
-      name: 'rename_session',
-      description:
-        '重命名指定会话（等同用户手动重命名）。sessionId 来自 list_sessions；title 是新标题（非空）。' +
-        '会话管家自己的会话不可重命名。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          sessionId: { type: 'string', description: '目标会话 id（来自 list_sessions）' },
-          title: { type: 'string', description: '新标题' },
-        },
-        required: ['sessionId', 'title'],
-      },
-      riskLevel: 'reversible',
-      execute: async (args) => ctx.renameSession(String(args.sessionId ?? ''), String(args.title ?? '')),
-    },
-    {
-      name: 'set_session_workdir',
-      description:
-        '设置指定会话的工作目录（等同用户手动设置该会话的工作目录）。' +
-        'sessionId 来自 list_sessions；workdir 是新的工作目录绝对路径（非空）。' +
-        '只影响该会话后续执行的命令/文件操作的工作目录，不影响正在运行的任务。' +
-        '会话管家自己的会话不可修改工作目录。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          sessionId: { type: 'string', description: '目标会话 id（来自 list_sessions）' },
-          workdir: { type: 'string', description: '新的工作目录绝对路径' },
-        },
-        required: ['sessionId', 'workdir'],
-      },
-      riskLevel: 'reversible',
-      execute: async (args) => ctx.setSessionWorkdir(String(args.sessionId ?? ''), String(args.workdir ?? '')),
-    },
-    {
-      name: 'delete_session',
-      description:
-        '删除指定会话（等同用户手动删除，危险操作，不可恢复）。sessionId 来自 list_sessions。' +
-        '删除前会拒绝该会话所有待审批请求、取消待回答提问、清理持久化文件；若删的是当前激活会话会自动切到剩余会话。' +
-        '会话管家自己的会话不可删除。执行前务必向用户确认目标会话 id 正确。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          sessionId: { type: 'string', description: '要删除的会话 id（来自 list_sessions）' },
-        },
-        required: ['sessionId'],
-      },
-      riskLevel: 'irreversible',
-      guide: {
-        usage: [
-          '删除会话是危险且不可恢复的操作，执行前必须向用户复述目标会话 id 与标题，得到明确确认后才能删除。',
-        ],
-        cautions: [
-          '会话管家自己的会话不可删除。',
-        ],
-      },
-      execute: async (args) => ctx.deleteSession(String(args.sessionId ?? '')),
     },
     {
       name: 'resolve_approval',

@@ -2,21 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import '../models/protocol.dart';
+import '../theme.dart';
 import 'tool_step.dart';
 
 /// 消息气泡渲染（对齐桌面端 UserMessage / AssistantMessage / ReasoningBlock）。
 /// - 用户气泡：右对齐、主题紫底白字、右下小角。
 /// - 助手气泡：左对齐、左上小角、顶部「耗时 + 步数统计」、工具步骤紧凑、思考过程可折叠、正文 Markdown。
-
-const Color _cAccent = Color(0xFF8B5CF6); // 用户气泡主色（手机端 primary 紫）
-const Color _cAssistantBg = Color(0xFF1A1A24); // 助手气泡背景
-const Color _cText = Color(0xFFE0E0E0);
-const Color _cTextMuted = Color(0xFF808080);
-const Color _cTextFaint = Color(0xFF5A5A5A);
-const Color _cBorder = Color(0xFF3A3A3C);
-const Color _cRunning = Color(0xFF22D3EE);
-const Color _cSuccess = Color(0xFF34D399);
-const Color _cError = Color(0xFFF87171);
+/// 颜色统一走 context.appColors（亮/暗主题切换自动刷新）。
 
 /// 用户消息气泡（右对齐、紫底白字、右下小角）。
 /// 长按弹出操作菜单：复制 / 重新生成（重试）/ 编辑并重发（对齐桌面端 UserMessage 的操作）。
@@ -30,29 +22,30 @@ class UserBubble extends StatelessWidget {
   const UserBubble({super.key, required this.content, this.onResend, this.onEdit});
 
   Future<void> _showMenu(BuildContext context) async {
+    final c = context.appColors;
     final action = await showModalBottomSheet<String>(
       context: context,
-      backgroundColor: const Color(0xFF1C1C26),
+      backgroundColor: c.bottomSheetBg,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
       builder: (ctx) => SafeArea(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             ListTile(
-              leading: const Icon(Icons.copy_outlined, size: 20, color: Color(0xFFE0E0E0)),
-              title: const Text('复制', style: TextStyle(color: Color(0xFFE0E0E0))),
+              leading: Icon(Icons.copy_outlined, size: 20, color: c.textPrimary),
+              title: Text('复制', style: TextStyle(color: c.textPrimary)),
               onTap: () => Navigator.pop(ctx, 'copy'),
             ),
             if (onResend != null)
               ListTile(
-                leading: const Icon(Icons.refresh, size: 20, color: Color(0xFFE0E0E0)),
-                title: const Text('重新生成', style: TextStyle(color: Color(0xFFE0E0E0))),
+                leading: Icon(Icons.refresh, size: 20, color: c.textPrimary),
+                title: Text('重新生成', style: TextStyle(color: c.textPrimary)),
                 onTap: () => Navigator.pop(ctx, 'resend'),
               ),
             if (onEdit != null)
               ListTile(
-                leading: const Icon(Icons.edit_outlined, size: 20, color: Color(0xFFE0E0E0)),
-                title: const Text('编辑并重发', style: TextStyle(color: Color(0xFFE0E0E0))),
+                leading: Icon(Icons.edit_outlined, size: 20, color: c.textPrimary),
+                title: Text('编辑并重发', style: TextStyle(color: c.textPrimary)),
                 onTap: () => Navigator.pop(ctx, 'edit'),
               ),
           ],
@@ -100,6 +93,7 @@ class UserBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = context.appColors;
     return GestureDetector(
       onLongPress: () => _showMenu(context),
       child: Align(
@@ -108,9 +102,9 @@ class UserBubble extends StatelessWidget {
           margin: const EdgeInsets.symmetric(vertical: 6),
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.78),
-          decoration: const BoxDecoration(
-            color: _cAccent,
-            borderRadius: BorderRadius.only(topLeft: Radius.circular(16), topRight: Radius.circular(16), bottomLeft: Radius.circular(16), bottomRight: Radius.circular(4)),
+          decoration: BoxDecoration(
+            color: c.bubbleUser,
+            borderRadius: const BorderRadius.only(topLeft: Radius.circular(16), topRight: Radius.circular(16), bottomLeft: Radius.circular(16), bottomRight: Radius.circular(4)),
           ),
           child: Text(content, style: const TextStyle(fontSize: 15, color: Colors.white, height: 1.5)),
         ),
@@ -134,6 +128,7 @@ class _ReasoningSectionState extends State<ReasoningSection> {
 
   @override
   Widget build(BuildContext context) {
+    final c = context.appColors;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -147,10 +142,10 @@ class _ReasoningSectionState extends State<ReasoningSection> {
                 AnimatedRotation(
                   turns: _open ? 0 : -0.25,
                   duration: const Duration(milliseconds: 150),
-                  child: const Icon(Icons.expand_more, size: 15, color: _cTextMuted),
+                  child: Icon(Icons.expand_more, size: 15, color: c.textMuted),
                 ),
                 const SizedBox(width: 2),
-                Text(widget.streaming ? '正在思考…' : '思考过程', style: const TextStyle(fontSize: 12, color: _cTextMuted)),
+                Text(widget.streaming ? '正在思考…' : '思考过程', style: TextStyle(fontSize: 12, color: c.textMuted)),
               ],
             ),
           ),
@@ -159,12 +154,12 @@ class _ReasoningSectionState extends State<ReasoningSection> {
           Container(
             margin: const EdgeInsets.only(top: 2),
             padding: const EdgeInsets.only(left: 10),
-            decoration: const BoxDecoration(border: Border(left: BorderSide(color: _cBorder, width: 2))),
+            decoration: BoxDecoration(border: Border(left: BorderSide(color: c.border, width: 2))),
             constraints: const BoxConstraints(maxHeight: 240),
             child: SingleChildScrollView(
               child: Text(
                 widget.content,
-                style: const TextStyle(fontSize: 12, color: _cTextMuted, height: 1.6),
+                style: TextStyle(fontSize: 12, color: c.textMuted, height: 1.6),
               ),
             ),
           ),
@@ -192,6 +187,7 @@ class AssistantBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = context.appColors;
     final hasContent = content.isNotEmpty;
     final hasReasoning = reasoning != null && reasoning!.isNotEmpty;
     final hasTools = toolSteps.isNotEmpty;
@@ -202,15 +198,15 @@ class AssistantBubble extends StatelessWidget {
         margin: const EdgeInsets.symmetric(vertical: 6),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.88),
-        decoration: const BoxDecoration(
-          color: _cAssistantBg,
-          borderRadius: BorderRadius.only(topLeft: Radius.circular(4), topRight: Radius.circular(16), bottomLeft: Radius.circular(16), bottomRight: Radius.circular(16)),
+        decoration: BoxDecoration(
+          color: c.bubbleAi,
+          borderRadius: const BorderRadius.only(topLeft: Radius.circular(4), topRight: Radius.circular(16), bottomLeft: Radius.circular(16), bottomRight: Radius.circular(16)),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             // 顶部：耗时 + 步数统计（对齐桌面端 StepStats，无工具步骤且无耗时时不渲染）
-            if (turnDuration != null || hasTools) _buildStats(),
+            if (turnDuration != null || hasTools) _buildStats(c),
             // 工具执行步骤（紧凑单行）
             if (hasTools) ...[
               const SizedBox(height: 2),
@@ -225,7 +221,7 @@ class AssistantBubble extends StatelessWidget {
                 child: MarkdownBody(
                   data: content,
                   selectable: true,
-                  styleSheet: _markdownStyle(),
+                  styleSheet: _markdownStyle(c),
                 ),
               ),
             // 思考中占位
@@ -243,7 +239,7 @@ class AssistantBubble extends StatelessWidget {
     );
   }
 
-  Widget _buildStats() {
+  Widget _buildStats(AppColors c) {
     final stats = toolStepStats(toolSteps);
     final spans = <TextSpan>[];
     void sep() => spans.add(const TextSpan(text: ' · '));
@@ -255,43 +251,43 @@ class AssistantBubble extends StatelessWidget {
       spans.add(TextSpan(text: '${stats.total} 步'));
       if (stats.success > 0) {
         sep();
-        spans.add(TextSpan(text: '${stats.success} 成功', style: const TextStyle(color: _cSuccess)));
+        spans.add(TextSpan(text: '${stats.success} 成功', style: TextStyle(color: c.success)));
       }
       if (stats.failed > 0) {
         sep();
-        spans.add(TextSpan(text: '${stats.failed} 失败', style: const TextStyle(color: _cError)));
+        spans.add(TextSpan(text: '${stats.failed} 失败', style: TextStyle(color: c.error)));
       }
       if (stats.running > 0) {
         sep();
-        spans.add(TextSpan(text: '${stats.running} 执行中', style: const TextStyle(color: _cRunning)));
+        spans.add(TextSpan(text: '${stats.running} 执行中', style: TextStyle(color: c.running)));
       }
     }
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
-      child: Text.rich(TextSpan(children: spans), style: const TextStyle(fontSize: 11, color: _cTextFaint)),
+      child: Text.rich(TextSpan(children: spans), style: TextStyle(fontSize: 11, color: c.textFaint)),
     );
   }
 }
 
-/// 深色主题下的 Markdown 样式（代码块/引用块适配深色气泡背景）
-MarkdownStyleSheet _markdownStyle() {
+/// Markdown 样式（跟随当前主题语义色：代码/引用块适配亮暗气泡背景）
+MarkdownStyleSheet _markdownStyle(AppColors c) {
   return MarkdownStyleSheet(
-    p: const TextStyle(fontSize: 15, height: 1.5, color: _cText),
-    code: const TextStyle(
+    p: TextStyle(fontSize: 15, height: 1.5, color: c.textPrimary),
+    code: TextStyle(
       fontSize: 13,
       fontFamily: 'monospace',
-      backgroundColor: Color(0xFF2A2A3A),
-      color: Color(0xFF7DD3FC),
+      backgroundColor: c.inputBg,
+      color: c.codeText,
     ),
     codeblockDecoration: BoxDecoration(
-      color: const Color(0xFF14141C),
+      color: c.codeBg,
       borderRadius: BorderRadius.circular(8),
-      border: Border.all(color: const Color(0xFF2A2A3A)),
+      border: Border.all(color: c.border),
     ),
     codeblockPadding: const EdgeInsets.all(10),
-    blockquoteDecoration: const BoxDecoration(
-      color: Color(0xFF1A1A24),
-      border: Border(left: BorderSide(color: Color(0xFF8B5CF6), width: 3)),
+    blockquoteDecoration: BoxDecoration(
+      color: c.bubbleAi,
+      border: Border(left: BorderSide(color: c.bubbleUser, width: 3)),
     ),
     blockquotePadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
   );

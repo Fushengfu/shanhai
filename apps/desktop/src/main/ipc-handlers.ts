@@ -9,6 +9,7 @@ import { listSystemWallpapers, applySystemWallpaper } from './system-wallpaper'
 import { startRemoteServer, stopRemoteServer, getRemoteStatus, refreshPairingCode } from './remote-server'
 import { startRemoteRelay, stopRemoteRelay, getRelayStatus } from './remote-relay'
 import { checkAndPromptForUpdate, getLastUpdateCheckResult, fetchMobileApkInfo } from './app-updater'
+import { listMarketPlugins, downloadAndInstallPlugin, submitPluginToMarket, listMyPlugins } from './marketplace'
 
 /**
  * 渲染进程 → 主进程 调用（IPC handler）。
@@ -265,6 +266,16 @@ export function registerIpc(): void {
   ipcMain.handle('app:get-update-status', async () => getLastUpdateCheckResult())
   ipcMain.handle('mobile:get-apk-info', async (_e, packageName: string) => fetchMobileApkInfo(packageName))
 
+  // —— 插件市场（公开列表 / 下载安装 / 提交）——
+  ipcMain.handle('market:list', async (_e, params: { keyword?: string; category?: string; hasUI?: boolean | ''; page?: number; pageSize?: number }) =>
+    listMarketPlugins(params ?? {}),
+  )
+  ipcMain.handle('market:install', async (_e, pluginId: string) => downloadAndInstallPlugin(pluginId))
+  ipcMain.handle('market:submit', async (_e, pluginDirOrId: string, categories?: string[]) =>
+    submitPluginToMarket(pluginDirOrId, categories),
+  )
+  ipcMain.handle('market:mine', async () => listMyPlugins())
+
   // —— 插件窗口白名单 IPC（第 1 步：插件专用 preload 的统一入口，双层校验）——
   // 第一层：插件窗口只能经专用 preload（window.shanhaiPlugin）调用，物理拿不到全量 window.shanhai；
   // 第二层：此处按「插件 id + 能力名」校验——反查发起窗口的插件 appId，能力必须在全局白名单内，
@@ -274,6 +285,7 @@ export function registerIpc(): void {
     'getVersion', 'clipboardWriteText', 'clipboardReadText', 'speak', 'selectDirectory',
     'listSessions', 'listMemory', 'getUiState', 'closeApp', 'getWallpaper', 'getTokenStats',
     'invokePluginService', 'modelCall', 'listModels', 'modelCallStream',
+    'videoGen', 'videoGenQuery', 'imageGen', 'imageGenQuery', 'tts', 'uploadFile',
   ])
   ipcMain.handle('plugin:invoke', async (e, capability: string, ...args: unknown[]) => {
     const win = BrowserWindow.fromWebContents(e.sender)
@@ -348,6 +360,30 @@ export function registerIpc(): void {
           }
         })()
         return { ok: true, callId: payload.callId }
+      }
+      case 'videoGen':
+        // 视频生成提交：透传网关 POST /api/v1/video/generations（真实接口已存在），返回 { taskId }
+        return runtime.invokeVideoGen(appId, args[0] as { model?: string; prompt: string; duration: string | number; resolution?: string; ratio?: string; audio?: boolean | string; firstFrame?: { url?: string; base64?: string }; referenceImages?: Array<{ url?: string; base64?: string }>; seed?: number; promptExtend?: boolean; watermark?: boolean })
+      case 'videoGenQuery':
+        // 视频生成查询：透传网关 GET /api/v1/video/generations/{taskId}（真实接口已存在）
+        return runtime.invokeVideoGenQuery(appId, args[0] as { taskId: string })
+      case 'imageGen':
+        // 图片生成提交：透传网关 POST /api/v1/image/generations（网关尚未实现，桥已预留）
+        return runtime.invokeImageGen(appId, args[0] as { model?: string; prompt: string })
+      case 'imageGenQuery':
+        // 图片生成查询：透传网关 GET /api/v1/image/generations/{taskId}（网关尚未实现，桥已预留）
+        return runtime.invokeImageGenQuery(appId, args[0] as { taskId: string })
+      case 'tts':
+        // 语音合成提交：透传网关 POST /api/v1/audio/tts（网关尚未实现，桥已预留）
+        return runtime.invokeTts(appId, args[0] as { model?: string; text: string })
+      case 'uploadFile': {
+        // 插件上传素材/文件到七牛，返回公网 URL。凭证用「登录账号上传」（memberToken），与输入框图片上传同一体系。
+        // 主进程持有凭证（memberToken），不暴露给插件；插件只提供文件 base64 + 可选 mimeType/fileName。
+        const input = (args[0] ?? {}) as { dataBase64?: string; mimeType?: string; fileName?: string }
+        if (!input?.dataBase64) throw new Error('uploadFile 需要 dataBase64 文件内容')
+        const url = await runtime.uploadFile(input.dataBase64, input.mimeType, input.fileName)
+        if (!url) throw new Error('上传文件失败：未登录或上传异常（请先登录再上传素材）')
+        return url
       }
       default:
         throw new Error(`未实现的插件能力: ${capability}`)

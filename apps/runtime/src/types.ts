@@ -40,6 +40,36 @@ export type PluginModelStreamEvent =
   | { type: 'done' }
 
 
+/** 插件视频生成入参（契约字段严格对齐插件侧，主进程透传网关 POST /api/v1/video/generations） */
+export interface PluginVideoGenInput {
+  model?: string
+  prompt: string
+  duration: string | number
+  resolution?: string
+  ratio?: string
+  audio?: boolean | string
+  firstFrame?: { url?: string; base64?: string }
+  referenceImages?: Array<{ url?: string; base64?: string }>
+  seed?: number
+  promptExtend?: boolean
+  watermark?: boolean
+}
+
+/** 插件图片生成入参（网关 /api/v1/image/generations 尚未实现，桥已预留；字段以网关最终契约为准，透传不裁剪） */
+export interface PluginImageGenInput {
+  model?: string
+  prompt: string
+  [key: string]: unknown
+}
+
+/** 插件语音合成入参（网关 /api/v1/audio/tts 尚未实现，桥已预留；字段以网关最终契约为准，透传不裁剪） */
+export interface PluginTtsInput {
+  model?: string
+  text: string
+  [key: string]: unknown
+}
+
+
 /** token 用量快照（UI 底部状态栏展示：累计 / 本轮 / 上下文占比） */
 export interface TokenSnapshot {
   /** 累计（本次启动以来的所有模型调用） */
@@ -223,6 +253,7 @@ export interface Runtime {
   saveUploadedFile(fileName: string, dataBase64: string): Promise<string>
   /** 把图片 base64（不含 data: 前缀）上传到云存储，返回 https 公网链接；未登录/失败返回 null（回退 data URL） */
   uploadImage(imageBase64: string, mimeType?: string): Promise<string | null>
+  uploadFile(dataBase64: string, mimeType?: string, fileName?: string): Promise<string | null>
   /** 列出指定会话（缺省当前会话）打开的浏览器窗口（会话级隔离） */
   listBrowserWindows(sessionId?: string): Promise<Array<{ appId: string; url: string; title: string }>>
   /** 显示并聚焦指定浏览器窗口（用户点击标签恢复窗口） */
@@ -348,6 +379,10 @@ export interface Runtime {
   selfmodInspect(sessionId?: string): unknown
   /** 自修改：恢复已安装插件（AI 自研应用跨会话/跨重启留存），返回恢复数量。由主进程在窗口就绪后调用 */
   restoreInstalledPlugins(): Promise<number>
+  /** 自修改（市场）：激活一个已还原落盘到 ~/.shanhai/plugins/<id>/ 的插件（用户点「下载安装」已授权，覆盖升级 + 免审批） */
+  installMarketPlugin(id: string): Promise<{ id: string; installed: boolean }>
+  /** 当前网关 APIKey（登录后发放，用于网关 API 鉴权如插件市场提交；未登录返回空串） */
+  getGatewayApiKey(): string
   /** 自修改：browser 半投递前的 round-trip 审批请求回调（UI 弹卡片） */
   onClientRunRequest(cb: (req: { requestId: string; sessionId: string; pkgId: string; name: string; purpose: string }) => void): () => void
   /** UI 应答 browser 半投递审批（approved=true 投递，false 拒绝） */
@@ -374,6 +409,16 @@ export interface Runtime {
   listModelsForPlugin(): Promise<Array<{ id: string; name: string }>>
   /** 插件流式模型调用：边生成边经 emit 推送分片；modelId 受控（须在可用列表内），限流/配额沿用 modelCall */
   invokeModelForPluginStream(appId: string, input: { prompt: string; systemPrompt?: string; modelId?: string }, emit: (ev: PluginModelStreamEvent) => void): Promise<void>
+  /** 插件视频生成（提交）：透传网关 POST /api/v1/video/generations，返回 { taskId }；受白名单 + permissions 声明 + 限流约束 */
+  invokeVideoGen(appId: string, input: PluginVideoGenInput): Promise<{ taskId: string }>
+  /** 插件视频生成查询：透传网关 GET /api/v1/video/generations/{taskId}，返回 { status, progress?, errorMessage? } */
+  invokeVideoGenQuery(appId: string, input: { taskId: string }): Promise<{ status: string; progress?: number; errorMessage?: string }>
+  /** 插件图片生成（提交）：透传网关 POST /api/v1/image/generations（网关尚未实现，桥已预留，返回透传） */
+  invokeImageGen(appId: string, input: PluginImageGenInput): Promise<unknown>
+  /** 插件图片生成查询：透传网关 GET /api/v1/image/generations/{taskId}（网关尚未实现，桥已预留，返回透传） */
+  invokeImageGenQuery(appId: string, input: { taskId: string }): Promise<unknown>
+  /** 插件语音合成（提交）：透传网关 POST /api/v1/audio/tts（网关尚未实现，桥已预留，返回透传） */
+  invokeTts(appId: string, input: PluginTtsInput): Promise<unknown>
   /** 列出长期记忆（按会话隔离，仅返回当前会话的记忆） */
   listMemory(sessionId: string): Array<{ id: number; scope: string; key: string; value: unknown; source: string; confidence: number; timestamp: number; sessionId?: string }>
   /** 删除一条长期记忆（按 id） */

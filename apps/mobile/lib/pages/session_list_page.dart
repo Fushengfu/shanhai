@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import '../theme.dart';
 import '../services/ws_client.dart';
 import '../models/protocol.dart';
 import 'chat_page.dart';
@@ -190,9 +191,10 @@ class _SessionCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final accent = Theme.of(context).colorScheme.primary;
+    final c = context.appColors;
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 5),
-      color: const Color(0xFF1A1A24),
+      color: c.cardBg,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       child: InkWell(
         borderRadius: BorderRadius.circular(12),
@@ -207,7 +209,7 @@ class _SessionCard extends StatelessWidget {
                 height: 10,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: s.busy ? const Color(0xFF22D3EE) : (s.active ? accent : Colors.grey.shade600),
+                  color: s.busy ? c.running : (s.active ? accent : Colors.grey.shade600),
                 ),
               ),
               const SizedBox(width: 12),
@@ -223,8 +225,8 @@ class _SessionCard extends StatelessWidget {
                         if (s.busy)
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                            decoration: BoxDecoration(color: const Color(0xFF1E3A46), borderRadius: BorderRadius.circular(10)),
-                            child: const Text('执行中', style: TextStyle(fontSize: 11, color: Color(0xFF22D3EE))),
+                            decoration: BoxDecoration(color: c.running.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(10)),
+                            child: Text('执行中', style: TextStyle(fontSize: 11, color: c.running)),
                           ),
                       ],
                     ),
