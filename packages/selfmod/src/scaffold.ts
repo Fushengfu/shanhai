@@ -359,6 +359,25 @@ export interface ShanhaiPluginBridge {
     onDone?: () => void
     onError?: (error: Error) => void
   }): { cancel: () => void }
+  /**
+   * 视频生成（提交）：透传网关 POST /api/v1/video/generations，返回 { taskId }。需显式声明 permissions: ["videoGen"]。
+   * 入参契约（严格对齐网关）：{ model?, prompt, duration, resolution?, ratio?, audio?, firstFrame?, referenceImages?, seed?, promptExtend?, watermark? }。
+   */
+  videoGen(input: { model?: string; prompt: string; duration: string | number; resolution?: string; ratio?: string; audio?: boolean | string; firstFrame?: { url?: string; base64?: string }; referenceImages?: Array<{ url?: string; base64?: string }>; seed?: number; promptExtend?: boolean; watermark?: boolean }): Promise<{ taskId: string }>
+  /** 视频生成查询：透传网关 GET /api/v1/video/generations/{taskId}，返回 { status, progress?, videoUrl?, errorMessage? }。需显式声明 permissions: ["videoGenQuery"]。 */
+  videoGenQuery(input: { taskId: string }): Promise<{ status: string; progress?: number; videoUrl?: string; resultUrl?: string; videoUrlRaw?: string; errorMessage?: string }>
+  /** 图片生成（提交）：透传网关 POST /api/v1/image/generations，返回 { taskId }。需显式声明 permissions: ["imageGen"]。 */
+  imageGen(input: { model?: string; prompt: string; [key: string]: unknown }): Promise<{ taskId: string }>
+  /** 图片生成查询：透传网关 GET /api/v1/image/generations/{taskId}，终态补调 /result 拿图地址。需显式声明 permissions: ["imageGenQuery"]。 */
+  imageGenQuery(input: { taskId: string }): Promise<{ status: string; progress?: number; imageUrl?: string; resultUrl?: string; sourceUrl?: string; errorMessage?: string }>
+  /** 语音合成（提交）：透传网关 POST /api/v1/audio/tts（网关尚未实现，桥已预留）。需显式声明 permissions: ["tts"]。 */
+  tts(input: { model?: string; text: string; [key: string]: unknown }): Promise<unknown>
+  /**
+   * 上传文件到七牛云，返回 https 公网 URL（供素材/图片直传，拿到公网链接后转给 videoGen 等）。
+   * 凭证由主进程持有（登录账号 memberToken），插件只传文件 base64 + 可选 mimeType/fileName，拿不到 token/key。
+   * 需显式声明 permissions: ["uploadFile"]；未登录返回错误。
+   */
+  uploadFile(input: { dataBase64: string; mimeType?: string; fileName?: string }): Promise<string>
 }
 
 declare global {

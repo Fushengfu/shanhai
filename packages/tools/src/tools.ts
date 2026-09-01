@@ -1,7 +1,7 @@
-import { promises as fs } from 'node:fs'
+import { promises as fs, existsSync } from 'node:fs'
 import { execFile as execFileCallback, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
-import { resolve, isAbsolute, join, relative } from 'node:path'
+import { resolve, isAbsolute, join, relative, dirname } from 'node:path'
 
 const execFile = promisify(execFileCallback)
 
@@ -49,8 +49,8 @@ export interface ToolContract {
   resolveRisk?: (
     args: Record<string, unknown>,
   ) =>
-    | { riskLevel: RiskLevel; approvalRequired?: boolean; outsideWorkdir?: boolean }
-    | Promise<{ riskLevel: RiskLevel; approvalRequired?: boolean; outsideWorkdir?: boolean }>
+    | { riskLevel: RiskLevel; approvalRequired?: boolean; outsideWorkdir?: boolean; forceApproval?: boolean }
+    | Promise<{ riskLevel: RiskLevel; approvalRequired?: boolean; outsideWorkdir?: boolean; forceApproval?: boolean }>
   execute: (args: Record<string, unknown>) => unknown | Promise<unknown>
 }
 
@@ -220,6 +220,29 @@ export function sanitizeBinaryOutput(text: string): string {
   // 3. 连续不可打印字符块（cat 二进制文件吐出的乱码）
   out = out.replace(/[^\x20-\x7E\n\r\t]{64,}/g, '[二进制数据已省略]')
   return out
+}
+
+/**
+ * 破坏性命令检测（P0-8）：命中即视为高危，即使在 never（全自动）安全模式下也强制审批。
+ * 只匹配明确的高破坏性命令，避免误伤正常开发命令（如 rm 单个文件、git reset 不带 --hard 等）。
+ */
+export function isDestructiveCommand(cmd: string): boolean {
+  if (!cmd) return false
+  const patterns: RegExp[] = [
+    /\brm\s+-[A-Za-z]*r[A-Za-z]*f\b/,                          // rm -rf / rm -fr / rm -Rf
+    /\brm\s+-[A-Za-z]*f[A-Za-z]*r\b/,                          // rm -fR 变体
+    /\brm\s+-[A-Za-z]*r[A-Za-z]*\s+(\/|\/etc|\/usr|\/var|\/home|\/root|\/boot|\/opt|~)(\s|$)/, // rm -r / 递归删根/家目录
+    /\bdd\s+if=/i,                                             // dd 磁盘写入
+    /\bmkfs\b/,                                                // 格式化文件系统
+    /\b(?:fdisk|parted)\b/,                                    // 分区工具
+    /:\(\)\s*\{/,                                              // fork bomb
+    /\bsudo\b/,                                                // 提权
+    /\bchmod\s+(-R\s+)?777\b/,                                 // 放宽权限（chmod 777 / chmod -R 777）
+    /\bgit\s+reset\s+--hard\b/,                                // 破坏 git 历史
+    />\s*\/dev\/(sd[a-z]+|nvme[0-9n]+|disk|hda|vda|mmcblk[0-9]+)\b/, // 重定向到块设备
+    /\b(?:shutdown|reboot|halt|poweroff)\b/,                   // 关机/重启
+  ]
+  return patterns.some((re) => re.test(cmd))
 }
 
 /**
@@ -403,6 +426,10 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
         throw new Error('read_file 缺少 path 参数：请提供要读取的文件路径（相对或绝对路径）')
       }
       const path = resolvePath(args.path)
+      // 路径存在性前置校验：路径不存在直接给中文友好错误，避免模型靠 ENOENT 英文报错继续猜路径
+      if (!existsSync(path)) {
+        throw new Error(`路径不存在：${path}（请先 list_dir 确认实际路径）`)
+      }
       const text = await fs.readFile(path, 'utf8')
       const lines = text.split('\n')
       const total = lines.length
@@ -471,6 +498,11 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
       }
       const path = resolvePath(args.path)
       const content = String(args.content)
+      // 父目录存在性前置校验：父目录不存在时写文件必然 ENOENT，提前给中文友好错误（文件本身不存在是合法的覆盖写/新建场景）
+      const parentDir = dirname(path)
+      if (!existsSync(parentDir)) {
+        throw new Error(`路径不存在：${parentDir}（请先 list_dir 确认实际路径，write_file 不会自动创建缺失的目录）`)
+      }
       // 写入前读取旧内容，供前端渲染 git diff 效果；文件不存在则为 null（新建）
       let before: string | null = null
       try {
@@ -538,11 +570,15 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
       const replaceAll = args.replaceAll === true
       const expectedOccurrences = typeof args.expectedOccurrences === 'number' ? args.expectedOccurrences : undefined
 
+      // 路径存在性前置校验：目标文件不存在直接给中文友好错误，避免模型靠 ENOENT 英文报错继续猜路径
+      if (!existsSync(path)) {
+        throw new Error(`路径不存在：${path}（请先 list_dir 确认实际路径）`)
+      }
       let before: string
       try {
         before = await fs.readFile(path, 'utf8')
       } catch {
-        throw new Error(`edit_file 读取文件失败：${path} 不存在或无法读取`)
+        throw new Error(`edit_file 读取文件失败：${path} 无法读取`)
       }
 
       // 命中次数 = split 后段数 - 1（split/join 不做正则替换模式解析，避免 $ 等特殊字符被误解）
@@ -587,9 +623,11 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
     },
     riskLevel: 'irreversible',
     approvalRequired: true,
-    resolveRisk: (args): { riskLevel: RiskLevel; approvalRequired: boolean; outsideWorkdir: boolean } => {
+    resolveRisk: (args): { riskLevel: RiskLevel; approvalRequired: boolean; outsideWorkdir: boolean; forceApproval: boolean } => {
       const cmd = typeof args.command === 'string' ? args.command : ''
-      return { riskLevel: 'irreversible', approvalRequired: true, outsideWorkdir: commandLooksOutsideWorkdir(cmd) }
+      // 破坏性命令（rm -rf / sudo / dd / mkfs / chmod 777 等）：即使 never（全自动）模式也强制审批（P0-8）
+      const destructive = isDestructiveCommand(cmd)
+      return { riskLevel: 'irreversible', approvalRequired: true, outsideWorkdir: commandLooksOutsideWorkdir(cmd), forceApproval: destructive }
     },
     guide: {
       usage: [
@@ -647,6 +685,10 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
     execute: async (args) => {
       const raw = args.path ? String(args.path) : ''
       const dir = raw ? resolvePath(raw) : getCwd()
+      // 目录存在性前置校验：目录不存在直接给中文友好错误，避免 buildDirTree 静默返回空导致模型以为列不出
+      if (!existsSync(dir)) {
+        throw new Error(`路径不存在：${dir}（请先 list_dir 父目录确认实际路径）`)
+      }
       const maxDepth = typeof args.maxDepth === 'number' ? args.maxDepth : 3
       return buildDirTree(dir, maxDepth, 300)
     },

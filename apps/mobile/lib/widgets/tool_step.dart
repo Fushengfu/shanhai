@@ -44,27 +44,11 @@ const Map<String, String> _toolNameMap = {
   'rollback_file': '回滚文件',
   'remember': '保存记忆',
   'recall_memory': '召回记忆',
-  'plugin_inspect': '查看自修改',
-  'plugin_define': '定义动态包',
-  'plugin_run': '运行动态包',
-  'plugin_stop': '停止动态包',
-  'plugin_undefine': '删除动态包',
-  'plugin_test': '测试动态包',
-  'plugin_install': '安装动态包',
-  'plugin_uninstall': '卸载动态包',
-  'list_sessions': '查看会话列表',
-  'inspect_session': '查看会话详情',
+  'plugin': '插件',
+  'session': '管理会话',
   'list_models': '查看可用模型',
-  'switch_session': '切换激活会话',
   'send_message': '给会话下发任务',
   'inject_message': '给会话追加需求',
-  'set_session_model': '切换会话模型',
-  'set_session_approval': '配置会话安全模式',
-  'set_session_workdir': '设置会话工作目录',
-  'create_session': '新建会话',
-  'rename_session': '重命名会话',
-  'delete_session': '删除会话',
-  'choose_session': '选择会话',
   'choose_model': '选择模型',
   'ask_user': '向用户提问',
   'mcp_list_tools': '查看 MCP 工具',
@@ -75,10 +59,7 @@ const Map<String, String> _toolNameMap = {
   'terminal_run': '终端执行命令',
   'terminal_list': '列出终端',
   'terminal_close': '关闭终端',
-  'list_ledger': '查看台账目录',
-  'read_ledger': '读取台账',
-  'write_ledger': '写入台账',
-  'edit_ledger': '编辑台账',
+  'ledger': '管家台账',
   'answer_ask': '代答提问',
   'resolve_approval': '决策审批',
 };
@@ -107,13 +88,53 @@ const Map<String, String> _skillActionNameMap = {
   'browser-use:clear_cookies': '清除 Cookie',
 };
 
-/// 工具名 → 中文显示名（skill_run 按 skillId+action 细分，未知名回退「工具操作」）
+/// plugin 顶层工具（插件统一入口）的 action → 中文显示名
+const Map<String, String> _pluginActionNameMap = {
+  'list': '列出已装插件',
+  'inspect': '查看插件运行时表',
+  'scaffold': '生成插件项目',
+  'build': '编译插件',
+  'test-load': '插件干跑加载',
+  'verify': '验证插件产物',
+  'install': '安装插件',
+  'publish': '打包共享插件',
+  'uninstall': '卸载插件',
+  'tool': '调用插件工具',
+};
+
+/// ledger 顶层工具（管家台账统一入口）的 action → 中文显示名
+const Map<String, String> _ledgerActionNameMap = {
+  'list': '查看台账目录',
+  'read': '读取台账',
+  'write': '写入台账',
+  'edit': '编辑台账',
+};
+
+/// session 顶层工具（会话实体管理统一入口）的 action → 中文显示名
+const Map<String, String> _sessionActionNameMap = {
+  'list': '查看会话列表',
+  'inspect': '查看会话详情',
+  'switch': '切换激活会话',
+  'create': '新建会话',
+  'rename': '重命名会话',
+  'set_workdir': '设置会话工作目录',
+  'delete': '删除会话',
+  'set_model': '切换会话模型',
+  'set_approval': '配置会话安全模式',
+  'choose': '选择会话',
+  'resume': '续跑会话',
+};
+
+/// 工具名 → 中文显示名（skill_run / plugin / ledger / session 按 action 细分，未知名回退「工具操作」）
 String friendlyToolName(String name, Map<String, dynamic>? args) {
+  final action = args?['action']?.toString() ?? '';
   if (name == 'skill_run') {
     final skillId = args?['skillId']?.toString() ?? '';
-    final action = args?['action']?.toString() ?? '';
     return _skillActionNameMap['$skillId:$action'] ?? '执行技能';
   }
+  if (name == 'plugin') return _pluginActionNameMap[action] ?? '插件';
+  if (name == 'ledger') return _ledgerActionNameMap[action] ?? '管家台账';
+  if (name == 'session') return _sessionActionNameMap[action] ?? '管理会话';
   return _toolNameMap[name] ?? '工具操作';
 }
 
@@ -139,14 +160,7 @@ IconData _toolIcon(String name) {
     case 'remember':
     case 'recall_memory':
       return Icons.schedule;
-    case 'plugin_inspect':
-    case 'plugin_define':
-    case 'plugin_run':
-    case 'plugin_stop':
-    case 'plugin_undefine':
-    case 'plugin_test':
-    case 'plugin_install':
-    case 'plugin_uninstall':
+    case 'plugin':
       return Icons.code;
     case 'mcp_list_tools':
     case 'mcp_call':
@@ -159,33 +173,19 @@ IconData _toolIcon(String name) {
     case 'terminal_list':
     case 'terminal_close':
       return Icons.terminal;
-    case 'list_ledger':
-    case 'read_ledger':
-    case 'write_ledger':
-    case 'edit_ledger':
+    case 'ledger':
       return Icons.book_outlined;
     case 'answer_ask':
       return Icons.question_answer_outlined;
     case 'resolve_approval':
       return Icons.fact_check_outlined;
-    case 'list_sessions':
-    case 'inspect_session':
+    case 'session':
       return Icons.people_outline;
     case 'list_models':
       return Icons.memory;
-    case 'switch_session':
-      return Icons.sync;
     case 'send_message':
     case 'inject_message':
       return Icons.send;
-    case 'set_session_approval':
-      return Icons.shield_outlined;
-    case 'create_session':
-      return Icons.add;
-    case 'rename_session':
-      return Icons.edit_outlined;
-    case 'delete_session':
-      return Icons.delete_outline;
     default:
       if (name.startsWith('browser')) return Icons.public;
       return Icons.build_outlined;
@@ -213,6 +213,18 @@ String _skillRunSummary(Map<String, dynamic> args) {
 String toolSummary(String name, Map<String, dynamic>? args) {
   if (args == null) return '';
   if (name == 'skill_run') return _skillRunSummary(args);
+  if (name == 'plugin') {
+    final action = args['action']?.toString() ?? '';
+    final inner = args['args'] is Map ? (args['args'] as Map).cast<String, dynamic>() : <String, dynamic>{};
+    if (action == 'install' || action == 'uninstall' || action == 'scaffold' || action == 'build' || action == 'test-load' || action == 'verify') {
+      return inner['id']?.toString() ?? '';
+    }
+    if (action == 'publish') return inner['pluginDir']?.toString() ?? inner['id']?.toString() ?? '';
+    if (action == 'tool') return '${args['pluginId'] ?? ''}/${args['tool'] ?? ''}';
+    return '';
+  }
+  if (name == 'ledger') return args['path']?.toString() ?? '';
+  if (name == 'session') return args['sessionId']?.toString() ?? '';
   if (name == 'read_file' || name == 'write_file' || name == 'edit_file' || name == 'rollback_file') return args['path']?.toString() ?? '';
   if (name == 'run_command') return args['command']?.toString() ?? '';
   if (name == 'list_dir') return args['path']?.toString() ?? '当前目录';

@@ -411,12 +411,12 @@ export interface Runtime {
   invokeModelForPluginStream(appId: string, input: { prompt: string; systemPrompt?: string; modelId?: string }, emit: (ev: PluginModelStreamEvent) => void): Promise<void>
   /** 插件视频生成（提交）：透传网关 POST /api/v1/video/generations，返回 { taskId }；受白名单 + permissions 声明 + 限流约束 */
   invokeVideoGen(appId: string, input: PluginVideoGenInput): Promise<{ taskId: string }>
-  /** 插件视频生成查询：透传网关 GET /api/v1/video/generations/{taskId}，返回 { status, progress?, errorMessage? } */
-  invokeVideoGenQuery(appId: string, input: { taskId: string }): Promise<{ status: string; progress?: number; errorMessage?: string }>
-  /** 插件图片生成（提交）：透传网关 POST /api/v1/image/generations（网关尚未实现，桥已预留，返回透传） */
-  invokeImageGen(appId: string, input: PluginImageGenInput): Promise<unknown>
-  /** 插件图片生成查询：透传网关 GET /api/v1/image/generations/{taskId}（网关尚未实现，桥已预留，返回透传） */
-  invokeImageGenQuery(appId: string, input: { taskId: string }): Promise<unknown>
+  /** 插件视频生成查询：透传网关 GET /api/v1/video/generations/{taskId}，返回 { status, progress?, videoUrl?, errorMessage? } */
+  invokeVideoGenQuery(appId: string, input: { taskId: string }): Promise<{ status: string; progress?: number; videoUrl?: string; resultUrl?: string; videoUrlRaw?: string; errorMessage?: string }>
+  /** 插件图片生成（提交）：透传网关 POST /api/v1/image/generations，返回 { taskId }；受白名单 + permissions 声明 + 限流约束 */
+  invokeImageGen(appId: string, input: PluginImageGenInput): Promise<{ taskId: string }>
+  /** 插件图片生成查询：透传网关 GET /api/v1/image/generations/{taskId}，终态补调 /result 拿图地址，返回 { status, progress?, imageUrl?, resultUrl?, sourceUrl?, errorMessage? } */
+  invokeImageGenQuery(appId: string, input: { taskId: string }): Promise<{ status: string; progress?: number; imageUrl?: string; resultUrl?: string; sourceUrl?: string; errorMessage?: string }>
   /** 插件语音合成（提交）：透传网关 POST /api/v1/audio/tts（网关尚未实现，桥已预留，返回透传） */
   invokeTts(appId: string, input: PluginTtsInput): Promise<unknown>
   /** 列出长期记忆（按会话隔离，仅返回当前会话的记忆） */

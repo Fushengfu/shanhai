@@ -1,6 +1,6 @@
 {
   "name": "@shanhai/desktop",
-  "version": "0.5.5",
+  "version": "0.6.0",
   "private": true,
   "packageManager": "pnpm@10.5.0",
   "type": "module",

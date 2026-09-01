@@ -10,15 +10,18 @@ export interface PluginAppInfo {
 }
 
 /**
- * 顶部「应用菜单」面板（类似开始菜单 / macOS 应用菜单）。
+ * Dock 上方「应用菜单」面板（类似开始菜单 / macOS 应用菜单）。
  *
- * 挂在桌面壳窗口（DesktopApp）顶部弹出：列出所有已安装的插件应用（图标 + 名称），
+ * 挂在桌面壳窗口（DesktopApp）弹出：列出所有已安装的插件应用（图标 + 名称），
  * 点击应用项 openApp 打开对应窗口并关闭面板；点击面板外遮罩或再次点 Dock 入口关闭。
+ * 面板紧贴 Dock 上方弹出（bottom 定位，据主进程返回的 Dock 顶部偏移量计算），而非屏幕顶部。
  *
  * 打开/关闭状态由全局共享状态 ui.appMenuOpen 驱动（Dock 入口写、桌面壳读），跨窗口同步。
  */
 export function AppMenuPanel(): React.JSX.Element | null {
   const [apps, setApps] = useState<PluginAppInfo[]>([])
+  // Dock 窗口顶部距桌面壳底部的距离（用于把面板定位在 Dock 上方，紧贴 Dock 弹出）
+  const [dockTop, setDockTop] = useState(132)
 
   useEffect(() => {
     let mounted = true
@@ -26,6 +29,9 @@ export function AppMenuPanel(): React.JSX.Element | null {
       if (mounted) setApps(list ?? [])
     })
     const off = window.shanhai?.onPluginAppsChanged((list) => setApps(list ?? []))
+    void window.shanhai?.getDockTop().then((v) => {
+      if (mounted && v) setDockTop(v)
+    })
     return () => {
       mounted = false
       off?.()
@@ -48,11 +54,11 @@ export function AppMenuPanel(): React.JSX.Element | null {
         onClick={close}
         style={{ position: 'fixed', inset: 0, zIndex: 90 }}
       />
-      {/* 顶部面板 */}
+      {/* Dock 上方面板（紧贴 Dock 弹出，据主进程返回的 Dock 顶部偏移量定位） */}
       <div
         style={{
           position: 'fixed',
-          top: 20,
+          bottom: dockTop + 12,
           left: '50%',
           transform: 'translateX(-50%)',
           zIndex: 100,

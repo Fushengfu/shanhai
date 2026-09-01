@@ -103,12 +103,12 @@ export interface ShanhaiPluginBridge {
    * 入参契约（严格对齐网关）：{ model?, prompt, duration, resolution?, ratio?, audio?, firstFrame?, referenceImages?, seed?, promptExtend?, watermark? }。
    */
   videoGen(input: { model?: string; prompt: string; duration: string | number; resolution?: string; ratio?: string; audio?: boolean | string; firstFrame?: { url?: string; base64?: string }; referenceImages?: Array<{ url?: string; base64?: string }>; seed?: number; promptExtend?: boolean; watermark?: boolean }): Promise<{ taskId: string }>
-  /** 视频生成查询：透传网关 GET /api/v1/video/generations/{taskId}，返回 { status, progress?, errorMessage? }。需显式声明 permissions: ["videoGenQuery"]。 */
-  videoGenQuery(input: { taskId: string }): Promise<{ status: string; progress?: number; errorMessage?: string }>
-  /** 图片生成（提交）：透传网关 POST /api/v1/image/generations（网关尚未实现，桥已预留）。需显式声明 permissions: ["imageGen"]。 */
-  imageGen(input: { model?: string; prompt: string; [key: string]: unknown }): Promise<unknown>
-  /** 图片生成查询：透传网关 GET /api/v1/image/generations/{taskId}（网关尚未实现，桥已预留）。需显式声明 permissions: ["imageGenQuery"]。 */
-  imageGenQuery(input: { taskId: string }): Promise<unknown>
+  /** 视频生成查询：透传网关 GET /api/v1/video/generations/{taskId}，返回 { status, progress?, videoUrl?, errorMessage? }。需显式声明 permissions: ["videoGenQuery"]。 */
+  videoGenQuery(input: { taskId: string }): Promise<{ status: string; progress?: number; videoUrl?: string; resultUrl?: string; videoUrlRaw?: string; errorMessage?: string }>
+  /** 图片生成（提交）：透传网关 POST /api/v1/image/generations，返回 { taskId }。需显式声明 permissions: ["imageGen"]。 */
+  imageGen(input: { model?: string; prompt: string; [key: string]: unknown }): Promise<{ taskId: string }>
+  /** 图片生成查询：透传网关 GET /api/v1/image/generations/{taskId}，终态补调 /result 拿图地址。需显式声明 permissions: ["imageGenQuery"]。 */
+  imageGenQuery(input: { taskId: string }): Promise<{ status: string; progress?: number; imageUrl?: string; resultUrl?: string; sourceUrl?: string; errorMessage?: string }>
   /** 语音合成（提交）：透传网关 POST /api/v1/audio/tts（网关尚未实现，桥已预留）。需显式声明 permissions: ["tts"]。 */
   tts(input: { model?: string; text: string; [key: string]: unknown }): Promise<unknown>
   /**
@@ -157,9 +157,9 @@ const pluginBridge: ShanhaiPluginBridge = {
     return { cancel: cleanup }
   },
   videoGen: (input) => invoke('videoGen', input) as Promise<{ taskId: string }>,
-  videoGenQuery: (input) => invoke('videoGenQuery', input) as Promise<{ status: string; progress?: number; errorMessage?: string }>,
-  imageGen: (input) => invoke('imageGen', input) as Promise<unknown>,
-  imageGenQuery: (input) => invoke('imageGenQuery', input) as Promise<unknown>,
+  videoGenQuery: (input) => invoke('videoGenQuery', input) as Promise<{ status: string; progress?: number; videoUrl?: string; resultUrl?: string; videoUrlRaw?: string; errorMessage?: string }>,
+  imageGen: (input) => invoke('imageGen', input) as Promise<{ taskId: string }>,
+  imageGenQuery: (input) => invoke('imageGenQuery', input) as Promise<{ status: string; progress?: number; imageUrl?: string; resultUrl?: string; sourceUrl?: string; errorMessage?: string }>,
   tts: (input) => invoke('tts', input) as Promise<unknown>,
   uploadFile: (input) => invoke('uploadFile', input) as Promise<string>,
 }

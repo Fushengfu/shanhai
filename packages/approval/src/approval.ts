@@ -42,7 +42,9 @@ export class ApprovalService {
    * @param outsideWorkdir 本次操作是否访问工作目录之外（由工具 resolveRisk 提供），
    *  用于「workdir」策略：工作目录内（false）免审批，访问目录外（true）才审批。
    */
-  requiresApproval(tool: ToolContract, session?: Session, outsideWorkdir?: boolean): boolean {
+  requiresApproval(tool: ToolContract, session?: Session, outsideWorkdir?: boolean, forceApproval?: boolean): boolean {
+    // 破坏性命令（rm -rf / sudo / dd / mkfs / chmod 777 等）强制审批：即使 never（全自动）模式也拦，覆盖 never 早退
+    if (forceApproval) return true
     const policy = session ? (effectiveApprovalPolicy(session.list()) ?? this.policy) : this.policy
     if (policy === 'never') return false
     // 工作目录内免审批：明确判定本次操作未访问工作目录外 → 免审批

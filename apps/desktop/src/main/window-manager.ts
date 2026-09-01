@@ -400,6 +400,18 @@ export function resizeDockWindow(width: number, height: number): void {
   })
 }
 
+/** 获取 Dock 窗口顶部距桌面壳底部（= 屏幕 workArea 底部）的距离（像素），供应用菜单面板定位在 Dock 上方弹出 */
+export function getDockTopOffset(): number {
+  const display = screen.getPrimaryDisplay()
+  const dock = findWindow('dock')
+  if (dock && !dock.win.isDestroyed() && dock.win.isVisible()) {
+    const b = dock.win.getBounds()
+    return display.workArea.y + display.workArea.height - b.y
+  }
+  // 回退：Dock 初始高 96，位于工作区底部上方 24px
+  return 96 + 24
+}
+
 /** 最小化窗口（自定义标题栏按钮用，按发起窗口定位）。聊天窗口的最小化 = 隐藏（与关闭一致，常驻窗口不缩到系统 Dock），app 类窗口走系统最小化。 */
 export function minimizeWindow(win: BrowserWindow | null | undefined): void {
   if (!win || win.isDestroyed()) return

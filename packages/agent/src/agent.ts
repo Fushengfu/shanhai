@@ -117,6 +117,14 @@ export class AgentLoop {
   private readonly approvalSession: Session
   /** 是否已被用户中止（点「停止」）：在每轮循环 / 流式每个 chunk / 工具执行前检查，尽快中断 */
   private aborted = false
+  /** 运行护栏（P0-7）：上一次工具调用的「工具名+参数」指纹，用于检测「连续用相同参数重复调用同一工具」 */
+  private lastToolCallKey = ''
+  /** 运行护栏（P0-7）：当前工具调用指纹连续出现的次数（≥3 触发重复调用熔断） */
+  private repeatCallCount = 0
+  /** 运行护栏（P0-7）：上一次工具结果指纹，用于检测「连续多步结果无实质变化」 */
+  private lastResultDigest = ''
+  /** 运行护栏（P0-7）：工具结果指纹连续不变的步数（≥5 触发无进展熔断） */
+  private noProgressCount = 0
   /** 最后一次 LLM 返回的真实 usage.total_tokens（网关真实返回，非本地估算）：循环中判断上下文是否超窗口用。
    * 用 totalTokens（prompt + completion）判断实际总消耗窗口，而非只看 prompt 部分。
    * 从会话 usage/record 事件恢复；之后每次模型调用后由 recordUsage 更新。 */
@@ -404,7 +412,38 @@ export class AgentLoop {
       if (toolCalls.length > 0) {
         // 一次响应可能返回多个工具调用（OpenAI 并行 tool_calls）：逐个执行，结果依次回喂
         for (const tc of toolCalls) {
-          await this.handleToolCall(messages, tc, response.reasoningContent)
+          // 运行护栏（P0-7）：记录本次调用的「工具名+参数」指纹，用于「连续用相同参数重复调用」检测
+          const key = `${tc.name}::${JSON.stringify(tc.args ?? {})}`
+          if (key === this.lastToolCallKey) {
+            this.repeatCallCount++
+          } else {
+            this.lastToolCallKey = key
+            this.repeatCallCount = 1
+          }
+          const digest = await this.handleToolCall(messages, tc, response.reasoningContent)
+          // 无进展检测：结果指纹与上一步相同则累计（结果无实质变化）
+          if (digest === this.lastResultDigest) {
+            this.noProgressCount++
+          } else {
+            this.lastResultDigest = digest
+            this.noProgressCount = 0
+          }
+        }
+        // 熔断判定：重复调用 / 无进展触发后注入护栏提示，让模型停止空转、改用其它方法或向用户求助
+        if (this.repeatCallCount >= 3) {
+          const toolName = this.lastToolCallKey.split('::')[0] ?? '该工具'
+          messages.push({
+            role: 'user',
+            content: `[运行护栏] 你已连续 ${this.repeatCallCount} 次用相同参数调用 ${toolName}，但结果没有变化。请停止重复调用，改用其它方法，或向用户求助说明卡点。`,
+          })
+          this.repeatCallCount = 0
+          this.lastToolCallKey = ''
+        } else if (this.noProgressCount >= 5) {
+          messages.push({
+            role: 'user',
+            content: `[运行护栏] 最近连续 ${this.noProgressCount} 步工具调用没有产生实质进展（结果无变化）。请停止空转，重新审视任务：改用其它方法，或向用户求助。`,
+          })
+          this.noProgressCount = 0
         }
         continue
       }
@@ -670,7 +709,7 @@ export class AgentLoop {
     })
   }
 
-  private async handleToolCall(messages: ChatMessage[], call: ToolCall, reasoningContent?: string): Promise<void> {
+  private async handleToolCall(messages: ChatMessage[], call: ToolCall, reasoningContent?: string): Promise<string> {
     // 用户点「停止」：工具执行前检查，已中止则不落盘 tool/call、不执行工具，直接中断
     if (this.aborted) {
       this.flushPendingInjections()
@@ -693,7 +732,7 @@ export class AgentLoop {
       this.session.append('tool/result', { callId, name: call.name, error })
       messages.push(assistantCallMsg())
       messages.push({ role: 'tool', content: error, toolCallId: callId })
-      return
+      return `err:unknown-tool:${call.name}`
     }
 
     // 审批门（会话级审批策略：requiresApproval 从该会话事件日志回放 policy）。
@@ -703,7 +742,8 @@ export class AgentLoop {
     const riskLevel = dynamicRisk?.riskLevel ?? tool.riskLevel
     const approvalRequired = dynamicRisk?.approvalRequired ?? tool.approvalRequired
     const outsideWorkdir = dynamicRisk?.outsideWorkdir
-    if (this.approval.requiresApproval({ ...tool, riskLevel, approvalRequired }, this.approvalSession, outsideWorkdir)) {
+    const forceApproval = dynamicRisk?.forceApproval ?? false
+    if (this.approval.requiresApproval({ ...tool, riskLevel, approvalRequired }, this.approvalSession, outsideWorkdir, forceApproval)) {
       const outcome = await this.approval.request(this.approvalSession, {
         id: callId,
         toolName: call.name,
@@ -716,7 +756,7 @@ export class AgentLoop {
         this.session.append('tool/result', { callId, name: call.name, error })
         messages.push(assistantCallMsg())
         messages.push({ role: 'tool', content: error, toolCallId: callId })
-        return
+        return `err:approval-${outcome}`
       }
     }
 
@@ -741,11 +781,13 @@ export class AgentLoop {
           messages.push({ role: 'user', content: [{ type: 'image_url', image_url: { url: imageUrl } }] })
         }
       }
+      return `ok:${JSON.stringify(result)}`
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err)
       this.session.append('tool/result', { callId, name: call.name, error })
       messages.push(assistantCallMsg())
       messages.push({ role: 'tool', content: `error: ${error}`, toolCallId: callId })
+      return `err:${error}`
     }
   }
 }

@@ -10,12 +10,14 @@ export interface PluginAppInfo {
 
 /**
  * 桌面壳窗口（全屏壁纸）上的「已安装插件应用」图标区：列出插件应用（图标 + 名称），
- * 点击图标 openApp 打开对应插件窗口。无已安装插件应用时返回 null（不占空间）。
+ * 点击图标 openApp 打开对应插件窗口；按住图标拖拽到 Dock 可把插件添加到 Dock（跨窗口拖放）。
+ * 无已安装插件应用时返回 null（不占空间）。
  *
  * 挂在 DesktopApp 的壁纸之上（AiOrb 下方），图标悬浮显示，风格接近 macOS 桌面图标。
  */
 export function PluginAppsPanel(): React.JSX.Element | null {
   const [apps, setApps] = useState<PluginAppInfo[]>([])
+  const [draggingId, setDraggingId] = useState<string | null>(null)
 
   useEffect(() => {
     let mounted = true
@@ -29,6 +31,22 @@ export function PluginAppsPanel(): React.JSX.Element | null {
     }
   }, [])
 
+  // 拖拽：mousedown 开始 → 主进程广播给 Dock；本窗口 mouseup（未拖到 Dock）= 取消；
+  // 若用户在 Dock 上释放，本窗口收不到 mouseup，靠主进程 drag-end 广播清理。
+  useEffect(() => {
+    if (!draggingId) return
+    const handleMouseUp = (): void => {
+      setDraggingId(null)
+      window.shanhai?.cancelPluginDrag()
+    }
+    const offDragEnd = window.shanhai?.onPluginDragEnd(() => setDraggingId(null))
+    document.addEventListener('mouseup', handleMouseUp)
+    return () => {
+      document.removeEventListener('mouseup', handleMouseUp)
+      offDragEnd?.()
+    }
+  }, [draggingId])
+
   if (apps.length === 0) return null
 
   return (
@@ -36,11 +54,15 @@ export function PluginAppsPanel(): React.JSX.Element | null {
       {apps.map((app) => (
         <button
           key={app.appId}
+          onMouseDown={() => {
+            setDraggingId(app.appId)
+            window.shanhai?.beginPluginDrag(app.appId)
+          }}
           onClick={(e) => {
             e.stopPropagation()
             void window.shanhai?.openApp(app.appId)
           }}
-          title={`${app.name}（插件应用）`}
+          title={`${app.name}（插件应用，点击打开；拖拽到 Dock 固定）`}
           style={{
             display: 'flex',
             flexDirection: 'column',
@@ -53,8 +75,9 @@ export function PluginAppsPanel(): React.JSX.Element | null {
             background: 'rgba(20, 20, 28, 0.55)',
             backdropFilter: 'blur(10px)',
             color: 'var(--text)',
-            cursor: 'pointer',
-            transition: 'transform 0.12s ease, background 0.12s ease',
+            cursor: 'grab',
+            transition: 'transform 0.12s ease, background 0.12s ease, opacity 0.12s ease',
+            opacity: draggingId === app.appId ? 0.45 : 1,
           }}
           onMouseEnter={(e) => {
             e.currentTarget.style.transform = 'translateY(-4px)'

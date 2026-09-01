@@ -21,19 +21,35 @@ export function DockApp(): React.JSX.Element {
   // 退出登录菜单（登录态下点击登录状态项弹出）
   const [authMenuOpen, setAuthMenuOpen] = useState(false)
 
-  // 动态插件窗口应用图标（AI 自研插件 install 后桌面壳 Dock 显示，点击 openApp 打开）
+  // 动态插件窗口应用图标（AI 自研插件 install 后【不】自动显示，由用户手动从桌面壳拖拽到 Dock 添加；点击 openApp 打开）
   const [pluginApps, setPluginApps] = useState<Array<{ appId: string; name: string }>>([])
+  // 跨窗口拖拽「进行中」状态（桌面壳 PluginAppsPanel 发起 → 主进程广播 → Dock 进入可接受态）
+  const [dragActive, setDragActive] = useState(false)
   useEffect(() => {
     let mounted = true
-    void window.shanhai?.listPluginApps().then((apps) => {
+    void window.shanhai?.listDockPlugins().then((apps) => {
       if (mounted) setPluginApps(apps)
     })
-    const off = window.shanhai?.onPluginAppsChanged((apps) => setPluginApps(apps))
+    const offList = window.shanhai?.onDockPluginsChanged((apps) => setPluginApps(apps))
+    const offDragStart = window.shanhai?.onPluginDragStart(() => setDragActive(true))
+    const offDragEnd = window.shanhai?.onPluginDragEnd(() => setDragActive(false))
     return () => {
       mounted = false
-      off?.()
+      offList?.()
+      offDragStart?.()
+      offDragEnd?.()
     }
   }, [])
+
+  // 拖放接收：拖拽进行中时，用户在 Dock 窗口内释放鼠标（mouseup）即完成添加
+  useEffect(() => {
+    if (!dragActive) return
+    const handleMouseUp = (): void => {
+      void window.shanhai?.completePluginDrag()
+    }
+    document.addEventListener('mouseup', handleMouseUp)
+    return () => document.removeEventListener('mouseup', handleMouseUp)
+  }, [dragActive])
 
   // 主题：订阅主进程广播，跟随聊天窗口切换（亮/暗实时同步）
   useThemeSync()
@@ -176,7 +192,7 @@ export function DockApp(): React.JSX.Element {
           </button>
         ))}
 
-        {/* 动态插件窗口应用（AI 自研插件 install 后自动显示，点击打开独立窗口） */}
+        {/* 动态插件窗口应用（从桌面壳拖拽添加的 Dock 固定图标，点击打开独立窗口） */}
         {pluginApps.map((app) => (
           <button
             key={`plugin-${app.appId}`}
@@ -210,6 +226,32 @@ export function DockApp(): React.JSX.Element {
             </span>
           </button>
         ))}
+
+        {/* 拖拽进行中：显示放置提示（把桌面插件图标拖到这里松手添加） */}
+        {dragActive && (
+          <div
+            data-dock-drop
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 4,
+              width: 72,
+              height: 76,
+              borderRadius: 14,
+              border: '2px dashed var(--accent)',
+              color: 'var(--accent)',
+              fontSize: 11,
+              fontWeight: 600,
+              cursor: 'copy',
+              background: 'rgba(0,0,0,0.06)',
+            }}
+          >
+            <span style={{ fontSize: 20, lineHeight: 1 }}>＋</span>
+            <span>松开放置</span>
+          </div>
+        )}
 
         {/* 登录状态 + 登录/登出入口（一目了然是否已登录） */}
         <div style={{ width: 1, alignSelf: 'stretch', margin: '8px 2px', background: 'var(--border-soft)' }} />

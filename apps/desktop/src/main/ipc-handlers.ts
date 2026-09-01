@@ -2,8 +2,9 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
 import { SUPERVISOR_ID } from '@shanhai/runtime'
 import { safeSend } from './safe-send'
 import { getRuntime } from './runtime'
-import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow, toggleMaximizeWindow, resizeDockWindow, hideSupervisorToBubble, showSupervisorFromBubble, moveSupervisorBubble, hideToSystemDesktop, getWindowType, getWindowAppId } from './window-manager'
+import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow, toggleMaximizeWindow, resizeDockWindow, hideSupervisorToBubble, showSupervisorFromBubble, moveSupervisorBubble, hideToSystemDesktop, getWindowType, getWindowAppId, getDockTopOffset } from './window-manager'
 import { getPluginApp, listPluginApps, resolvePluginIconDataUrl } from './plugin-apps'
+import { listDockPluginApps, beginPluginDrag, cancelPluginDrag, completePluginDrag } from './dock-plugins'
 import { getUiState, patchUiState, getWallpaper, setWallpaper, filterUiStateForWindow, filterUiStateForPlugin, type UiStoreState } from './ui-store'
 import { listSystemWallpapers, applySystemWallpaper } from './system-wallpaper'
 import { startRemoteServer, stopRemoteServer, getRemoteStatus, refreshPairingCode } from './remote-server'
@@ -92,6 +93,12 @@ export function registerIpc(): void {
   ipcMain.handle('plugin-app:get', async (_e, appId: string) => getPluginApp(appId) ?? null)
   ipcMain.handle('plugin-app:list', async () => listPluginApps())
   ipcMain.handle('plugin-app:icon', async (_e, appId: string) => resolvePluginIconDataUrl(appId) ?? null)
+
+  // —— Dock 手动固定插件（安装不自动上 Dock，改手动从桌面拖拽添加）——
+  ipcMain.handle('dock-plugin:list', async () => listDockPluginApps())
+  ipcMain.on('dock-plugin:drag-start', (_e, appId: string) => beginPluginDrag(appId))
+  ipcMain.on('dock-plugin:drag-cancel', () => cancelPluginDrag())
+  ipcMain.handle('dock-plugin:drag-complete', async () => completePluginDrag())
 
   // —— 长期记忆 ——
   ipcMain.handle('memory:list', async (_e, sessionId: string) => runtime.listMemory(sessionId))
@@ -208,6 +215,8 @@ export function registerIpc(): void {
   ipcMain.on('window:resizeDock', (_e, width: number, height: number) => resizeDockWindow(width, height))
   // 退出到桌面：隐藏所有山海窗口回到系统界面，应用后台运行（托盘/快捷键恢复）
   ipcMain.handle('window:hideToDesktop', async () => hideToSystemDesktop())
+  // 获取 Dock 顶部距桌面壳底部的距离（应用菜单面板据此定位在 Dock 上方弹出）
+  ipcMain.handle('window:getDockTop', async () => getDockTopOffset())
 
   // —— 主题切换（亮/暗）：聊天窗口切换后广播给所有窗口，让各独立窗口（会话管家/Dock/桌面壳/应用窗口）实时跟随 ——
   ipcMain.on('theme:set', (_e, theme: 'light' | 'dark') => {

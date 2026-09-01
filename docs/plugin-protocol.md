@@ -107,7 +107,7 @@ client 半运行在浏览器渲染进程，**唯一形态**：窗口应用（配
 
 - 窗口内容由 `dist/client.html` + `dist/assets/*`（vite 完整 React bundle）渲染，**可用完整 React + JSX + 任意依赖 + 复杂 UI**。
 - 该入口挂**插件专用 preload**（`plugin.cjs`），暴露两个桥：
-  - `window.shanhaiPlugin`（白名单桥，15 项能力，见 §6）—— 插件调山海公开接口的**唯一**通道；
+  - `window.shanhaiPlugin`（白名单桥，21 项能力，见 §6）—— 插件调山海公开接口的**唯一**通道；
   - `window.shanhai`（宿主桥，**极度缩小**：仅 `windowType`/`platform`/`windowAppId`/`getPluginApp`/`closeApp`/`minimizeWindow`/`toggleMaximizeWindow`，无任何危险接口）。
 - 构建配置要求：`base: './'`（Electron `loadFile(file://)` 下资源必须相对路径）。
 
@@ -221,7 +221,7 @@ interface InstalledPackageMeta {
 
 **危险接口（`auth:*` / `chat:run` / `supervisor:*` / `model:switch` / `model:addCustom` / `model:updateCustom` / `model:removeCustom` / `remote:disable` / `approval:setPolicy` / `session:delete` / `settings:set` / `wallpaper:set` 等）永不进白名单，物理拿不到。** 注意：`chat:run` 是「完整多轮 agent 循环」（带工具调用/审批/多轮），插件**永远拿不到**；插件若需要模型能力，只能用下方 §6 新增的 `listModels` / `modelCall` / `modelCallStream`（受控模型能力，见「模型调用」小节）。
 
-## 6. 白名单能力清单（15 项）
+## 6. 白名单能力清单（21 项）
 
 | 能力 | 说明 |
 |------|------|
@@ -240,8 +240,14 @@ interface InstalledPackageMeta {
 | `modelCall` | **模型调用（非流式）**：用「当前选中的模型」或「listModels 可用列表里指定的模型」做一次单次文本生成（受控，见 §6.1）。**需显式声明** `permissions: ["modelCall"]` |
 | `listModels` | **列出可用模型**：返回山海网关可用模型列表（精简 `{ id, name }`，隔离 apiKey/baseUrl）。**需显式声明** `permissions: ["listModels"]` |
 | `modelCallStream` | **流式模型调用**：边生成边推送分片，适合长文本避免一次性返回超时（受控，见 §6.3）。**需显式声明** `permissions: ["modelCallStream"]` |
+| `videoGen` | **视频生成（提交）**：透传网关 `POST /api/v1/video/generations`，返回 `{ taskId }`（真实接口已存在，见 §6.2）。**需显式声明** `permissions: ["videoGen"]` |
+| `videoGenQuery` | **视频生成查询**：透传网关 `GET /api/v1/video/generations/{taskId}`，返回 `{ status, progress?, errorMessage? }`（只读查询，见 §6.2）。**需显式声明** `permissions: ["videoGenQuery"]` |
+| `imageGen` | **图片生成（提交）**：透传网关 `POST /api/v1/image/generations`（网关尚未实现，桥已预留，见 §6.2）。**需显式声明** `permissions: ["imageGen"]` |
+| `imageGenQuery` | **图片生成查询**：透传网关 `GET /api/v1/image/generations/{taskId}`（网关尚未实现，桥已预留，见 §6.2）。**需显式声明** `permissions: ["imageGenQuery"]` |
+| `tts` | **语音合成（提交）**：透传网关 `POST /api/v1/audio/tts`（网关尚未实现，桥已预留，见 §6.2）。**需显式声明** `permissions: ["tts"]` |
+| `uploadFile` | **上传文件到七牛云**：返回 https 公网 URL（供素材/图片直传，拿到公网链接后转给 videoGen 等）。凭证由主进程持有（登录账号 memberToken），插件只传文件 base64 + 可选 mimeType/fileName，拿不到 token/key。**需显式声明** `permissions: ["uploadFile"]`；未登录返回错误 |
 
-> 完整可声明清单即上述 15 项；`permissions` 缺省 = 空数组 = 最小权限。
+> 完整可声明清单即上述 21 项；`permissions` 缺省 = 空数组 = 最小权限。
 
 ### 6.1 模型调用（`modelCall` / `modelCallStream` / `listModels`）
 
@@ -292,6 +298,53 @@ const stream = window.shanhaiPlugin.modelCallStream(
 4. **需显式声明**：三个能力都要显式声明（**非默认放行**），install 顶层审批时一并批准。
 5. **限流**：主进程按「插件 id」做简单频率限制（默认每插件每分钟 20 次），超限抛错；token 用量计入全局配额（`getTokenStats` 可见）。
 6. **流式兜底**：若所选模型 provider 不支持流式，`modelCallStream` 自动回退为「一次 `onChunk` 输出全文 + `onUsage` + `onDone`」，前端无需区分；断流/网络异常走 `onError`，已收到的 `onChunk` 部分文本仍可用。
+
+### 6.2 视频 / 图片 / 语音生成（`videoGen` / `videoGenQuery` / `imageGen` / `imageGenQuery` / `tts` / `uploadFile`）
+
+插件窗口内「AI 视频/图片/语音生成」场景（如 AI 短剧工坊的「生成视频/配图/配音」）需要直连山海网关的媒体生成接口。山海提供**六个受控媒体生成能力**，全部透传网关接口，与 `chat:run`（完整 agent 循环）严格区分：
+
+| 能力 | 形态 | 网关接口 | 状态 | permissions |
+|------|------|---------|------|-------------|
+| `videoGen` | 提交（异步） | `POST /api/v1/video/generations` → `{ taskId }` | **真实接口已存在** | `["videoGen"]` |
+| `videoGenQuery` | 查询（只读） | `GET /api/v1/video/generations/{taskId}` → `{ status, progress?, errorMessage? }` | **真实接口已存在** | `["videoGenQuery"]` |
+| `imageGen` | 提交（异步） | `POST /api/v1/image/generations` | 网关尚未实现，桥已预留 | `["imageGen"]` |
+| `imageGenQuery` | 查询（只读） | `GET /api/v1/image/generations/{taskId}` | 网关尚未实现，桥已预留 | `["imageGenQuery"]` |
+| `tts` | 提交（同步） | `POST /api/v1/audio/tts` | 网关尚未实现，桥已预留 | `["tts"]` |
+| `uploadFile` | 上传素材 | 七牛云直传 → 返回 https 公网 URL | **可用**（需登录） | `["uploadFile"]` |
+
+**① 视频生成（提交 + 查询轮询）**：
+```ts
+// 1) 提交生成任务
+const { taskId } = await window.shanhaiPlugin.videoGen({
+  prompt: '雨夜街头，女主角回眸',   // 必填：画面描述
+  duration: 5,                        // 必填：时长（秒）
+  resolution: '1080p',                // 可选
+  ratio: '16:9',                      // 可选
+  audio: false,                       // 可选：是否带音频
+  firstFrame: { url: 'https://...' }, // 可选：首帧图
+  referenceImages: [{ url: 'https://...' }], // 可选：参考图
+})
+// 2) 轮询查询进度
+const res = await window.shanhaiPlugin.videoGenQuery({ taskId })
+// res = { status: 'pending'|'processing'|'succeeded'|'failed', progress?: 0-100, errorMessage? }
+```
+
+**② 上传素材 `uploadFile()`（拿到公网 URL 转给 videoGen 等）**：
+```ts
+const url = await window.shanhaiPlugin.uploadFile({
+  dataBase64: '...',   // 必填：文件内容 base64
+  mimeType: 'image/png',  // 可选
+  fileName: 'cover.png',  // 可选
+})
+// url = 'https://xxx.qiniu.com/...'  → 作为 videoGen 的 firstFrame/referenceImages
+```
+
+**安全规则（媒体生成能力共用，写死，插件不可突破）**：
+1. **受控透传**：六个能力都只是「插件 → 主进程 → 网关」的受控透传，插件**不直接**持有网关 apiKey/baseUrl；鉴权/限流由主进程统一处理。
+2. **素材上传凭证隔离**：`uploadFile` 的七牛凭证由主进程持有（登录账号 memberToken），插件只提供文件 base64，**拿不到 token/key**，无法越权传任意文件或改凭证。
+3. **需显式声明**：六个能力都要显式声明（**非默认放行**），install 顶层审批时一并批准。
+4. **限流**：生成类（videoGen/imageGen/tts）复用 modelCall 的频率窗口（每插件每分钟 20 次）；查询类（videoGenQuery/imageGenQuery）只读、不加限流。
+5. **危险接口隔离**：六个能力与 `model:switch` / `chat:run` / `supervisor:*` 完全隔离，插件依然物理拿不到。
 
 ---
 

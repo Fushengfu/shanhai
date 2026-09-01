@@ -223,6 +223,22 @@ export interface ShanhaiBridge {
   getPluginIcon(appId: string): Promise<string | null>
   /** 订阅动态插件窗口应用清单变化（安装/卸载时主进程广播完整清单，Dock 据此增删图标） */
   onPluginAppsChanged(cb: (apps: Array<{ appId: string; name: string; icon?: string }>) => void): () => void
+  /** 列出 Dock 上手动固定的插件应用（安装不自动上 Dock，需手动从桌面拖拽添加） */
+  listDockPlugins(): Promise<Array<{ appId: string; name: string; icon?: string }>>
+  /** 订阅 Dock 固定插件清单变化（拖拽添加/移除时主进程广播最新清单） */
+  onDockPluginsChanged(cb: (apps: Array<{ appId: string; name: string; icon?: string }>) => void): () => void
+  /** 开始一次「从桌面拖插件到 Dock」（mousedown 时触发，fire-and-forget） */
+  beginPluginDrag(appId: string): void
+  /** 取消拖拽（用户在非 Dock 区域释放，fire-and-forget） */
+  cancelPluginDrag(): void
+  /** 完成拖拽（用户在 Dock 上释放），返回最新 Dock 固定插件清单 */
+  completePluginDrag(): Promise<Array<{ appId: string; name: string; icon?: string }>>
+  /** 订阅「拖拽开始」（Dock 据此进入可接受状态） */
+  onPluginDragStart(cb: (appId: string) => void): () => void
+  /** 订阅「拖拽结束」（成功/取消都会触发，Dock 据此退出可接受状态） */
+  onPluginDragEnd(cb: () => void): () => void
+  /** 获取 Dock 窗口顶部距桌面壳底部的距离（应用菜单面板据此定位在 Dock 上方） */
+  getDockTop(): Promise<number>
   /** 桌面被点击时，把聊天/应用窗口带回桌面之上（fire-and-forget） */
   restoreAboveDesktop(): void
   /** 隐藏聊天窗口（自定义关闭按钮，聊天窗口常驻不销毁） */
@@ -479,6 +495,26 @@ const bridge: ShanhaiBridge = {
     ipcRenderer.on('plugin-apps:changed', listener)
     return () => ipcRenderer.removeListener('plugin-apps:changed', listener)
   },
+  listDockPlugins: () => ipcRenderer.invoke('dock-plugin:list'),
+  onDockPluginsChanged: (cb) => {
+    const listener = (_e: unknown, apps: Array<{ appId: string; name: string; icon?: string }>) => cb(apps)
+    ipcRenderer.on('dock-plugins:changed', listener)
+    return () => ipcRenderer.removeListener('dock-plugins:changed', listener)
+  },
+  beginPluginDrag: (appId) => ipcRenderer.send('dock-plugin:drag-start', appId),
+  cancelPluginDrag: () => ipcRenderer.send('dock-plugin:drag-cancel'),
+  completePluginDrag: () => ipcRenderer.invoke('dock-plugin:drag-complete'),
+  onPluginDragStart: (cb) => {
+    const listener = (_e: unknown, appId: string) => cb(appId)
+    ipcRenderer.on('dock-plugin-drag:start', listener)
+    return () => ipcRenderer.removeListener('dock-plugin-drag:start', listener)
+  },
+  onPluginDragEnd: (cb) => {
+    const listener = () => cb()
+    ipcRenderer.on('dock-plugin-drag:end', listener)
+    return () => ipcRenderer.removeListener('dock-plugin-drag:end', listener)
+  },
+  getDockTop: () => ipcRenderer.invoke('window:getDockTop'),
   restoreAboveDesktop: () => ipcRenderer.send('window:restoreAboveDesktop'),
   hideChatWindow: () => ipcRenderer.invoke('window:hideChat'),
   hideSelf: () => ipcRenderer.invoke('window:hideSelf'),

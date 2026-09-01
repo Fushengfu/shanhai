@@ -636,6 +636,49 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     return { prompt }
   }
 
+  /** 解包网关统一响应 { code, data, message }：
+   *  - code 存在且非 0 → 抛网关错误（带 message，避免把业务失败当成功）；
+   *  - 成功返回 data（若 data 是对象）；无 {code,data} 包装时返回原响应；非对象返回 null。
+   * 网关真实响应形如 {"code":0,"data":{"taskId":"gwv_xxx",...},"message":"success"}，字段在 data 里而非顶层。 */
+  const unwrapGatewayData = (raw: unknown): Record<string, unknown> | null => {
+    if (raw === null || raw === undefined) return null
+    if (typeof raw !== 'object') return null
+    const obj = raw as Record<string, unknown>
+    if (typeof obj.code === 'number' && obj.code !== 0) {
+      const msg = typeof obj.message === 'string' ? obj.message : `code=${obj.code}`
+      throw new Error(`网关返回错误：${msg}（code=${obj.code}）`)
+    }
+    if (obj.data !== null && obj.data !== undefined && typeof obj.data === 'object') {
+      return obj.data as Record<string, unknown>
+    }
+    return obj
+  }
+
+  /** 从响应 data 取 taskId，兼容 taskId / task_id / id 别名（gwv_ 前缀）。 */
+  const pickTaskId = (data: Record<string, unknown> | null): string => {
+    if (!data) return ''
+    for (const k of ['taskId', 'task_id', 'id'] as const) {
+      const v = data[k]
+      if (typeof v === 'string' && v.trim()) return v
+    }
+    return ''
+  }
+
+  /** 从 data 按候选字段名取第一个存在的非空字符串（用于兼容网关字段别名）。 */
+  const pickStr = (data: Record<string, unknown> | null, keys: readonly string[]): string | undefined => {
+    if (!data) return undefined
+    for (const k of keys) {
+      const v = data[k]
+      if (typeof v === 'string' && v.trim()) return v
+    }
+    return undefined
+  }
+
+  /** 视频生成终态集合（大写）：命中即任务已结束，可补调结果接口拿 videoUrl。 */
+  const VIDEO_TERMINAL_STATUSES = new Set(['SUCCEEDED', 'COMPLETED', 'FAILED', 'ERROR', 'FAIL', 'CANCELLED', 'CANCELED'])
+  /** 图片生成终态集合（大写）：命中即任务已结束，可补调结果接口拿 imageUrl。 */
+  const IMAGE_TERMINAL_STATUSES = new Set(['SUCCEEDED', 'COMPLETED', 'FAILED', 'ERROR', 'FAIL', 'CANCELLED', 'CANCELED'])
+
   return {
     kernel: ctx.kernel,
     session: ctx.sessionRef,
@@ -1300,38 +1343,116 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
 
     async invokeVideoGen(appId, input) {
       // 视频生成提交：透传网关 POST /api/v1/video/generations（真实接口已存在），返回 { taskId }。鉴权复用网关 apiKey，限流复用 modelCall 窗口。
+      // 网关统一响应 { code, data:{ taskId, status, ... }, message }，taskId 在 data.taskId（gwv_ 前缀），非顶层——必须先解包再取。
       preparePluginMediaGen(appId, input)
-      const res = (await gatewayRequest('/api/v1/video/generations', { body: input })) as { taskId?: string } | null
-      if (!res || typeof res.taskId !== 'string') {
-        throw new Error('视频生成提交失败：网关未返回 taskId')
+      const raw = await gatewayRequest('/api/v1/video/generations', { body: input })
+      const data = unwrapGatewayData(raw)
+      const taskId = pickTaskId(data)
+      if (!taskId) {
+        throw new Error(`视频生成提交失败：网关未返回 taskId（响应：${JSON.stringify(raw).slice(0, 300)}）`)
       }
-      return { taskId: res.taskId }
+      return { taskId }
     },
 
     async invokeVideoGenQuery(appId, input) {
-      // 视频生成查询：透传网关 GET /api/v1/video/generations/{taskId}（真实接口已存在）。查询只读，不加限流。
+      // 视频生成查询：先调状态接口 GET /api/v1/video/generations/{taskId} 拿 status/progress。
+      // 网关状态接口 data 里不含视频链接（SUCCEEDED 时也没有）；链接只在结果接口
+      // GET /api/v1/video/generations/{taskId}/result 里返回。结果接口可能同时给两个链接：
+      //   - resultUrl / result_url：七牛持久链接（优先用，不会 24h 过期）
+      //   - videoUrlRaw / sourceUrl / video_url / videoUrl：万相临时链接（兜底）
+      // 因此：到终态（SUCCEEDED/FAILED 等）时补调结果接口，把持久/临时两个链接都透传回来。
       const taskId = typeof (input as { taskId?: unknown })?.taskId === 'string' ? (input as { taskId: string }).taskId.trim() : ''
       if (!taskId) throw new Error('videoGenQuery 缺少 taskId 参数')
-      return (await gatewayRequest(`/api/v1/video/generations/${encodeURIComponent(taskId)}`)) as { status: string; progress?: number; errorMessage?: string }
+      // 网关统一响应 { code, data:{ status, ... }, message }，字段均在 data 里——解包后再取。
+      const raw = await gatewayRequest(`/api/v1/video/generations/${encodeURIComponent(taskId)}`)
+      const data = unwrapGatewayData(raw) ?? {}
+      const status = typeof data.status === 'string' ? data.status : ''
+      // 状态接口可能直接给链接（通常不含），先按兼容别名取一遍（七牛持久 + 万相临时）
+      let resultUrl = pickStr(data, ['resultUrl', 'result_url'])
+      let videoUrlRaw = pickStr(data, ['videoUrlRaw', 'sourceUrl', 'video_url', 'videoUrl', 'videoPath', 'url'])
+      // 终态：补调结果接口，拿持久链接 resultUrl + 临时链接 videoUrlRaw（兼容网关未改：结果接口可能只有单字段 videoUrl=万相临时链接）
+      if (VIDEO_TERMINAL_STATUSES.has(status.toUpperCase())) {
+        try {
+          const resultRaw = await gatewayRequest(`/api/v1/video/generations/${encodeURIComponent(taskId)}/result`)
+          const resultData = unwrapGatewayData(resultRaw) ?? {}
+          const rResultUrl = pickStr(resultData, ['resultUrl', 'result_url'])
+          const rVideoUrlRaw = pickStr(resultData, ['videoUrlRaw', 'sourceUrl', 'video_url', 'videoUrl', 'videoPath', 'url'])
+          if (rResultUrl) resultUrl = rResultUrl
+          if (rVideoUrlRaw) videoUrlRaw = rVideoUrlRaw
+        } catch {
+          // 结果接口失败不阻断查询，仅影响链接字段（保留状态接口已拿到的 status/progress）
+        }
+      }
+      // videoUrl：优先七牛持久链接，空则回退万相临时链接（保留插件已在用的字段，向前兼容）
+      const videoUrl = resultUrl ?? videoUrlRaw
+      return {
+        status,
+        progress: typeof data.progress === 'number' ? data.progress : undefined,
+        videoUrl,
+        resultUrl,
+        videoUrlRaw,
+        errorMessage: typeof data.error === 'string' ? data.error : typeof data.errorMessage === 'string' ? data.errorMessage : undefined,
+      }
     },
 
     async invokeImageGen(appId, input) {
-      // 图片生成提交：透传网关 POST /api/v1/image/generations（网关尚未实现，桥已预留）。
+      // 图片生成提交：透传网关 POST /api/v1/image/generations，返回 { taskId }。鉴权复用网关 apiKey，限流复用 modelCall 窗口。
+      // 网关统一响应 { code, data:{ taskId, status, ... }, message }，taskId 在 data.taskId（gwi_ 前缀），非顶层——必须先解包再取。
       preparePluginMediaGen(appId, input)
-      return gatewayRequest('/api/v1/image/generations', { body: input })
+      const raw = await gatewayRequest('/api/v1/image/generations', { body: input })
+      const data = unwrapGatewayData(raw)
+      const taskId = pickTaskId(data)
+      if (!taskId) {
+        throw new Error(`图片生成提交失败：网关未返回 taskId（响应：${JSON.stringify(raw).slice(0, 300)}）`)
+      }
+      return { taskId }
     },
 
     async invokeImageGenQuery(appId, input) {
-      // 图片生成查询：透传网关 GET /api/v1/image/generations/{taskId}（网关尚未实现，桥已预留）。
+      // 图片生成查询：先调状态接口 GET /api/v1/image/generations/{taskId} 拿 status/progress。
+      // 网关状态接口 data 里不含图地址（SUCCEEDED 时也没有）；图地址只在结果接口
+      // GET /api/v1/image/generations/{taskId}/result 里返回。结果接口可能同时给两个链接：
+      //   - resultUrl / result_url：七牛持久链接（优先用，不会 24h 过期）
+      //   - sourceUrl / image_url / imageUrl / url：上游临时链接（兜底）
+      // 因此：到终态（SUCCEEDED/FAILED 等）时补调结果接口，把持久/临时两个链接都透传回来。
       const taskId = typeof (input as { taskId?: unknown })?.taskId === 'string' ? (input as { taskId: string }).taskId.trim() : ''
       if (!taskId) throw new Error('imageGenQuery 缺少 taskId 参数')
-      return gatewayRequest(`/api/v1/image/generations/${encodeURIComponent(taskId)}`)
+      // 网关统一响应 { code, data:{ status, ... }, message }，字段均在 data 里——解包后再取。
+      const raw = await gatewayRequest(`/api/v1/image/generations/${encodeURIComponent(taskId)}`)
+      const data = unwrapGatewayData(raw) ?? {}
+      const status = typeof data.status === 'string' ? data.status : ''
+      // 状态接口可能直接给链接（通常不含），先按兼容别名取一遍（七牛持久 + 上游临时）
+      let resultUrl = pickStr(data, ['resultUrl', 'result_url'])
+      let sourceUrl = pickStr(data, ['sourceUrl', 'image_url', 'imageUrl', 'url'])
+      // 终态：补调结果接口，拿持久链接 resultUrl + 临时链接 sourceUrl（兼容网关未改：结果接口可能只有单字段 imageUrl=临时链接）
+      if (IMAGE_TERMINAL_STATUSES.has(status.toUpperCase())) {
+        try {
+          const resultRaw = await gatewayRequest(`/api/v1/image/generations/${encodeURIComponent(taskId)}/result`)
+          const resultData = unwrapGatewayData(resultRaw) ?? {}
+          const rResultUrl = pickStr(resultData, ['resultUrl', 'result_url'])
+          const rSourceUrl = pickStr(resultData, ['sourceUrl', 'image_url', 'imageUrl', 'url'])
+          if (rResultUrl) resultUrl = rResultUrl
+          if (rSourceUrl) sourceUrl = rSourceUrl
+        } catch {
+          // 结果接口失败不阻断查询，仅影响链接字段（保留状态接口已拿到的 status/progress）
+        }
+      }
+      // imageUrl：优先七牛持久链接，空则回退上游临时链接（保留插件已在用的字段，向前兼容）
+      const imageUrl = resultUrl ?? sourceUrl
+      return {
+        status,
+        progress: typeof data.progress === 'number' ? data.progress : undefined,
+        imageUrl,
+        resultUrl,
+        sourceUrl,
+        errorMessage: typeof data.error === 'string' ? data.error : typeof data.errorMessage === 'string' ? data.errorMessage : undefined,
+      }
     },
 
     async invokeTts(appId, input) {
-      // 语音合成提交：透传网关 POST /api/v1/audio/tts（网关尚未实现，桥已预留）。
+      // 语音合成提交：透传网关 POST /api/v1/audio/tts（网关尚未实现，桥已预留）。解包 { code, data } 统一返回 data。
       preparePluginMediaGen(appId, input)
-      return gatewayRequest('/api/v1/audio/tts', { body: input })
+      return unwrapGatewayData(await gatewayRequest('/api/v1/audio/tts', { body: input }))
     },
 
     onClientRunRequest(cb) {
