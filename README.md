@@ -4,6 +4,11 @@
 
 山海是一个运行在 macOS 桌面的智能体应用：多专家编排、真实工具执行、会话级隔离、可自我升级。后端内核自研（提供 `ctx`/`inject`/`effect`/`slots`/`fiber` 语义），前端用 Electron + React 渲染，另配 Flutter 移动端。
 
+## 下载
+
+- [🪟 Windows 版下载](https://store.bjctykj.com/app-versions/Windows/1788325471_Shanhai-0.6.0-x64.exe)（x64）
+- [🍎 macOS 版下载](https://store.bjctykj.com/app-versions/macOS/1788325602_Shanhai-0.6.0-arm64.dmg)（Apple Silicon / arm64）
+
 ## 功能
 
 - **账号密码登录**：对接会员网关 `<YOUR_GATEWAY_DOMAIN>`（密码 SHA-256 加密），登录后拉取网关模型列表，也支持接入自定义 OpenAI 兼容端点
