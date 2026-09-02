@@ -229,3 +229,7 @@ cd apps/mobile && flutter build apk --release   # 打包 Android release APK
 - [山海开发计划](docs/山海开发计划.md)
 - [智能体设计文档](docs/智能体设计文档.md)
 - [插件协议规范](docs/plugin-protocol.md)（插件开发权威契约，AI 开发插件前必读）
+
+## 开源许可
+
+本项目采用 [MIT License](LICENSE) 开源协议，允许自由使用、修改、复制与分发，仅需保留版权声明。详见根目录 [LICENSE](LICENSE) 文件。
