@@ -39,6 +39,12 @@
   --tint-red: #fff2f0;
   --tint-red-strong: #ffccc7;
   --tint-green: #f6ffed;
+  /* 窗口可见描边：内容窗口（chat/supervisor/app）在无系统阴影的透明窗口上，用描边区分窗口边界 */
+  --window-border: #b8b8b8;
+  /* 标题栏窗口控制按钮（对齐文件管理器插件标准，独立变量避免波及全局语义色） */
+  --titlebar-btn-color: #666a73;
+  --titlebar-btn-hover-bg: #e9ebee;
+  --titlebar-btn-danger: #dc2626;
 }
 
 /* 暗色 */
@@ -75,6 +81,11 @@ html[data-theme='dark'] {
   --tint-red: #332022;
   --tint-red-strong: #4a2426;
   --tint-green: #1f2e1f;
+  --window-border: #4d4d50;
+  /* 标题栏窗口控制按钮（暗色） */
+  --titlebar-btn-color: #b0b3ba;
+  --titlebar-btn-hover-bg: #333438;
+  --titlebar-btn-danger: #f85149;
 }
 
 html,
@@ -102,6 +113,23 @@ html[data-platform='win32'][data-rounded='true'] #root {
   background: transparent;
   border-radius: 16px;
   overflow: hidden;
+}
+
+/* 内容窗口肉眼可见的边界线：Windows 下实例窗口为 frameless + transparent + hasShadow:false，
+   多窗口叠放/并排时边界糊成一片白。给 chat / supervisor / app 三种内容窗口画一圈随主题变色的描边。
+   用 body::after 覆盖层画在最上层、pointer-events:none，不占布局、不遮内容、不挡标题栏拖拽；
+   desktop(全屏桌面壳) / dock / supervisor-bubble(60×60 悬浮图标) 是背景/悬浮元素，不加描边。 */
+html[data-platform='win32'][data-window='chat'] body::after,
+html[data-platform='win32'][data-window='supervisor'] body::after,
+html[data-platform='win32'][data-window='app'] body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  border: 1px solid var(--window-border);
+  border-radius: 16px;
+  pointer-events: none;
+  z-index: 2147483647;
+  box-sizing: border-box;
 }
 
 /* 全局动画 keyframes：所有窗口（聊天 / 会话管家 / 应用等）共享。

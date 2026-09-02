@@ -54,3 +54,26 @@ export interface Capability {
   provide?: string[]
   consume?: string[]
 }
+
+/**
+ * 能力风险等级（阶段2 能力级审批，对齐 ToolContract.riskLevel 的三档，
+ * 但作用到「跨插件能力调用」这一层，与「会话级审批策略」独立）。
+ * - read-only：只读（文件读 / 网络 GET）——默认放行
+ * - write：写（文件写 / 网络 POST）——按 ask 策略审批
+ * - destructive：破坏性（浏览器 DOM 操作 / 任意页注入 / 发消息）——逐次强制审批
+ */
+export type CapabilityRisk = 'read-only' | 'write' | 'destructive'
+
+/**
+ * 能力元数据（系统插件在 ctx.provideCapability 注册能力时声明）。
+ * 只有声明了元数据的能力调用才走「能力级审批」；普通 `ctx.provide` 注册的服务无元数据、
+ * 保持原有路由行为（不经审批），避免误伤现网插件。
+ */
+export interface CapabilityMeta {
+  /** 能力名（如 network:http / filesystem） */
+  name: string
+  /** 风险等级 */
+  risk: CapabilityRisk
+  /** 显式审批策略（缺省按 risk 推断：read-only→allow、write→ask、destructive→always） */
+  approval?: 'allow' | 'ask' | 'always'
+}

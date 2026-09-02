@@ -18,10 +18,10 @@ import type {
   ToolTrace,
 } from './types'
 import { EMPTY_SESSION } from './types'
-import { formatBytes, readFileAsDataUrl } from './components/ui'
+import { formatBytes } from './components/ui'
 import { SlotView } from './slots'
 import { UIContext, type UIContextValue } from './ui-context'
-import { patchUiStore, useUiStore, getUiStoreSnapshot } from './store-client'
+import { patchUiStore, useUiStoreSelector, getUiStoreSnapshot } from './store-client'
 import { AiOrb } from './components/AiOrb'
 import './plugins/WelcomePlugin'
 import './plugins/StatusbarPlugin'
@@ -33,31 +33,23 @@ import './plugins/ChatPlugin'
 import './plugins/ComposerPlugin'
 import './plugins/TerminalPlugin'
 
-/** PCM(Float32 16kHz) → 16-bit 单声道 PCM 的 base64（参考 taco：网关 ASR 端点 audioData 只收 PCM base64，非 WAV） */
-function pcmToBase64(pcm: Float32Array): string {
-  const int16 = new Int16Array(pcm.length)
-  for (let i = 0; i < pcm.length; i++) {
-    const s = Math.max(-1, Math.min(1, pcm[i] ?? 0))
-    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff
-  }
-  const bytes = new Uint8Array(int16.buffer)
-  let bin = ''
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i] ?? 0)
-  return btoa(bin)
-}
-
-/** 计算一帧 PCM 的均方根能量（RMS），用于语音活动检测（VAD）判断有音/静音 */
-function audioRms(frame: Float32Array): number {
-  let sum = 0
-  for (let i = 0; i < frame.length; i++) {
-    const v = frame[i] ?? 0
-    sum += v * v
-  }
-  return Math.sqrt(sum / frame.length)
-}
-
 export function App() {
-  const ui = useUiStore()
+  const ui = useUiStoreSelector((s) => ({
+    loggedIn: s.loggedIn,
+    username: s.username,
+    loginOpen: s.loginOpen,
+    currentSessionId: s.currentSessionId,
+    sessions: s.sessions,
+    sessionMap: s.sessionMap,
+    models: s.models,
+    selectedModel: s.selectedModel,
+    currentTokenStats: s.tokenStatsBySession[s.currentSessionId] ?? null,
+    curApproval: (s.approvalQueues[s.currentSessionId] ?? [])[0] ?? null,
+    curAsk: (s.askQueues[s.currentSessionId] ?? [])[0] ?? null,
+    browserWindows: s.browserWindows,
+    approvalPolicy: s.approvalPolicy,
+    retryPrompt: s.retryPrompt,
+  }))
   const loggedIn = ui.loggedIn
   const username = ui.username
   const sessions = ui.sessions
@@ -65,9 +57,6 @@ export function App() {
   const sessionMap = ui.sessionMap
   const models = ui.models
   const selectedModel = ui.selectedModel
-  const tokenStatsBySession = ui.tokenStatsBySession
-  const approvalQueues = ui.approvalQueues
-  const askQueues = ui.askQueues
   const browserWindows = ui.browserWindows
   const approvalPolicy = ui.approvalPolicy
   const retryPrompt = ui.retryPrompt
@@ -79,12 +68,12 @@ export function App() {
   const setSessions = (list: SessionListItem[]): void => patchUiStore({ sessions: list })
   const setCurrentSessionId = (id: string): void => patchUiStore({ currentSessionId: id })
   const setModels = (list: GatewayModel[]): void => patchUiStore({ models: list })
-  const setSelectedModel = (id: string): void => patchUiStore({ selectedModel: id })
+  const setSelectedModel = useCallback((id: string): void => patchUiStore({ selectedModel: id }), [])
   const setTokenStatsBySession = (v: Record<string, TokenSnapshot>): void => patchUiStore({ tokenStatsBySession: v })
   const setApprovalQueues = (v: Record<string, ApprovalRequest[]>): void => patchUiStore({ approvalQueues: v })
   const setAskQueues = (v: Record<string, AskRequest[]>): void => patchUiStore({ askQueues: v })
   const setBrowserWindows = (v: BrowserWindowItem[]): void => patchUiStore({ browserWindows: v })
-  const setApprovalPolicyState = (p: 'ask' | 'workdir' | 'never'): void => patchUiStore({ approvalPolicy: p })
+  const setApprovalPolicyState = useCallback((p: 'ask' | 'workdir' | 'never'): void => patchUiStore({ approvalPolicy: p }), [])
   const setRetryPrompt = (v: RetryPrompt | null): void => patchUiStore({ retryPrompt: v })
 
   // 登录弹窗开关已上移到共享 store（跨窗口：Dock 点击「登录」→ patchUiStore({loginOpen:true}) → 聊天窗口据此弹出）
@@ -126,7 +115,6 @@ export function App() {
     })
   }, [sessions, sessionMap])
 
-  const [modelMenuOpen, setModelMenuOpen] = useState(false)
   const [customModelDrawerOpen, setCustomModelDrawerOpen] = useState(false)
   const [tracePanelOpen, setTracePanelOpen] = useState(false)
   const [memoryPanelOpen, setMemoryPanelOpen] = useState(false)
@@ -134,32 +122,26 @@ export function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null)
   const [editingTitle, setEditingTitle] = useState('')
-  const modelMenuRef = useRef<HTMLDivElement>(null)
-  // 附件（图片/音频/视频/文件），本地状态（不跨窗口共享）
-  const [attachments, setAttachments] = useState<AttachmentItem[]>([])
-  const fileRef = useRef<HTMLInputElement>(null)
   // 图片预览：点击输入框/聊天历史里的图片放大查看（遮罩层，点击或 Esc 关闭）
   const [previewImage, setPreviewImage] = useState<string | null>(null)
   // 跟踪当前会话 id（供审批回调等闭包读取最新值，避免捕获旧 state）
   const currentSessionIdRef = useRef('')
   // 每个会话的输入框草稿（输入到一半切换会话，切回来草稿不丢）
   const draftRef = useRef<Record<string, { input: string; attachments: AttachmentItem[] }>>({})
-  const [input, setInput] = useState('')
-  // 输入法组合中标记：中文等 IME 用回车选词时不应触发发送（keydown 时 isComposing 为 true）
-  const isComposingRef = useRef(false)
-  // 语音输入：录音中标记 + 录音句柄（AudioContext 采 PCM → WAV，交后端 LLM 网关 AI 识别，macOS Speech 作为降级兜底）
-  const [recording, setRecording] = useState(false)
-  const mediaRecorderRef = useRef<{ stop: () => void } | null>(null)
-  // 语音输入轻提示（如「未检测到有效语音」），非空时短暂显示后自动清除
-  const [voiceNotice, setVoiceNotice] = useState('')
-  useEffect(() => {
-    if (!voiceNotice) return
-    const t = setTimeout(() => setVoiceNotice(''), 3200)
-    return () => clearTimeout(t)
-  }, [voiceNotice])
-  // 安全模式（审批策略）：ask=危险操作每次询问，workdir=工作目录内免审批，never=从不询问直接执行
-  const [approvalMenuOpen, setApprovalMenuOpen] = useState(false)
-  const approvalMenuRef = useRef<HTMLDivElement>(null)
+  // —— 输入态下沉：input / attachments 等高频输入态已移入 ChatComposer 组件，这里只保留 ——
+  // ① composerRef：当前输入的真值缓存（App 的 send 从中读取，ChatComposer 每次 render 同步）；
+  // ② composerSeed：外部重置信号（草稿恢复 / 新建清空 / 发送清空），seq 递增触发 ChatComposer 重同步自身输入态。
+  const composerRef = useRef<{ input: string; attachments: AttachmentItem[] }>({ input: '', attachments: [] })
+  const [composerSeed, setComposerSeed] = useState({ seq: 0, input: '', attachments: [] as AttachmentItem[] })
+  // 外部重置 Composer 输入态（草稿恢复 / 新建清空 / 发送清空）
+  const resetComposer = useCallback((input: string, attachments: AttachmentItem[]) => {
+    composerRef.current = { input, attachments }
+    setComposerSeed((prev) => ({ seq: prev.seq + 1, input, attachments }))
+  }, [])
+  /** 欢迎页建议点击：把建议文本填入输入框（保留现有附件），触发 ChatComposer 重同步 */
+  const setComposerInput = useCallback((text: string) => {
+    resetComposer(text, composerRef.current.attachments)
+  }, [resetComposer])
   // 消息队列：任务执行中提交的新消息进入队列，任务完成后自动执行（队列模式）；queueId 用于出队时定位消息流里的「排队中」气泡
   const pendingQueue = useRef<Record<string, Array<{ queueId: string; text: string; parts: ContentPart[]; images: string[] }>>>({})
   // 当前会话排队中的消息数（UI 提示「排队中 N 条」）
@@ -186,9 +168,9 @@ export function App() {
   // 「继续执行」入口状态：从当前会话读取（会话级隔离，避免多会话/后台任务下按钮串扰）
   const incompleteTurn = cur.incompleteTurn
   // 当前会话的待审批请求（会话级隔离：只显示当前会话队列的头一个，并行会话互不串扰）
-  const curApproval = (approvalQueues[currentSessionId] ?? [])[0] ?? null
+  const curApproval = ui.curApproval
   // 当前会话的待回答提问（会话级隔离：只显示当前会话队列的头一个）
-  const curAsk = (askQueues[currentSessionId] ?? [])[0] ?? null
+  const curAsk = ui.curAsk
   // 当前会话的 browser 半投递审批请求
   const curClientRunRequest = (clientRunRequests[currentSessionId] ?? [])[0] ?? null
 
@@ -288,30 +270,6 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [patchSession, refreshModelsList])
 
-  // 模型下拉：点击窗口其他位置时关闭弹窗
-  useEffect(() => {
-    if (!modelMenuOpen) return
-    function onDown(e: MouseEvent): void {
-      if (modelMenuRef.current && !modelMenuRef.current.contains(e.target as Node)) {
-        setModelMenuOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', onDown)
-    return () => document.removeEventListener('mousedown', onDown)
-  }, [modelMenuOpen])
-
-  // 安全模式下拉：点击窗口其他位置时关闭
-  useEffect(() => {
-    if (!approvalMenuOpen) return
-    function onDown(e: MouseEvent): void {
-      if (approvalMenuRef.current && !approvalMenuRef.current.contains(e.target as Node)) {
-        setApprovalMenuOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', onDown)
-    return () => document.removeEventListener('mousedown', onDown)
-  }, [approvalMenuOpen])
-
   async function refreshSessions(): Promise<void> {
     const list = (await window.shanhai?.listSessions()) ?? []
     setSessions(list)
@@ -343,21 +301,16 @@ export function App() {
     }
   }
 
-  async function saveWorkdir(wd: string): Promise<void> {
-    const sid = currentSessionId
-    if (!sid || !wd) return
-    await window.shanhai?.setSessionWorkdir(sid, wd)
-    setSessions(getUiStoreSnapshot().sessions.map((s) => (s.id === sid ? { ...s, workDir: wd } : s)))
-  }
-
-  async function pickWorkdir(): Promise<void> {
-    const sid = currentSessionId
+  const pickWorkdir = useCallback(async (): Promise<void> => {
+    const sid = currentSessionIdRef.current
     if (!sid) return
-    const current = sessions.find((s) => s.id === sid)?.workDir ?? ''
+    const current = getUiStoreSnapshot().sessions.find((s) => s.id === sid)?.workDir ?? ''
     const picked = await window.shanhai?.selectDirectory(current)
     if (!picked) return
-    await saveWorkdir(picked)
-  }
+    await window.shanhai?.setSessionWorkdir(sid, picked)
+    const list = getUiStoreSnapshot().sessions.map((s) => (s.id === sid ? { ...s, workDir: picked } : s))
+    patchUiStore({ sessions: list })
+  }, [])
 
   /** 刷新当前会话的浏览器窗口列表（会话级隔离，agent 打开/关闭窗口后同步到标签区） */
   async function refreshBrowserWindows(sessionId?: string): Promise<void> {
@@ -378,17 +331,16 @@ export function App() {
   }
 
   async function switchToSession(id: string): Promise<void> {
-    // 保存当前会话输入框草稿，切回来不丢
+    // 保存当前会话输入框草稿，切回来不丢（从 composerRef 读当前输入真值）
     if (currentSessionId) {
-      draftRef.current[currentSessionId] = { input, attachments }
+      draftRef.current[currentSessionId] = composerRef.current
     }
     setCurrentSessionId(id)
     currentSessionIdRef.current = id
     // 终端面板开关已会话级隔离（SessionUIState.terminalPanelOpen），切会话时 cur 自动切换，无需手动收起
-    // 恢复目标会话草稿（若有），否则清空输入框
+    // 恢复目标会话草稿（若有），否则清空输入框（通过 resetComposer 触发 ChatComposer 重同步）
     const draft = draftRef.current[id]
-    setInput(draft?.input ?? '')
-    setAttachments(draft?.attachments ?? [])
+    resetComposer(draft?.input ?? '', draft?.attachments ?? [])
     await window.shanhai?.switchSession(id)
     // 会话级审批策略：切到该会话时同步其安全模式到 UI
     void window.shanhai?.getApprovalPolicy().then((p) => setApprovalPolicyState(p)).catch(() => undefined)
@@ -424,14 +376,13 @@ export function App() {
     if (!id) return
     loadedSessions.current.add(id)
     patchSession(id, { items: [], streaming: '', streamingReasoning: '', busy: false })
-    // 保存当前会话草稿，新建会话输入框清空
+    // 保存当前会话草稿，新建会话输入框清空（从 composerRef 读数，resetComposer 触发 ChatComposer 清空）
     if (currentSessionId) {
-      draftRef.current[currentSessionId] = { input, attachments }
+      draftRef.current[currentSessionId] = composerRef.current
     }
     setCurrentSessionId(id)
     currentSessionIdRef.current = id
-    setInput('')
-    setAttachments([])
+    resetComposer('', [])
     await refreshSessions()
   }
 
@@ -470,7 +421,6 @@ export function App() {
       setModels([...getUiStoreSnapshot().models, m])
       setSelectedModel(m.id)
       await window.shanhai?.switchModel(m.id)
-      setModelMenuOpen(false)
     }
   }
 
@@ -488,17 +438,16 @@ export function App() {
   }
 
   /** 切换当前模型（会话级），供模型下拉框与自定义模型面板共用 */
-  function selectModel(id: string): void {
+  const selectModel = useCallback((id: string): void => {
     setSelectedModel(id)
     void window.shanhai?.switchModel(id)
-  }
+  }, [setSelectedModel])
 
   /** 切换安全模式（审批策略）并持久化 */
-  function switchApprovalPolicy(policy: 'ask' | 'workdir' | 'never'): void {
+  const switchApprovalPolicy = useCallback((policy: 'ask' | 'workdir' | 'never'): void => {
     setApprovalPolicyState(policy)
-    setApprovalMenuOpen(false)
     void window.shanhai?.setApprovalPolicy(policy)
-  }
+  }, [setApprovalPolicyState])
 
   /** 任务完成自动语音播报：受「语音播报」开关控制，清洗 markdown 符号后截断播报，避免 TTS 读出 ``` 等符号；失败静默忽略。
    *  播报期间置 isSpeaking=true，聊天窗口显示 3D AI 特效；播完（无论成败）复位。 */
@@ -596,10 +545,15 @@ export function App() {
     }
   }
 
-  async function send(): Promise<void> {
-    const sid = currentSessionId
+  /** doRun 的最新引用（供 useCallback 化的 send 调用，避免闭包捕获旧 doRun） */
+  const doRunRef = useRef<(sid: string, text: string, parts: ContentPart[], images: string[], opts?: { queueId?: string }) => Promise<void>>(doRun)
+  doRunRef.current = doRun
+
+  const send = useCallback(async (): Promise<void> => {
+    const sid = currentSessionIdRef.current
     if (!sid) return
-    const text = input.trim()
+    const { input: inputText, attachments } = composerRef.current
+    const text = inputText.trim()
     if (!text && attachments.length === 0) return
     // 图片必须已上传（拿到 https 链接）才能发送：上传中/上传失败都阻止，绝不用 base64 data URL（会撑爆上下文）
     if (attachments.some((a) => a.type === 'image' && a.uploadStatus !== 'done')) return
@@ -638,10 +592,9 @@ export function App() {
     }
     // 文件说明拼进消息文本（agent 据此 read_file 读取工作目录里的文件）
     const finalText = fileNotes.length > 0 ? `${text}${text ? '\n\n' : ''}[已附加文件]\n${fileNotes.join('\n')}` : text
-    setInput('')
-    setAttachments([])
+    resetComposer('', [])
     delete draftRef.current[sid]
-    if (cur.busy) {
+    if (getUiStoreSnapshot().sessionMap[sid]?.busy ?? false) {
       const q = pendingQueue.current[sid] ?? []
       let mode: 'queue' | 'insert' = 'queue'
       try {
@@ -668,13 +621,12 @@ export function App() {
       setQueueCount((pendingQueue.current[sid] ?? []).length)
       return
     }
-    void doRun(sid, finalText, parts, images)
-  }
+    void doRunRef.current(sid, finalText, parts, images)
+  }, [patchSession, resetComposer, setQueueCount])
 
   async function respondApproval(outcome: 'allowed-once' | 'rejected'): Promise<void> {
     // 只响应当前会话队列的头一个待审批请求（会话级隔离）
-    const sid = currentSessionId
-    const req = (approvalQueues[sid] ?? [])[0]
+    const req = curApproval
     if (!req) return
     await window.shanhai?.respondApproval(outcome, req.id)
     // 弹窗关闭由 runtime 的 onApprovalResolved 事件统一驱动（ui-store removeApprovalRequest），
@@ -683,8 +635,7 @@ export function App() {
 
   /** 回答 AI 的提问（只响应当前会话队列的头一个，会话级隔离） */
   async function respondAsk(answer: string): Promise<void> {
-    const sid = currentSessionId
-    const req = (askQueues[sid] ?? [])[0]
+    const req = curAsk
     if (!req) return
     await window.shanhai?.respondAsk(req.id, answer)
     // 弹窗关闭由 runtime 的 onAskResolved 事件统一驱动（ui-store removeAskRequest），
@@ -693,8 +644,7 @@ export function App() {
 
   /** 取消 AI 的提问/选择（只取消当前会话队列的头一个，会话级隔离；resolve 为取消标记而非把取消当答案） */
   async function cancelAsk(): Promise<void> {
-    const sid = currentSessionId
-    const req = (askQueues[sid] ?? [])[0]
+    const req = curAsk
     if (!req) return
     await window.shanhai?.cancelAsk(req.id)
     // 弹窗关闭由 runtime 的 onAskResolved 事件统一驱动（ui-store removeAskRequest），
@@ -839,196 +789,15 @@ export function App() {
     patchSession(sid, { incompleteTurn: incomplete })
   }
 
-  /** 语音输入：点击开始录音，再次点击停止；录音结束交后端 LLM 网关 AI 识别，结果填入输入框 */
-  async function toggleRecording(): Promise<void> {
-    if (recording) {
-      mediaRecorderRef.current?.stop()
-      return
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      // 参考 taco：AudioContext 采 PCM（16kHz 单声道），而非 MediaRecorder 的 webm。
-      // 网关 ASR 端点 audioData 只收 PCM(Int16 16kHz) 的 base64，16kHz 16bit 是 ASR 标准输入。
-      const audioCtx = new AudioContext({ sampleRate: 16000 })
-      const source = audioCtx.createMediaStreamSource(stream)
-      const processor = audioCtx.createScriptProcessor(4096, 1, 1)
-      const chunks: Float32Array[] = []
-      // 语音活动检测（VAD）：估计噪声底、跟踪有语音帧与连续静音帧，
-      // 用于识别「有效录音」，并在连续静音 ≥ 3 秒时自动停止并提交前面有效部分
-      const FRAME_SECONDS = 4096 / 16000 // 每帧约 0.256s
-      const TRAILING_SILENCE_FRAMES = 12 // 连续静音 ≥ 约 3 秒（12 帧）触发自动停止/截断
-      const NOISE_ESTIMATE_FRAMES = 6 // 前 6 帧（约 1.5s）用均值快速估计噪声底，之后转慢速滑动平均
-      let noiseFloor = 0
-      let totalFrames = 0
-      let lastVoiceFrame = -1 // 最后一个有语音帧的索引
-      let consecutiveSilenceFrames = 0 // 当前连续静音帧数
-      let stopped = false
-
-      const finishRecording = (trigger: 'manual' | 'auto'): void => {
-        if (stopped) return
-        stopped = true
-        try {
-          processor.disconnect()
-          source.disconnect()
-          stream.getTracks().forEach((t) => t.stop())
-        } catch {
-          // 忽略断开异常
-        }
-        void audioCtx.close().catch(() => undefined)
-        void (async () => {
-          if (chunks.length === 0) {
-            setRecording(false)
-            return
-          }
-          try {
-            // 全程未检测到有效语音：提示，不提交识别
-            if (lastVoiceFrame < 0) {
-              setVoiceNotice('未检测到有效语音，请重试')
-              return
-            }
-            // 有效语音截止到最后一帧；其后的静音在自动停止/尾部静音过长时被裁掉
-            let keepFrames = totalFrames
-            if (trigger === 'auto') {
-              keepFrames = lastVoiceFrame + 1
-              setVoiceNotice(`检测到约 ${(consecutiveSilenceFrames * FRAME_SECONDS).toFixed(1)} 秒静音，已自动结束并提交有效语音`)
-            } else if (totalFrames - 1 - lastVoiceFrame >= TRAILING_SILENCE_FRAMES) {
-              keepFrames = lastVoiceFrame + 1
-              setVoiceNotice(`已自动截断结尾 ${((totalFrames - keepFrames) * FRAME_SECONDS).toFixed(1)} 秒静音`)
-            }
-            let total = 0
-            for (let i = 0; i < keepFrames; i++) total += chunks[i]?.length ?? 0
-            const pcm = new Float32Array(total)
-            let off = 0
-            for (let i = 0; i < keepFrames; i++) {
-              const c = chunks[i]
-              if (c) {
-                pcm.set(c, off)
-                off += c.length
-              }
-            }
-            const pcmBase64 = pcmToBase64(pcm)
-            const text = (await window.shanhai?.transcribeAudio(pcmBase64)) ?? ''
-            if (text.trim()) setInput((prev) => (prev ? `${prev}${text.trim()}` : text.trim()))
-          } catch (err) {
-            console.error('语音识别失败', err)
-          } finally {
-            setRecording(false)
-          }
-        })()
-      }
-
-      processor.onaudioprocess = (e) => {
-        // ScriptProcessor 复用内部 buffer，必须拷贝，否则后续帧覆盖前面数据
-        const frame = new Float32Array(e.inputBuffer.getChannelData(0))
-        chunks.push(frame)
-        const r = audioRms(frame)
-        // 有语音：RMS 超过噪声底阈值；开头噪声底尚未稳定时靠绝对阈值 0.012 兜底，不吞开头语音
-        if (r > Math.max(noiseFloor * 3, 0.012)) {
-          lastVoiceFrame = totalFrames
-          consecutiveSilenceFrames = 0
-        } else {
-          // 静音帧更新噪声底（前几帧快速均值估计，之后慢速滑动平均）；语音帧不参与，避免被大声开头污染噪声底
-          noiseFloor = totalFrames < NOISE_ESTIMATE_FRAMES
-            ? (noiseFloor * totalFrames + r) / (totalFrames + 1)
-            : noiseFloor * 0.95 + r * 0.05
-          consecutiveSilenceFrames++
-          // 已有有效语音且连续静音 ≥ 3 秒：自动停止并提交前面有效部分
-          if (lastVoiceFrame >= 0 && consecutiveSilenceFrames >= TRAILING_SILENCE_FRAMES) {
-            finishRecording('auto')
-            return
-          }
-        }
-        totalFrames++
-      }
-      source.connect(processor)
-      // 用静音 gain 驱动 ScriptProcessor：保持 onaudioprocess 有数据流触发，但不把麦克风声音回放到扬声器（避免回声/啸叫）
-      const silenceGain = audioCtx.createGain()
-      silenceGain.gain.value = 0
-      processor.connect(silenceGain)
-      silenceGain.connect(audioCtx.destination)
-
-      mediaRecorderRef.current = {
-        stop: () => finishRecording('manual'),
-      }
-      setRecording(true)
-    } catch (err) {
-      console.error('麦克风不可用或录音失败', err)
-      setRecording(false)
-    }
-  }
-
-  function stopSend(): void {
-    const sid = currentSessionId
+  const stopSend = useCallback((): void => {
+    const sid = currentSessionIdRef.current
     // 立即给用户反馈：停止三点动画/流式渲染，busy 置 false（对齐 taco：点停止即停，不再等后端慢慢返回才刷新）。
     // 后端 stop() 会中止运行中的 loop，run() 返回后 doRun 的 finally 兜底再次置 false（幂等）。
     if (sid) {
       patchSession(sid, { busy: false, streaming: '', streamingReasoning: '' })
     }
     void window.shanhai?.stop()
-  }
-
-  /** 生成附件唯一 id（用于异步上传后回填状态） */
-  const genId = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-
-  /** 图片附件自动上传云存储：拿到 https 链接后回填到对应附件，失败标记 error（回退 data URL） */
-  function uploadImageAttachment(id: string, dataUrl: string, mime: string): void {
-    void (async () => {
-      const base64 = dataUrl.replace(/^data:[^;]+;base64,/, '')
-      try {
-        const url = (await window.shanhai?.uploadImage(base64, mime)) ?? null
-        setAttachments((prev) => prev.map((x) => (x.id === id ? { ...x, uploadStatus: url ? 'done' : 'error', url: url ?? undefined } : x)))
-      } catch {
-        setAttachments((prev) => prev.map((x) => (x.id === id ? { ...x, uploadStatus: 'error' } : x)))
-      }
-    })()
-  }
-
-  /** 重新上传某张上传失败的图片附件（点击重试） */
-  function retryImageUpload(id: string): void {
-    const a = attachments.find((x) => x.id === id)
-    if (!a || a.type !== 'image') return
-    setAttachments((prev) => prev.map((x) => (x.id === id ? { ...x, uploadStatus: 'uploading', url: undefined } : x)))
-    uploadImageAttachment(id, a.dataUrl, a.mime)
-  }
-
-  async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>): Promise<void> {
-    const files = e.target.files
-    if (!files) return
-    for (const file of Array.from(files)) {
-      const type = file.type.startsWith('image/')
-        ? 'image'
-        : file.type.startsWith('audio/')
-          ? 'audio'
-          : file.type.startsWith('video/')
-            ? 'video'
-            : 'file'
-      const dataUrl = await readFileAsDataUrl(file)
-      if (type === 'image') {
-        const id = genId()
-        setAttachments((prev) => [...prev, { id, type, name: file.name, dataUrl, mime: file.type, size: file.size, uploadStatus: 'uploading' }])
-        uploadImageAttachment(id, dataUrl, file.type || 'image/png')
-      } else {
-        setAttachments((prev) => [...prev, { id: genId(), type, name: file.name, dataUrl, mime: file.type, size: file.size }])
-      }
-    }
-    e.target.value = ''
-  }
-
-  async function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>): Promise<void> {
-    const items = e.clipboardData?.items
-    if (!items) return
-    for (const item of Array.from(items)) {
-      if (item.type.startsWith('image/')) {
-        const file = item.getAsFile()
-        if (file) {
-          const dataUrl = await readFileAsDataUrl(file)
-          const id = genId()
-          setAttachments((prev) => [...prev, { id, type: 'image', name: `pasted-${Date.now()}.png`, dataUrl, mime: file.type || 'image/png', size: file.size, uploadStatus: 'uploading' }])
-          uploadImageAttachment(id, dataUrl, file.type || 'image/png')
-        }
-      }
-    }
-  }
+  }, [patchSession])
 
   // 空状态：当前会话还没有任何消息（新建会话 / 首次使用默认会话）
   const isEmpty = cur.items.length === 0
@@ -1082,43 +851,27 @@ export function App() {
     respondClientRun,
     respondRetry,
     // composer
-    input,
-    setInput,
-    attachments,
-    setAttachments,
-    retryImageUpload,
+    composerRef,
+    composerSeed,
+    setComposerInput,
     queueCount,
-    recording,
-    voiceNotice,
     models,
     selectedModel,
     setSelectedModel,
-    modelMenuOpen,
-    setModelMenuOpen,
     systemModels,
     customModels,
     approvalPolicy,
-    approvalMenuOpen,
-    setApprovalMenuOpen,
     workDir,
     workDirName,
-    fileRef,
-    modelMenuRef,
-    approvalMenuRef,
-    isComposingRef,
     send,
     stopSend,
-    toggleRecording,
-    handleFileSelect,
-    handlePaste,
     pickWorkdir,
     switchApprovalPolicy,
     selectModel,
     handleRemoveModel,
     setCustomModelDrawerOpen,
-    // welcome（复用 setInput）
     // statusbar
-    currentTokenStats: tokenStatsBySession[currentSessionId] ?? null,
+    currentTokenStats: ui.currentTokenStats,
     // panels
     customModelDrawerOpen,
     addCustomModel: handleAddModel,

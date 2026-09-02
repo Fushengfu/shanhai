@@ -28,7 +28,13 @@ export function PluginAppIcon({ appId, size = 28 }: { appId: string; size?: numb
         alt=""
         width={size}
         height={size}
-        style={{ borderRadius: 7, objectFit: 'cover', display: 'block', flexShrink: 0 }}
+        style={{
+          borderRadius: 7,
+          objectFit: 'contain',
+          display: 'block',
+          flexShrink: 0,
+          // SVG/PNG 图标按原始比例完整显示，避免 cover 裁剪掉图标边缘导致“看不清”
+        }}
       />
     )
   }

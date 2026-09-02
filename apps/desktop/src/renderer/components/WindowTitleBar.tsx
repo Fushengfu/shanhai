@@ -4,8 +4,8 @@ import * as React from 'react'
 import { IconClose, IconMaximize, IconMinimize, IconRestore } from './icons'
 import { smallIconBtn } from './ui'
 
-/** 标题栏窗口控制按钮（最小化/最大化/关闭），统一 28×28 小图标按钮 + hover 背景 */
-function WindowControlButton(props: { title: string; onClick: () => void; children: ReactNode }): React.JSX.Element {
+/** 标题栏窗口控制按钮（最小化/最大化/关闭），对齐文件管理器插件标准：36×36、圆角 8、关闭键 hover 红色 */
+export function WindowControlButton(props: { title: string; onClick: () => void; children: ReactNode; danger?: boolean }): React.JSX.Element {
   return (
     <button
       onClick={props.onClick}
@@ -13,15 +13,27 @@ function WindowControlButton(props: { title: string; onClick: () => void; childr
       style={
         {
           ...smallIconBtn,
-          color: 'var(--text-muted)',
-          width: 28,
-          height: 28,
+          color: 'var(--titlebar-btn-color)',
+          width: 36,
+          height: 36,
+          padding: 0,
+          borderRadius: 8,
           flexShrink: 0,
           ...({ WebkitAppRegion: 'no-drag' } as React.CSSProperties),
         } as React.CSSProperties
       }
-      onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--bg-hover)')}
-      onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+      onMouseEnter={(e) => {
+        if (props.danger) {
+          e.currentTarget.style.background = 'var(--titlebar-btn-danger)'
+          e.currentTarget.style.color = '#fff'
+        } else {
+          e.currentTarget.style.background = 'var(--titlebar-btn-hover-bg)'
+        }
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.background = 'transparent'
+        e.currentTarget.style.color = 'var(--titlebar-btn-color)'
+      }}
     >
       {props.children}
     </button>
@@ -33,7 +45,7 @@ function WindowControlButton(props: { title: string; onClick: () => void; childr
  * 整条标题栏可拖动窗口（-webkit-app-region: drag），左侧图标 + 标题 + 副标题，右侧操作按钮 + 自定义窗口控制按钮（no-drag）。
  * 窗口控制按钮统一为「最小化 / 最大化(还原) / 关闭」，替代 macOS 系统红绿灯（titleBarStyle:'hidden'）。
  */
-export function WindowTitleBar(props: {
+export const WindowTitleBar = React.memo(function WindowTitleBar(props: {
   icon?: ReactNode
   title: string
   subtitle?: string
@@ -101,7 +113,7 @@ export function WindowTitleBar(props: {
           {props.actions}
         </div>
       )}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, ...({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4, ...({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) }}>
         <WindowControlButton title="最小化" onClick={handleMinimize}>
           <IconMinimize />
         </WindowControlButton>
@@ -109,11 +121,11 @@ export function WindowTitleBar(props: {
           {maximized ? <IconRestore /> : <IconMaximize />}
         </WindowControlButton>
         {props.onClose && (
-          <WindowControlButton title="关闭" onClick={props.onClose}>
+          <WindowControlButton title="关闭" onClick={props.onClose} danger>
             <IconClose />
           </WindowControlButton>
         )}
       </div>
     </div>
   )
-}
+})

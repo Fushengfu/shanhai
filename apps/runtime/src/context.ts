@@ -122,6 +122,12 @@ export interface RuntimeContext {
   pendingApprovals: Map<string, { resolve: (outcome: ApprovalOutcome) => void; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }>
   approvalResolvedCallbacks: Set<(requestId: string) => void>
   askResolvedCallbacks: Set<(requestId: string) => void>
+  // —— 能力级审批（阶段2b）：插件跨插件调用带元数据能力（write/destructive）时的审批桥 ——
+  capabilityApprovalCallbacks: Set<(req: { requestId: string; callerPkgId: string; capability: string; risk: string; sessionId?: string }) => void>
+  pendingCapabilityApprovals: Map<string, { resolve: (approved: boolean) => void; callerPkgId: string; capability: string; risk: string; sessionId?: string }>
+  capabilityApprovalResolvedCallbacks: Set<(requestId: string) => void>
+  // —— 阶段3c：会话级能力授权白名单（remember for this session）。key = `${sessionId}:${callerPkgId}:${capability}` ——
+  capabilityApprovalSessionGrants: Set<string>
   approval: ApprovalService
 
   // —— 能力实例 ——

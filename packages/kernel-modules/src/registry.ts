@@ -9,7 +9,7 @@ export interface ClientPluginDeclaration {
 /**
  * 客户端插件注册表（host 侧）。
  *
- * 宿主侧插件声明 client 半（moduleId + slots），注册后组合成 __DSH_BOOT__ 清单。
+ * 宿主侧插件声明 client 半（moduleId + slots），注册后组合成引导清单（BootManifest）。
  */
 export class ClientModuleRegistry {
   private readonly modules = new Map<string, string>()

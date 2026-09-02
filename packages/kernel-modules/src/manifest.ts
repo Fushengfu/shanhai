@@ -1,5 +1,5 @@
 /**
- * __DSH_BOOT__ 清单（wire 单一来源）。
+ * 引导清单（BootManifest，wire 单一来源）。
  *
  * 宿主扫出所有声明 client 半的插件，组合成 BootManifest，渲染进程按清单懒加载。
  * parseBootManifest 在 wire 边界校验，失败响亮报错（不静默吞）。

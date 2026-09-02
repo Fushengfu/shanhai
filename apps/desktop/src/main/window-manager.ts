@@ -155,6 +155,9 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
       ? { transparent: true, backgroundColor: '#00000000', hasShadow: false }
       : {}),
     ...(type === 'supervisor-bubble' ? { alwaysOnTop: true, resizable: false, minimizable: false, maximizable: false, skipTaskbar: true } : {}),
+    // 会话管家窗口：永远置顶，始终浮在所有山海其它窗口之上（不被 chat/desktop/app 盖住），便于长期可见。
+    // alwaysOnTop 不影响最小化/关闭/拖动；悬浮图标(supervisor-bubble)已置顶，此处对齐管家主窗口。
+    ...(type === 'supervisor' ? { alwaysOnTop: true } : {}),
     ...(type === 'app' ? { alwaysOnTop: true } : {}),
     fullscreen: shellBounds ? false : (opts.fullscreen ?? false),
     show: opts.show ?? true,

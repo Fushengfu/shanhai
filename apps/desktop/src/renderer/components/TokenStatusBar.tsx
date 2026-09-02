@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import type { TokenSnapshot } from '../types'
 import { fmtTokens } from './ui'
 
-export function TokenStatusBar({ stats }: { stats: TokenSnapshot | null }) {
+export const TokenStatusBar = memo(function TokenStatusBar({ stats }: { stats: TokenSnapshot | null }) {
   if (!stats) {
     return <div style={{ padding: '6px 16px', borderTop: '1px solid var(--border)', background: 'var(--bg-panel)', fontSize: 11, color: 'var(--text-faint)' }}>token 用量统计中…</div>
   }
@@ -27,7 +27,7 @@ export function TokenStatusBar({ stats }: { stats: TokenSnapshot | null }) {
       </span>
     </div>
   )
-}
+})
 
 /** 上下文窗口占用环形指示器：中间显示百分比，悬停弹出详情（最大窗口/当前占用/剩余可用/占比） */
 export function ContextRing({ stats }: { stats: TokenSnapshot }) {

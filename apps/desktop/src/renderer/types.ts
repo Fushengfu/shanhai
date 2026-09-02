@@ -50,6 +50,15 @@ export interface ApprovalRequest {
   riskLevel: string
 }
 
+/** 能力级审批请求（插件跨插件调用 write/destructive 能力；sessionId 标记发起会话，用于会话级 remember 授权） */
+export interface CapabilityApprovalRequest {
+  requestId: string
+  callerPkgId: string
+  capability: string
+  risk: string
+  sessionId?: string
+}
+
 /** 一张 macOS 系统壁纸的元信息（listSystemWallpapers 返回项） */
 export interface SystemWallpaperMeta {
   id: string
@@ -415,6 +424,7 @@ declare global {
       getSessionHistory(id?: string): Promise<HistoryItem[]>
       getSessionTrace(id?: string): Promise<Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string; reasoningContent?: string; toolCalls?: Array<{ id: string; name: string; args: Record<string, unknown> }>; toolCallId?: string; toolName?: string; result?: unknown; error?: string; turn: number; timestamp: number }>>
       respondApproval(outcome: 'allowed-once' | 'rejected', requestId: string): Promise<void>
+      respondCapabilityApproval(requestId: string, approved: boolean, rememberForSession?: boolean): Promise<void>
       onAskRequest(cb: (req: AskRequest) => void): () => void
       respondAsk(requestId: string, answer: string): Promise<void>
       cancelAsk(requestId: string): Promise<void>

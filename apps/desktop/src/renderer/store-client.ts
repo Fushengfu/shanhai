@@ -1,8 +1,9 @@
-import { useSyncExternalStore } from 'react'
+import { useRef, useSyncExternalStore } from 'react'
 import type {
   ApprovalRequest,
   AskRequest,
   BrowserWindowItem,
+  CapabilityApprovalRequest,
   GatewayModel,
   RetryPrompt,
   SessionListItem,
@@ -36,6 +37,8 @@ export interface SharedState {
   browserWindows: BrowserWindowItem[]
   retryPrompt: RetryPrompt | null
   wallpaper: string | null
+  /** 能力级审批队列（插件调 write/destructive 能力时的全局审批请求） */
+  capabilityApprovals: CapabilityApprovalRequest[]
 }
 
 const EMPTY_STATE: SharedState = {
@@ -55,6 +58,7 @@ const EMPTY_STATE: SharedState = {
   browserWindows: [],
   retryPrompt: null,
   wallpaper: null,
+  capabilityApprovals: [],
 }
 
 let snapshot: SharedState = EMPTY_STATE
@@ -152,6 +156,48 @@ function subscribe(cb: () => void): () => void {
 /** 订阅全局 UI 共享状态（会话消息流/流式/审批/token/轨迹/当前会话/模型/登录态等），跨窗口一致 */
 export function useUiStore(): SharedState {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+}
+
+/** 浅比较：对象/数组逐字段 Object.is。用于窄订阅——selector 结果浅相等时返回上一次缓存引用，
+ *  使 useSyncExternalStore 的 Object.is(getSnapshot) 判定为 true，从而跳过无关状态变化触发的重渲染。 */
+function shallowEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true
+  if (typeof a !== 'object' || a === null || typeof b !== 'object' || b === null) return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false
+    return true
+  }
+  const ka = Object.keys(a as Record<string, unknown>)
+  const kb = Object.keys(b as Record<string, unknown>)
+  if (ka.length !== kb.length) return false
+  for (const k of ka) {
+    if (!Object.is((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])) return false
+  }
+  return true
+}
+
+/** 窄订阅（selector 版）：只订阅 selector 选出的窄字段，窄字段浅比较不变时不触发重渲染。
+ *  替代 useUiStore() 全量订阅，消除「其他会话的工具步骤 / token / 审批 / 流式等高频变化拖累本组件整体重渲染」的问题。
+ *  注意：selector 每次返回新对象没关系，getSnapshot 内部用缓存引用 + 浅比较保证结果引用稳定。 */
+export function useUiStoreSelector<T>(selector: (s: SharedState) => T): T {
+  const cacheRef = useRef<{ val: T } | null>(null)
+  const selRef = useRef(selector)
+  selRef.current = selector
+
+  const getSnap = (): T => {
+    const s = getSnapshot()
+    const next = selRef.current(s)
+    const cache = cacheRef.current
+    if (cache !== null && shallowEqual(cache.val, next)) {
+      return cache.val
+    }
+    cacheRef.current = { val: next }
+    return next
+  }
+
+  return useSyncExternalStore(subscribe, getSnap, getSnap)
 }
 
 /** 订阅指定会话的流式增量（正文 text + 思考 reasoning），由主进程 chat:delta/chat:reasoning 独立小事件本地累加。

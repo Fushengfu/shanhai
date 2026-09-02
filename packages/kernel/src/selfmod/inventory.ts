@@ -35,7 +35,7 @@ export interface InspectReport {
 /**
  * 动态插件清单（K5 自修改）。
  *
- * 对应 DSH extensions 机制的 plugin_inspect / plugin_define / plugin_stop / plugin_undefine：
+ * 提供 plugin_inspect / plugin_define / plugin_stop / plugin_undefine：
  * 只读报告、记录 package、撤回、遗忘。plugin_run 在 runtime 层集成审批后执行。
  */
 export class PluginInventory {
@@ -50,6 +50,8 @@ export class PluginInventory {
     sessionId: string
     id?: string
     permissions?: string[]
+    /** 能力清单（least privilege）：provide/consume 声明（阶段1b 起用于跨插件能力路由，静态声明、非审批） */
+    capabilities?: Capability
     entryHost?: string
     entryHtml?: string
     icon?: string
@@ -64,6 +66,7 @@ export class PluginInventory {
       status: 'defined',
       sessionId: def.sessionId,
       permissions: def.permissions ?? [],
+      capabilities: def.capabilities,
       entryHost: def.entryHost,
       entryHtml: def.entryHtml,
       icon: def.icon,
@@ -124,6 +127,8 @@ export interface InstalledPackageMeta {
   installedAt: number
   /** 已审批的权限清单（plugin:invoke 白名单能力名，install 时随 manifest 落盘） */
   permissions?: string[]
+  /** 能力清单（least privilege）：provide/consume 声明，install 时随 manifest 落盘（阶段1b 跨插件能力路由用） */
+  capabilities?: Capability
   /** host 半编译产物绝对路径（dist/host.cjs，第 3 步起支持） */
   entryHost?: string
   /** client 半编译产物绝对路径（dist/client.html，第 2 步起支持） */

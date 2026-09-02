@@ -2,7 +2,7 @@
   "name": "@shanhai/kernel",
   "version": "0.1.0",
   "type": "module",
-  "description": "山海自研插件内核（K1 组合运行时 + K2 版本生命周期 + K4 安全 + K5 自修改），接口对齐 DSH/Cordis",
+  "description": "山海自研插件内核（K1 组合运行时 + K2 版本生命周期 + K4 安全 + K5 自修改）",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",

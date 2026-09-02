@@ -2,7 +2,7 @@
   "name": "@shanhai/llm",
   "version": "0.1.0",
   "type": "module",
-  "description": "山海 LLM 能力（对齐 dsh-llm）：Model 接口 + DeepSeek provider + mock 回退",
+  "description": "山海 LLM 能力：Model 接口 + DeepSeek provider + mock 回退",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",

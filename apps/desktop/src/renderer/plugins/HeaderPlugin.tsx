@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { IconActivity, IconClock, IconClose, IconMaximize, IconMinimize, IconMonitor, IconMoon, IconRestore, IconSettings, IconSidebar, IconSun, IconTerminal } from '../components/icons'
 import { smallIconBtn } from '../components/ui'
+import { WindowControlButton } from '../components/WindowTitleBar'
 import { registerSlot, AppendSlotView } from '../slots'
 import { useUIContext } from '../ui-context'
 
@@ -72,27 +73,15 @@ function HeaderSlot(): React.JSX.Element {
         >
           {ctx.theme === 'light' ? <IconMoon /> : <IconSun />}
         </button>
-        <button
-          onClick={handleMinimize}
-          title="最小化"
-          style={{ ...smallIconBtn, marginLeft: 4, WebkitAppRegion: 'no-drag' } as React.CSSProperties}
-        >
+        <WindowControlButton title="最小化" onClick={handleMinimize}>
           <IconMinimize />
-        </button>
-        <button
-          onClick={() => void handleToggleMaximize()}
-          title={maximized ? '还原' : '最大化'}
-          style={{ ...smallIconBtn, WebkitAppRegion: 'no-drag' } as React.CSSProperties}
-        >
+        </WindowControlButton>
+        <WindowControlButton title={maximized ? '还原' : '最大化'} onClick={() => void handleToggleMaximize()}>
           {maximized ? <IconRestore /> : <IconMaximize />}
-        </button>
-        <button
-          onClick={() => void window.shanhai?.hideChatWindow()}
-          title="关闭窗口"
-          style={{ ...smallIconBtn, WebkitAppRegion: 'no-drag' } as React.CSSProperties}
-        >
+        </WindowControlButton>
+        <WindowControlButton title="关闭窗口" onClick={() => void window.shanhai?.hideChatWindow()} danger>
           <IconClose />
-        </button>
+        </WindowControlButton>
         {/* 追加型扩展点：agent 往顶栏右侧追加按钮/小组件（不替换核心顶栏） */}
         <AppendSlotView slot="header.actions" />
       </header>

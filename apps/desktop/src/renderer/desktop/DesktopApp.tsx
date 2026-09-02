@@ -29,6 +29,7 @@ export function DesktopApp(): React.JSX.Element {
       style={{
         width: '100vw',
         height: '100vh',
+        position: 'relative',
         display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',

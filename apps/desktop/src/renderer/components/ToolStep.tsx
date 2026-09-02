@@ -3,7 +3,7 @@ import type { ToolTrace } from '../types'
 import { IconActivity, IconAvatar, IconChevronDown, IconClock, IconCode, IconEdit, IconFile, IconGlobe, IconImage, IconMonitor, IconPlus, IconRefresh, IconSend, IconShield, IconTerminal, IconTrash, IconTree, IconUsers, IconWrench } from './icons'
 import { redactSecret, stringifyResult, truncate } from './ui'
 
-// ===== 工具调用渲染（参考 DSH ToolRow / Codex：单行摘要 + 类型卡片，不显示 JSON）=====
+// ===== 工具调用渲染（单行摘要 + 类型卡片，不显示 JSON）=====
 
 /** 已有专门交互 UI 的机制类工具：不在聊天流里以「工具步骤」卡片形式显示（避免暴露内部工具名 + 与专用卡片重复展示） */
 const HIDDEN_STEP_TOOLS = new Set(['ask_user'])
@@ -466,7 +466,7 @@ export function renderToolResult(name: string, result: unknown, error: string | 
   )
 }
 
-/** 工具执行步骤（DSH ToolRow 风格）：单行摘要（中文标题 + 摘要）+ 折叠的类型卡片 */
+/** 工具执行步骤：单行摘要（中文标题 + 摘要）+ 折叠的类型卡片 */
 export const ToolStep = memo(function ToolStep({ trace }: { trace: ToolTrace }) {
   // 机制类工具（如 ask_user 提问）已有专用交互卡片，这里不再渲染工具步骤，避免暴露内部工具名
   if (HIDDEN_STEP_TOOLS.has(trace.name)) return null

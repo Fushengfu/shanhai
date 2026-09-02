@@ -1,4 +1,11 @@
-import { PluginInventory, PluginStore, DisposerStack, type DynamicPackage } from '@shanhai/kernel'
+import {
+  PluginInventory,
+  PluginStore,
+  DisposerStack,
+  type Capability,
+  type CapabilityMeta,
+  type DynamicPackage,
+} from '@shanhai/kernel'
 import type { ToolContract } from '@shanhai/tools'
 import { createRequire } from 'node:module'
 import { existsSync, readFileSync, promises as fs } from 'node:fs'
@@ -7,12 +14,13 @@ import { homedir } from 'node:os'
 import { scaffoldPlugin, SCAFFOLD_WORKSPACE_DIR } from './scaffold'
 import { buildPlugin, verifyBuildArtifacts, type PluginBuildResult } from './build'
 import { packagePluginShare, PACKAGE_SHARE_CATEGORIES } from './share-pack'
+import { auditHostDangerousModules, auditHostSafeModules, HARD_BLOCK_DANGEROUS_NODE_MODULES } from './node-module-audit'
 
 // 主进程 require 上下文（加载 host 半编译产物 host.cjs；selfmod 被 desktop/runtime bundle 成 ESM，故用 createRequire 拿 CJS require）
 const nodeRequire = createRequire(import.meta.url)
 
 /**
- * K5 自修改运行时（对齐 DSH 的 extensions 机制）：让 agent 在会话中检查、定义、运行、停止自己的插件。
+ * K5 自修改运行时（extensions 机制）：让 agent 在会话中检查、定义、运行、停止自己的插件。
  *
  * 职责划分：
  * - `PluginInventory`（kernel 包）只负责「内存清单」（define / inspect / undefine 的记录壳）。
@@ -33,6 +41,8 @@ const nodeRequire = createRequire(import.meta.url)
 interface HostFacade {
   on(name: string, listener: (...args: unknown[]) => unknown): void
   provide(name: string, impl: unknown): void
+  /** 阶段2：注册带「能力元数据」的服务（系统插件用它声明能力风险等级，供跨插件调用时走能力级审批）。 */
+  provideCapability(name: string, meta: CapabilityMeta, impl: unknown): void
   tools: { register(tool: ToolContract): void }
   /** 打开本插件的窗口应用（appId 缺省 = 插件 id，已安装插件即持久化 id；窗口内容由 client 半源码提供） */
   openWindow(appId?: string): void
@@ -72,6 +82,18 @@ export interface SelfModifyHooks {
   openAppWindow(appId: string): void
   /** 关闭插件的窗口应用（appId = 插件持久化 id；由主进程 closeApp 销毁对应 app 窗口） */
   closeAppWindow(appId: string): void
+  /**
+   * 阶段1a（可选）：为插件创建隔离的能力总线作用域，把 host 半 provide 的服务「双写」进内核 Context。
+   * 返回 { provide, dispose }：provide 把服务注册进该插件的内核隔离 Context；dispose 在插件 stop/uninstall 时撤销。
+   * 未装配（不实现）则双写退化为仅私有 Map，现有插件与 RPC 行为完全不变（向后兼容）。
+   */
+  attachCapability?(pkgId: string): { provide(name: string, impl: unknown): void; dispose(): void }
+  /**
+   * 阶段2（可选）：能力级审批 approver。跨插件调用「带能力元数据」的能力（write/destructive）时阻塞在此，
+   * 返回 true 放行、false 拒绝。未装配时：read-only 放行、write 放行（保守：无 approver 不拦，但留待阶段2b 接弹窗）、
+   * destructive 拒绝（破坏性能力无 approver 一律不放行，避免静默越权）。
+   */
+  requestCapabilityApproval?(callerPkgId: string, capability: string, meta: CapabilityMeta): Promise<boolean>
 }
 
 /** 兼容两种导出形态：CJS `module.exports = fn`（mod 即 fn）与 ESM→CJS 转换 `export default fn`（mod.default = fn） */
@@ -98,6 +120,20 @@ function loadHostEntry(entry: string): (ctx: HostFacade) => unknown {
   const src = readFileSync(entry, 'utf8')
   if (/\brequire\s*\(\s*['"](electron|@shanhai[^'"]*)['"]\s*\)/.test(src)) {
     throw new Error('host 半编译产物违规 external（electron / @shanhai/*），请以自包含 bundle 重新构建')
+  }
+  // 阶段0 安全补漏：审计危险 node 内置模块（联网/文件/进程）。默认告警不拒绝（HARD_BLOCK=false），
+  // 避免破坏已安装、正在使用这些能力的插件；阶段1/2 受控桥就绪后再打开硬拦截。
+  const dangerousHits = auditHostDangerousModules(src)
+  if (dangerousHits.length > 0) {
+    if (HARD_BLOCK_DANGEROUS_NODE_MODULES) {
+      throw new Error(
+        `host 半编译产物引用危险 node 内置模块（${dangerousHits.join(', ')}），属未授权能力，已拒绝加载（待受控桥开放）`,
+      )
+    }
+    const safeHits = auditHostSafeModules(src)
+    console.warn(
+      `[selfmod] host 半编译产物引用危险 node 内置模块（${dangerousHits.join(', ')}），无害模块（${safeHits.join(', ') || '无'}）已放行：暂时放行（阶段0 告警不拒绝），待阶段1/2 受控桥就绪后拦截`,
+    )
   }
   const resolved = nodeRequire.resolve(entry)
   delete nodeRequire.cache[resolved]
@@ -134,6 +170,20 @@ function normalizePluginId(raw: string): string {
   return id
 }
 
+/**
+ * 阶段2：能力级审批策略判定（对齐 ApprovalService.requiresApproval 的「风险分级」，但作用到能力层）。
+ * - read-only：默认放行（除非显式 approval==='always'）
+ * - write：默认需审批（显式 approval==='allow' 则放行）
+ * - destructive：永远审批（强制，等同于 forceApproval 语义，显式 allow 也不放行）
+ * 只有声明了能力元数据（provideCapability）的调用才会走到这里；普通 provide 服务无元数据，不经此判定。
+ */
+function capabilityRequiresApproval(meta: CapabilityMeta): boolean {
+  if (meta.risk === 'destructive') return true
+  if (meta.risk === 'write') return meta.approval !== 'allow'
+  // read-only
+  return meta.approval === 'always'
+}
+
 export class SelfModifyRuntime {
   private readonly inventory = new PluginInventory()
   private readonly services = new Map<string, unknown>()
@@ -145,6 +195,12 @@ export class SelfModifyRuntime {
    */
   private readonly pluginTools = new Map<string, Map<string, PluginToolEntry>>()
   private readonly disposers = new Map<string, () => Promise<void>>()
+
+  /** 阶段1a：插件 → 能力总线作用域（host 半 provide 的双写目标）。首次 provide 时懒创建，stop/uninstall 时随 stack 撤销并删除。 */
+  private readonly capabilityScopes = new Map<string, { provide(name: string, impl: unknown): void; dispose(): void }>()
+
+  /** 阶段2：能力元数据注册表（`插件id:能力名` → CapabilityMeta），供跨插件调用时做能力级审批判定。 */
+  private readonly capabilityMetas = new Map<string, CapabilityMeta>()
 
   constructor(
     private readonly hooks: SelfModifyHooks,
@@ -174,6 +230,8 @@ export class SelfModifyRuntime {
       /** 版本号（如 2.0.0），install 时随 manifest 落盘；覆盖升级时用于标识版本 */
       version?: string
       permissions?: string[]
+      /** 能力清单（least privilege）：provide/consume 声明（阶段1b 跨插件能力路由用，静态声明、非审批） */
+      capabilities?: Capability
       icon?: string
       dependencies?: Record<string, string>
       /** host 半编译产物绝对路径（工程化链路 / 测试加载用；install 时会自动探测，通常无需显式传） */
@@ -265,7 +323,55 @@ export class SelfModifyRuntime {
           this.hostServices.set(pkg.id, byId)
         }
         byId.set(name, impl)
+        // 阶段1a：双写进内核能力总线（可选 attachCapability）。懒创建插件级 scope，scope 生命周期随整个插件 stack
+        // 统一撤销（stop/uninstall 时 stack.dispose 触发：删除 capabilityScopes 项 + dispose scope）。
+        // 向后兼容：未实现 attachCapability（如 testLoad 的 mockHooks）则退化为仅私有 Map，RPC 行为完全不变。
+        if (this.hooks.attachCapability) {
+          let scope = this.capabilityScopes.get(pkg.id)
+          if (!scope) {
+            const created = this.hooks.attachCapability(pkg.id)
+            this.capabilityScopes.set(pkg.id, created)
+            scope = created
+            stack.collect(() => {
+              if (this.capabilityScopes.get(pkg.id) === created) this.capabilityScopes.delete(pkg.id)
+              created.dispose()
+            })
+          }
+          scope.provide(name, impl)
+        }
         stack.collect(() => {
+          if (this.services.get(name) === impl) this.services.delete(name)
+          const m = this.hostServices.get(pkg.id)
+          if (m && m.get(name) === impl) m.delete(name)
+        })
+      },
+      provideCapability: (name, meta, impl) => {
+        // 阶段2：复用 provide 的注册（本插件私有表 + 内核总线双写）+ 记录能力元数据。
+        // 与 provide 的区别：额外写 capabilityMetas（`插件id:能力名` → meta），供跨插件调用时走能力级审批。
+        this.capabilityMetas.set(`${pkg.id}:${name}`, meta)
+        // —— 以下与 provide 完全一致的注册 + 撤销逻辑（保持单一事实来源）——
+        this.services.set(name, impl)
+        let byId = this.hostServices.get(pkg.id)
+        if (!byId) {
+          byId = new Map()
+          this.hostServices.set(pkg.id, byId)
+        }
+        byId.set(name, impl)
+        if (this.hooks.attachCapability) {
+          let scope = this.capabilityScopes.get(pkg.id)
+          if (!scope) {
+            const created = this.hooks.attachCapability(pkg.id)
+            this.capabilityScopes.set(pkg.id, created)
+            scope = created
+            stack.collect(() => {
+              if (this.capabilityScopes.get(pkg.id) === created) this.capabilityScopes.delete(pkg.id)
+              created.dispose()
+            })
+          }
+          scope.provide(name, impl)
+        }
+        stack.collect(() => {
+          if (this.capabilityMetas.get(`${pkg.id}:${name}`) === meta) this.capabilityMetas.delete(`${pkg.id}:${name}`)
           if (this.services.get(name) === impl) this.services.delete(name)
           const m = this.hostServices.get(pkg.id)
           if (m && m.get(name) === impl) m.delete(name)
@@ -326,11 +432,84 @@ export class SelfModifyRuntime {
    * 返回值经 IPC 回传渲染进程，必须是 JSON 可序列化数据（函数/类实例会被序列化丢弃）。
    */
   async invokeService(appId: string, name: string, args: unknown[] = []): Promise<unknown> {
-    const impl = this.hostServices.get(appId)?.get(name)
-    if (typeof impl !== 'function') {
-      throw new Error(`插件 "${appId}" 未注册可调用的 host 服务「${name}」（需在 host 半用 ctx.provide(name, fn) 注册）`)
+    // 1) 先查本插件（向后兼容：现有插件、现有「本插件内 invoke 本插件服务」行为完全不变）
+    const local = this.hostServices.get(appId)?.get(name)
+    if (typeof local === 'function') {
+      return (local as (...a: unknown[]) => unknown)(...args)
     }
-    return (impl as (...a: unknown[]) => unknown)(...args)
+    // 2) 阶段1b：跨插件能力路由。仅当本插件未注册、且声明了 capabilities.consume 该能力名时才路由。
+    const consume = this.inventory.get(appId)?.capabilities?.consume ?? []
+    if (consume.includes(name)) {
+      const provider = this.findCapabilityProvider(name, appId)
+      if (provider) {
+        // 阶段2：能力级审批。仅当目标能力声明了能力元数据（系统插件用 provideCapability 注册）时才走审批；
+        // 普通 provide 注册的服务无元数据，保持现状直接调用（向后兼容，不误伤现网插件内部 RPC）。
+        const meta = this.capabilityMetas.get(`${provider.pkgId}:${name}`)
+        if (meta && capabilityRequiresApproval(meta)) {
+          if (!this.hooks.requestCapabilityApproval) {
+            throw new Error(`能力「${name}」风险等级 ${meta.risk} 需要审批，但当前未装配能力级 approver（阶段2b 待接弹窗）`)
+          }
+          const approved = await this.hooks.requestCapabilityApproval(appId, name, meta)
+          if (!approved) {
+            throw new Error(`插件 "${appId}" 调用「${name}」未获用户审批，已拒绝`)
+          }
+        }
+        // 有元数据（系统能力/受控桥）：impl 真实签名 (callerPkgId, ...args)，首参注入调用方插件 id（按插件做文件/网络隔离）。
+        // 无元数据（普通插件 provide 服务）：保持签名 (...args)，向后兼容。
+        if (meta) {
+          return (provider.impl as (caller: string, ...a: unknown[]) => unknown)(appId, ...args)
+        }
+        return provider.impl(...args)
+      }
+      // 声明了 consume 但当前没有任何插件提供该能力 → 响亮失败，不静默返回空值
+      throw new Error(
+        `插件 "${appId}" 声明消费能力「${name}」，但当前没有任何插件提供该能力（需有系统插件在 host 半 ctx.provide("${name}", fn) 注册）`,
+      )
+    }
+    // 未声明 consume 且本插件也未注册 → 保持原有响亮报错
+    throw new Error(`插件 "${appId}" 未注册可调用的 host 服务「${name}」（需在 host 半用 ctx.provide(name, fn) 注册）`)
+  }
+
+  /**
+   * 阶段1b：在所有「已运行」插件（排除调用方自身）中查找注册了指定能力名（服务名）的目标插件。
+   * 解析顺序：consume 声明的能力名 = 目标插件 host 半 ctx.provide(name) 里的 name。
+   * 同名多提供者歧义：按插件 id 字典序取第一个（确定性、可复现），一般不出现同名能力。
+   */
+  private findCapabilityProvider(name: string, excludeAppId: string): { pkgId: string; impl: (...a: unknown[]) => unknown } | undefined {
+    const candidates: Array<{ id: string; impl: unknown }> = []
+    for (const [id, byName] of this.hostServices.entries()) {
+      if (id === excludeAppId) continue
+      const impl = byName.get(name)
+      if (typeof impl === 'function') candidates.push({ id, impl })
+    }
+    if (candidates.length === 0) return undefined
+    candidates.sort((a, b) => a.id.localeCompare(b.id))
+    const first = candidates[0]!
+    return { pkgId: first.id, impl: first.impl as (...a: unknown[]) => unknown }
+  }
+
+  /**
+   * 阶段2b：注册「受控桥系统能力」（network:http / filesystem 等）。
+   * 与普通插件 host 半 `provideCapability` 的区别：系统能力不是来自某个插件 host.cjs 的 factory，
+   * 而是内核/selfmod 侧直接注入的受控实现，pkgId 用虚拟「系统插件」命名空间（如 system:network）。
+   * - 写入 hostServices → 供 findCapabilityProvider 跨插件路由查找到；
+   * - 写入 capabilityMetas → 供能力级审批判定；
+   * - impl 签名：(callerPkgId, ...args)，首参是「调用方插件 id」，供受控桥按插件隔离
+   *   （文件私有目录/配额、网络并发等）。
+   */
+  registerSystemCapability(
+    pkgId: string,
+    name: string,
+    meta: CapabilityMeta,
+    impl: (callerPkgId: string, ...args: unknown[]) => unknown,
+  ): void {
+    let byId = this.hostServices.get(pkgId)
+    if (!byId) {
+      byId = new Map()
+      this.hostServices.set(pkgId, byId)
+    }
+    byId.set(name, impl)
+    this.capabilityMetas.set(`${pkgId}:${name}`, meta)
   }
 
   /** plugin(tool) 统一分派：按 (pluginId, tool) 双键查 Registry 找到对应插件工具并执行（找不到给明确报错） */
@@ -379,8 +558,8 @@ export class SelfModifyRuntime {
       })
   }
 
-  /** 读工作区工程 package.json 的元信息（name / description / version），用于 install 自动 define 时兜底 */
-  private static readProjectMeta(id: string): { name?: string; purpose?: string; version?: string } {
+  /** 读工作区工程 package.json 的元信息（name / description / version / permissions），用于 install 自动 define 时兜底 */
+  private static readProjectMeta(id: string): { name?: string; purpose?: string; version?: string; permissions?: string[] } {
     try {
       const pkgPath = join(SCAFFOLD_WORKSPACE_DIR, id, 'package.json')
       if (!existsSync(pkgPath)) return {}
@@ -389,6 +568,7 @@ export class SelfModifyRuntime {
         name: typeof raw.name === 'string' ? raw.name : undefined,
         purpose: typeof raw.description === 'string' ? raw.description : undefined,
         version: typeof raw.version === 'string' ? raw.version : undefined,
+        permissions: Array.isArray(raw.permissions) ? raw.permissions.map((x) => String(x)) : undefined,
       }
     } catch {
       return {}
@@ -430,19 +610,24 @@ export class SelfModifyRuntime {
   async install(
     projectId: string,
     sessionId: string,
-    opts: { persistId?: string; name?: string; purpose?: string; version?: string; permissions?: string[] } = {},
+    opts: { persistId?: string; name?: string; purpose?: string; version?: string; permissions?: string[]; capabilities?: Capability } = {},
   ): Promise<{ id: string; installed: boolean }> {
     if (!this.store) throw new Error('插件仓库未装配，无法安装')
 
     const pid = normalizePluginId(projectId)
     const id = normalizePluginId(opts.persistId ?? pid)
 
-    // 自动 define：读工作区 package.json 拿 name/purpose/version 兜底（入参可覆盖），permissions 由入参显式声明
+    // 自动 define：读工作区 package.json 拿 name/purpose/version/permissions 兜底（入参可覆盖）。
+    // permissions 语义 = 显式覆盖：入参显式传了就用入参（哪怕空数组，表示「我要精确控制权限」）；
+    // 未传则读工作区 package.json.permissions（scaffold 模板默认已声明模板 App.tsx 用到的 6 项白名单能力）兜底；
+    // 再没有则空数组（最小权限）。
     const projectMeta = SelfModifyRuntime.readProjectMeta(pid)
     const name = (opts.name ?? '').trim() || projectMeta.name || pid
     const purpose = (opts.purpose ?? '').trim() || projectMeta.purpose || '山海插件应用'
     const version = opts.version ?? projectMeta.version
-    const permissions = Array.isArray(opts.permissions) ? opts.permissions.map((x) => String(x)) : []
+    const permissions = Array.isArray(opts.permissions)
+      ? opts.permissions.map((x) => String(x))
+      : projectMeta.permissions ?? []
 
     const pkg = this.inventory.define({
       id,
@@ -450,6 +635,7 @@ export class SelfModifyRuntime {
       purpose,
       version,
       permissions,
+      capabilities: opts.capabilities,
       sessionId,
     })
     this.inventory.setSession(id, '*')
@@ -504,6 +690,7 @@ export class SelfModifyRuntime {
       purpose: pkg.purpose,
       version: pkg.version,
       permissions: pkg.permissions ?? [],
+      capabilities: pkg.capabilities,
       entryHost: pkg.entryHost,
       entryHtml: pkg.entryHtml,
       icon: pkg.icon,
@@ -548,6 +735,7 @@ export class SelfModifyRuntime {
         version: meta.version,
         sessionId: '*',
         permissions: meta.permissions ?? [],
+        capabilities: meta.capabilities,
         entryHost: meta.entryHost,
         entryHtml: meta.entryHtml,
         icon: meta.icon,
@@ -607,6 +795,7 @@ export class SelfModifyRuntime {
       version: meta.version,
       sessionId: '*',
       permissions: meta.permissions ?? [],
+      capabilities: meta.capabilities,
       entryHost: hasHost ? entryHost : undefined,
       entryHtml: hasHtml ? entryHtml : undefined,
       icon: meta.icon,
@@ -809,19 +998,28 @@ export class SelfModifyRuntime {
           purpose: { type: 'string', description: '可选：用途说明（缺省读工作区 package.json description）' },
           version: { type: 'string', description: '可选：版本号（缺省读工作区 package.json version）' },
           permissions: { type: 'array', items: { type: 'string' }, description: '可选：插件声明的白名单能力名清单（窗口应用形态才需要，用于调 window.shanhaiPlugin 桥）。缺省 = 空数组 = 最小权限' },
+          capabilities: { type: 'object', description: '可选：能力清单（least privilege）。{ provide?: string[], consume?: string[] }。consume 声明本插件要跨插件调用的系统能力名（如 ["network:http","filesystem"]），provide 声明本插件对外提供的能力名。缺省 = 空 = 只调本插件自身服务' },
         },
         required: ['id'],
       },
       riskLevel: 'reversible',
       approvalRequired: true,
-      execute: async (args) =>
-        this.install(String(args.id ?? ''), sid(), {
+      execute: async (args) => {
+        const cap = args.capabilities && typeof args.capabilities === 'object' ? (args.capabilities as { provide?: unknown; consume?: unknown }) : undefined
+        return this.install(String(args.id ?? ''), sid(), {
           persistId: args.persistId ? String(args.persistId) : undefined,
           name: args.name ? String(args.name) : undefined,
           purpose: args.purpose ? String(args.purpose) : undefined,
           version: args.version ? String(args.version) : undefined,
           permissions: Array.isArray(args.permissions) ? args.permissions.map((x) => String(x)) : undefined,
-        }),
+          capabilities: cap
+            ? {
+                provide: Array.isArray(cap.provide) ? cap.provide.map((x) => String(x)) : undefined,
+                consume: Array.isArray(cap.consume) ? cap.consume.map((x) => String(x)) : undefined,
+              }
+            : undefined,
+        })
+      },
     }
 
     const uninstallTool: ToolContract = {
@@ -986,7 +1184,7 @@ export class SelfModifyRuntime {
           args: {
             type: 'object',
             description:
-              '传给该动作的参数对象。inspect:{what?,name?}；scaffold:{id,name?,purpose?}；build/test-load/verify:{id,projectDir?}；install:{id,persistId?,name?,purpose?,version?,permissions?}；publish:{pluginDir,categories?,outDir?}；uninstall:{id}；tool:{…传给插件工具的参数对象}',
+              '传给该动作的参数对象。inspect:{what?,name?}；scaffold:{id,name?,purpose?}；build/test-load/verify:{id,projectDir?}；install:{id,persistId?,name?,purpose?,version?,permissions?,capabilities?}；publish:{pluginDir,categories?,outDir?}；uninstall:{id}；tool:{…传给插件工具的参数对象}',
           },
           pluginId: { type: 'string', description: '仅 action=tool 时必填：插件持久化 id（list 返回的 id 字段）' },
           tool: { type: 'string', description: '仅 action=tool 时必填：要调用的插件工具名（= 插件 host 半 tools.register 时用的 name）' },

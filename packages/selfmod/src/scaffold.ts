@@ -255,21 +255,77 @@ const host = (): NonNullable<Window['shanhai']> => {
   return window.shanhai
 }
 
-/** 标题栏：frameless 窗口的统一自定义标题栏（拖动区 + 最小化/最大化/关闭，与山海内置应用同风格） */
-function TitleBar(): JSX.Element {
+/** 内联窗口控制图标：与山海内置应用 WindowTitleBar 同款（16×16 SVG 描边，stroke=currentColor，随文字色） */
+function IconWinApp(): JSX.Element {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="7" height="7" rx="1.5" />
+      <rect x="14" y="3" width="7" height="7" rx="1.5" />
+      <rect x="3" y="14" width="7" height="7" rx="1.5" />
+      <rect x="14" y="14" width="7" height="7" rx="1.5" />
+    </svg>
+  )
+}
+
+function IconWinMinimize(): JSX.Element {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 12h14" />
+    </svg>
+  )
+}
+
+function IconWinMaximize(): JSX.Element {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="5" y="5" width="14" height="14" rx="2" />
+    </svg>
+  )
+}
+
+function IconWinRestore(): JSX.Element {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="5" y="9" width="12" height="12" rx="2" />
+      <path d="M9 5h10a2 2 0 0 1 2 2v10" />
+    </svg>
+  )
+}
+
+function IconWinClose(): JSX.Element {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18 6L6 18M6 6l12 12" />
+    </svg>
+  )
+}
+
+/** 标题栏：与山海内置应用 WindowTitleBar 同款（图标块 + 标题 + 副标题 + 36×36 SVG 三键窗口控制） */
+function TitleBar(props: { title: string; subtitle?: string; onClose: () => void }): JSX.Element {
+  const [maximized, setMaximized] = useState(false)
+  const handleToggleMaximize = async (): Promise<void> => {
+    const next = await host().toggleMaximizeWindow()
+    setMaximized(next ?? false)
+  }
   return (
     <header className="titlebar">
-      <span className="title">插件窗口 · 编译产物渲染</span>
-      <span className="spacer" />
-      <div className="winbtns">
-        <button className="winbtn" onClick={() => host().minimizeWindow()} title="最小化">
-          ─
+      <span className="titlebar-icon">
+        <IconWinApp />
+      </span>
+      <div className="titlebar-text">
+        <div className="titlebar-title">{props.title}</div>
+        {props.subtitle && <div className="titlebar-subtitle">{props.subtitle}</div>}
+      </div>
+      <div className="titlebar-spacer" />
+      <div className="titlebar-winbtns">
+        <button className="titlebar-winbtn" onClick={() => host().minimizeWindow()} title="最小化">
+          <IconWinMinimize />
         </button>
-        <button className="winbtn" onClick={() => void host().toggleMaximizeWindow()} title="最大化/还原">
-          □
+        <button className="titlebar-winbtn" onClick={() => void handleToggleMaximize()} title={maximized ? '还原' : '最大化'}>
+          {maximized ? <IconWinRestore /> : <IconWinMaximize />}
         </button>
-        <button className="winbtn close" onClick={() => void api().closeApp()} title="关闭窗口">
-          ✕
+        <button className="titlebar-winbtn" onClick={props.onClose} title="关闭">
+          <IconWinClose />
         </button>
       </div>
     </header>
@@ -286,7 +342,7 @@ export function App(): JSX.Element {
 
   return (
     <div className="app">
-      <TitleBar />
+      <TitleBar title="插件窗口" subtitle="编译产物渲染" onClose={() => void api().closeApp()} />
       <main className="body">
         <p className="hero">Dock 图标测试成功 —— client 半已脱离 new Function，改用编译产物 + loadFile 渲染</p>
         <p className="muted">插件应用 id：{pluginAppId || '（未知）'}</p>
@@ -405,13 +461,40 @@ export {}
 `
 
 const STYLE_CSS = `:root {
+  color-scheme: light;
+  --bg-app: #f7f7f8;
+  --bg-subtle: #f5f5f5;
+  --bg-hover: #e9ebee;
+  --panel: #ffffff;
+  --border: #eeeeee;
+  --text: #333333;
+  --text-secondary: #666a73;
+  --text-muted: #999999;
+  --accent: #1677ff;
+  --tint-blue-soft: #f0f7ff;
+  --tint-purple: #faf7ff;
+  --purple: #5b3b8e;
+  --danger: #dc2626;
+  /* 向后兼容别名（旧模板卡片/按钮等仍引用这些变量名） */
+  --bg: var(--bg-subtle);
+  --muted: var(--text-muted);
+}
+
+html[data-theme='dark'] {
   color-scheme: dark;
-  --bg: #14161a;
-  --panel: #1d2129;
-  --border: #2a303b;
-  --text: #e6e8ec;
-  --muted: #8a93a3;
-  --accent: #4c8dff;
+  --bg-app: #1e1e1e;
+  --bg-subtle: #2c2c2d;
+  --bg-hover: #333438;
+  --panel: #262627;
+  --border: #3a3a3c;
+  --text: #e0e0e0;
+  --text-secondary: #b0b3ba;
+  --text-muted: #808080;
+  --accent: #4096ff;
+  --tint-blue-soft: #182638;
+  --tint-purple: #2b2433;
+  --purple: #8c6bb5;
+  --danger: #f85149;
 }
 
 * {
@@ -440,50 +523,77 @@ body {
 .titlebar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 0 12px 0 16px;
-  height: 44px;
+  gap: 10px;
+  padding: 16px 20px;
   border-bottom: 1px solid var(--border);
+  background: var(--bg-subtle);
   -webkit-app-region: drag;
   user-select: none;
+  flex-shrink: 0;
 }
 
-.title {
+.titlebar-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--tint-blue-soft);
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.titlebar-text {
+  min-width: 0;
+}
+
+.titlebar-title {
   font-weight: 600;
-  font-size: 13px;
+  font-size: 15px;
+  color: var(--text);
+  line-height: 1.2;
 }
 
-.spacer {
+.titlebar-subtitle {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 1px;
+}
+
+.titlebar-spacer {
   flex: 1;
 }
 
-.winbtns {
+.titlebar-winbtns {
   display: flex;
   align-items: center;
   gap: 4px;
   -webkit-app-region: no-drag;
 }
 
-.winbtn {
+.titlebar-winbtn {
   -webkit-app-region: no-drag;
   border: none;
   background: transparent;
-  color: var(--muted);
-  width: 28px;
-  height: 28px;
-  border-radius: 6px;
+  color: var(--text-secondary);
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 8px;
   cursor: pointer;
-  font-size: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
-.winbtn:hover {
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--text);
+.titlebar-winbtn:hover {
+  background: var(--bg-hover);
 }
 
-.winbtn.close:hover {
-  background: rgba(255, 82, 82, 0.2);
-  color: #ff6b6b;
+.titlebar-winbtn:last-child:hover {
+  background: var(--danger);
+  color: #fff;
 }
 
 .body {
@@ -645,6 +755,7 @@ const PACKAGE_JSON = `{
   "private": true,
   "type": "module",
   "description": "<PLUGIN_PURPOSE>",
+  "permissions": ["getVersion", "getUiState", "listSessions", "clipboardWriteText", "clipboardReadText", "speak"],
   "scripts": {
     "build:host": "esbuild src/host.ts --bundle --platform=node --format=cjs --outfile=dist/host.cjs --log-level=error",
     "build:client": "vite build",

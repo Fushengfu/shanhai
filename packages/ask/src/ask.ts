@@ -50,7 +50,7 @@ export interface AskRequest {
 export const ASK_CANCELLED = '__ASK_CANCELLED__'
 
 /**
- * 提问服务（对齐 dsh 的「向用户请求输入」能力）。
+ * 提问服务（「向用户请求输入」能力）。
  *
  * - ask：发起提问并阻塞等待用户回答（Promise 直到 respond/cancel 才 resolve）
  * - onRequest：订阅提问请求（UI 监听后弹卡片）

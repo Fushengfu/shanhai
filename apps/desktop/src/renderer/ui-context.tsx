@@ -3,7 +3,6 @@ import type * as React from 'react'
 import type {
   ApprovalRequest,
   AskRequest,
-  AttachmentItem,
   BrowserWindowItem,
   ClientRunRequest,
   GatewayModel,
@@ -12,6 +11,7 @@ import type {
   SessionUIState,
   TokenSnapshot,
 } from './types'
+import type { ChatComposerSeed, ChatComposerState } from './components/ChatComposer'
 
 /**
  * UI 上下文（框架派生 props 的载体）：shell（App）持有应用状态，通过 UIContext 派生给各 slot 插件组件，
@@ -72,37 +72,23 @@ export interface UIContextValue {
   respondRetry: (action: 'retry' | 'cancel') => void
 
   // —— shell.composer ——
-  input: string
-  setInput: (v: string) => void
-  attachments: AttachmentItem[]
-  setAttachments: React.Dispatch<React.SetStateAction<AttachmentItem[]>>
-  /** 重新上传某张上传失败的图片附件（点击重试时调用） */
-  retryImageUpload: (id: string) => void
+  /** Composer 当前输入的真值缓存（App 的 send 读取；ChatComposer 每次 render 同步最新值） */
+  composerRef: React.MutableRefObject<ChatComposerState>
+  /** 外部重置信号（草稿恢复 / 新建清空 / 发送清空），seq 递增触发 ChatComposer 重同步自身输入态 */
+  composerSeed: ChatComposerSeed
+  /** 欢迎页建议点击：把建议文本填入输入框（保留现有附件） */
+  setComposerInput: (text: string) => void
   queueCount: number
-  recording: boolean
-  /** 语音输入轻提示（如「未检测到有效语音」），空串表示无提示 */
-  voiceNotice: string
   models: GatewayModel[]
   selectedModel: string
   setSelectedModel: (v: string) => void
-  modelMenuOpen: boolean
-  setModelMenuOpen: React.Dispatch<React.SetStateAction<boolean>>
   systemModels: GatewayModel[]
   customModels: GatewayModel[]
   approvalPolicy: 'ask' | 'workdir' | 'never'
-  approvalMenuOpen: boolean
-  setApprovalMenuOpen: React.Dispatch<React.SetStateAction<boolean>>
   workDir: string
   workDirName: string
-  fileRef: React.RefObject<HTMLInputElement>
-  modelMenuRef: React.RefObject<HTMLDivElement>
-  approvalMenuRef: React.RefObject<HTMLDivElement>
-  isComposingRef: React.MutableRefObject<boolean>
   send: () => Promise<void>
   stopSend: () => void
-  toggleRecording: () => Promise<void>
-  handleFileSelect: (e: React.ChangeEvent<HTMLInputElement>) => Promise<void>
-  handlePaste: (e: React.ClipboardEvent<HTMLTextAreaElement>) => Promise<void>
   pickWorkdir: () => Promise<void>
   switchApprovalPolicy: (policy: 'ask' | 'workdir' | 'never') => void
   selectModel: (id: string) => void

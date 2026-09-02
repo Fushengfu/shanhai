@@ -19,6 +19,8 @@ async function bootstrap(): Promise<void> {
   // 圆角规则只在 data-platform='win32' 时生效；macOS 的 frameless 窗口有系统原生圆角，不受影响。
   document.documentElement.dataset.platform = window.shanhai?.platform ?? ''
   document.documentElement.dataset.rounded = 'true'
+  // 窗口类型标记：供 theme.css 按窗口类型做差异化（如 chat/supervisor/app 内容窗口加可见描边，桌面壳/Dock/悬浮图标不加）
+  document.documentElement.dataset.window = windowType
 
   if (windowType === 'desktop') {
     const { DesktopApp } = await import('./desktop/DesktopApp')

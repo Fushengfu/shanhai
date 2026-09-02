@@ -81,6 +81,11 @@ export function registerIpc(): void {
   ipcMain.handle('approval:getPolicy', async () => runtime.getApprovalPolicy())
   ipcMain.handle('approval:setPolicy', async (_e, policy: 'ask' | 'workdir' | 'never') => runtime.setApprovalPolicy(policy))
 
+  // —— 能力级审批（插件跨插件调用 write/destructive 能力）：允许/拒绝回传 runtime resolve ——
+  ipcMain.handle('capability-approval:respond', async (_e, requestId: string, approved: boolean, rememberForSession?: boolean) =>
+    runtime.respondCapabilityApproval(requestId, approved, rememberForSession),
+  )
+
   // —— AI 向用户提问（单选/多选/填空/选择器）——
   ipcMain.handle('ask:respond', async (_e, requestId: string, answer: string) => runtime.respondAsk(requestId, answer))
   ipcMain.handle('ask:cancel', async (_e, requestId: string) => runtime.cancelAsk(requestId))

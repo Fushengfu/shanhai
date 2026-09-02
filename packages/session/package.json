@@ -2,7 +2,7 @@
   "name": "@shanhai/session",
   "version": "0.1.0",
   "type": "module",
-  "description": "山海会话（对齐 dsh-session）：类型化事件日志，回放即状态",
+  "description": "山海会话：类型化事件日志，回放即状态",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",

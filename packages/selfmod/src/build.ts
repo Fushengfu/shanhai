@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { auditHostDangerousModules, HARD_BLOCK_DANGEROUS_NODE_MODULES } from './node-module-audit'
 
 /**
  * 插件应用「进程内构建器」（升级方案第 6 步）。
@@ -259,7 +260,13 @@ export async function verifyBuildArtifacts(projectDir: string): Promise<{
       if (/\brequire\s*\(\s*['"](electron|@shanhai[^'"]*)['"]\s*\)/.test(src)) {
         hostAudit = { ok: false, reason: 'host 半产物违规 external（electron / @shanhai/*），请以自包含 bundle 重新构建' }
       } else {
-        hostAudit = { ok: true }
+        // 阶段0 安全补漏：审计危险 node 内置模块（联网/文件/进程）。默认告警不拒绝；硬拦截开关打开时才 fail。
+        const dangerousHits = auditHostDangerousModules(src)
+        if (dangerousHits.length > 0 && HARD_BLOCK_DANGEROUS_NODE_MODULES) {
+          hostAudit = { ok: false, reason: `host 半产物引用危险 node 内置模块（${dangerousHits.join(', ')}），属未授权能力（待受控桥开放）` }
+        } else {
+          hostAudit = { ok: true }
+        }
       }
     } catch (err) {
       hostAudit = { ok: false, reason: `读取 host 产物失败: ${err instanceof Error ? err.message : String(err)}` }

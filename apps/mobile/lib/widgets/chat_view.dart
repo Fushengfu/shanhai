@@ -43,6 +43,12 @@ class ChatView extends StatefulWidget {
 class _ChatViewState extends State<ChatView> {
   final _inputCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
+  /// 当前列表是否「吸底」（offset 接近 0，即视觉底部的最新消息）。
+  /// reverse 列表 offset=0 是最新消息；往上滑 offset 增大（查看历史）。
+  bool _isAtBottom = true;
+  /// 「吸底」判定阈值（逻辑像素）：offset ≤ 该值视为在底部。
+  /// 用户手动上滑超过该阈值后，新消息到来不再自动滚到底，避免打断浏览。
+  static const double _stickThreshold = 50.0;
 
   List<HistoryItem> _items = [];
   String _streaming = '';
@@ -66,6 +72,15 @@ class _ChatViewState extends State<ChatView> {
   void initState() {
     super.initState();
     _incompleteTurn = widget.initialIncompleteTurn;
+    // 监听滚动位置，维护「是否吸底」状态：仅当用户在底部时才允许新消息自动滚到底，
+    // 用户上滑查看历史时保持当前位置不打断浏览。
+    _scrollCtrl.addListener(() {
+      if (!_scrollCtrl.hasClients) return;
+      final atBottom = _scrollCtrl.offset <= _stickThreshold;
+      if (atBottom != _isAtBottom) {
+        _isAtBottom = atBottom;
+      }
+    });
     _loadHistory();
     _eventSub = widget.ws.events.listen(_onEvent);
     // 切换设备后重新配对成功（paired）时，重新加载当前会话/管家的历史数据。
@@ -139,7 +154,7 @@ class _ChatViewState extends State<ChatView> {
         _truncated = resp.truncated;
         _loading = false;
       });
-      _scrollToBottom();
+      _scrollToBottom(force: true);
     } catch (_) {
       if (mounted) setState(() => _loading = false);
     }
@@ -233,7 +248,10 @@ class _ChatViewState extends State<ChatView> {
 
   /// 滚回最新消息。列表采用 reverse 布局，offset 0 即最新消息（视觉底部），
   /// 用 jumpTo 瞬时定位，避开 animateTo 目标值在懒加载列表下被低估的问题。
-  void _scrollToBottom() {
+  /// 默认仅在「吸底」时才滚动（用户上滑查看历史时不打断）；
+  /// [force] 为 true 时无条件滚到底（初始加载、用户主动发送等场景）。
+  void _scrollToBottom({bool force = false}) {
+    if (!force && !_isAtBottom) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollCtrl.hasClients) {
         _scrollCtrl.jumpTo(0);
@@ -355,7 +373,7 @@ class _ChatViewState extends State<ChatView> {
       _streamingReasoning = '';
       _pendingTools = [];
     });
-    _scrollToBottom();
+    _scrollToBottom(force: true);
     await widget.sendFn(content);
   }
 

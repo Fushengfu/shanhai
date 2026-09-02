@@ -101,7 +101,7 @@ export interface SuspendedSnapshot {
 }
 
 /**
- * AgentLoop（对齐 dsh-agent-loop）：ReAct 循环。
+ * AgentLoop：ReAct 循环。
  *
  * 消息 → 模型决策 → 工具审批 → 工具执行 → 结果回喂 → 再决策，直到文本收敛。
  * 每个可观测步骤落一条类型化会话事件（回放即状态）。
@@ -612,7 +612,7 @@ export class AgentLoop {
       return messages
     }
     if (!summary) return messages
-    return [...prefix, { role: 'assistant', content: `【本轮执行摘要】${summary}` }]
+    return [...prefix, { role: 'user', content: `【本轮执行摘要】${summary}\n\n请基于以上摘要继续完成剩余任务。` }]
   }
 
   /** 带自动重试的模型决策：可重试错误（网络/超时/5xx/429/余额不足/网关错误）自动重试最多 MAX_AUTO_RETRY 次（指数退避）。
@@ -632,7 +632,10 @@ export class AgentLoop {
         if (isContextLengthError(err)) throw err
         if (!isRetryableError(err)) throw err
         lastErr = err
-        if (attempt < MAX_AUTO_RETRY - 1) await sleep(AUTO_RETRY_BACKOFF_MS * 2 ** attempt)
+        if (attempt < MAX_AUTO_RETRY - 1) {
+          const base = isRateLimitError(err) ? RATE_LIMIT_BACKOFF_MS : AUTO_RETRY_BACKOFF_MS
+          await sleep(computeBackoffMs(attempt, base))
+        }
       }
     }
     const msg = lastErr instanceof Error ? lastErr.message : String(lastErr)
@@ -799,6 +802,8 @@ const TOOL_TIMEOUT_MS = 5 * 60 * 1000
 const MAX_AUTO_RETRY = 5
 /** 自动重试初始退避时间（毫秒），指数增长（500ms → 1s → 2s → 4s） */
 const AUTO_RETRY_BACKOFF_MS = 500
+/** 限流类错误（429/Throttling）初始退避时间（毫秒），指数增长（1s → 2s → 4s → 8s），比普通可重试错误更保守，给限流器足够冷却时间 */
+const RATE_LIMIT_BACKOFF_MS = 1000
 
 /** 用户发起新任务时（新发消息 / 编辑重发 / 点击重发）回放历史保留的最近对话回合数（20 轮：用户原始消息 + 最终 assistant 回复正文） */
 const MAX_HISTORY_TURNS = 20
@@ -843,11 +848,27 @@ function isRetryableError(err: unknown): boolean {
   if (/ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EPIPE|ECONNABORTED|UND_ERR_SOCKET|fetch\s*failed|network|socket|terminated|aborted|socket\s*hang\s*up|网络/i.test(msg)) return true
   // HTTP 5xx（网关/服务端临时故障）与 429（限流）
   if (/(?:API|status|HTTP)\s*5\d\d|(?:API|status|HTTP)\s*429/i.test(msg)) return true
+  // 429 限流：网关报错形如「upstream error 429: {...}」，429 前无 API/status/HTTP 前缀，裸匹配 429 兜底
+  if (/\b429\b/i.test(msg)) return true
+  // 限流/节流措辞：Throttling.BurstRate / rate limit / too many requests 等，网关限流可能不带 429 字样也不带「限流」中文
+  if (/throttl|burst\s*rate|rate\s*limit|rate\s*exceeded|too\s*many\s*requests/i.test(msg)) return true
   // 余额不足 / 配额 / 限流
-  if (/余额不足|insufficient|balance|quota|billing|rate\s*limit|限流|超额/i.test(msg)) return true
+  if (/余额不足|insufficient|balance|quota|billing|限流|超额/i.test(msg)) return true
   // 网关错误码（gateway error code N）
   if (/gateway\s*error/i.test(msg)) return true
   return false
+}
+
+/** 判断错误是否专属于「限流/节流」（429 / Throttling），区别于网络抖动/5xx 等其它可重试错误，用于给限流更长的指数退避 */
+function isRateLimitError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return /\b429\b|throttl|burst\s*rate|rate\s*limit|rate\s*exceeded|too\s*many\s*requests/i.test(msg)
+}
+
+/** 指数退避 + 随机抖动：baseMs * 2^attempt，再乘 0.8~1.2 抖动因子，避免多客户端/多任务同步重试再次撞限流 */
+function computeBackoffMs(attempt: number, baseMs: number): number {
+  const exp = baseMs * 2 ** attempt
+  return Math.round(exp * (0.8 + Math.random() * 0.4))
 }
 
 /** 从 __retry_exhausted__::<原因> 错误中提取失败原因（无前缀返回 undefined），供挂起快照落盘、前端弹窗展示 */

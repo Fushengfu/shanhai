@@ -155,7 +155,7 @@ export function DockApp(): React.JSX.Element {
           <span style={{ transform: 'scale(1.6)', display: 'inline-flex' }}>
             <IconGrid />
           </span>
-          <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>应用</span>
+          <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>应用</span>
         </button>
 
         {APP_REGISTRY.map((app) => (
@@ -188,7 +188,7 @@ export function DockApp(): React.JSX.Element {
             <span style={{ transform: 'scale(1.6)', display: 'inline-flex' }}>
               <app.Icon />
             </span>
-            <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{app.name}</span>
+            <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{app.name}</span>
           </button>
         ))}
 
@@ -220,8 +220,8 @@ export function DockApp(): React.JSX.Element {
               e.currentTarget.style.transform = 'translateY(0)'
             }}
           >
-            <PluginAppIcon appId={app.appId} size={28} />
-            <span style={{ fontSize: 11, color: 'var(--text-secondary)', maxWidth: 64, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <PluginAppIcon appId={app.appId} size={30} />
+            <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', maxWidth: 64, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {app.name}
             </span>
           </button>
@@ -298,8 +298,9 @@ export function DockApp(): React.JSX.Element {
             </span>
             <span
               style={{
-                fontSize: 11,
-                color: 'var(--text-secondary)',
+                fontSize: 12,
+                fontWeight: 500,
+                color: 'var(--text)',
                 maxWidth: 64,
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
@@ -399,7 +400,7 @@ export function DockApp(): React.JSX.Element {
           <span style={{ transform: 'scale(1.6)', display: 'inline-flex' }}>
             <IconMonitor />
           </span>
-          <span style={{ fontSize: 11, color: 'var(--text-secondary)', maxWidth: 64, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', maxWidth: 64, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             回桌面
           </span>
         </button>

@@ -46,7 +46,7 @@ export interface ComposerProps {
   stopSend: () => void
 }
 
-export function Composer(p: ComposerProps): React.JSX.Element {
+export const Composer = React.memo(function Composer(p: ComposerProps): React.JSX.Element {
   const systemModels = p.models.filter((m) => !m.custom)
   const customModels = p.models.filter((m) => m.custom)
 
@@ -317,4 +317,4 @@ export function Composer(p: ComposerProps): React.JSX.Element {
       </div>
     </div>
   )
-}
+})

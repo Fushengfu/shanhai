@@ -2,7 +2,7 @@
   "name": "@shanhai/agent",
   "version": "0.1.0",
   "type": "module",
-  "description": "山海 agent 循环（对齐 dsh-agent-loop）：ReAct + 流式 + 编排（Triage/断点续跑）",
+  "description": "山海 agent 循环：ReAct + 流式 + 编排（Triage/断点续跑）",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",

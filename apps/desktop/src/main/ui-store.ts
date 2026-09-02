@@ -109,6 +109,15 @@ export interface ApprovalRequest {
   riskLevel: string
 }
 
+/** 能力级审批请求（插件跨插件调用 write/destructive 能力时触发；sessionId 标记发起会话，用于会话级 remember 授权）。字段与 runtime 对齐。 */
+export interface CapabilityApprovalRequest {
+  requestId: string
+  callerPkgId: string
+  capability: string
+  risk: string
+  sessionId?: string
+}
+
 export interface BrowserWindowItem {
   appId: string
   url: string
@@ -141,6 +150,8 @@ export interface UiStoreState {
   retryPrompt: RetryPrompt | null
   /** 桌面壳壁纸：CSS backgroundImage 值（预设渐变字符串或 data:image base64）。null = 默认渐变 */
   wallpaper: string | null
+  /** 能力级审批队列（插件调 write/destructive 能力时的全局审批请求，与工具审批 approvalQueues 分离） */
+  capabilityApprovals: CapabilityApprovalRequest[]
 }
 
 export const EMPTY_SESSION: SessionUIState = {
@@ -169,6 +180,7 @@ const INITIAL_STATE: UiStoreState = {
   browserWindows: [],
   retryPrompt: null,
   wallpaper: null,
+  capabilityApprovals: [],
 }
 
 let state: UiStoreState = INITIAL_STATE
@@ -290,6 +302,7 @@ export function initUiStore(runtime: Runtime): void {
     selectedModel: runtime.getCurrentModelId(),
     approvalPolicy: runtime.getApprovalPolicy(),
     wallpaper: getWallpaper(),
+    capabilityApprovals: runtime.listPendingCapabilityApprovals(),
   }
   listeners.forEach((l) => l())
 
@@ -359,6 +372,13 @@ export function initUiStore(runtime: Runtime): void {
 
   // 管家代答提问后，关闭对应弹窗（removeAskRequest 按 requestId 过滤所有会话队列）
   runtime.onAskResolved((requestId) => removeAskRequest(requestId))
+
+  // 能力级审批（插件跨插件调用 write/destructive 能力）：全局队列，无 sessionId。
+  // 请求到达 push 进 capabilityApprovals（弹能力审批卡片），决策 resolve 后移除。
+  runtime.onCapabilityApprovalRequest((req) => {
+    mutate((s) => ({ ...s, capabilityApprovals: [...s.capabilityApprovals, req] }))
+  })
+  runtime.onCapabilityApprovalResolved((requestId) => removeCapabilityApprovalRequest(requestId))
 
   // token 用量按会话隔离
   runtime.onTokenStats((sessionId, stats) => {
@@ -489,4 +509,12 @@ export function removeAskRequest(requestId: string): void {
     }
     return { ...s, askQueues: next }
   })
+}
+
+/** 能力级审批被 resolve 后，从全局能力审批队列移除对应项并广播（桌面上限据卡片关闭） */
+export function removeCapabilityApprovalRequest(requestId: string): void {
+  mutate((s) => ({
+    ...s,
+    capabilityApprovals: s.capabilityApprovals.filter((r) => r.requestId !== requestId),
+  }))
 }

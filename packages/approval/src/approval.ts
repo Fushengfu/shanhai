@@ -14,7 +14,7 @@ export interface ApprovalRequest {
 export type Approver = (req: ApprovalRequest) => ApprovalOutcome | Promise<ApprovalOutcome>
 
 /**
- * 审批服务（对齐 dsh-user-approval）。
+ * 审批服务。
  *
  * - requiresApproval：never 不审批；工具显式 approvalRequired 或 irreversible/high 风险 → 审批。
  * - request：落 approval/request + approval/outcome 事件（回放即状态）。

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as React from 'react'
 import { createPortal } from 'react-dom'
-import { getUiStoreSnapshot, patchUiStore, useUiStore, useStreaming } from '../store-client'
-import { EMPTY_SESSION, type AttachmentItem, type ChatItem, type ContentPart, type HistoryItem, type SessionListItem, type SessionUIState } from '../types'
+import { getUiStoreSnapshot, patchUiStore, useUiStoreSelector, useStreaming } from '../store-client'
+import { EMPTY_SESSION, type ChatItem, type ContentPart, type HistoryItem, type SessionListItem, type SessionUIState } from '../types'
 import { WindowTitleBar } from '../components/WindowTitleBar'
 import { AiOrb } from '../components/AiOrb'
 import { AssistantMessage } from '../components/AssistantMessage'
@@ -16,10 +16,10 @@ import { ReasoningBlock } from '../components/ReasoningBlock'
 import { AskCard } from '../components/AskCard'
 import { SessionPicker } from '../components/SessionPicker'
 import { ModelPicker } from '../components/ModelPicker'
-import { Composer } from '../components/Composer'
+import { SupervisorComposer, type SupervisorComposerHandle } from './SupervisorComposer'
 import { TokenStatusBar } from '../components/TokenStatusBar'
 import { IconMonitor, IconWarn, IconMoon, IconSun } from '../components/icons'
-import { btn, formatBytes, prettyValue, readFileAsDataUrl, LiveDuration, ThinkingDots } from '../components/ui'
+import { btn, formatBytes, prettyValue, LiveDuration, ThinkingDots } from '../components/ui'
 import { useThemeSync, readTheme, applyTheme, type ThemeMode } from '../theme'
 
 /** 会话管家超级会话的固定 id（与 runtime 的 SUPERVISOR_ID 一致） */
@@ -40,29 +40,6 @@ const AI_BUBBLE_STYLE: React.CSSProperties = {
   wordBreak: 'break-word',
   userSelect: 'text',
   WebkitUserSelect: 'text',
-}
-
-/** PCM(Float32 16kHz) → 16-bit 单声道 PCM 的 base64（与聊天窗口一致） */
-function pcmToBase64(pcm: Float32Array): string {
-  const int16 = new Int16Array(pcm.length)
-  for (let i = 0; i < pcm.length; i++) {
-    const s = Math.max(-1, Math.min(1, pcm[i] ?? 0))
-    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff
-  }
-  const bytes = new Uint8Array(int16.buffer)
-  let bin = ''
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i] ?? 0)
-  return btoa(bin)
-}
-
-/** 计算一帧 PCM 的均方根能量（RMS），用于语音活动检测（VAD） */
-function audioRms(frame: Float32Array): number {
-  let sum = 0
-  for (let i = 0; i < frame.length; i++) {
-    const v = frame[i] ?? 0
-    sum += v * v
-  }
-  return Math.sqrt(sum / frame.length)
 }
 
 /** 把后端历史消息（HistoryItem[]）转换为消息流 items（ChatItem[]）：tool-result 合并到同 callId 的 tool-call */
@@ -151,28 +128,49 @@ function supervisorArgsSummary(args: Record<string, unknown>, sessions: SessionL
  * 输入框复用聊天窗口的 Composer（附件 / 模型 / 安全模式 / 麦克风 / 发送 完全一致）。
  */
 export function SupervisorApp(): React.JSX.Element {
-  const ui = useUiStore()
-  const cur = ui.sessionMap[SUPERVISOR_SID] ?? EMPTY_SESSION
+  // 卡顿优化（P0）：窄订阅替代全量 useUiStore()。仅订阅 supervisor 会话自身相关的窄字段，
+  // 其他会话的工具步骤 / token / 审批 / 流式等高频变化不再触发管家整窗重渲染（浅比较不变的字段返回缓存引用）。
+  const ui = useUiStoreSelector((s) => ({
+    cur: s.sessionMap[SUPERVISOR_SID] ?? EMPTY_SESSION,
+    curApproval: (s.approvalQueues[SUPERVISOR_SID] ?? [])[0] ?? null,
+    curAsk: (s.askQueues[SUPERVISOR_SID] ?? [])[0] ?? null,
+    capabilityApproval: s.capabilityApprovals[0] ?? null,
+    models: s.models,
+    selectedModel: s.selectedModel,
+    loggedIn: s.loggedIn,
+    // sessions 从订阅移除：仅 supervisorArgsSummary 用一次，改为 getUiStoreSnapshot() 按需读取
+    // 避免其他会话 start/end 重建 sessions 数组时拖累管家整窗重渲染
+    tokenStats: s.tokenStatsBySession[SUPERVISOR_SID] ?? null,
+  }))
+  const cur = ui.cur
   const streaming = useStreaming(SUPERVISOR_SID)
-  const curApproval = (ui.approvalQueues[SUPERVISOR_SID] ?? [])[0] ?? null
-  const curAsk = (ui.askQueues[SUPERVISOR_SID] ?? [])[0] ?? null
+  const curApproval = ui.curApproval
+  const curAsk = ui.curAsk
+  const capabilityApproval = ui.capabilityApproval
 
-  const [input, setInput] = useState('')
-  const [attachments, setAttachments] = useState<AttachmentItem[]>([])
-  const [recording, setRecording] = useState(false)
-  const [voiceNotice, setVoiceNotice] = useState('')
-  const [modelMenuOpen, setModelMenuOpen] = useState(false)
-  const [approvalMenuOpen, setApprovalMenuOpen] = useState(false)
+  // 卡顿优化（P0）：流式正文 markdown 节流（对齐 ChatPlugin）。streaming.text 每帧都在变长，
+  // 逐帧全量解析 ReactMarkdown 很费；这里每 120ms 才把最新文本写入 state 渲染一次。
+  const streamTextRef = useRef(streaming.text)
+  streamTextRef.current = streaming.text
+  const lastRenderedTextRef = useRef('')
+  const [streamedText, setStreamedText] = useState('')
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (streamTextRef.current !== lastRenderedTextRef.current) {
+        lastRenderedTextRef.current = streamTextRef.current
+        setStreamedText(streamTextRef.current)
+      }
+    }, 120)
+    return () => clearInterval(iv)
+  }, [])
+
   const [isSpeaking, setIsSpeaking] = useState(false)
-  /** 管家自己的模型 / 安全模式（supervisor 会话级，独立于其他会话与全局） */
-  const [supervisorModel, setSupervisorModel] = useState('')
-  const [supervisorApproval, setSupervisorApproval] = useState<'ask' | 'workdir' | 'never'>('ask')
   const [previewImage, setPreviewImage] = useState<string | null>(null)
-  const fileRef = useRef<HTMLInputElement>(null)
-  const modelMenuRef = useRef<HTMLDivElement>(null)
-  const approvalMenuRef = useRef<HTMLDivElement>(null)
-  const isComposingRef = useRef(false)
-  const mediaRecorderRef = useRef<{ stop: () => void } | null>(null)
+  // 能力级审批「本会话记住此授权」勾选（阶段3c remember）：用户允许时勾选则写 session 级授权白名单
+  const [rememberCapability, setRememberCapability] = useState(false)
+  // 卡顿优化（P1）：onPreviewImage useCallback 稳定化，避免 nodes 重建时所有消息 memo 失效
+  const handlePreviewImage = useCallback((url: string) => setPreviewImage(url), [])
+  const composerRef = useRef<SupervisorComposerHandle>(null)
   const listRef = useRef<HTMLDivElement>(null)
   const atBottomRef = useRef(true)
 
@@ -204,8 +202,6 @@ export function SupervisorApp(): React.JSX.Element {
     void api.getSupervisorHistory().then((history) => {
       patchSession({ items: historyToItems(history) })
     })
-    void api.supervisorGetModel().then((m) => setSupervisorModel(m)).catch(() => undefined)
-    void api.supervisorGetApproval().then((p) => setSupervisorApproval(p)).catch(() => undefined)
     // 管家会话 token 用量：主动拉取初始累计值（累计值从 supervisor 会话事件日志恢复），后续由 onTokenStats 广播实时更新
     void api.getTokenStats(SUPERVISOR_SID).then((s) => patchUiStore({ tokenStatsBySession: { [SUPERVISOR_SID]: s } })).catch(() => undefined)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -233,7 +229,9 @@ export function SupervisorApp(): React.JSX.Element {
     const el = listRef.current
     if (!el) return
     if (atBottomRef.current) el.scrollTop = el.scrollHeight
-  }, [cur.items, streaming.text, streaming.reasoning, curApproval])
+    // 依赖 streamedText（120ms 节流后的 state）而非 streaming.text/reasoning（每帧变长），
+    // 避免 rAF 期间每帧触发同步 reflow（scrollTop = scrollHeight 强制 layout）
+  }, [cur.items, streamedText, curApproval])
 
   /** 任务完成自动语音播报：受「语音播报」开关控制，清洗 markdown 后截断播报，播报期间显示 3D 特效 */
   async function speakResult(text: string): Promise<void> {
@@ -261,187 +259,6 @@ export function SupervisorApp(): React.JSX.Element {
     }
   }
 
-  /** 生成附件唯一 id */
-  const genId = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-
-  /** 图片附件自动上传云存储：拿到 https 链接后回填到对应附件 */
-  function uploadImageAttachment(id: string, dataUrl: string, mime: string): void {
-    void (async () => {
-      const base64 = dataUrl.replace(/^data:[^;]+;base64,/, '')
-      try {
-        const url = (await window.shanhai?.uploadImage(base64, mime)) ?? null
-        setAttachments((prev) => prev.map((x) => (x.id === id ? { ...x, uploadStatus: url ? 'done' : 'error', url: url ?? undefined } : x)))
-      } catch {
-        setAttachments((prev) => prev.map((x) => (x.id === id ? { ...x, uploadStatus: 'error' } : x)))
-      }
-    })()
-  }
-
-  /** 重新上传某张上传失败的图片附件 */
-  function retryImageUpload(id: string): void {
-    const a = attachments.find((x) => x.id === id)
-    if (!a || a.type !== 'image') return
-    setAttachments((prev) => prev.map((x) => (x.id === id ? { ...x, uploadStatus: 'uploading', url: undefined } : x)))
-    uploadImageAttachment(id, a.dataUrl, a.mime)
-  }
-
-  async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>): Promise<void> {
-    const files = e.target.files
-    if (!files) return
-    for (const file of Array.from(files)) {
-      const type = file.type.startsWith('image/')
-        ? 'image'
-        : file.type.startsWith('audio/')
-          ? 'audio'
-          : file.type.startsWith('video/')
-            ? 'video'
-            : 'file'
-      const dataUrl = await readFileAsDataUrl(file)
-      if (type === 'image') {
-        const id = genId()
-        setAttachments((prev) => [...prev, { id, type, name: file.name, dataUrl, mime: file.type, size: file.size, uploadStatus: 'uploading' }])
-        uploadImageAttachment(id, dataUrl, file.type || 'image/png')
-      } else {
-        setAttachments((prev) => [...prev, { id: genId(), type, name: file.name, dataUrl, mime: file.type, size: file.size }])
-      }
-    }
-    e.target.value = ''
-  }
-
-  async function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>): Promise<void> {
-    const items = e.clipboardData?.items
-    if (!items) return
-    for (const item of Array.from(items)) {
-      if (item.type.startsWith('image/')) {
-        const file = item.getAsFile()
-        if (file) {
-          const dataUrl = await readFileAsDataUrl(file)
-          const id = genId()
-          setAttachments((prev) => [...prev, { id, type: 'image', name: `pasted-${Date.now()}.png`, dataUrl, mime: file.type || 'image/png', size: file.size, uploadStatus: 'uploading' }])
-          uploadImageAttachment(id, dataUrl, file.type || 'image/png')
-        }
-      }
-    }
-  }
-
-  /** 语音输入：点击开始录音，再次点击停止；录音结束交后端 AI 识别，结果填入输入框（与聊天窗口一致） */
-  async function toggleRecording(): Promise<void> {
-    if (recording) {
-      mediaRecorderRef.current?.stop()
-      return
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const audioCtx = new AudioContext({ sampleRate: 16000 })
-      const source = audioCtx.createMediaStreamSource(stream)
-      const processor = audioCtx.createScriptProcessor(4096, 1, 1)
-      const chunks: Float32Array[] = []
-      const FRAME_SECONDS = 4096 / 16000
-      const TRAILING_SILENCE_FRAMES = 12
-      const NOISE_ESTIMATE_FRAMES = 6
-      let noiseFloor = 0
-      let totalFrames = 0
-      let lastVoiceFrame = -1
-      let consecutiveSilenceFrames = 0
-      let stopped = false
-
-      const finishRecording = (trigger: 'manual' | 'auto'): void => {
-        if (stopped) return
-        stopped = true
-        try {
-          processor.disconnect()
-          source.disconnect()
-          stream.getTracks().forEach((t) => t.stop())
-        } catch {
-          // 忽略断开异常
-        }
-        void audioCtx.close().catch(() => undefined)
-        void (async () => {
-          if (chunks.length === 0) {
-            setRecording(false)
-            return
-          }
-          try {
-            if (lastVoiceFrame < 0) {
-              setVoiceNotice('未检测到有效语音，请重试')
-              return
-            }
-            let keepFrames = totalFrames
-            if (trigger === 'auto') {
-              keepFrames = lastVoiceFrame + 1
-              setVoiceNotice(`检测到约 ${(consecutiveSilenceFrames * FRAME_SECONDS).toFixed(1)} 秒静音，已自动结束并提交有效语音`)
-            } else if (totalFrames - 1 - lastVoiceFrame >= TRAILING_SILENCE_FRAMES) {
-              keepFrames = lastVoiceFrame + 1
-              setVoiceNotice(`已自动截断结尾 ${((totalFrames - keepFrames) * FRAME_SECONDS).toFixed(1)} 秒静音`)
-            }
-            let total = 0
-            for (let i = 0; i < keepFrames; i++) total += chunks[i]?.length ?? 0
-            const pcm = new Float32Array(total)
-            let off = 0
-            for (let i = 0; i < keepFrames; i++) {
-              const c = chunks[i]
-              if (c) {
-                pcm.set(c, off)
-                off += c.length
-              }
-            }
-            const pcmBase64 = pcmToBase64(pcm)
-            const text = (await window.shanhai?.transcribeAudio(pcmBase64)) ?? ''
-            if (text.trim()) setInput((prev) => (prev ? `${prev}${text.trim()}` : text.trim()))
-          } catch (err) {
-            console.error('语音识别失败', err)
-          } finally {
-            setRecording(false)
-          }
-        })()
-      }
-
-      processor.onaudioprocess = (e) => {
-        const frame = new Float32Array(e.inputBuffer.getChannelData(0))
-        chunks.push(frame)
-        const r = audioRms(frame)
-        if (totalFrames < NOISE_ESTIMATE_FRAMES) {
-          noiseFloor = (noiseFloor * totalFrames + r) / (totalFrames + 1)
-          totalFrames++
-          return
-        }
-        if (r > Math.max(noiseFloor * 3, 0.012)) {
-          lastVoiceFrame = totalFrames
-          consecutiveSilenceFrames = 0
-        } else {
-          consecutiveSilenceFrames++
-          if (lastVoiceFrame >= 0 && consecutiveSilenceFrames >= TRAILING_SILENCE_FRAMES) {
-            finishRecording('auto')
-            return
-          }
-        }
-        totalFrames++
-      }
-      source.connect(processor)
-      processor.connect(audioCtx.destination)
-
-      mediaRecorderRef.current = { stop: () => finishRecording('manual') }
-      setRecording(true)
-    } catch (err) {
-      console.error('麦克风不可用或录音失败', err)
-      setRecording(false)
-    }
-  }
-
-  /** 切换管家自己的模型：只影响 supervisor 会话，不碰全局默认模型、不碰其他会话 */
-  function selectModel(id: string): void {
-    setSupervisorModel(id)
-    setModelMenuOpen(false)
-    void window.shanhai?.supervisorSetModel(id)
-  }
-
-  /** 切换管家自己的安全模式：只影响 supervisor 会话，不碰全局、不碰其他会话 */
-  function switchApprovalPolicy(policy: 'ask' | 'workdir' | 'never'): void {
-    setSupervisorApproval(policy)
-    setApprovalMenuOpen(false)
-    void window.shanhai?.supervisorSetApproval(policy)
-  }
-
   /** 响应管家会话的审批请求：通知 runtime 后由 onApprovalResolved 事件统一移除（否则弹窗会一直显示） */
   async function respondApproval(outcome: 'allowed-once' | 'rejected'): Promise<void> {
     const req = (getUiStoreSnapshot().approvalQueues[SUPERVISOR_SID] ?? [])[0]
@@ -460,6 +277,14 @@ export function SupervisorApp(): React.JSX.Element {
     // 此处不再手动 patchUiStore 移除，避免与 resolved 事件双重移除。
   }
 
+  /** 响应能力级审批（插件跨插件调用 write/destructive 能力）：允许/拒绝后由 onCapabilityApprovalResolved 事件统一移除 */
+  function respondCapabilityApproval(approved: boolean, rememberForSession = false): void {
+    if (!capabilityApproval) return
+    void window.shanhai?.respondCapabilityApproval(capabilityApproval.requestId, approved, rememberForSession)
+    // 弹窗关闭由 runtime 的 onCapabilityApprovalResolved 事件统一驱动（ui-store removeCapabilityApprovalRequest），
+    // 此处不再手动 patchUiStore 移除，避免与 resolved 事件双重移除。
+  }
+
   /** 取消管家会话的 AI 提问/选择：通知 runtime 取消（resolve 为取消标记），由 onAskResolved 事件统一移除 */
   async function cancelAsk(): Promise<void> {
     const req = (getUiStoreSnapshot().askQueues[SUPERVISOR_SID] ?? [])[0]
@@ -469,10 +294,10 @@ export function SupervisorApp(): React.JSX.Element {
     // 此处不再手动 patchUiStore 移除，避免与 resolved 事件双重移除。
   }
 
-  function stopSend(): void {
+  const stopSend = useCallback((): void => {
     patchSession({ busy: false, streaming: '', streamingReasoning: '' })
     void window.shanhai?.stop()
-  }
+  }, [patchSession])
 
   /** 重新发送：截断到该用户消息重新生成（对齐聊天窗口 resendMessage，直接重发不填回输入框） */
   const resendMessage = useCallback((userIndex: number): void => {
@@ -528,7 +353,9 @@ export function SupervisorApp(): React.JSX.Element {
   }, [patchSession])
 
   /** 发送消息给管家（等同用户在管家窗口输入）：处理附件后调 supervisorRun */
-  async function send(): Promise<void> {
+  const send = useCallback(async (): Promise<void> => {
+    const input = composerRef.current?.getInput() ?? ''
+    const attachments = composerRef.current?.getAttachments() ?? []
     const text = input.trim()
     if (!text || cur.busy) return
     if (attachments.some((a) => a.type === 'image' && a.uploadStatus !== 'done')) return
@@ -563,8 +390,7 @@ export function SupervisorApp(): React.JSX.Element {
       )
     }
     const finalText = fileNotes.length > 0 ? `${text}${text ? '\n\n' : ''}[已附加文件]\n${fileNotes.join('\n')}` : text
-    setInput('')
-    setAttachments([])
+    composerRef.current?.clearInput()
     const startTs = Date.now()
     patchSession((s) => ({
       items: [...s.items, { kind: 'user', content: text, images, turnSeq: s.items.filter((it) => it.kind === 'user').length + 1 }],
@@ -573,6 +399,16 @@ export function SupervisorApp(): React.JSX.Element {
       busy: true,
       turnStartTs: startTs,
     }))
+    // 竞态修复：interrupted/catch 分支追加 assistant 气泡前，先从主进程拉取 onSessionActivity('end') 已重建的权威 items，
+    // 避免用本地滞后的 s.items 覆盖主进程刚重建的含正文 items（「执行完正文消失」竞态）。
+    const authoritativeItems = async (): Promise<ChatItem[] | null> => {
+      try {
+        const history = await window.shanhai?.getSupervisorHistory()
+        return history ? historyToItems(history) : null
+      } catch {
+        return null
+      }
+    }
     let interrupted = false
     try {
       const result = (await window.shanhai?.supervisorRun(finalText, parts)) ?? ''
@@ -581,24 +417,16 @@ export function SupervisorApp(): React.JSX.Element {
       // 正常完成：assistant 正文由主进程 ui-store 的 onSessionActivity('end') 用 getSessionHistory 重建，
       // 这里不再重复 push（否则会出现「带工具调用」+「纯正文」两个重复气泡）。仅中断时补「已中断」提示气泡。
       if (interrupted) {
-        patchSession((s) => ({
-          items: [
-            ...s.items,
-            { kind: 'assistant', content: result, turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: Date.now() - startTs },
-          ],
-        }))
+        const base = (await authoritativeItems()) ?? getUiStoreSnapshot().sessionMap[SUPERVISOR_SID]?.items ?? []
+        patchSession({ items: [...base, { kind: 'assistant', content: result, turnSeq: base.filter((it) => it.kind === 'user').length, turnDuration: Date.now() - startTs }] })
       }
     } catch (err) {
-      patchSession((s) => ({
-        items: [
-          ...s.items,
-          { kind: 'assistant', content: `错误：${err instanceof Error ? err.message : String(err)}`, turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: Date.now() - startTs },
-        ],
-      }))
+      const base = (await authoritativeItems()) ?? getUiStoreSnapshot().sessionMap[SUPERVISOR_SID]?.items ?? []
+      patchSession({ items: [...base, { kind: 'assistant', content: `错误：${err instanceof Error ? err.message : String(err)}`, turnSeq: base.filter((it) => it.kind === 'user').length, turnDuration: Date.now() - startTs }] })
     } finally {
       patchSession({ busy: false })
     }
-  }
+  }, [cur.busy, patchSession])
 
   // 消息流渲染（按轮次分组：user 后收集 tool，遇 assistant 聚合进回复气泡）
   // 用 useMemo 缓存历史消息节点：streaming 变化时 items/busy/resend/edit 引用均不变，返回缓存的 nodes，
@@ -634,7 +462,7 @@ export function SupervisorApp(): React.JSX.Element {
             pending={it.pending}
             onResend={resendMessage}
             onEditResend={editResend}
-            onPreviewImage={(url) => setPreviewImage(url)}
+            onPreviewImage={handlePreviewImage}
           />,
         )
       } else if (it.kind === 'assistant') {
@@ -647,7 +475,7 @@ export function SupervisorApp(): React.JSX.Element {
             reasoningContent={it.reasoningContent}
             toolSteps={tools}
             turnDuration={it.turnDuration}
-            onPreviewImage={(url) => setPreviewImage(url)}
+            onPreviewImage={handlePreviewImage}
           />,
         )
       } else {
@@ -656,7 +484,7 @@ export function SupervisorApp(): React.JSX.Element {
     }
     if (!cur.busy) flushTools('tail')
     return { nodes, pendingTools: toolBuffer }
-  }, [cur.items, cur.busy, resendMessage, editResend, setPreviewImage])
+  }, [cur.items, cur.busy, resendMessage, editResend, handlePreviewImage])
 
   return (
     <div
@@ -735,10 +563,10 @@ export function SupervisorApp(): React.JSX.Element {
                     </div>
                   )}
                   {streaming.reasoning && <ReasoningBlock content={streaming.reasoning} streaming />}
-                  {streaming.text && (
+                  {streamedText && (
                     <div style={{ minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
                       <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents((url) => setPreviewImage(url))}>
-                        {normalizeTreeBlocks(stripWrappedRecordTag(streaming.text))}
+                        {normalizeTreeBlocks(stripWrappedRecordTag(streamedText))}
                       </ReactMarkdown>
                       <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
                     </div>
@@ -754,43 +582,20 @@ export function SupervisorApp(): React.JSX.Element {
         )}
       </div>
 
-      {/* 输入区：复用聊天窗口 Composer（附件 / 模型 / 工作目录 / 安全模式 / 麦克风 / 发送 完全一致） */}
-      <Composer
-        isEmpty={false}
-        attachments={attachments}
-        setAttachments={setAttachments}
-        retryImageUpload={retryImageUpload}
-        setPreviewImage={setPreviewImage}
-        fileRef={fileRef}
-        handleFileSelect={handleFileSelect}
-        queueCount={0}
-        voiceNotice={voiceNotice}
-        input={input}
-        setInput={setInput}
-        isComposingRef={isComposingRef}
-        handlePaste={handlePaste}
-        modelMenuRef={modelMenuRef}
-        modelMenuOpen={modelMenuOpen}
-        setModelMenuOpen={setModelMenuOpen}
-        models={ui.models}
-        selectedModel={supervisorModel || ui.selectedModel}
-        loggedIn={ui.loggedIn}
-        selectModel={selectModel}
-        showWorkdir={false}
-        approvalMenuRef={approvalMenuRef}
-        approvalMenuOpen={approvalMenuOpen}
-        setApprovalMenuOpen={setApprovalMenuOpen}
-        approvalPolicy={supervisorApproval}
-        switchApprovalPolicy={switchApprovalPolicy}
-        recording={recording}
-        toggleRecording={toggleRecording}
+      {/* 输入区：自包含 SupervisorComposer（附件 / 模型 / 安全模式 / 麦克风 / 发送），键入只重渲染本子树 */}
+      <SupervisorComposer
+        ref={composerRef}
         busy={cur.busy}
-        send={send}
-        stopSend={stopSend}
+        models={ui.models}
+        defaultSelectedModel={ui.selectedModel}
+        loggedIn={ui.loggedIn}
+        setPreviewImage={setPreviewImage}
+        onSend={send}
+        onStop={stopSend}
       />
 
       {/* token 用量状态栏：与聊天窗口一致（累计 / 本轮 / 缓存命中 / 轮次 / 上下文占比），数据源为管家会话（supervisor） */}
-      <TokenStatusBar stats={ui.tokenStatsBySession[SUPERVISOR_SID] ?? null} />
+      <TokenStatusBar stats={ui.tokenStats ?? null} />
 
       {/* 审批弹窗（管家会话的工具审批） */}
       {curApproval && (
@@ -817,13 +622,64 @@ export function SupervisorApp(): React.JSX.Element {
             <span style={{ color: 'var(--tint-red-strong)', marginLeft: 6 }}>（{riskLevelLabel(curApproval.riskLevel)}）</span>
           </div>
           <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-            {supervisorArgsSummary(curApproval.args, ui.sessions)}
+            {supervisorArgsSummary(curApproval.args, getUiStoreSnapshot().sessions ?? [])}
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
             <button onClick={() => void respondApproval('allowed-once')} style={btn('var(--accent)', '#fff')}>
               允许一次
             </button>
             <button onClick={() => void respondApproval('rejected')} style={btn('var(--bg-panel)', 'var(--text)', '1px solid var(--border-strong)')}>
+              拒绝
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 能力级审批卡片（插件跨插件调用 write/destructive 能力，如 network:http POST / filesystem 写） */}
+      {capabilityApproval && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: 158,
+            left: 16,
+            right: 16,
+            padding: 14,
+            borderRadius: 12,
+            border: '1px solid var(--tint-orange-strong, var(--tint-red-strong))',
+            background: 'var(--tint-orange, var(--tint-red))',
+            fontSize: 13,
+            boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+            zIndex: 20,
+          }}
+        >
+          <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text)' }}>
+            <IconWarn />
+            插件能力调用需要确认
+          </div>
+          <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>
+            插件 <b style={{ color: 'var(--text)' }}>{capabilityApproval.callerPkgId}</b> 请求调用能力：
+            <b style={{ color: 'var(--text)', marginLeft: 6 }}>{capabilityApproval.capability}</b>
+          </div>
+          <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12 }}>
+            风险等级：<span style={{ color: 'var(--tint-red-strong)', fontWeight: 600 }}>{capabilityApproval.risk}</span>
+            {capabilityApproval.sessionId && (
+              <span style={{ marginLeft: 8, color: 'var(--text-muted)' }}>会话 {capabilityApproval.sessionId}</span>
+            )}
+          </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={rememberCapability}
+              onChange={(e) => setRememberCapability(e.target.checked)}
+              style={{ cursor: 'pointer' }}
+            />
+            本次会话内记住此授权（同类能力不再逐次弹窗）
+          </label>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={() => respondCapabilityApproval(true, rememberCapability)} style={btn('var(--accent)', '#fff')}>
+              允许
+            </button>
+            <button onClick={() => respondCapabilityApproval(false)} style={btn('var(--bg-panel)', 'var(--text)', '1px solid var(--border-strong)')}>
               拒绝
             </button>
           </div>

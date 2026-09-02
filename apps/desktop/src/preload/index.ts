@@ -350,6 +350,8 @@ export interface ShanhaiBridge {
   // 审批
   onApprovalRequest(cb: (req: ApprovalRequest) => void): () => void
   respondApproval(outcome: 'allowed-once' | 'rejected', requestId: string): Promise<void>
+  // 能力级审批（插件调 write/destructive 能力）：允许/拒绝
+  respondCapabilityApproval(requestId: string, approved: boolean, rememberForSession?: boolean): Promise<void>
   // AI 向用户提问（单选/多选/填空/选择器）
   onAskRequest(cb: (req: AskRequest) => void): () => void
   respondAsk(requestId: string, answer: string): Promise<void>
@@ -605,6 +607,7 @@ const bridge: ShanhaiBridge = {
   getSessionHistory: (id) => ipcRenderer.invoke('session:history', id),
   getSessionTrace: (id) => ipcRenderer.invoke('session:trace', id),
   respondApproval: (outcome, requestId) => ipcRenderer.invoke('approval:respond', outcome, requestId),
+  respondCapabilityApproval: (requestId, approved, rememberForSession) => ipcRenderer.invoke('capability-approval:respond', requestId, approved, rememberForSession),
   run: (message, attachments) => ipcRenderer.invoke('chat:run', message, attachments),
   supervisorRun: (message, attachments) => ipcRenderer.invoke('supervisor:run', message, attachments),
   getSupervisorHistory: () => ipcRenderer.invoke('supervisor:history'),

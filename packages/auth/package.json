@@ -2,7 +2,7 @@
   "name": "@shanhai/auth",
   "version": "0.1.0",
   "type": "module",
-  "description": "山海认证（对齐 dsh-credentials）：账号密码登录（SHA-256）+ 凭证本地存储（600 权限）",
+  "description": "山海认证：账号密码登录（SHA-256）+ 凭证本地存储（600 权限）",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",

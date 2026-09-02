@@ -163,21 +163,77 @@ const host = (): NonNullable<Window['shanhai']> => {
   return window.shanhai
 }
 
-/** 标题栏：frameless 窗口的统一自定义标题栏（拖动区 + 最小化/最大化/关闭，与山海内置应用同风格） */
-function TitleBar(): JSX.Element {
+/** 内联窗口控制图标：与山海内置应用 WindowTitleBar 同款（16×16 SVG 描边，stroke=currentColor，随文字色） */
+function IconWinApp(): JSX.Element {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="7" height="7" rx="1.5" />
+      <rect x="14" y="3" width="7" height="7" rx="1.5" />
+      <rect x="3" y="14" width="7" height="7" rx="1.5" />
+      <rect x="14" y="14" width="7" height="7" rx="1.5" />
+    </svg>
+  )
+}
+
+function IconWinMinimize(): JSX.Element {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 12h14" />
+    </svg>
+  )
+}
+
+function IconWinMaximize(): JSX.Element {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="5" y="5" width="14" height="14" rx="2" />
+    </svg>
+  )
+}
+
+function IconWinRestore(): JSX.Element {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="5" y="9" width="12" height="12" rx="2" />
+      <path d="M9 5h10a2 2 0 0 1 2 2v10" />
+    </svg>
+  )
+}
+
+function IconWinClose(): JSX.Element {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18 6L6 18M6 6l12 12" />
+    </svg>
+  )
+}
+
+/** 标题栏：与山海内置应用 WindowTitleBar 同款（图标块 + 标题 + 副标题 + 28×28 SVG 三键窗口控制） */
+function TitleBar(props: { title: string; subtitle?: string; onClose: () => void }): JSX.Element {
+  const [maximized, setMaximized] = useState(false)
+  const handleToggleMaximize = async (): Promise<void> => {
+    const next = await host().toggleMaximizeWindow()
+    setMaximized(next ?? false)
+  }
   return (
     <header className="titlebar">
-      <span className="title">插件窗口 · 编译产物渲染</span>
-      <span className="spacer" />
-      <div className="winbtns">
-        <button className="winbtn" onClick={() => host().minimizeWindow()} title="最小化">
-          ─
+      <span className="titlebar-icon">
+        <IconWinApp />
+      </span>
+      <div className="titlebar-text">
+        <div className="titlebar-title">{props.title}</div>
+        {props.subtitle && <div className="titlebar-subtitle">{props.subtitle}</div>}
+      </div>
+      <div className="titlebar-spacer" />
+      <div className="titlebar-winbtns">
+        <button className="titlebar-winbtn" onClick={() => host().minimizeWindow()} title="最小化">
+          <IconWinMinimize />
         </button>
-        <button className="winbtn" onClick={() => void host().toggleMaximizeWindow()} title="最大化/还原">
-          □
+        <button className="titlebar-winbtn" onClick={() => void handleToggleMaximize()} title={maximized ? '还原' : '最大化'}>
+          {maximized ? <IconWinRestore /> : <IconWinMaximize />}
         </button>
-        <button className="winbtn close" onClick={() => void api().closeApp()} title="关闭窗口">
-          ✕
+        <button className="titlebar-winbtn" onClick={props.onClose} title="关闭">
+          <IconWinClose />
         </button>
       </div>
     </header>
@@ -194,7 +250,7 @@ export function App(): JSX.Element {
 
   return (
     <div className="app">
-      <TitleBar />
+      <TitleBar title="插件窗口" subtitle="编译产物渲染" onClose={() => void api().closeApp()} />
       <main className="body">
         <p className="hero">Dock 图标测试成功 —— client 半已脱离 new Function，改用编译产物 + loadFile 渲染</p>
         <p className="muted">插件应用 id：{pluginAppId || '（未知）'}</p>

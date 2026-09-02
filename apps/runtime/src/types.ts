@@ -308,6 +308,14 @@ export interface Runtime {
   listPendingApprovals(): Array<{ id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }>
   /** 审批被管家决策 resolve 后回调（requestId 定位，UI 据此关闭对应弹窗） */
   onApprovalResolved(cb: (requestId: string) => void): () => void
+  /** 能力级审批请求回调（插件跨插件调用 write/destructive 能力时弹能力审批卡片；sessionId 标记发起会话，用于会话级 remember 授权） */
+  onCapabilityApprovalRequest(cb: (req: { requestId: string; callerPkgId: string; capability: string; risk: string; sessionId?: string }) => void): () => void
+  /** UI 应答能力级审批（requestId 定位，approved=true 放行 / false 拒绝；rememberForSession=true 时本会话内记住该授权） */
+  respondCapabilityApproval(requestId: string, approved: boolean, rememberForSession?: boolean): void
+  /** 查询当前待处理的能力级审批（供手机端/桌面端连接后恢复弹窗） */
+  listPendingCapabilityApprovals(): Array<{ requestId: string; callerPkgId: string; capability: string; risk: string; sessionId?: string }>
+  /** 能力级审批被 resolve 后回调（requestId 定位，UI 据此关闭对应弹窗） */
+  onCapabilityApprovalResolved(cb: (requestId: string) => void): () => void
   /** 提问被管家代答 resolve 后回调（requestId 定位，UI 据此关闭对应弹窗） */
   onAskResolved(cb: (requestId: string) => void): () => void
   /** AI 向用户提问请求回调（UI 弹交互式卡片，req 带 sessionId，会话级隔离） */
@@ -350,7 +358,7 @@ export interface Runtime {
   run(message: string, opts?: { maxSteps?: number; attachments?: ContentPart[] }): Promise<string>
 
   /**
-   * 重新发送某条用户消息（参考 DSH / taco 的 resendFromExisting）：
+   * 重新发送某条用户消息（resendFromExisting）：
    * 截断到该用户消息之前，重新生成回复。newContent 传了则用新内容（编辑后重发）。
    * userMessageIndex 为该会话内用户消息的序号（0 起）。
    */

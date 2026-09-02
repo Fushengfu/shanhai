@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type UIEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { IconActivity, IconWrench } from './icons'
@@ -72,11 +72,16 @@ function ToolResultRow({ m, callMap }: { m: TraceEntry; callMap: Map<string, Cal
 }
 
 /** 单条消息痕迹：索引 #N + 角色标签 + 轮次 + 时间 + 元数据（reasoning / tool_calls / tool_call_id）+ 内容 */
-function TraceRow({ m, index, callMap }: { m: TraceEntry; index: number; callMap: Map<string, CallMeta> }) {
+function TraceRow({ m, index, callMap, isLast }: { m: TraceEntry; index: number; callMap: Map<string, CallMeta>; isLast?: boolean }) {
   const meta = ROLE_META[m.role]
   const time = new Date(m.timestamp).toLocaleString('zh-CN', { hour12: false })
   return (
-    <div style={{ marginBottom: 10, border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg-panel)', overflow: 'hidden' }}>
+    <div style={{ display: 'flex', gap: 12, alignItems: 'stretch' }}>
+      <div style={{ width: 16, flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+        <span style={{ width: 10, height: 10, borderRadius: '50%', background: meta.color, flexShrink: 0, marginTop: 14, boxShadow: '0 0 0 2px var(--bg-panel)' }} />
+        {!isLast && <span style={{ width: 2, flex: 1, background: 'var(--border)', marginTop: 4 }} />}
+      </div>
+      <div style={{ flex: 1, minWidth: 0, marginBottom: isLast ? 0 : 10, border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg-panel)', overflow: 'hidden' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', background: meta.bg, borderBottom: '1px solid var(--border)' }}>
         <span style={{ fontSize: 11, color: 'var(--text-faint)', fontFamily: 'ui-monospace, monospace', flexShrink: 0 }}>#{index}</span>
         <span style={{ fontSize: 11, fontWeight: 600, color: meta.color, padding: '1px 8px', borderRadius: 10, background: 'var(--bg-panel)', border: `1px solid ${meta.color}` }}>{meta.label}</span>
@@ -123,6 +128,7 @@ function TraceRow({ m, index, callMap }: { m: TraceEntry; index: number; callMap
           <div style={{ color: 'var(--text-faint)', fontSize: 12 }}>（无内容）</div>
         )}
       </div>
+      </div>
     </div>
   )
 }
@@ -138,9 +144,21 @@ export function TracePanel({ left, top, sessionId, busy, streamingReasoning, str
   variant?: 'panel' | 'window'
 }) {
   const [trace, setTrace] = useState<TraceEntry[]>([])
+  const [loading, setLoading] = useState(true)
+  // 分批渲染：数据量大时避免一次性全量渲染导致卡顿（配合滚动懒加载逐批增量渲染）
+  const [visibleCount, setVisibleCount] = useState(50)
   useEffect(() => {
     let alive = true
-    void window.shanhai?.getSessionTrace(sessionId).then((t) => { if (alive) setTrace(t ?? []) }).catch(() => undefined)
+    setLoading(true)
+    setVisibleCount(50)
+    void window.shanhai?.getSessionTrace(sessionId).then((t) => {
+      if (alive) {
+        setTrace(t ?? [])
+        setLoading(false)
+      }
+    }).catch(() => {
+      if (alive) setLoading(false)
+    })
     return () => { alive = false }
   }, [sessionId])
 
@@ -164,6 +182,18 @@ export function TracePanel({ left, top, sessionId, busy, streamingReasoning, str
   const roleCount = (r: TraceEntry['role']): number => trace.filter((m) => m.role === r).length
   const toolCallCount = trace.filter((m) => m.toolCalls && m.toolCalls.length > 0).length
 
+  const visibleTrace = trace.slice(0, visibleCount)
+  const hasMore = visibleCount < trace.length
+  const streamingActive = Boolean(streamingReasoning || streaming)
+  // 滚动到接近底部时增量加载更多，避免长列表一次性渲染卡死
+  const handleScroll = (e: UIEvent<HTMLDivElement>): void => {
+    if (!hasMore) return
+    const el = e.currentTarget
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 200) {
+      setVisibleCount((v) => Math.min(v + 50, trace.length))
+    }
+  }
+
   return (
     <div style={{ ...(variant === 'window' ? { height: '100vh' } : { position: 'fixed', top, left, right: 0, bottom: 0, zIndex: 50, borderLeft: '1px solid var(--border)', boxShadow: '-20px 0 60px rgba(0,0,0,0.2)' }), background: 'var(--bg-panel)', display: 'flex', flexDirection: 'column', overflow: 'hidden', fontFamily: 'system-ui, sans-serif' }}>
       <WindowTitleBar
@@ -173,21 +203,36 @@ export function TracePanel({ left, top, sessionId, busy, streamingReasoning, str
         onClose={() => onClose?.()}
       />
 
-        <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px' }}>
-          {trace.length === 0 && !busy && (
+        <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px' }} onScroll={handleScroll}>
+          {/* 加载提示：轨迹数据拉取期间显示骨架占位，避免被误判为「暂无」或界面无响应 */}
+          {loading && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: '8px 0' }}>
+              {[0, 1, 2, 3].map((i) => (
+                <div key={i} style={{ display: 'flex', gap: 12 }}>
+                  <div style={{ width: 10, height: 10, borderRadius: '50%', background: 'var(--border)', flexShrink: 0, marginTop: 6 }} />
+                  <div style={{ flex: 1, height: 44, borderRadius: 8, background: 'var(--bg-subtle)' }} />
+                </div>
+              ))}
+              <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 12, padding: '8px 0' }}>正在加载执行轨迹…</div>
+            </div>
+          )}
+          {!loading && trace.length === 0 && !busy && (
             <div style={{ textAlign: 'center', color: 'var(--text-faint)', padding: '80px 0', fontSize: 14 }}>暂无执行痕迹，发送一条消息开始</div>
           )}
-          {trace.map((m, i) => (
-            <TraceRow key={i} m={m} index={i + 1} callMap={callMap} />
+          {!loading && visibleTrace.map((m, i) => (
+            <TraceRow key={i} m={m} index={i + 1} callMap={callMap} isLast={i === visibleTrace.length - 1 && !hasMore && !streamingActive && !busy} />
           ))}
-          {streamingReasoning && (
-            <TraceRow m={{ role: 'assistant', content: '', reasoningContent: streamingReasoning, turn: 0, timestamp: Date.now() }} index={trace.length + 1} callMap={callMap} />
+          {!loading && streamingReasoning && (
+            <TraceRow m={{ role: 'assistant', content: '', reasoningContent: streamingReasoning, turn: 0, timestamp: Date.now() }} index={trace.length + 1} callMap={callMap} isLast={!streaming} />
           )}
-          {streaming && (
-            <TraceRow m={{ role: 'assistant', content: streaming, turn: 0, timestamp: Date.now() }} index={trace.length + 2} callMap={callMap} />
+          {!loading && streaming && (
+            <TraceRow m={{ role: 'assistant', content: streaming, turn: 0, timestamp: Date.now() }} index={trace.length + 2} callMap={callMap} isLast />
           )}
-          {busy && !streamingReasoning && !streaming && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', fontSize: 13 }}>
+          {!loading && hasMore && !streamingActive && (
+            <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 12, padding: '8px 0 16px' }}>继续向下滚动加载更多…</div>
+          )}
+          {!loading && busy && !streamingReasoning && !streaming && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', fontSize: 13, paddingLeft: 28 }}>
               <span style={{ width: 10, height: 10, borderRadius: '50%', background: 'var(--purple-soft)' }} />
               思考中
               <ThinkingDots />

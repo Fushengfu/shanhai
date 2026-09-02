@@ -1,6 +1,26 @@
 import { Kernel, FileSnapshotStore, PluginStore, type DynamicPackage } from '@shanhai/kernel'
 import { CORE_SLOTS } from '@shanhai/kernel-modules/client'
-import { SelfModifyRuntime } from '@shanhai/selfmod'
+import {
+  SelfModifyRuntime,
+  createNetworkBridge,
+  createFilesystemBridge,
+  NETWORK_CAPABILITY,
+  FILESYSTEM_CAPABILITY,
+  NETWORK_CAPABILITY_META,
+  FILESYSTEM_CAPABILITY_META,
+  BROWSER_READ_CAPABILITY,
+  BROWSER_NAVIGATE_CAPABILITY,
+  BROWSER_INTERACT_CAPABILITY,
+  BROWSER_EXECUTE_CAPABILITY,
+  BROWSER_COOKIE_CAPABILITY,
+  BROWSER_SCREENSHOT_CAPABILITY,
+  BROWSER_READ_CAPABILITY_META,
+  BROWSER_NAVIGATE_CAPABILITY_META,
+  BROWSER_INTERACT_CAPABILITY_META,
+  BROWSER_EXECUTE_CAPABILITY_META,
+  BROWSER_COOKIE_CAPABILITY_META,
+  BROWSER_SCREENSHOT_CAPABILITY_META,
+} from '@shanhai/selfmod'
 import { Session, type ApprovalPolicy, type SessionEvent } from '@shanhai/session'
 import { ApprovalService } from '@shanhai/approval'
 import { AgentLoop, type SuspendedSnapshot } from '@shanhai/agent'
@@ -101,6 +121,11 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   ctx.pendingApprovals = new Map<string, { resolve: (outcome: ApprovalOutcome) => void; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }>()
   ctx.approvalResolvedCallbacks = new Set<(requestId: string) => void>()
   ctx.askResolvedCallbacks = new Set<(requestId: string) => void>()
+  ctx.capabilityApprovalCallbacks = new Set<(req: { requestId: string; callerPkgId: string; capability: string; risk: string; sessionId?: string }) => void>()
+  ctx.pendingCapabilityApprovals = new Map<string, { resolve: (approved: boolean) => void; callerPkgId: string; capability: string; risk: string; sessionId?: string }>()
+  ctx.capabilityApprovalResolvedCallbacks = new Set<(requestId: string) => void>()
+  // 阶段3c：会话级能力授权白名单（remember for this session）
+  ctx.capabilityApprovalSessionGrants = new Set<string>()
   ctx.computerUse = createPlatformComputerUseService()
   ctx.browserUse = options.browserUse ?? createMockBrowserUseService()
   ctx.terminalUse = options.terminalUse ?? createMockTerminalService()
@@ -396,6 +421,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
 
   // —— K5 自修改（plugin_* 工具 + vm 沙箱 + browser 半投递 + round-trip 审批）——
 
+  // 阶段3e：插件 stop/uninstall 时销毁其浏览器窗口的后绑定清理函数。
+  // 声明在 selfmod 构造之前（removeClient 需引用它做延迟调用），真正实现由下方 browser 注册块赋值。
+  let closeBrowserWindowsForPlugin: ((pkgId: string) => Promise<void>) | undefined
+
   // 已安装插件持久化仓库（AI 自研应用落盘到 ~/.shanhai/plugins/，跨会话/跨重启留存）
   ctx.selfmod = new SelfModifyRuntime({
     listServices: () => ['session', 'approval', 'agent', 'memory', 'voice', 'computerUse', 'browserUse', 'model', 'credentials'],
@@ -418,6 +447,15 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
     removeClient: async (pkgId: string) => {
       ctx.clientRemoveCallbacks.forEach((cb) => cb(pkgId))
+      // 阶段3e：插件被 stop/uninstall 时销毁其浏览器窗口，防浏览器进程窗口残留泄漏。
+      // closeBrowserWindowsForPlugin 由下方 browser 注册块赋值；未赋值（如 browser 后端为 mock）则跳过。
+      if (closeBrowserWindowsForPlugin) {
+        try {
+          await closeBrowserWindowsForPlugin(pkgId)
+        } catch {
+          // 窗口清理失败不阻断插件卸载流程
+        }
+      }
     },
     openAppWindow: (appId: string) => {
       ctx.openAppWindowCallbacks.forEach((cb) => cb(appId))
@@ -425,7 +463,215 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     closeAppWindow: (appId: string) => {
       ctx.closeAppWindowCallbacks.forEach((cb) => cb(appId))
     },
+    attachCapability: (pkgId: string) => {
+      // 阶段1a：为插件创建独立的内核隔离子 Context，把 host 半 provide 的服务双写进能力总线。
+      // 命名规则 plugin:<pkgId>:<name>（对齐「系统插件能力总线」评估文档）；scope 为 extend 出来的子上下文。
+      // 内核 Context 无 unprovide，撤销靠「丢弃 scope 引用」实现（stop/uninstall 时 selfmod 删 capabilityScopes 项 + 调 dispose）。
+      const scope = ctx.kernel.ctx.extend()
+      return {
+        provide: (name: string, impl: unknown) => {
+          scope.provide(`plugin:${pkgId}:${name}`, impl)
+        },
+        dispose: () => {
+          void scope.dispose()
+        },
+      }
+    },
+    requestCapabilityApproval: (callerPkgId: string, capability: string, meta) =>
+      new Promise<boolean>((resolve) => {
+        // 阶段3c：会话级授权白名单短路。sessionId 由 runtime 内部解析（sessionContext 优先，回退当前选中会话）。
+        const sid = sessionContext.getStore() ?? ctx.currentSessionId ?? ''
+        const grantKey = `${sid}:${callerPkgId}:${capability}`
+        if (sid && ctx.capabilityApprovalSessionGrants.has(grantKey)) {
+          // 本会话内已记住授权 → 直接放行（不弹窗、不广播审批请求），避免浏览器高频交互逐次弹窗
+          resolve(true)
+          return
+        }
+        // 阶段2b：能力级审批 approver。跨插件调用 write/destructive 能力时阻塞在此，广播审批请求等待 UI 决策。
+        const requestId = `capability-approval-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        ctx.pendingCapabilityApprovals.set(requestId, { resolve, callerPkgId, capability, risk: meta.risk, sessionId: sid })
+        ctx.capabilityApprovalCallbacks.forEach((cb) => cb({ requestId, callerPkgId, capability, risk: meta.risk, sessionId: sid }))
+      }),
   }, ctx.pluginStore)
+
+  // —— 阶段2b：受控桥系统插件注入运行时 ——
+  // 把 network / filesystem 受控桥注册为「系统插件」能力（pkgId 虚拟命名空间 system:network / system:filesystem），
+  // 普通插件在 manifest 声明 capabilities.consume = ['network:http', 'filesystem'] 后即可跨插件路由调用。
+  // system-capabilities.ts 的 impl 首参是 callerPkgId（由 selfmod.invokeService 注入），据此按插件隔离。
+  {
+    const networkBridge = createNetworkBridge({ maxConcurrent: 8, timeoutMs: 30000 })
+    ctx.selfmod.registerSystemCapability('system:network', NETWORK_CAPABILITY, NETWORK_CAPABILITY_META, async (_callerPkgId: string, op: unknown, ...rest: unknown[]) => {
+      if (op === 'httpGet') return networkBridge.httpGet(String(rest[0] ?? ''))
+      if (op === 'httpPost') return networkBridge.httpPost(String(rest[0] ?? ''), String(rest[1] ?? ''))
+      throw new Error(`network:http 未知操作: ${String(op)}`)
+    })
+
+    // 文件桥按「调用方插件 id」各建一个独立私有目录 + 配额实例（rootDir = ~/.shanhai/plugins/<id>/data）
+    const filesystemBridges = new Map<string, ReturnType<typeof createFilesystemBridge>>()
+    const getFileBridge = (pkgId: string) => {
+      let bridge = filesystemBridges.get(pkgId)
+      if (!bridge) {
+        bridge = createFilesystemBridge({ rootDir: join(homedir(), '.shanhai', 'plugins', pkgId, 'data'), maxBytes: 64 * 1024 * 1024 })
+        filesystemBridges.set(pkgId, bridge)
+      }
+      return bridge
+    }
+    ctx.selfmod.registerSystemCapability('system:filesystem', FILESYSTEM_CAPABILITY, FILESYSTEM_CAPABILITY_META, async (callerPkgId: string, op: unknown, ...rest: unknown[]) => {
+      const bridge = getFileBridge(callerPkgId)
+      if (op === 'readFile') return bridge.readFile(String(rest[0] ?? ''))
+      if (op === 'writeFile') {
+        await bridge.writeFile(String(rest[0] ?? ''), String(rest[1] ?? ''))
+        return { ok: true }
+      }
+      if (op === 'listDir') return bridge.listDir(rest.length > 0 ? String(rest[0]) : '.')
+      if (op === 'exists') return bridge.exists(String(rest[0] ?? ''))
+      if (op === 'usageBytes') return bridge.usageBytes()
+      throw new Error(`filesystem 未知操作: ${String(op)}`)
+    })
+
+    // —— 阶段3b：浏览器受控桥系统插件注入运行时 ——
+    // 复用 ctx.browserUse（Electron 内置 Chromium 后端，零额外依赖），把 6 个 BROWSER 能力注册为系统插件能力。
+    // 一插件一独立 context：appId = browser:<callerPkgId>:default（含冒号 → browser.ts 的 partitionOf 走独立 partition），
+    // 与 network/filesystem 同级，普通插件 manifest 声明 capabilities.consume = ['browser:read', ...] 后跨插件调用。
+    // impl 首参 callerPkgId 由 selfmod.invokeService 注入；操作经 op 分发到 BrowserUseService 对应方法。
+    const browserAppId = (pkgId: string) => `browser:${pkgId}:default`
+    const b = ctx.browserUse
+
+    // —— 阶段3e：disposer + 并发上限 ——
+    // 每插件（callerPkgId）最多 3 个浏览器窗口、全局合计最多 8 个，超限抛明确错误，防插件失控/恶意开一堆窗口拖死主机。
+    // 计数基于 ctx.browserUse.list() 实时统计（非自维护 Map），无「异常关闭导致计数漂移」问题。
+    const BROWSER_MAX_PER_PLUGIN = 3
+    const BROWSER_MAX_GLOBAL = 8
+    // appId 形如 browser:<pkgId>:<短名>，以 `browser:` 前缀区分「插件浏览器窗口」与其它窗口（会话默认窗口 / deepseek bridge 等）。
+    // create 前做并发校验：每插件按 `browser:<pkgId>:` 前缀计数，全局按 `browser:` 前缀计数。
+    const ensureBrowserUnderLimit = async (pkgId: string): Promise<void> => {
+      const apps = await b.list().catch(() => [])
+      const pluginPrefix = `browser:${pkgId}:`
+      const used = apps.filter((w) => w.appId.startsWith(pluginPrefix)).length
+      const global = apps.filter((w) => w.appId.startsWith('browser:')).length
+      if (used >= BROWSER_MAX_PER_PLUGIN) {
+        throw new Error(`插件 "${pkgId}" 浏览器窗口数已达上限（${BROWSER_MAX_PER_PLUGIN} 个），请先关闭旧窗口再新建`)
+      }
+      if (global >= BROWSER_MAX_GLOBAL) {
+        throw new Error(`浏览器全局窗口数已达上限（${BROWSER_MAX_GLOBAL} 个），请先关闭部分窗口再新建`)
+      }
+    }
+    // disposer：关闭某插件的全部浏览器窗口（stop/uninstall 时经 removeClient 触发；基于 list() 实时查找，幂等）。
+    closeBrowserWindowsForPlugin = async (pkgId: string): Promise<void> => {
+      const prefix = `browser:${pkgId}:`
+      const apps = await b.list().catch(() => [])
+      for (const w of apps) {
+        if (w.appId.startsWith(prefix)) {
+          try {
+            await b.close(w.appId)
+          } catch {
+            // 单个窗口关闭失败（已被销毁/后端不可用）不阻断其余清理
+          }
+        }
+      }
+    }
+
+    // browser:read —— 只读（getContent/getInfo/getConsoleLogs/getNetworkRequests/list/wait），默认放行
+    ctx.selfmod.registerSystemCapability('system:browser', BROWSER_READ_CAPABILITY, BROWSER_READ_CAPABILITY_META, async (callerPkgId: string, op: unknown, ...rest: unknown[]) => {
+      const appId = browserAppId(callerPkgId)
+      if (op === 'getContent') return b.getContent(String(rest[0] ?? ''), appId, Boolean(rest[1]))
+      if (op === 'getInfo') return b.getInfo(appId)
+      if (op === 'getConsoleLogs') return b.getConsoleLogs(appId, rest[0] !== undefined ? Number(rest[0]) : undefined, Boolean(rest[1]))
+      if (op === 'getNetworkRequests') return b.getNetworkRequests(appId, rest[0] !== undefined ? Number(rest[0]) : undefined)
+      if (op === 'list') return b.list()
+      if (op === 'wait') return b.wait(String(rest[0] ?? ''), appId, rest[1] !== undefined ? Number(rest[1]) : undefined)
+      throw new Error(`browser:read 未知操作: ${String(op)}`)
+    })
+
+    // browser:navigate —— write（navigate/create/close/show/setShowOnCreate），ask 审批
+    ctx.selfmod.registerSystemCapability('system:browser', BROWSER_NAVIGATE_CAPABILITY, BROWSER_NAVIGATE_CAPABILITY_META, async (callerPkgId: string, op: unknown, ...rest: unknown[]) => {
+      const appId = browserAppId(callerPkgId)
+      if (op === 'navigate') {
+        await b.navigate(String(rest[0] ?? ''), appId)
+        return { ok: true }
+      }
+      if (op === 'create') {
+        // 阶段3e：并发上限校验（每插件 ≤3、全局 ≤8），超限在开窗前抛错
+        await ensureBrowserUnderLimit(callerPkgId)
+        return b.create(appId, rest[0] !== undefined ? String(rest[0]) : undefined, rest[1] !== undefined ? String(rest[1]) : undefined)
+      }
+      if (op === 'close') {
+        await b.close(appId)
+        return { ok: true }
+      }
+      if (op === 'show') {
+        await b.show(appId)
+        return { ok: true }
+      }
+      if (op === 'setShowOnCreate') {
+        b.setShowOnCreate?.(Boolean(rest[0]))
+        return { ok: true }
+      }
+      throw new Error(`browser:navigate 未知操作: ${String(op)}`)
+    })
+
+    // browser:interact —— write（click/type/scroll），ask 审批（select 无独立方法，v1 归入 type 语义）
+    ctx.selfmod.registerSystemCapability('system:browser', BROWSER_INTERACT_CAPABILITY, BROWSER_INTERACT_CAPABILITY_META, async (callerPkgId: string, op: unknown, ...rest: unknown[]) => {
+      const appId = browserAppId(callerPkgId)
+      if (op === 'click') {
+        await b.click(String(rest[0] ?? ''), appId)
+        return { ok: true }
+      }
+      if (op === 'type') {
+        await b.type(String(rest[0] ?? ''), String(rest[1] ?? ''), appId, Boolean(rest[2]))
+        return { ok: true }
+      }
+      if (op === 'scroll') {
+        await b.scroll((rest[0] ?? 'down') as 'up' | 'down' | 'left' | 'right', appId, rest[1] !== undefined ? Number(rest[1]) : undefined, rest[2] !== undefined ? String(rest[2]) : undefined)
+        return { ok: true }
+      }
+      throw new Error(`browser:interact 未知操作: ${String(op)}`)
+    })
+
+    // browser:execute —— destructive（evaluate/chatWithPageBridge），永远逐次审批
+    ctx.selfmod.registerSystemCapability('system:browser', BROWSER_EXECUTE_CAPABILITY, BROWSER_EXECUTE_CAPABILITY_META, async (callerPkgId: string, op: unknown, ...rest: unknown[]) => {
+      const appId = browserAppId(callerPkgId)
+      if (op === 'evaluate') return b.evaluate(String(rest[0] ?? ''), appId)
+      if (op === 'chatWithPageBridge') {
+        if (typeof b.chatWithPageBridge !== 'function') throw new Error('browser:execute 的 chatWithPageBridge 当前浏览器后端不支持')
+        return b.chatWithPageBridge(String(rest[0] ?? ''), (rest[1] && typeof rest[1] === 'object' ? rest[1] : {}) as { mode?: string; thinking?: boolean }, appId)
+      }
+      throw new Error(`browser:execute 未知操作: ${String(op)}`)
+    })
+
+    // browser:cookie —— write（getCookies/setCookie/clearCookies，敏感，读也按 write 对待），ask 审批
+    ctx.selfmod.registerSystemCapability('system:browser', BROWSER_COOKIE_CAPABILITY, BROWSER_COOKIE_CAPABILITY_META, async (callerPkgId: string, op: unknown, ...rest: unknown[]) => {
+      const appId = browserAppId(callerPkgId)
+      if (op === 'getCookies') return b.getCookies(appId)
+      if (op === 'setCookie') {
+        await b.setCookie(rest[0] as never, appId)
+        return { ok: true }
+      }
+      if (op === 'clearCookies') {
+        await b.clearCookies(appId)
+        return { ok: true }
+      }
+      throw new Error(`browser:cookie 未知操作: ${String(op)}`)
+    })
+
+    // browser:screenshot —— read-only（截图落盘，返回文件绝对路径，禁止把 PNG 字节/base64 塞进返回值）
+    // 落盘目录与文件桥一致：~/.shanhai/plugins/<callerPkgId>/data/screenshots/，按插件隔离。
+    const screenshotSeq = new Map<string, number>()
+    ctx.selfmod.registerSystemCapability('system:browser', BROWSER_SCREENSHOT_CAPABILITY, BROWSER_SCREENSHOT_CAPABILITY_META, async (callerPkgId: string, op: unknown, ...rest: unknown[]) => {
+      const appId = browserAppId(callerPkgId)
+      if (op !== 'screenshot') throw new Error(`browser:screenshot 未知操作: ${String(op)}`)
+      const buf = await b.screenshot(appId)
+      const bytes = new Uint8Array(buf)
+      const dir = join(homedir(), '.shanhai', 'plugins', callerPkgId, 'data', 'screenshots')
+      await fs.mkdir(dir, { recursive: true })
+      // 时间戳 + 逐个递增序号防同一毫秒重名覆盖
+      const seq = (screenshotSeq.get(callerPkgId) ?? 0) + 1
+      screenshotSeq.set(callerPkgId, seq)
+      const target = join(dir, `shot-${Date.now()}-${seq}.png`)
+      await fs.writeFile(target, bytes)
+      return target
+    })
+  }
 
   // —— 通用工具（视觉分析 / 快照回滚 / 长期记忆）+ 提问插件（ask_user）——
   // 能力在 runtime 装配，工具定义集中在 @shanhai/tools 的 createUtilityTools 与 @shanhai/ask 的 createAskTools（不散落在 bootstrap）。
@@ -802,6 +1048,11 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
     async deleteSession(id) {
       await sessionsModule.deleteSessionInternal(id)
+      // 阶段3c：删除会话时清理该 sessionId 的能力授权白名单（key = `${sessionId}:...` 前缀匹配），避免授权残留被其它会话复用
+      const prefix = `${id}:`
+      for (const grant of [...ctx.capabilityApprovalSessionGrants]) {
+        if (grant.startsWith(prefix)) ctx.capabilityApprovalSessionGrants.delete(grant)
+      }
     },
     getSessionWorkdir(id) {
       const meta = ctx.sessions.get(id ?? ctx.currentSessionId ?? '')
@@ -927,6 +1178,35 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     onApprovalResolved(cb) {
       ctx.approvalResolvedCallbacks.add(cb)
       return () => ctx.approvalResolvedCallbacks.delete(cb)
+    },
+    onCapabilityApprovalRequest(cb) {
+      ctx.capabilityApprovalCallbacks.add(cb)
+      return () => ctx.capabilityApprovalCallbacks.delete(cb)
+    },
+    respondCapabilityApproval(requestId, approved, rememberForSession) {
+      const p = ctx.pendingCapabilityApprovals.get(requestId)
+      if (p) {
+        // 阶段3c：允许 + 勾选「本会话记住」→ 写入会话级授权白名单（后续同类能力直接短路放行，不再逐次弹窗）
+        if (approved && rememberForSession && p.sessionId) {
+          ctx.capabilityApprovalSessionGrants.add(`${p.sessionId}:${p.callerPkgId}:${p.capability}`)
+        }
+        p.resolve(approved)
+        ctx.pendingCapabilityApprovals.delete(requestId)
+        ctx.capabilityApprovalResolvedCallbacks.forEach((cb) => cb(requestId))
+      }
+    },
+    listPendingCapabilityApprovals() {
+      return [...ctx.pendingCapabilityApprovals.entries()].map(([requestId, p]) => ({
+        requestId,
+        callerPkgId: p.callerPkgId,
+        capability: p.capability,
+        risk: p.risk,
+        sessionId: p.sessionId,
+      }))
+    },
+    onCapabilityApprovalResolved(cb) {
+      ctx.capabilityApprovalResolvedCallbacks.add(cb)
+      return () => ctx.capabilityApprovalResolvedCallbacks.delete(cb)
     },
     onAskResolved(cb) {
       ctx.askResolvedCallbacks.add(cb)

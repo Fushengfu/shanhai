@@ -2,7 +2,7 @@
   "name": "@shanhai/kernel-modules",
   "version": "0.1.0",
   "type": "module",
-  "description": "山海模块系统（K3，双端）：__DSH_BOOT__ 清单 + 客户端懒加载 CJS + slots 组合",
+  "description": "山海模块系统（K3，双端）：引导清单（BootManifest）+ 客户端懒加载 CJS + slots 组合",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",

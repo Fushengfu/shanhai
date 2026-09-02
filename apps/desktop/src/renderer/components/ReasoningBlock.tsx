@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import { IconChevronDown } from './icons'
 
 /** 「思考过程」折叠区块（紧凑版：无边框、无灰底卡片，左侧细线 + 折叠文字） */
-export function ReasoningBlock({ content, streaming }: { content: string; streaming?: boolean }) {
+export const ReasoningBlock = memo(function ReasoningBlock({ content, streaming }: { content: string; streaming?: boolean }) {
   const [open, setOpen] = useState(!!streaming)
   return (
     <div style={{ marginBottom: 6 }}>
@@ -23,4 +23,4 @@ export function ReasoningBlock({ content, streaming }: { content: string; stream
       )}
     </div>
   )
-}
+})
