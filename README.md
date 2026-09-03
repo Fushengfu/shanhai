@@ -6,8 +6,8 @@
 
 ## 下载
 
-- [🪟 Windows 版下载](https://store.bjctykj.com/app-versions/Windows/1788325471_Shanhai-0.6.0-x64.exe)（x64）
-- [🍎 macOS 版下载](https://store.bjctykj.com/app-versions/macOS/1788325602_Shanhai-0.6.0-arm64.dmg)（Apple Silicon / arm64）
+- [🪟 Windows 版下载](https://store.bjctykj.com/app-versions/Windows/1788425655_Shanhai-0.6.2-x64.exe)（x64，v0.6.2）
+- [🍎 macOS 版下载](https://store.bjctykj.com/app-versions/macOS/1788425981_Shanhai-0.6.2-arm64.dmg)（Apple Silicon / arm64，v0.6.2）
 
 ## 功能
 
@@ -25,6 +25,28 @@
 - **常驻托盘**：关闭窗口最小化到系统托盘，全局快捷键（⌘+Shift+Space）唤出/隐藏窗口
 - **云存储上传**：走网关 upload-token，返回 https 链接
 - **DeepSeek 桥接**：把已登录的 DeepSeek 网页版封装成 OpenAI 兼容 `/v1/chat/completions`
+
+## 界面预览
+
+> 以下为山海桌面端实际运行界面的截图（来源：本地实测环境，图片已存放于仓库 `docs/images/`）。
+
+### 1. 桌面会话与插件应用
+
+![山海桌面会话与插件应用](docs/images/desktop-overview.png)
+
+山海桌面整体：左上角为已安装的插件应用图标（切西瓜 / billiards / fish-hunter / AI视频工坊 / file-manager），底部为悬浮 Dock（应用 / 创意空间 / 聊天 / 管家 / 终端 / 设置 / 模型 / 壁纸 / 用户 / 回桌面），右侧打开「会话管家」窗口（主 Agent · 监控与调度所有会话），右下角为消息输入区与模型/上下文统计。
+
+### 2. 主会话窗口与多会话管理
+
+![山海主会话窗口与多会话管理](docs/images/main-window.png)
+
+山海主窗口：左侧为「会话」列表（可搜索、可新增，按时间倒序展示各会话），右侧主内容区展示当前会话（如「文件处理」）的检查结果与执行进度，底部为消息输入区（含模型选择、执行模式、麦克风、发送按钮）与 token/上下文统计；同时并排打开「会话管家」窗口。
+
+### 3. 插件窗口应用（3D 桌球）
+
+![山海插件窗口应用（3D 桌球）](docs/images/plugin-billiards.png)
+
+山海插件体系中的窗口应用示例：最前方为「3D 桌球（8球）」游戏插件窗口（3D 台球桌、绿呢/棕色边框、母球瞄准虚线、力度条、简单/普通/困难难度、帮助/回放/重新摆球），后方并排为主会话窗口与「会话管家」窗口，演示「插件应用 + 会话管理」同屏协作。
 
 ## 山海的能力
 
