@@ -90,10 +90,10 @@ if (!gotSingleInstanceLock) {
     await loadWindowContent(dockWin)
     // 聊天窗口（浮动在桌面之上，承载对话主界面）：默认隐藏，启动时仅显示桌面壳 + Dock + 会话管家窗口，
     // 用户通过 Dock「聊天」图标 / 托盘 / 全局快捷键打开聊天窗口
-    const chatWin = createWindow({ type: 'chat', show: false })
+    const chatWin = createWindow({ type: 'chat', appId: 'subSession', show: false })
     await loadWindowContent(chatWin)
     // 会话管家窗口（独立常驻，右侧停靠，承载主 Agent 单会话聊天界面）
-    const supervisorWin = createWindow({ type: 'supervisor' })
+    const supervisorWin = createWindow({ type: 'supervisor', width: 500, height: 760, appId: 'mainSession' })
     await loadWindowContent(supervisorWin)
     registerPush()
 

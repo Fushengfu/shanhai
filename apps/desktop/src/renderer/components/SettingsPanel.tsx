@@ -315,6 +315,14 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
     return () => unsub?.()
   }, [])
 
+  // 订阅网关中继状态实时推送：401 凭证失效（连网关被拒）时能实时感知，而不是只在打开设置时被动查一次
+  useEffect(() => {
+    const unsub = window.shanhai?.onRelayStatus((status) => {
+      setRelay(status)
+    })
+    return () => unsub?.()
+  }, [])
+
   useEffect(() => {
     function onKey(e: KeyboardEvent): void {
       if (e.key === 'Escape') onClose?.()
@@ -551,10 +559,25 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                   {relay?.enabled ? (
                     <div style={{ padding: '8px 0', fontSize: 12, lineHeight: 1.9, color: 'var(--text-secondary)' }}>
                       <div>
-                        连接状态：<span style={{ fontWeight: 600, color: relay.connected ? 'var(--success-text)' : 'var(--danger-text)' }}>{relay.connected ? '已连接网关' : '未连接（需登录会员账号）'}</span>
+                        连接状态：<span style={{ fontWeight: 600, color: relay.connected ? 'var(--success-text)' : relay.authFailed ? 'var(--danger-text)' : 'var(--danger-text)' }}>{relay.connected ? '已连接网关' : relay.authFailed ? '凭证失效（请重新登录）' : '未连接（需登录会员账号）'}</span>
                       </div>
                       <div>账号：{relay.username ?? '未登录'}</div>
                       <div>已连接手机：{relay.clientCount} 台</div>
+                      {relay.error ? (
+                        <div
+                          style={{
+                            marginTop: 6,
+                            padding: '8px 10px',
+                            borderRadius: 6,
+                            fontSize: 12,
+                            lineHeight: 1.5,
+                            color: relay.authFailed ? 'var(--danger-text)' : 'var(--text)',
+                            background: relay.authFailed ? 'var(--tint-red, rgba(239,68,68,0.12))' : 'var(--tint-orange, rgba(245,158,11,0.12))',
+                          }}
+                        >
+                          {relay.error}
+                        </div>
+                      ) : null}
                       <div style={{ color: 'var(--text-faint)' }}>手机 App 用同一会员账号登录后即可自动配对连接，无需配对码。</div>
                     </div>
                   ) : (

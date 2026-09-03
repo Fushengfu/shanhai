@@ -95,7 +95,7 @@ function normalizeMarketPlugin(raw: Record<string, unknown>): MarketPlugin {
 function installedPluginIds(): Set<string> {
   const ids = new Set<string>()
   try {
-    const entries = require('node:fs').readdirSync(PLUGINS_DIR, { withFileTypes: true })
+    const entries = readdirSync(PLUGINS_DIR, { withFileTypes: true })
     for (const e of entries) {
       if (e.isDirectory()) ids.add(e.name)
     }

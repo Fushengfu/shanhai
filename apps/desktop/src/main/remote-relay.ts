@@ -1,4 +1,6 @@
 import { WebSocket } from 'ws'
+import { BrowserWindow } from 'electron'
+import { safeSend } from './safe-send'
 import { getRuntime } from './runtime'
 import { handleCommand, subscribeRuntimeEvents } from './remote-protocol'
 
@@ -28,6 +30,10 @@ export interface RelayStatus {
   url: string
   username: string | null
   clientCount: number
+  /** 最近一次连接错误文案（401 未授权 / 其它连接失败），null 表示无错误 */
+  error: string | null
+  /** 是否因登录凭证失效（401）被网关拒绝，此时不再重连，需用户重新登录 */
+  authFailed: boolean
 }
 
 let relayUrl = DEFAULT_RELAY_URL
@@ -39,6 +45,10 @@ let unsubs: Array<() => void> = []
 let reconnectTimer: NodeJS.Timeout | null = null
 let pingTimer: NodeJS.Timeout | null = null
 let reconnectAttempts = 0
+/** 最近一次连接错误文案（含 401 认证失效），null 表示无错误 */
+let relayError: string | null = null
+/** 是否因登录凭证失效（401）被网关拒绝：true 时不再自动重连，避免反复 401 刷屏 */
+let authFailed = false
 
 function sendToRelay(obj: unknown): void {
   if (hostWs && hostWs.readyState === WebSocket.OPEN) {
@@ -61,6 +71,15 @@ function ensureSyncSubscribed(): void {
 function unsubscribeSync(): void {
   unsubs.forEach((u) => u())
   unsubs = []
+}
+
+/** 把当前 relay 状态（含连接错误）推送给所有渲染进程窗口，让 UI 能实时感知网关连接失败 */
+function broadcastRelayStatus(): void {
+  const status = getRelayStatus()
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue
+    safeSend(win, 'relay:status', status)
+  }
 }
 
 function connect(): void {
@@ -89,8 +108,11 @@ function connect(): void {
     connected = true
     reconnectAttempts = 0 // 连接成功，重置退避计数
     clientCount = 0 // 重连后重置客户端计数，等网关重新下发 client_connected 再同步
+    relayError = null // 连接成功，清除上次错误
+    authFailed = false
     startPing() // 心跳保活
     unsubscribeSync() // 数据同步延迟到手机连上后再建立
+    broadcastRelayStatus()
   })
 
   ws.on('message', (raw) => {
@@ -122,8 +144,21 @@ function connect(): void {
   })
 
   ws.on('error', (err) => {
-    console.error('[relay] 网关连接错误:', err instanceof Error ? err.message : err)
-    // close 随后触发，统一在 close 里重连
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error('[relay] 网关连接错误:', msg)
+    // 401 = 网关鉴权拒绝（登录凭证失效/过期），不再自动重连，避免反复 401 刷屏；
+    // 其它错误（网络抖动/网关宕机）保留重连。
+    const is401 = /401/i.test(msg)
+    authFailed = is401
+    relayError = is401
+      ? '登录凭证已失效或未授权（401），请重新登录后再使用外网远程'
+      : `网关连接失败：${msg}`
+    if (is401) {
+      // 立即停止后续重连（close 里的 scheduleReconnect 会因 authFailed 而跳过）
+      reconnectAttempts = 0
+    }
+    broadcastRelayStatus()
+    // close 随后触发，401 时不再重连
   })
 }
 
@@ -145,6 +180,7 @@ function stopPing(): void {
 }
 
 function scheduleReconnect(): void {
+  if (authFailed) return // 登录凭证失效（401）：不再自动重连，避免反复 401 刷屏
   if (reconnectTimer) return
   // 指数退避 + 随机抖动：多台电脑同时断线时不惊群重连，避免反复触发网关踢 Client
   const exp = Math.min(RECONNECT_DELAY_MS * Math.pow(2, reconnectAttempts), 60000)
@@ -167,6 +203,9 @@ export function startRemoteRelay(url: string = DEFAULT_RELAY_URL): RelayStatus {
     connected = false
     return getRelayStatus()
   }
+  // 主动（重新）开启：清除上一次的 401 失效标记，允许重新建立连接
+  authFailed = false
+  relayError = null
   connect()
   return getRelayStatus()
 }
@@ -187,6 +226,8 @@ export function stopRemoteRelay(): void {
   }
   connected = false
   clientCount = 0
+  relayError = null
+  authFailed = false
 }
 
 /** 查询网关中继状态（供设置面板展示连接状态） */
@@ -197,5 +238,7 @@ export function getRelayStatus(): RelayStatus {
     url: relayUrl,
     username: getRuntime().username,
     clientCount,
+    error: relayError,
+    authFailed,
   }
 }

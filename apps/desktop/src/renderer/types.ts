@@ -83,6 +83,8 @@ export interface RelayStatus {
   url: string
   username: string | null
   clientCount: number
+  error: string | null
+  authFailed: boolean
 }
 
 /** 应用版本检查/更新结果（主进程 → 渲染层） */
@@ -365,6 +367,8 @@ declare global {
       relayDisable(): Promise<RelayStatus>
       /** 查询网关中继状态 */
       relayStatus(): Promise<RelayStatus>
+      /** 订阅网关中继状态变化（连接成功/失败/401 失效时主进程推送），返回取消订阅函数 */
+      onRelayStatus(cb: (status: RelayStatus) => void): () => void
       /** 获取当前应用版本号 */
       getVersion(): Promise<string>
       /** 手动检查更新（弹窗引导下载/安装） */
