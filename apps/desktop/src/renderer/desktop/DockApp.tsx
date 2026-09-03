@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { APP_REGISTRY } from '../apps/registry'
+import { DOCK_APPS } from '../apps/registry'
 import { useThemeSync } from '../theme'
 import { useUiStore, patchUiStore } from '../store-client'
 import { IconAvatar, IconMonitor, IconGrid } from '../components/icons'
@@ -158,7 +158,7 @@ export function DockApp(): React.JSX.Element {
           <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>应用</span>
         </button>
 
-        {APP_REGISTRY.map((app) => (
+        {DOCK_APPS.map((app) => (
           <button
             key={app.id}
             data-dock-icon
