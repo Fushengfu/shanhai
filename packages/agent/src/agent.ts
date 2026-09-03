@@ -84,6 +84,11 @@ export interface AgentLoopOptions {
   /** 裁剪历史回合时是否保留回合内的工具调用事件（tool/call + tool/result + assistant(tool_calls)）。
    * true=按事件完整回放（管家会话用，保证工具调用历史不丢失、后续决策有依据）；false/缺省=只保留 user + 最终 assistant 正文（普通会话用，压缩上下文体积）。 */
   preserveToolCalls?: boolean
+  /** 是否剔除「最后一个未完成轮次」（发新任务 run() 时才传 true）：网络异常中断执行后，历史会残留一条
+   * 已发出但没等到 assistant 正文的孤立 user（其后可能有未走完的 tool 消息）。裁剪时若最后一个 user 回合
+   * 无最终 assistant 正文，则连同其后的 tool 消息一起丢弃，只回放完整问答轮，避免与新任务的 user 叠成
+   * 「连续两条 user、第一条无正文」。resumeRun（断点续跑）与管家会话不传（保持原回放，不裁剪未完成轮）。 */
+  dropIncompleteTurn?: boolean
 }
 
 /**
@@ -199,18 +204,19 @@ export class AgentLoop {
 
   async run(message: string, options?: AgentLoopOptions): Promise<string> {
     const maxSteps = options?.maxSteps ?? 2000
+    const maxHistoryTurns = options?.maxHistoryTurns ?? MAX_HISTORY_TURNS
     let messages: ChatMessage[] = []
     if (options?.systemPrompt) messages.push({ role: 'system', content: options.systemPrompt })
 
     // 从 session 事件日志回放历史（多轮对话 + 断点续跑：中断后历史仍在 session）
     // includeReasoning=false：上下文回放（近轮数裁剪、供模型使用）剔除 reasoning_content，避免思维链撑爆上下文、触发超时；
     // 仅 preserveToolCalls=true（按事件完整回放，保留工具调用）时才视为完整事件回放，保留 reasoning_content。
-    this.replayHistory(messages, options?.preserveToolCalls === true)
+    this.replayHistory(messages, options?.preserveToolCalls === true, maxHistoryTurns)
 
     // 用户发起的新任务（新发消息 / 编辑重发 / 点击重发）：始终按最近 maxHistoryTurns（缺省 20）轮对话回放（每轮只保留用户消息 + 最终 assistant 回复正文，
     // 丢弃更早历史与工具执行过程），不再全量回放。断点续跑 resumeRun() 走独立路径，保留全量已执行历史。
     // preserveToolCalls=true 时（管家会话），每回合按事件完整回放、保留工具调用（tool/call + tool/result + assistant(tool_calls)）。
-    this.trimHistoryToRecentTurns(messages, options?.maxHistoryTurns, options?.preserveToolCalls)
+    this.trimHistoryToRecentTurns(messages, maxHistoryTurns, options?.preserveToolCalls, options?.dropIncompleteTurn)
 
     // 追加当前消息（含多模态附件，附件一并写入事件日志，回放时还原）。
     // 落盘永远保留原始 message + attachments；发给模型的内容在有 modelContent 时用降级后的文字（如图片降级）
@@ -242,8 +248,27 @@ export class AgentLoop {
    * includeReasoning：是否把历史 assistant 消息的 reasoning_content（思维链）带回 messages。
    * - 上下文回放（run() 近轮数裁剪、供模型使用）默认传 false：剔除 reasoning_content，避免思维链撑爆上下文、触发超时；
    * - 完整事件回放（resumeRun 断点续跑 / preserveToolCalls=true 按事件完整回放）传 true：保留 reasoning_content。 */
-  private replayHistory(messages: ChatMessage[], includeReasoning = true): void {
-    for (const e of this.session.list()) {
+  private replayHistory(messages: ChatMessage[], includeReasoning = true, maxTurns?: number): void {
+    const total = this.session.size
+    let start = 0
+    if (maxTurns !== undefined && maxTurns > 0) {
+      // 发新任务(run)时只回放最近 maxTurns 个 user 回合：从尾部反向扫描（不整体 list() 复制），
+      // 定位第 maxTurns 个 user/message 的起点。不足 maxTurns 轮则 start 保持 0（全量回放），与未裁剪时一致。
+      let userCount = 0
+      for (let i = total - 1; i >= 0; i--) {
+        const e = this.session.at(i)
+        if (e?.type === 'user/message') {
+          userCount++
+          if (userCount >= maxTurns) {
+            start = i
+            break
+          }
+        }
+      }
+    }
+    for (let i = start; i < total; i++) {
+      const e = this.session.at(i)
+      if (!e) continue
       if (e.type === 'user/message') {
         const d = e.data as { content: string; attachments?: ContentPart[] }
         if (this.supportsVision) {
@@ -283,8 +308,13 @@ export class AgentLoop {
    * 工具执行过程，最大程度压缩体积同时保留对话主线。按 user 消息为回合边界，不切断「assistant(tool_calls) ↔ tool」配对
    * （这些过程整体丢弃，不会产生孤立 tool 消息）。历史不足 MAX_HISTORY_TURNS 轮时保留全部（等于未裁剪）。
    * 断点续跑 resumeRun() 不调用本方法，保留全量已执行历史。 */
-  private trimHistoryToRecentTurns(messages: ChatMessage[], maxTurns?: number, preserveToolCalls?: boolean): void {
-    const trimmed = this.buildTrimmedMessages(messages, maxTurns, preserveToolCalls)
+  private trimHistoryToRecentTurns(
+    messages: ChatMessage[],
+    maxTurns?: number,
+    preserveToolCalls?: boolean,
+    dropIncompleteTurn?: boolean,
+  ): void {
+    const trimmed = this.buildTrimmedMessages(messages, maxTurns, preserveToolCalls, dropIncompleteTurn)
     messages.length = 0
     messages.push(...trimmed)
   }
@@ -292,8 +322,15 @@ export class AgentLoop {
   /** 裁剪 messages 到最近 maxTurns（缺省 MAX_HISTORY_TURNS）个对话回合，返回新数组：
    * - preserveToolCalls=true：每回合按事件完整保留（user → assistant(tool_calls) → tool → ... → 最终 assistant 正文），不丢弃工具调用；
    * - preserveToolCalls=false/缺省：每回合只保留「用户原始消息 + 最终 assistant 回复正文」，丢弃中间的 tool/call、tool/result、assistant(tool_calls) 工具执行过程。
+   * - dropIncompleteTurn=true（发新任务 run():由普通会话传入）：若最后一个 user 回合无最终 assistant 正文（网络中断残留的孤立 user），
+   *   连同其后的 tool 消息一起丢弃，只回放完整问答轮，避免与新任务的 user 叠成连续两条 user。resumeRun / 管家不传该标志，保持原回放。
    * 调用方已确认需要裁剪，此处不再判断回合数是否超上限，始终只保留最近 limit 个回合。 */
-  private buildTrimmedMessages(messages: ChatMessage[], maxTurns?: number, preserveToolCalls?: boolean): ChatMessage[] {
+  private buildTrimmedMessages(
+    messages: ChatMessage[],
+    maxTurns?: number,
+    preserveToolCalls?: boolean,
+    dropIncompleteTurn?: boolean,
+  ): ChatMessage[] {
     const limit = maxTurns ?? MAX_HISTORY_TURNS
     const systemMsgs = messages.filter((m) => m.role === 'system')
     const rest = messages.filter((m) => m.role !== 'system')
@@ -305,6 +342,7 @@ export class AgentLoop {
     const keptUserIndices = userIndices.slice(-limit) // 最近 limit 个 user 消息在 rest 中的索引
     keptUserIndices.forEach((userIdx, t) => {
       const nextUserIdx = keptUserIndices[t + 1] ?? rest.length // 下一个 user 消息的位置（最后一个回合取 rest 末尾）
+      const isLastTurn = t === keptUserIndices.length - 1
       if (preserveToolCalls) {
         // 按事件完整保留该回合：user → assistant(tool_calls) → tool/result → ... → 最终 assistant 正文
         for (let i = userIdx; i < nextUserIdx; i++) {
@@ -312,6 +350,20 @@ export class AgentLoop {
           if (m) kept.push(m)
         }
         return
+      }
+      // 发新任务时剔除「最后一个未完成轮次」：网络中断遗留的孤立 user（其后没有最终 assistant 正文）。
+      // 只在最后一个 user 回合且 dropIncompleteTurn=true 时判定，避免误删中间的正常轮次。
+      if (dropIncompleteTurn && isLastTurn) {
+        let hasFinalText = false
+        for (let i = userIdx + 1; i < nextUserIdx; i++) {
+          const m = rest[i]
+          if (m && m.role === 'assistant' && !isToolCallMessage(m)) {
+            hasFinalText = true
+            break
+          }
+        }
+        // 无最终 assistant 正文 → 该回合是未完成轮次，连同其后未走完的 tool 消息一起跳过
+        if (!hasFinalText) return
       }
       const userMsg = rest[userIdx]
       if (!userMsg) return

@@ -8,6 +8,12 @@ import { useEffect, useRef } from 'react'
  * - 中心发光核心 + 粒子深度着色（近处青蓝 / 远处紫）
  * - speaking=true 时：旋转加速 + 整体呼吸扩散 + 粒子辉光增强
  * 用途：语音播报时置顶浮层展示；桌面壳窗口常驻装饰（speaking=false）。
+ *
+ * 性能优化（针对 supervisor renderer CPU 黑洞）：
+ * - 粒子数 150 → 40：O(n²) 连线从 ~1.1 万次/帧降到 ~780 次/帧
+ * - 移除 shadowBlur：Canvas2D 最昂贵操作之一，改为普通 fill + 深度 alpha
+ * - 中心径向渐变只创建一次（pulse 幅度仅 3%~9%，视觉差异可忽略），避免每帧重建渐变对象
+ * - 非 speaking 状态降到 15fps，避免空转打满 CPU；speaking 才回 60fps
  */
 interface Particle {
   x: number
@@ -15,9 +21,11 @@ interface Particle {
   z: number
 }
 
-const PARTICLE_COUNT = 150
+const PARTICLE_COUNT = 40
 const SPHERE_RADIUS = 96
 const SIZE = 320
+const FPS_IDLE = 15 // 非 speaking 降帧率，避免空转
+const IDLE_INTERVAL = Math.round(1000 / FPS_IDLE)
 
 /** 球面均匀采样（Fibonacci sphere） */
 function fibonacciSphere(n: number, radius: number): Particle[] {
@@ -51,9 +59,21 @@ export function AiOrb({ speaking = false }: { speaking?: boolean }): React.JSX.E
     ctx.scale(dpr, dpr)
 
     const particles = fibonacciSphere(PARTICLE_COUNT, SPHERE_RADIUS)
+    const cx = SIZE / 2
+    const cy = SIZE / 2
+    const coreRadius = SPHERE_RADIUS * 0.42
+
+    // 中心径向渐变：只创建一次（不随 pulse 缩放），避免每帧重建昂贵渐变对象
+    const coreGradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, coreRadius)
+    coreGradient.addColorStop(0, 'rgba(255,255,255,0.95)')
+    coreGradient.addColorStop(0.35, 'rgba(129,140,248,0.9)')
+    coreGradient.addColorStop(0.7, 'rgba(99,102,241,0.72)')
+    coreGradient.addColorStop(1, 'rgba(76,29,149,0)')
+
     let angleY = 0
     let angleX = 0
     let raf = 0
+    let timer = 0
     let last = performance.now()
 
     const draw = (now: number): void => {
@@ -66,8 +86,6 @@ export function AiOrb({ speaking = false }: { speaking?: boolean }): React.JSX.E
       const pulse = speakingNow ? 1 + 0.09 * Math.sin(now / 160) : 1 + 0.03 * Math.sin(now / 420)
 
       ctx.clearRect(0, 0, SIZE, SIZE)
-      const cx = SIZE / 2
-      const cy = SIZE / 2
       const radius = SPHERE_RADIUS * pulse
       const cosY = Math.cos(angleY)
       const sinY = Math.sin(angleY)
@@ -109,13 +127,11 @@ export function AiOrb({ speaking = false }: { speaking?: boolean }): React.JSX.E
         }
       }
 
-      // 发光粒子（近处青蓝 / 远处紫，带深度）
+      // 发光粒子（近处青蓝 / 远处紫，带深度）—— 已移除 shadowBlur，用普通 fill 避免昂贵阴影合成
       for (const p of proj) {
         if (!p) continue
         const depthAlpha = 0.5 + ((p.d + 1) / 2) * 0.5
         const r = 1.1 + ((p.d + 1) / 2) * 1.7
-        ctx.shadowBlur = speakingNow ? 12 : 7
-        ctx.shadowColor = 'rgba(34,211,238,0.9)'
         ctx.fillStyle = p.d > 0.15 ? 'rgba(34,211,238,0.95)' : 'rgba(139,92,246,0.85)'
         ctx.globalAlpha = depthAlpha
         ctx.beginPath()
@@ -123,23 +139,27 @@ export function AiOrb({ speaking = false }: { speaking?: boolean }): React.JSX.E
         ctx.fill()
       }
       ctx.globalAlpha = 1
-      ctx.shadowBlur = 0
 
-      // 中心发光核心
-      const core = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius * 0.42)
-      core.addColorStop(0, 'rgba(255,255,255,0.95)')
-      core.addColorStop(0.35, 'rgba(129,140,248,0.9)')
-      core.addColorStop(0.7, 'rgba(99,102,241,0.72)')
-      core.addColorStop(1, 'rgba(76,29,149,0)')
-      ctx.fillStyle = core
+      // 中心发光核心（使用缓存的渐变，固定半径）
+      ctx.fillStyle = coreGradient
       ctx.beginPath()
-      ctx.arc(cx, cy, radius * 0.42, 0, Math.PI * 2)
+      ctx.arc(cx, cy, coreRadius, 0, Math.PI * 2)
       ctx.fill()
 
-      raf = requestAnimationFrame(draw)
+      // speaking 用 60fps；非 speaking 降到 15fps，避免空转打满 CPU
+      if (speakingRef.current) {
+        raf = requestAnimationFrame(draw)
+      } else {
+        timer = window.setTimeout(() => {
+          raf = requestAnimationFrame(draw)
+        }, IDLE_INTERVAL)
+      }
     }
     raf = requestAnimationFrame(draw)
-    return () => cancelAnimationFrame(raf)
+    return () => {
+      cancelAnimationFrame(raf)
+      clearTimeout(timer)
+    }
   }, [])
 
   return (

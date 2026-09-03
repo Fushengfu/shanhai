@@ -1294,7 +1294,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       }
     },
     getCurrentModelId() {
-      return modelProviderModule.getCurrentModelId()
+      // 会话级模型：以「当前会话自己的 meta.modelId」为准（回退全局默认模型），
+      // 不读全局 ctx.currentModelId（后者是「运行时当前 provider」，可能因管家/后台切走而与该会话 meta 记录不一致，导致显示错）。
+      const meta = ctx.currentSessionId ? ctx.sessions.get(ctx.currentSessionId) : undefined
+      return meta?.modelId ?? ctx.defaultModelId
     },
     stop() {
       if (ctx.currentSessionId) sessionsModule.stopSessionInternal(ctx.currentSessionId)
@@ -1306,7 +1309,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     run: async (message, opts) => {
       const sid = ctx.currentSessionId
       if (!sid) throw new Error('没有活动会话')
-      return executionModule.runInSession(sid, message, opts)
+      // 会话级模型：普通发送也以该会话 meta.modelId 为准（与 resend / 管家下发一致），
+      // 避免依赖全局 ctx.currentModelId（后台执行/切走时可能与该会话 meta 记录不一致）。
+      const meta = ctx.sessions.get(sid)
+      return executionModule.runInSession(sid, message, opts, meta?.modelId ?? ctx.defaultModelId)
     },
 
     runSupervisor: (message, attachments) => executionModule.runSupervisorInternal(message, attachments),
@@ -1388,6 +1394,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         modelProviderModule.resolveCompactModel(),
       )
       ctx.runningLoops.set(sid, loop)
+      // 断点续跑前，剔除「最后一个任务」内的孤立 tool/call（有 callId 无配对 tool/result），
+      // 与 execution.ts 的 resume 路径保持一致：普通会话与管家会话统一清理，避免回放成「assistant 空 content + 无结果 tool」污染上下文。
+      meta.session.removeOrphanToolCalls(lastUserIdx + 1)
       ctx.sessionActivityCallbacks.forEach((cb) => cb(sid, 'start'))
       let suspended = false
       try {
@@ -1551,8 +1560,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       return true
     },
 
-    getApprovalPolicy() {
-      return sessionsModule.sessionApprovalPolicy()
+    getApprovalPolicy(sid) {
+      return sessionsModule.sessionApprovalPolicy(sid)
     },
 
     setApprovalPolicy(policy) {
@@ -1577,6 +1586,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
 
     installMarketPlugin(id) {
       return ctx.selfmod.installFromDisk(id)
+    },
+
+    uninstallMarketPlugin(id) {
+      return ctx.selfmod.uninstall(id)
     },
 
     getGatewayApiKey() {

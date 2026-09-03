@@ -91,6 +91,11 @@ export class Session {
     return this.events.slice(start, end)
   }
 
+  /** 按索引无复制读取单条事件（供反向扫描/末尾定位等只读遍历，避免 list() 全量复制） */
+  at(index: number): SessionEvent | undefined {
+    return this.events[index]
+  }
+
   /** 从历史事件恢复（会话持久化加载用），返回恢复的事件数 */
   restore(events: SessionEvent[]): number {
     for (const e of events) {
@@ -113,6 +118,43 @@ export class Session {
     this.events.length = count
     if (this.persistedCount > count) this.persistedCount = count
     this.needsRewrite = true
+    return removed
+  }
+
+  /**
+   * 移除 [sinceIndex, end) 区间内的「孤立 tool/call」——有 callId 但没有任何配对 tool/result 的工具调用。
+   * 这类半截事件只可能由进程级中断（崩溃/断电/被 kill）在「append('tool/call') 之后、append('tool/result') 之前」遗留，
+   * 回放时会变成「assistant 空 content + 无结果工具」污染上下文；断点续跑前应剔除，保留成对的 tool/call + tool/result（现场依据）。
+   * 返回移除数；有移除则置 needsRewrite=true（持久化层据此全量重写 events.jsonl）。
+   */
+  removeOrphanToolCalls(sinceIndex: number): number {
+    if (sinceIndex < 0) sinceIndex = 0
+    if (sinceIndex >= this.events.length) return 0
+    // 先收集区间内所有 tool/result 的 callId，作为「已配对」依据
+    const resultIds = new Set<string>()
+    for (let i = sinceIndex; i < this.events.length; i++) {
+      const e = this.events[i]
+      if (e?.type === 'tool/result') {
+        const d = e.data as { callId?: string }
+        if (d.callId) resultIds.add(d.callId)
+      }
+    }
+    let removed = 0
+    // 从后往前删（splice 不扰动前部下标），只删没有配对 result 的 tool/call
+    for (let i = this.events.length - 1; i >= sinceIndex; i--) {
+      const e = this.events[i]
+      if (e?.type === 'tool/call') {
+        const d = e.data as { callId?: string }
+        if (!d.callId || !resultIds.has(d.callId)) {
+          this.events.splice(i, 1)
+          removed++
+        }
+      }
+    }
+    if (removed > 0) {
+      if (this.persistedCount > this.events.length) this.persistedCount = this.events.length
+      this.needsRewrite = true
+    }
     return removed
   }
 

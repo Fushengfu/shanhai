@@ -65,6 +65,10 @@ let snapshot: SharedState = EMPTY_STATE
 const listeners = new Set<() => void>()
 let initialized = false
 
+/** 已应用的主进程快照版本号：用于丢弃过期快照（rev <= appliedRev），
+ *  避免主进程广播（全量覆盖）覆盖渲染进程刚更新的状态导致 currentSessionId/安全模式等回退串台。 */
+let appliedRev = 0
+
 /** 流式增量（正文 + 思考）的本地累加缓存：主进程 chat:delta/chat:reasoning 独立小事件直发，
  *  不走全量 ui:state 快照（避免每个 token 全量广播导致内存放大）。会话结束（busy=false）时清空。 */
 const EMPTY_STREAMING = { text: '', reasoning: '' }
@@ -104,15 +108,21 @@ function deepMerge<T>(target: T, patch: unknown): T {
 function ensureInit(): void {
   if (initialized) return
   initialized = true
-  void window.shanhai?.getUiState().then((s) => {
-    snapshot = s as unknown as SharedState
+  void window.shanhai?.getUiState().then((env) => {
+    if (env.rev <= appliedRev) return
+    appliedRev = env.rev
+    snapshot = env.state as unknown as SharedState
     listeners.forEach((l) => l())
   })
-  window.shanhai?.onUiState((s) => {
-    snapshot = s as unknown as SharedState
+  window.shanhai?.onUiState((env) => {
+    // 过期快照丢弃：主进程单调递增 rev，若本次 rev <= 已应用 rev 说明是「旧广播晚到」，
+    // 直接丢弃，避免全量覆盖把渲染进程刚更新的 currentSessionId / 安全模式等回退到旧值（快速切换串台）。
+    if (env.rev <= appliedRev) return
+    appliedRev = env.rev
+    snapshot = env.state as unknown as SharedState
     // 流式累加缓存清理：① 会话结束（busy=false）时清空；② 会话已从 sessionMap 移除（被删除/切出）时清空残留，
     // 避免切换/删除会话后 streamingCache 长期持有无用增量文本（内存持续增长）。遍历 streamingCache 键（会话数级）。
-    const sm = (s as unknown as SharedState).sessionMap ?? {}
+    const sm = (env.state as unknown as SharedState).sessionMap ?? {}
     for (const sid of Object.keys(streamingCache)) {
       const sess = sm[sid]
       if (!sess) {

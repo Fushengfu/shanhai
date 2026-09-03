@@ -378,8 +378,8 @@ export interface Runtime {
   injectMessage(sessionId: string, message: string): boolean
   /** 会话是否存在「未完成的消息」（最后一条用户消息之后没有 assistant/message 或 turn/end） */
   hasIncompleteTurn(sessionId: string): boolean
-  /** 当前审批策略（安全模式） */
-  getApprovalPolicy(): ApprovalPolicy
+  /** 审批策略（安全模式）。会话级：传 sid 读该会话的 meta.approvalPolicy，不传则读当前会话。 */
+  getApprovalPolicy(sid?: string): ApprovalPolicy
   /** 切换审批策略（安全模式），并持久化到本地 */
   setApprovalPolicy(policy: ApprovalPolicy): void
 
@@ -389,6 +389,8 @@ export interface Runtime {
   restoreInstalledPlugins(): Promise<number>
   /** 自修改（市场）：激活一个已还原落盘到 ~/.shanhai/plugins/<id>/ 的插件（用户点「下载安装」已授权，覆盖升级 + 免审批） */
   installMarketPlugin(id: string): Promise<{ id: string; installed: boolean }>
+  /** 自修改（市场）：卸载已安装插件（撤销运行 + 删除 ~/.shanhai/plugins/<id>/ 持久化目录，不可恢复） */
+  uninstallMarketPlugin(id: string): Promise<{ uninstalled: boolean }>
   /** 当前网关 APIKey（登录后发放，用于网关 API 鉴权如插件市场提交；未登录返回空串） */
   getGatewayApiKey(): string
   /** 自修改：browser 半投递前的 round-trip 审批请求回调（UI 弹卡片） */

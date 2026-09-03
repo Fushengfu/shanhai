@@ -11,6 +11,7 @@ import { makeMarkdownComponents, normalizeTreeBlocks, stripWrappedRecordTag } fr
 import { ReasoningBlock } from '../components/ReasoningBlock'
 import { DiffBlock, StepStats, ToolStep, toolDisplayName, riskLevelLabel } from '../components/ToolStep'
 import { UserMessage } from '../components/UserMessage'
+import { VirtualList } from '../components/VirtualList'
 import { IconChevronDown, IconCode, IconRefresh, IconWarn } from '../components/icons'
 import { btn, formatArgs, LiveDuration, ThinkingDots } from '../components/ui'
 import { registerSlot, SlotView, AppendSlotView } from '../slots'
@@ -194,8 +195,68 @@ function ChatSlot(): React.JSX.Element {
 
   return (
     <>
-      <div
-        ref={listRef}
+      <VirtualList
+        containerRef={listRef}
+        items={history.nodes}
+        isEmpty={ctx.isEmpty}
+        empty={<SlotView slot="shell.welcome" />}
+        footer={
+          <>
+            {ctx.cur.busy && (
+              <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
+                <div style={AI_BUBBLE_STYLE}>
+                  {/* 实时耗时 + 步数统计：任务执行中每秒跳动显示耗时，并实时统计已执行/成功/失败/执行中的步数 */}
+                  {(ctx.cur.turnStartTs != null || history.pendingTools.length > 0) && (
+                    <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 6 }}>
+                      {ctx.cur.turnStartTs != null && (
+                        <>
+                          耗时 <LiveDuration startTs={ctx.cur.turnStartTs} />
+                        </>
+                      )}
+                      <StepStats tools={history.pendingTools} />
+                    </div>
+                  )}
+                  {/* 当前轮已执行的工具步骤（实时） */}
+                  {history.pendingTools.length > 0 && (
+                    <div style={{ margin: '0 0 2px' }}>
+                      {history.pendingTools.map((t) => (
+                        <ToolStep key={t.callId} trace={t} />
+                      ))}
+                    </div>
+                  )}
+                  {/* 思考过程折叠块：显示在正文之前，流式展开显示完整思考 */}
+                  {streaming.reasoning && <ReasoningBlock content={streaming.reasoning} streaming />}
+                  {/* 正式回答：只显示最终正文（流式实时按 Markdown 渲染，与历史气泡一致；已节流 120ms 渲染，避免逐帧全量解析） */}
+                  {streamedText && (
+                    <div style={{ minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents(handlePreview)}>
+                        {normalizeTreeBlocks(stripWrappedRecordTag(streamedText))}
+                      </ReactMarkdown>
+                      <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
+                    </div>
+                  )}
+                  {/* 思考中三点动画：气泡底部（块级换行），任务结束才消失 */}
+                  <div style={{ display: 'block', color: 'var(--text-muted)', fontSize: 12, marginTop: 4 }}>
+                    思考中
+                    <ThinkingDots />
+                  </div>
+                </div>
+              </div>
+            )}
+            {ctx.incompleteTurn && !ctx.cur.busy && (
+              <div style={{ marginBottom: 8 }}>
+                <button
+                  onClick={ctx.resumeMessage}
+                  title="上次任务未完成，点击继续执行"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 14px', borderRadius: 14, border: '1px solid var(--accent)', background: 'var(--bg-panel)', color: 'var(--accent)', fontSize: 13, cursor: 'pointer' }}
+                >
+                  <IconRefresh />
+                  继续执行
+                </button>
+              </div>
+            )}
+          </>
+        }
         onScroll={handleScroll}
         style={
           ctx.isEmpty
@@ -203,8 +264,6 @@ function ChatSlot(): React.JSX.Element {
             : {
                 flex: 1,
                 minHeight: 0,
-                // 消息列表容器宽度约束：显式占满父级（≤ 窗口 - 侧边栏）、上限 100%、内边距不撑破，且用列 flex 让每条消息占满整行，
-                // 配合 `minWidth: 0`，任何宽内容（长代码/nowrap 表格/长 URL）都不能把容器推宽 → 从根上杜绝「气泡右侧超出窗口」
                 width: '100%',
                 maxWidth: '100%',
                 minWidth: 0,
@@ -219,72 +278,7 @@ function ChatSlot(): React.JSX.Element {
                 contain: 'layout',
               }
         }
-      >
-        {ctx.isEmpty ? (
-          <SlotView slot="shell.welcome" />
-        ) : (
-          <>
-            <>
-              {history.nodes}
-              {ctx.cur.busy && (
-                <>
-                  <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
-                    <div style={AI_BUBBLE_STYLE}>
-                      {/* 实时耗时 + 步数统计：任务执行中每秒跳动显示耗时，并实时统计已执行/成功/失败/执行中的步数 */}
-                      {(ctx.cur.turnStartTs != null || history.pendingTools.length > 0) && (
-                        <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 6 }}>
-                          {ctx.cur.turnStartTs != null && (
-                            <>
-                              耗时 <LiveDuration startTs={ctx.cur.turnStartTs} />
-                            </>
-                          )}
-                          <StepStats tools={history.pendingTools} />
-                        </div>
-                      )}
-                      {/* 当前轮已执行的工具步骤（实时） */}
-                      {history.pendingTools.length > 0 && (
-                        <div style={{ margin: '0 0 2px' }}>
-                          {history.pendingTools.map((t) => (
-                            <ToolStep key={t.callId} trace={t} />
-                          ))}
-                        </div>
-                      )}
-                      {/* 思考过程折叠块：显示在正文之前，流式展开显示完整思考 */}
-                      {streaming.reasoning && <ReasoningBlock content={streaming.reasoning} streaming />}
-                      {/* 正式回答：只显示最终正文（流式实时按 Markdown 渲染，与历史气泡一致；已节流 120ms 渲染，避免逐帧全量解析） */}
-                      {streamedText && (
-                        <div style={{ minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
-                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents(handlePreview)}>
-                            {normalizeTreeBlocks(stripWrappedRecordTag(streamedText))}
-                          </ReactMarkdown>
-                          <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
-                        </div>
-                      )}
-                      {/* 思考中三点动画：气泡底部（块级换行），任务结束才消失 */}
-                      <div style={{ display: 'block', color: 'var(--text-muted)', fontSize: 12, marginTop: 4 }}>
-                        思考中
-                        <ThinkingDots />
-                      </div>
-                    </div>
-                  </div>
-                </>
-              )}
-            </>
-            {ctx.incompleteTurn && !ctx.cur.busy && (
-              <div style={{ marginBottom: 8 }}>
-                <button
-                  onClick={ctx.resumeMessage}
-                  title="上次任务未完成，点击继续执行"
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 14px', borderRadius: 14, border: '1px solid var(--accent)', background: 'var(--bg-panel)', color: 'var(--accent)', fontSize: 13, cursor: 'pointer' }}
-                >
-                  <IconRefresh />
-                  继续执行
-                </button>
-              </div>
-            )}
-          </>
-        )}
-      </div>
+      />
 
       {/* 追加型扩展点：消息流下方（agent 往这里追加组件，不替换核心消息流） */}
       <AppendSlotView slot="chat.below" />

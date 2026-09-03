@@ -5,12 +5,12 @@ import { getRuntime } from './runtime'
 import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow, toggleMaximizeWindow, resizeDockWindow, hideSupervisorToBubble, showSupervisorFromBubble, moveSupervisorBubble, hideToSystemDesktop, getWindowType, getWindowAppId, getDockTopOffset } from './window-manager'
 import { getPluginApp, listPluginApps, resolvePluginIconDataUrl } from './plugin-apps'
 import { listDockPluginApps, beginPluginDrag, cancelPluginDrag, completePluginDrag } from './dock-plugins'
-import { getUiState, patchUiState, getWallpaper, setWallpaper, filterUiStateForWindow, filterUiStateForPlugin, type UiStoreState } from './ui-store'
+import { getUiState, getUiStateRev, patchUiState, getWallpaper, setWallpaper, filterUiStateForWindow, filterUiStateForPlugin, type UiStoreState } from './ui-store'
 import { listSystemWallpapers, applySystemWallpaper } from './system-wallpaper'
 import { startRemoteServer, stopRemoteServer, getRemoteStatus, refreshPairingCode } from './remote-server'
 import { startRemoteRelay, stopRemoteRelay, getRelayStatus } from './remote-relay'
 import { checkAndPromptForUpdate, getLastUpdateCheckResult, fetchMobileApkInfo } from './app-updater'
-import { listMarketPlugins, downloadAndInstallPlugin, submitPluginToMarket, listMyPlugins } from './marketplace'
+import { listMarketPlugins, downloadAndInstallPlugin, submitPluginToMarket, listMyPlugins, uninstallMarketPlugin } from './marketplace'
 
 /**
  * 渲染进程 → 主进程 调用（IPC handler）。
@@ -78,7 +78,7 @@ export function registerIpc(): void {
   ipcMain.handle('approval:respond', async (_e, outcome: 'allowed-once' | 'rejected', requestId: string) =>
     runtime.respondApproval(outcome, requestId),
   )
-  ipcMain.handle('approval:getPolicy', async () => runtime.getApprovalPolicy())
+  ipcMain.handle('approval:getPolicy', async (_e, sid?: string) => runtime.getApprovalPolicy(sid))
   ipcMain.handle('approval:setPolicy', async (_e, policy: 'ask' | 'workdir' | 'never') => runtime.setApprovalPolicy(policy))
 
   // —— 能力级审批（插件跨插件调用 write/destructive 能力）：允许/拒绝回传 runtime resolve ——
@@ -235,7 +235,7 @@ export function registerIpc(): void {
   ipcMain.handle('ui:getState', async (e) => {
     const win = BrowserWindow.fromWebContents(e.sender)
     const type = win ? getWindowType(win) : undefined
-    return filterUiStateForWindow(type, getUiState())
+    return { rev: getUiStateRev(), state: filterUiStateForWindow(type, getUiState()) }
   })
   ipcMain.handle('ui:patch', async (_e, patch: Partial<UiStoreState>) => patchUiState(patch))
 
@@ -289,6 +289,7 @@ export function registerIpc(): void {
     submitPluginToMarket(pluginDirOrId, categories),
   )
   ipcMain.handle('market:mine', async () => listMyPlugins())
+  ipcMain.handle('market:uninstall', async (_e, pluginId: string) => uninstallMarketPlugin(pluginId))
 
   // —— 插件窗口白名单 IPC（第 1 步：插件专用 preload 的统一入口，双层校验）——
   // 第一层：插件窗口只能经专用 preload（window.shanhaiPlugin）调用，物理拿不到全量 window.shanhai；

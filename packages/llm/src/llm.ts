@@ -146,7 +146,7 @@ export interface DeepSeekOptions {
 /** 思考模式下 assistant 消息缺 reasoning_content 时的回传占位符。
  * 网关在某些轮次（纯工具调用轮）会吞掉上游 reasoning_content 不转发，导致历史里该字段缺失；
  * DeepSeek reasoner 要求多轮回传 reasoning_content，缺失即 400。用非空占位符兜底（参考 taco 的「继续」）。 */
-const REASONING_FALLBACK = '继续'
+const REASONING_FALLBACK = '继续任务'
 
 /** DeepSeek/OpenAI 兼容的推理档位归一：medium/xhigh → high（官方映射表只认 low/high/max），其余白名单直传，不识别返回 undefined（避免下发引发 400） */
 function normalizeReasoningEffort(v: string | undefined): string | undefined {
@@ -260,7 +260,7 @@ function chatCompletionsUrl(baseUrl: string): string {
  *  - tool 带 toolCallId → 输出 tool_call_id（缺失时网关报 "missing field tool_call_id"）
  */
 function serializeMessages(messages: ChatMessage[], supportsReasoning = false): Array<Record<string, unknown>> {
-  return messages.map((m) => {
+  return messages.map((m,index) => {
     const calls = m.toolCalls ?? (m.toolCall ? [m.toolCall] : [])
     if (m.role === 'assistant' && calls.length > 0) {
       const msg: Record<string, unknown> = {
@@ -278,7 +278,7 @@ function serializeMessages(messages: ChatMessage[], supportsReasoning = false): 
       // thinking 模式：assistant 带 tool_calls 也必须回传 reasoning_content，否则网关 400
       if (m.reasoningContent) {
         msg.reasoning_content = m.reasoningContent
-      } else if (supportsReasoning) {
+      } else if (supportsReasoning && index === messages.length - 1) {
         // 网关吞掉 reasoning_content 的轮次：用占位符兜底，确保 DeepSeek 校验通过
         msg.reasoning_content = REASONING_FALLBACK
       }
@@ -296,7 +296,7 @@ function serializeMessages(messages: ChatMessage[], supportsReasoning = false): 
     // thinking 模式：assistant 文本消息回传 reasoning_content
     if (m.role === 'assistant' && m.reasoningContent) {
       msg.reasoning_content = m.reasoningContent
-    } else if (m.role === 'assistant' && supportsReasoning) {
+    } else if (m.role === 'assistant' && index === messages.length - 1 && supportsReasoning) {
       msg.reasoning_content = REASONING_FALLBACK
     }
     return msg

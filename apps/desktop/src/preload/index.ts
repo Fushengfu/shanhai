@@ -204,6 +204,12 @@ export interface GlobalUiState {
   wallpaper: string | null
 }
 
+/** ui:state / ui:getState 信封：rev 为单调递增版本号（渲染进程据此丢弃过期快照），state 为按窗口过滤后的快照 */
+export interface UiStateEnvelope {
+  rev: number
+  state: GlobalUiState
+}
+
 export interface ShanhaiBridge {
   /** 当前窗口类型（desktop/chat/app/supervisor），由主进程 additionalArguments 注入、preload 读 process.argv 得到 */
   windowType: 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble'
@@ -263,10 +269,10 @@ export interface ShanhaiBridge {
   setTheme(theme: 'light' | 'dark'): void
   /** 订阅主题变更（主进程广播 ui:theme），返回取消订阅函数 */
   onThemeChange(cb: (theme: 'light' | 'dark') => void): () => void
-  /** 读取全局 UI 共享状态快照（当前会话/会话列表/模型/登录态/审批策略） */
-  getUiState(): Promise<GlobalUiState>
-  /** 订阅全局 UI 共享状态变化（主进程 store 变化时推送最新快照） */
-  onUiState(cb: (state: GlobalUiState) => void): () => void
+  /** 读取全局 UI 共享状态快照（当前会话/会话列表/模型/登录态/审批策略），返回 { rev, state } 信封 */
+  getUiState(): Promise<UiStateEnvelope>
+  /** 订阅全局 UI 共享状态变化（主进程 store 变化时推送 { rev, state } 信封） */
+  onUiState(cb: (payload: UiStateEnvelope) => void): () => void
   /** 更新全局 UI 共享状态（字段级 patch，窗口动作后调用） */
   patchUiState(patch: Partial<GlobalUiState>): Promise<void>
   /** 读取桌面壁纸（CSS backgroundImage 值，null = 默认渐变） */
@@ -309,6 +315,8 @@ export interface ShanhaiBridge {
   submitPluginToMarket(pluginDirOrId: string, categories?: string[]): Promise<{ ok: boolean; message: string; zipPath?: string; data?: unknown }>
   /** 插件市场：列出「我已安装」插件（含自研标记 + 网关提交状态） */
   listMyPlugins(): Promise<{ ok: boolean; plugins: MyPluginPreload[]; mineError?: string }>
+  /** 插件市场：卸载已安装插件（撤销运行 + 删除 ~/.shanhai/plugins/<id>/ 目录，不可恢复） */
+  uninstallMarketPlugin(pluginId: string): Promise<{ ok: boolean; message: string }>
   // 认证
   status(): Promise<{ loggedIn: boolean; username: string | null }>
   login(username: string, password: string): Promise<{ username: string; nickname?: string }>
@@ -380,8 +388,8 @@ export interface ShanhaiBridge {
   hasRetrySnapshot(sessionId: string): Promise<{ reason?: string } | null>
   onDelta(cb: (sessionId: string, text: string) => void): () => void
   onReasoning(cb: (sessionId: string, text: string) => void): () => void
-  // 审批策略（安全模式）
-  getApprovalPolicy(): Promise<'ask' | 'workdir' | 'never'>
+  // 审批策略（安全模式）—— 会话级：传 sid 读该会话 meta.approvalPolicy，缺省读当前会话
+  getApprovalPolicy(sid?: string): Promise<'ask' | 'workdir' | 'never'>
   setApprovalPolicy(policy: 'ask' | 'workdir' | 'never'): Promise<void>
   // 模型 / 中断 / 语音 / 电脑
   switchModel(id: string): Promise<void>
@@ -535,7 +543,7 @@ const bridge: ShanhaiBridge = {
   },
   getUiState: () => ipcRenderer.invoke('ui:getState'),
   onUiState: (cb) => {
-    const listener = (_e: unknown, state: GlobalUiState) => cb(state)
+    const listener = (_e: unknown, payload: UiStateEnvelope) => cb(payload)
     ipcRenderer.on('ui:state', listener)
     return () => ipcRenderer.removeListener('ui:state', listener)
   },
@@ -564,6 +572,7 @@ const bridge: ShanhaiBridge = {
   installMarketPlugin: (pluginId) => ipcRenderer.invoke('market:install', pluginId),
   submitPluginToMarket: (pluginDirOrId, categories) => ipcRenderer.invoke('market:submit', pluginDirOrId, categories),
   listMyPlugins: () => ipcRenderer.invoke('market:mine'),
+  uninstallMarketPlugin: (pluginId) => ipcRenderer.invoke('market:uninstall', pluginId),
   status: () => ipcRenderer.invoke('auth:status'),
   login: (u, p) => ipcRenderer.invoke('auth:login', u, p),
   register: (u, p, nickname, phone, email) => ipcRenderer.invoke('auth:register', u, p, nickname, phone, email),
@@ -622,7 +631,7 @@ const bridge: ShanhaiBridge = {
   injectMessage: (sessionId, message) => ipcRenderer.invoke('chat:inject', sessionId, message),
   hasIncompleteTurn: (sessionId) => ipcRenderer.invoke('session:incomplete', sessionId),
   hasRetrySnapshot: (sessionId) => ipcRenderer.invoke('session:retry-snapshot', sessionId),
-  getApprovalPolicy: () => ipcRenderer.invoke('approval:getPolicy'),
+  getApprovalPolicy: (sid) => ipcRenderer.invoke('approval:getPolicy', sid),
   setApprovalPolicy: (policy) => ipcRenderer.invoke('approval:setPolicy', policy),
   switchModel: (id) => ipcRenderer.invoke('model:switch', id),
   getCurrentModelId: () => ipcRenderer.invoke('model:current'),

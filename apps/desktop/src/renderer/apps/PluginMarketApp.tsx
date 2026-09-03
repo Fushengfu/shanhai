@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { WindowTitleBar } from '../components/WindowTitleBar'
-import { IconStore, IconSearch, IconRefresh, IconPlus } from '../components/icons'
+import { IconStore, IconSearch, IconRefresh } from '../components/icons'
 import { smallIconBtn } from '../components/ui'
 import { useThemeSync } from '../theme'
 
@@ -106,13 +106,10 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
   const [sharing, setSharing] = useState<string | null>(null)
   const [shareMsg, setShareMsg] = useState('')
   const [shareOk, setShareOk] = useState(true)
-
-  // 提交 tab 状态
-  const [submitId, setSubmitId] = useState('')
-  const [submitCategories, setSubmitCategories] = useState<string[]>([])
-  const [submitting, setSubmitting] = useState(false)
-  const [submitMsg, setSubmitMsg] = useState('')
-  const [submitOk, setSubmitOk] = useState(true)
+  // 卸载状态（危险操作，二次确认后才真正调用）
+  const [uninstalling, setUninstalling] = useState<string | null>(null)
+  const [uninstallMsg, setUninstallMsg] = useState('')
+  const [uninstallOk, setUninstallOk] = useState(true)
 
   // 当前登录账号（提交/分享必须以登录账号发布；未登录时前置禁用按钮 + 提示）
   const [auth, setAuth] = useState<{ loggedIn: boolean; username: string | null }>({ loggedIn: false, username: null })
@@ -213,33 +210,30 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
     }
   }
 
-  const handleSubmit = async (): Promise<void> => {
-    if (submitting) return
-    const id = submitId.trim()
-    if (!id) {
-      setSubmitMsg('请填写插件工程 id（~/.shanhai/plugins-workspace/<id>）')
-      return
-    }
-    setSubmitting(true)
-    setSubmitMsg('')
+  const handleUninstall = async (id: string): Promise<void> => {
+    if (uninstalling) return
+    setUninstalling(id)
+    setUninstallMsg('')
     try {
-      const res = await window.shanhai?.submitPluginToMarket(id, submitCategories.length > 0 ? submitCategories : undefined)
-      setSubmitOk(!!res?.ok)
-      setSubmitMsg(
-        res?.ok
-          ? (res.message ?? '已提交') + (auth.username ? `（将以当前登录账号 ${auth.username} 发布）` : '')
-          : (res?.message ?? '提交失败'),
-      )
+      const res = await window.shanhai?.uninstallMarketPlugin(id)
+      setUninstallOk(!!res?.ok)
+      setUninstallMsg(res?.ok ? (res.message ?? '已卸载') : (res?.message ?? '卸载失败'))
+      if (res?.ok) {
+        // 卸载成功后刷新「我已安装」区块 + 刷新「发现」列表（更新 installed 标记）
+        void loadMine()
+        void load(keyword, category, hasUI)
+      }
     } catch (err) {
-      // IPC 桥异常（未返回 res 时）也必须有可见提示，防止「点了没反应」
-      setSubmitOk(false)
-      setSubmitMsg(err instanceof Error ? err.message : String(err))
+      setUninstallOk(false)
+      setUninstallMsg(err instanceof Error ? err.message : String(err))
     } finally {
-      setSubmitting(false)
+      setUninstalling(null)
     }
   }
 
   const filteredPlugins = useMemo(() => plugins, [plugins])
+  // 「我的提交」记录：已安装插件里网关有提交记录的那些（submitted=true）
+  const submittedPlugins = useMemo(() => myPlugins.filter((p) => p.submitted), [myPlugins])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden', background: 'var(--bg-app)', color: 'var(--text)', fontFamily: 'system-ui, sans-serif' }}>
@@ -250,7 +244,7 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
         {[
           { k: 'browse', label: '发现' },
           { k: 'mine', label: '我已安装' },
-          { k: 'submit', label: '提交我的插件' },
+          { k: 'submit', label: '我的提交' },
         ].map((t) => (
           <button
             key={t.k}
@@ -361,6 +355,9 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
             {shareMsg && (
               <div style={{ padding: '10px 12px', borderRadius: 8, background: shareOk ? 'var(--tint-green-soft, rgba(76,175,80,0.14))' : 'rgba(239,68,68,0.14)', color: shareOk ? 'var(--text)' : 'var(--text-danger, #ef4444)', fontSize: 13, lineHeight: 1.6, wordBreak: 'break-all' }}>{shareMsg}</div>
             )}
+            {uninstallMsg && (
+              <div style={{ padding: '10px 12px', borderRadius: 8, background: uninstallOk ? 'var(--tint-green-soft, rgba(76,175,80,0.14))' : 'rgba(239,68,68,0.14)', color: uninstallOk ? 'var(--text)' : 'var(--text-danger, #ef4444)', fontSize: 13, lineHeight: 1.6, wordBreak: 'break-all' }}>{uninstallMsg}</div>
+            )}
 
             <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{mineLoading ? '加载中…' : `共 ${myPlugins.length} 个已安装插件`}</div>
             {!mineLoading && myPlugins.length === 0 && (
@@ -368,137 +365,38 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
                 还没有安装任何插件。去「发现」tab 下载安装，或提交自己的插件。
               </div>
             )}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              {myPlugins.map((p) => {
-                const action = shareAction(p)
-                return (
-                  <div key={p.id} style={{ display: 'flex', gap: 12, alignItems: 'center', padding: '14px', borderRadius: 12, border: '1px solid var(--border)', background: 'var(--bg-panel)' }}>
-                    <div style={{ width: 42, height: 42, borderRadius: 10, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--tint-blue-soft)', color: 'var(--accent)', fontWeight: 700, fontSize: 16 }}>
-                      {(p.name || '?').slice(0, 1)}
-                    </div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--text)' }}>{p.name}</span>
-                        {p.version && <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>v{p.version}</span>}
-                        <Tag label="已安装" tone="green" />
-                        {p.selfMade && <Tag label="自研" tone="orange" />}
-                        {p.submitted && p.gatewayVersion && (
-                          <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>网关 v{p.gatewayVersion}</span>
-                        )}
-                      </div>
-                      <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 3, lineHeight: 1.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.purpose ?? ''}</div>
-                    </div>
-                    {action === 'share' && (
-                      <button
-                        onClick={() => void handleShare(p.id)}
-                        disabled={sharing === p.id || !auth.loggedIn}
-                        style={{ flexShrink: 0, padding: '8px 16px', borderRadius: 9, border: '1px solid var(--accent)', background: 'var(--tint-blue-soft)', color: 'var(--accent)', fontSize: 13, fontWeight: 600, cursor: sharing === p.id || !auth.loggedIn ? 'not-allowed' : 'pointer', opacity: sharing === p.id || !auth.loggedIn ? 0.55 : 1 }}
-                      >
-                        {sharing === p.id ? '分享中…' : '分享'}
-                      </button>
-                    )}
-                    {action === 'upgrade' && (
-                      <button
-                        onClick={() => void handleShare(p.id)}
-                        disabled={sharing === p.id || !auth.loggedIn}
-                        style={{ flexShrink: 0, padding: '8px 16px', borderRadius: 9, border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 13, fontWeight: 600, cursor: sharing === p.id || !auth.loggedIn ? 'not-allowed' : 'pointer', opacity: sharing === p.id || !auth.loggedIn ? 0.55 : 1 }}
-                      >
-                        {sharing === p.id ? '提交中…' : '提交升级版本共享'}
-                      </button>
-                    )}
-                  </div>
-                )
-              })}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(230px, 1fr))', gap: 14 }}>
+              {myPlugins.map((p) => (
+                <MyCard
+                  key={p.id}
+                  p={p}
+                  sharing={sharing === p.id}
+                  loggedIn={auth.loggedIn}
+                  onShare={handleShare}
+                  uninstalling={uninstalling === p.id}
+                  onUninstall={handleUninstall}
+                />
+              ))}
             </div>
           </div>
         ) : (
-          /* 提交 tab */
-          <div style={{ maxWidth: 560, display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {/* 当前登录账号提示：提交必须以登录账号发布（未登录前置禁用） */}
-            <div
-              style={{
-                padding: '10px 12px',
-                borderRadius: 8,
-                background: auth.loggedIn ? 'var(--tint-blue-soft)' : 'var(--tint-yellow-soft, rgba(255,193,7,0.12))',
-                color: auth.loggedIn ? 'var(--text)' : 'var(--text-secondary)',
-                fontSize: 13,
-                lineHeight: 1.6,
-              }}
-            >
-              {auth.loggedIn ? (
-                <>当前登录账号：<b style={{ fontWeight: 700 }}>{auth.username ?? '—'}</b>（提交将以该账号发布）</>
+          /* 我的提交 tab：我的提交记录列表（审核状态） */
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            {/* 我的提交记录列表 */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>我的提交记录</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{mineLoading ? '加载中…' : `共 ${submittedPlugins.length} 条提交记录`}</div>
+              {submittedPlugins.length === 0 ? (
+                <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
+                  还没有提交记录。提交自研插件后，这里会显示审核状态。
+                </div>
               ) : (
-                <>未登录。请先登录后再提交插件（提交需网关登录凭证鉴权）。</>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(230px, 1fr))', gap: 14 }}>
+                  {submittedPlugins.map((p) => (
+                    <SubmitRecordCard key={p.id} p={p} />
+                  ))}
+                </div>
               )}
-            </div>
-            <div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>插件工程 id</div>
-              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 3, lineHeight: 1.5 }}>
-                本地自研插件工程 id（位于 ~/.shanhai/plugins-workspace/&lt;id&gt;）。提交会先打包成共享 zip（含源码 + 构建产物 + manifest），再上传到网关创意空间等待审批。
-              </div>
-              <input
-                value={submitId}
-                onChange={(e) => setSubmitId(e.target.value)}
-                placeholder="如 shortdrama / todo-list"
-                style={{ marginTop: 8, width: '100%', boxSizing: 'border-box', padding: '9px 12px', borderRadius: 10, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text)', fontSize: 13, outline: 'none' }}
-              />
-            </div>
-
-            <div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>行业分类（可多选，缺省「其他」）</div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
-                {CATEGORIES.map((c) => {
-                  const active = submitCategories.includes(c)
-                  return (
-                    <button
-                      key={c}
-                      onClick={() => setSubmitCategories((prev) => (active ? prev.filter((x) => x !== c) : [...prev, c]))}
-                      style={{
-                        padding: '6px 12px',
-                        borderRadius: 999,
-                        border: `1px solid ${active ? 'var(--accent)' : 'var(--border)'}`,
-                        background: active ? 'var(--tint-blue-soft)' : 'var(--bg-panel)',
-                        color: active ? 'var(--accent)' : 'var(--text-secondary)',
-                        fontSize: 12,
-                        cursor: 'pointer',
-                      }}
-                    >
-                      {c}
-                    </button>
-                  )
-                })}
-              </div>
-            </div>
-
-            <button
-              onClick={() => void handleSubmit()}
-              disabled={submitting || !auth.loggedIn}
-              style={{
-                alignSelf: 'flex-start',
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 6,
-                padding: '9px 18px',
-                borderRadius: 9,
-                border: 'none',
-                cursor: submitting || !auth.loggedIn ? 'not-allowed' : 'pointer',
-                background: 'var(--accent)',
-                color: '#fff',
-                fontSize: 13,
-                fontWeight: 600,
-                opacity: submitting || !auth.loggedIn ? 0.55 : 1,
-              }}
-            >
-              <IconPlus />
-              {submitting ? '提交中…' : '提交到创意空间'}
-            </button>
-
-            {submitMsg && (
-              <div style={{ padding: '10px 12px', borderRadius: 8, background: submitOk ? 'var(--bg-subtle)' : 'rgba(239,68,68,0.14)', color: submitOk ? 'var(--text-secondary)' : 'var(--text-danger, #ef4444)', fontSize: 13, lineHeight: 1.6, wordBreak: 'break-all' }}>{submitMsg}</div>
-            )}
-
-            <div style={{ fontSize: 12, color: 'var(--text-faint)', lineHeight: 1.6 }}>
-              注意：仅允许提交 ~/.shanhai/plugins-workspace/ 下的自研插件工程；网关审批通过后才会出现在创意空间供其他用户下载安装。提交需要已登录（网关 APIKey 鉴权）。
             </div>
           </div>
         )}
@@ -527,16 +425,18 @@ function FilterChip({ label, active, onClick }: { label: string; active: boolean
   )
 }
 
-function Tag({ label, tone = 'blue' }: { label: string; tone?: 'blue' | 'gray' | 'green' | 'orange' }): React.JSX.Element {
+function Tag({ label, tone = 'blue' }: { label: string; tone?: 'blue' | 'gray' | 'green' | 'orange' | 'red' }): React.JSX.Element {
   const bg =
     tone === 'blue' ? 'var(--tint-blue-soft)' :
     tone === 'green' ? 'var(--tint-green-soft, rgba(76,175,80,0.14))' :
     tone === 'orange' ? 'var(--tint-orange-soft, rgba(255,152,0,0.14))' :
+    tone === 'red' ? 'rgba(239,68,68,0.14)' :
     'var(--bg-subtle)'
   const color =
     tone === 'blue' ? 'var(--accent)' :
     tone === 'green' ? 'var(--success-text, #2e7d32)' :
     tone === 'orange' ? 'var(--warning-text, #b26a00)' :
+    tone === 'red' ? 'var(--text-danger, #ef4444)' :
     'var(--text-muted)'
   return (
     <span style={{ fontSize: 10, padding: '2px 7px', borderRadius: 6, background: bg, color, fontWeight: 600 }}>{label}</span>
@@ -659,6 +559,180 @@ function MarketCard({ p, installing, onInstall }: { p: MarketItem; installing: b
   )
 }
 
+/** 「我已安装」插件卡片：复用「发现」面板卡片视觉（图标 + 名称 + 简介 + 标签 + 元信息 + 整宽操作按钮），
+ *  同时承载「已安装」专属信息（自研标记 / 本地版本 / 网关版本 / 分享 / 提交升级版本共享）。 */
+function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { p: MyItem; sharing: boolean; loggedIn: boolean; onShare: (id: string) => void; uninstalling: boolean; onUninstall: (id: string) => void }): React.JSX.Element {
+  const [hover, setHover] = useState(false)
+  const [confirming, setConfirming] = useState(false)
+  const action = shareAction(p)
+  return (
+    <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 12,
+        padding: 18,
+        borderRadius: 16,
+        border: `1px solid ${hover ? 'var(--accent)' : 'var(--border)'}`,
+        background: 'var(--bg-panel)',
+        boxShadow: hover ? '0 8px 24px rgba(0,0,0,0.10)' : '0 1px 3px rgba(0,0,0,0.04)',
+        transform: hover ? 'translateY(-2px)' : 'translateY(0)',
+        transition: 'box-shadow 0.18s ease, border-color 0.18s ease, transform 0.18s ease',
+      }}
+    >
+      {/* 顶部：图标 + 名称 + 简介 */}
+      <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
+        <AppIcon name={p.name} size={52} radius={13} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 15, color: 'var(--text)', lineHeight: 1.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</div>
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{p.purpose || '暂无简介'}</div>
+        </div>
+      </div>
+
+      {/* 中间：标签 */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        <Tag label="已安装" tone="green" />
+        {p.selfMade && <Tag label="自研" tone="orange" />}
+        {p.submitted && p.hasApproved && <Tag label="已上架" tone="blue" />}
+      </div>
+
+      {/* 元信息：本地版本 + 网关版本 */}
+      <div style={{ fontSize: 11, color: 'var(--text-faint)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+        {p.version && <span>v{p.version}</span>}
+        {p.submitted && p.gatewayVersion && <span>网关 v{p.gatewayVersion}</span>}
+      </div>
+
+      {/* 底部：操作按钮（分享 / 提交升级版本共享 / 已安装） */}
+      {action === 'share' && (
+        <button
+          onClick={() => onShare(p.id)}
+          disabled={sharing || !loggedIn}
+          style={{
+            width: '100%',
+            padding: '9px 0',
+            borderRadius: 10,
+            border: '1px solid var(--accent)',
+            background: 'var(--tint-blue-soft)',
+            color: 'var(--accent)',
+            fontSize: 13,
+            fontWeight: 600,
+            cursor: sharing || !loggedIn ? 'not-allowed' : 'pointer',
+            opacity: sharing || !loggedIn ? 0.55 : 1,
+            transition: 'opacity 0.15s ease',
+          }}
+        >
+          {sharing ? '分享中…' : '分享'}
+        </button>
+      )}
+      {action === 'upgrade' && (
+        <button
+          onClick={() => onShare(p.id)}
+          disabled={sharing || !loggedIn}
+          style={{
+            width: '100%',
+            padding: '9px 0',
+            borderRadius: 10,
+            border: 'none',
+            background: 'var(--accent)',
+            color: '#fff',
+            fontSize: 13,
+            fontWeight: 600,
+            cursor: sharing || !loggedIn ? 'not-allowed' : 'pointer',
+            opacity: sharing || !loggedIn ? 0.55 : 1,
+            transition: 'opacity 0.15s ease',
+          }}
+        >
+          {sharing ? '提交中…' : '提交升级版本共享'}
+        </button>
+      )}
+      {action === null && (
+        <button
+          disabled
+          style={{
+            width: '100%',
+            padding: '9px 0',
+            borderRadius: 10,
+            border: 'none',
+            background: 'var(--bg-subtle)',
+            color: 'var(--text-muted)',
+            fontSize: 13,
+            fontWeight: 600,
+            cursor: 'default',
+          }}
+        >
+          已安装
+        </button>
+      )}
+
+      {/* 卸载（危险操作，二次确认）：先点「卸载」进入确认态，再点「确认卸载」才真正调用 */}
+      {!confirming ? (
+        <button
+          onClick={() => setConfirming(true)}
+          disabled={uninstalling}
+          style={{
+            width: '100%',
+            padding: '8px 0',
+            borderRadius: 10,
+            border: '1px solid var(--text-danger, #ef4444)',
+            background: 'transparent',
+            color: 'var(--text-danger, #ef4444)',
+            fontSize: 12,
+            fontWeight: 600,
+            cursor: uninstalling ? 'not-allowed' : 'pointer',
+            opacity: uninstalling ? 0.55 : 1,
+            transition: 'opacity 0.15s ease',
+          }}
+        >
+          {uninstalling ? '卸载中…' : '卸载'}
+        </button>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '10px 12px', borderRadius: 10, background: 'rgba(239,68,68,0.08)', border: '1px solid var(--text-danger, #ef4444)' }}>
+          <div style={{ fontSize: 12, color: 'var(--text-danger, #ef4444)', lineHeight: 1.5 }}>确认卸载「{p.name}」？将从本机移除该插件，卸载不可恢复。</div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              onClick={() => { setConfirming(false); onUninstall(p.id) }}
+              disabled={uninstalling}
+              style={{
+                flex: 1,
+                padding: '7px 0',
+                borderRadius: 8,
+                border: 'none',
+                background: 'var(--text-danger, #ef4444)',
+                color: '#fff',
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: uninstalling ? 'not-allowed' : 'pointer',
+                opacity: uninstalling ? 0.55 : 1,
+              }}
+            >
+              {uninstalling ? '卸载中…' : '确认卸载'}
+            </button>
+            <button
+              onClick={() => setConfirming(false)}
+              disabled={uninstalling}
+              style={{
+                flex: 1,
+                padding: '7px 0',
+                borderRadius: 8,
+                border: '1px solid var(--border)',
+                background: 'var(--bg-panel)',
+                color: 'var(--text-secondary)',
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: uninstalling ? 'not-allowed' : 'pointer',
+              }}
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 /** 加载骨架屏：占位卡片（无真实数据时的 loading 态，避免白板） */
 function SkeletonCard(): React.JSX.Element {
   return (
@@ -676,6 +750,60 @@ function SkeletonCard(): React.JSX.Element {
         ))}
       </div>
       <div style={{ width: '100%', height: 36, borderRadius: 10, background: 'var(--bg-subtle)' }} />
+    </div>
+  )
+}
+
+/** 网关审核状态 → 展示文案 + 色调（gatewayStatus: approved/pending/rejected） */
+function reviewStatus(p: MyItem): { label: string; tone: 'green' | 'orange' | 'red' | 'gray' } {
+  const s = (p.gatewayStatus ?? '').toLowerCase()
+  if (s === 'approved') return { label: '已通过', tone: 'green' }
+  if (s === 'rejected') return { label: '未通过', tone: 'red' }
+  if (s === 'pending' || s === 'reviewing' || s === 'under_review' || s === 'submitted') return { label: '审核中', tone: 'orange' }
+  if (p.hasApproved) return { label: '已通过', tone: 'green' }
+  return { label: '审核中', tone: 'gray' }
+}
+
+/** 「我的提交」记录卡片：复用卡片视觉，突出展示审核状态（审核中 / 已通过 / 未通过） */
+function SubmitRecordCard({ p }: { p: MyItem }): React.JSX.Element {
+  const [hover, setHover] = useState(false)
+  const st = reviewStatus(p)
+  return (
+    <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 12,
+        padding: 18,
+        borderRadius: 16,
+        border: `1px solid ${hover ? 'var(--accent)' : 'var(--border)'}`,
+        background: 'var(--bg-panel)',
+        boxShadow: hover ? '0 8px 24px rgba(0,0,0,0.10)' : '0 1px 3px rgba(0,0,0,0.04)',
+        transform: hover ? 'translateY(-2px)' : 'translateY(0)',
+        transition: 'box-shadow 0.18s ease, border-color 0.18s ease, transform 0.18s ease',
+      }}
+    >
+      {/* 顶部：图标 + 名称 + 简介 */}
+      <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
+        <AppIcon name={p.name} size={52} radius={13} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 15, color: 'var(--text)', lineHeight: 1.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</div>
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{p.purpose || '暂无简介'}</div>
+        </div>
+      </div>
+
+      {/* 审核状态 */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        <Tag label={st.label} tone={st.tone} />
+      </div>
+
+      {/* 元信息：本地版本 + 网关版本 */}
+      <div style={{ fontSize: 11, color: 'var(--text-faint)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+        {p.version && <span>v{p.version}</span>}
+        {p.gatewayVersion && <span>网关 v{p.gatewayVersion}</span>}
+      </div>
     </div>
   )
 }

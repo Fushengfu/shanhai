@@ -18,6 +18,7 @@ import { SessionPicker } from '../components/SessionPicker'
 import { ModelPicker } from '../components/ModelPicker'
 import { SupervisorComposer, type SupervisorComposerHandle } from './SupervisorComposer'
 import { TokenStatusBar } from '../components/TokenStatusBar'
+import { VirtualList } from '../components/VirtualList'
 import { IconMonitor, IconWarn, IconMoon, IconSun } from '../components/icons'
 import { btn, formatBytes, prettyValue, LiveDuration, ThinkingDots } from '../components/ui'
 import { useThemeSync, readTheme, applyTheme, type ThemeMode } from '../theme'
@@ -28,6 +29,7 @@ const SUPERVISOR_SID = 'supervisor'
 /** AI 回复气泡通用底样（与 ChatPlugin 保持一致） */
 const AI_BUBBLE_STYLE: React.CSSProperties = {
   width: '85%',
+  boxSizing: 'border-box',
   padding: '10px 14px',
   borderRadius: 16,
   borderTopLeftRadius: 4,
@@ -36,15 +38,27 @@ const AI_BUBBLE_STYLE: React.CSSProperties = {
   fontSize: 14,
   lineHeight: 1.65,
   color: 'var(--text)',
-  overflowWrap: 'break-word',
+  overflowWrap: 'anywhere',
   wordBreak: 'break-word',
+  minWidth: 0,
   userSelect: 'text',
   WebkitUserSelect: 'text',
 }
 
+/**
+ * 历史消息块容器。此前为 resize 减重用 content-visibility:auto 跳过视口外块绘制，
+ * 但引入 VirtualList 真虚拟化后，content-visibility 与虚拟化的高度测量冲突：
+ * 视口外块被 content-visibility 按 contain-intrinsic-size 占位（高度不稳定），导致 ResizeObserver
+ * 实测高度在「占位/真实」间反复横跳，scrollHeight 抖动、滚动位置被浏览器 clamp 拽回底部。
+ * 现与 ChatPlugin 对齐：块不再用 content-visibility（虚拟化已真正减 DOM，无需再跳过绘制），保留空占位容器。
+ */
+const HISTORY_BLOCK_STYLE: React.CSSProperties = {}
+
 /** 把后端历史消息（HistoryItem[]）转换为消息流 items（ChatItem[]）：tool-result 合并到同 callId 的 tool-call */
 function historyToItems(history: HistoryItem[]): ChatItem[] {
   const out: ChatItem[] = []
+  // tool-call 的 callId → 在 out 中的下标：避免每条 tool-result 都 reverse+findIndex 的 O(n²)
+  const toolCallIndex = new Map<string, number>()
   for (const h of history) {
     if (h.kind === 'user') {
       const images = (h.attachments ?? [])
@@ -56,13 +70,14 @@ function historyToItems(history: HistoryItem[]): ChatItem[] {
     } else if (h.trace) {
       const trace = h.trace
       if (trace.kind === 'tool-result') {
-        const idx = [...out].reverse().findIndex((it) => it.kind === 'tool' && it.trace.kind === 'tool-call' && it.trace.callId === trace.callId)
-        if (idx >= 0) {
-          const realIdx = out.length - 1 - idx
+        const realIdx = toolCallIndex.get(trace.callId)
+        if (realIdx !== undefined) {
           const base = (out[realIdx] as Extract<ChatItem, { kind: 'tool' }>).trace
           out[realIdx] = { kind: 'tool', trace: { ...base, kind: 'tool-result', result: trace.result, error: trace.error } }
           continue
         }
+      } else if (trace.kind === 'tool-call') {
+        toolCallIndex.set(trace.callId, out.length)
       }
       out.push({ kind: 'tool', trace })
     }
@@ -172,7 +187,16 @@ export function SupervisorApp(): React.JSX.Element {
   const handlePreviewImage = useCallback((url: string) => setPreviewImage(url), [])
   const composerRef = useRef<SupervisorComposerHandle>(null)
   const listRef = useRef<HTMLDivElement>(null)
+  // 是否在底部：仅由滚动事件维护（对齐 ChatPlugin 已被验证正常的吸底写法）。
+  // 初始为 true：窗口首次加载历史时（cur.items 从空 → 填充）自动滚到底部最新消息。
   const atBottomRef = useRef(true)
+
+  // 用户滚动（滚轮/拖条/键盘）时更新「是否在底部」状态，供吸底 effect gate 用。
+  const handleScroll = useCallback((): void => {
+    const el = listRef.current
+    if (!el) return
+    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+  }, [])
 
   // 主题：订阅主进程广播，跟随聊天窗口切换（亮/暗实时同步）
   useThemeSync()
@@ -218,13 +242,10 @@ export function SupervisorApp(): React.JSX.Element {
     patchUiStore({ sessionMap: { [SUPERVISOR_SID]: existing ? next : { ...EMPTY_SESSION, ...next } } })
   }, [])
 
-  // 滚动跟随：用户是否在底部，仅由滚动事件维护
-  const handleScroll = (): void => {
-    const el = listRef.current
-    if (!el) return
-    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
-  }
-
+  // 吸底跟随：内容变化时只要用户在底部就滚到底（对齐 ChatPlugin 已被验证正常的写法）。
+  // 用 atBottomRef（滚动事件维护）gate，而非实时算 scrollTop：
+  // —— atBottomRef 初始为 true → 首次加载历史（cur.items 从空→填充）时自动滚到底部最新消息；
+  // —— 用户向上滚动后 handleScroll 把 atBottomRef 置 false，后续内容变化不再强行拽回底部。
   useEffect(() => {
     const el = listRef.current
     if (!el) return
@@ -441,7 +462,7 @@ export function SupervisorApp(): React.JSX.Element {
       const tools = toolBuffer
       toolBuffer = []
       nodes.push(
-        <div key={`tools-${keyBase}`}>
+        <div key={`tools-${keyBase}`} style={HISTORY_BLOCK_STYLE}>
           {tools.map((t) => (
             <ToolStep key={t.callId} trace={t} />
           ))}
@@ -453,30 +474,32 @@ export function SupervisorApp(): React.JSX.Element {
         flushTools(`u${seq}`)
         const idx = userIdx++
         nodes.push(
-          <UserMessage
-            key={`u${seq++}`}
-            content={it.content}
-            images={it.images}
-            userIndex={idx}
-            busy={cur.busy}
-            pending={it.pending}
-            onResend={resendMessage}
-            onEditResend={editResend}
-            onPreviewImage={handlePreviewImage}
-          />,
+          <div key={`u${seq++}`} style={HISTORY_BLOCK_STYLE}>
+            <UserMessage
+              content={it.content}
+              images={it.images}
+              userIndex={idx}
+              busy={cur.busy}
+              pending={it.pending}
+              onResend={resendMessage}
+              onEditResend={editResend}
+              onPreviewImage={handlePreviewImage}
+            />
+          </div>,
         )
       } else if (it.kind === 'assistant') {
         const tools = toolBuffer
         toolBuffer = []
         nodes.push(
-          <AssistantMessage
-            key={`a${seq++}`}
-            content={it.content}
-            reasoningContent={it.reasoningContent}
-            toolSteps={tools}
-            turnDuration={it.turnDuration}
-            onPreviewImage={handlePreviewImage}
-          />,
+          <div key={`a${seq++}`} style={HISTORY_BLOCK_STYLE}>
+            <AssistantMessage
+              content={it.content}
+              reasoningContent={it.reasoningContent}
+              toolSteps={tools}
+              turnDuration={it.turnDuration}
+              onPreviewImage={handlePreviewImage}
+            />
+          </div>,
         )
       } else {
         toolBuffer.push(it.trace)
@@ -516,20 +539,12 @@ export function SupervisorApp(): React.JSX.Element {
         }
       />
 
-      <div
-        ref={listRef}
+      <VirtualList
+        containerRef={listRef}
+        items={nodes}
         onScroll={handleScroll}
-        style={{
-          flex: 1,
-          minHeight: 0,
-          overflowY: 'auto',
-          overflowX: 'hidden',
-          padding: 16,
-          background: 'var(--bg-sidebar)',
-          position: 'relative',
-        }}
-      >
-        {cur.items.length === 0 && !cur.busy ? (
+        isEmpty={cur.items.length === 0 && !cur.busy}
+        empty={
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', paddingTop: 120, color: 'var(--text-muted)', fontSize: 13, gap: 8 }}>
             <span style={{ transform: 'scale(1.8)', display: 'inline-flex', color: 'var(--accent)' }}>
               <IconMonitor />
@@ -537,50 +552,64 @@ export function SupervisorApp(): React.JSX.Element {
             <div style={{ fontWeight: 600, fontSize: 15, color: 'var(--text)' }}>我是会话管家</div>
             <div>可以问我「现在有哪些会话在干活」「某个会话做到哪了」，或让我「给会话X新增需求」。</div>
           </div>
-        ) : (
-          <>
-            {nodes}
-            {cur.busy && (
-              <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
-                <div style={AI_BUBBLE_STYLE}>
-                  {/* 实时耗时 + 步数统计：任务执行中每秒跳动显示耗时，并实时统计已执行步数 */}
-                  {(cur.turnStartTs != null || pendingTools.length > 0) && (
-                    <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 6 }}>
-                      {cur.turnStartTs != null && (
-                        <>
-                          耗时 <LiveDuration startTs={cur.turnStartTs} />
-                        </>
-                      )}
-                      <StepStats tools={pendingTools} />
-                    </div>
-                  )}
-                  {/* 当前轮已执行的工具步骤（实时，与聊天窗口一致） */}
-                  {pendingTools.length > 0 && (
-                    <div style={{ margin: '0 0 2px' }}>
-                      {pendingTools.map((t) => (
-                        <ToolStep key={t.callId} trace={t} />
-                      ))}
-                    </div>
-                  )}
-                  {streaming.reasoning && <ReasoningBlock content={streaming.reasoning} streaming />}
-                  {streamedText && (
-                    <div style={{ minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
-                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents((url) => setPreviewImage(url))}>
-                        {normalizeTreeBlocks(stripWrappedRecordTag(streamedText))}
-                      </ReactMarkdown>
-                      <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
-                    </div>
-                  )}
-                  <div style={{ display: 'block', color: 'var(--text-muted)', fontSize: 12, marginTop: 4 }}>
-                    思考中
-                    <ThinkingDots />
+        }
+        footer={
+          cur.busy ? (
+            <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
+              <div style={AI_BUBBLE_STYLE}>
+                {/* 实时耗时 + 步数统计：任务执行中每秒跳动显示耗时，并实时统计已执行步数 */}
+                {(cur.turnStartTs != null || pendingTools.length > 0) && (
+                  <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 6 }}>
+                    {cur.turnStartTs != null && (
+                      <>
+                        耗时 <LiveDuration startTs={cur.turnStartTs} />
+                      </>
+                    )}
+                    <StepStats tools={pendingTools} />
                   </div>
+                )}
+                {/* 当前轮已执行的工具步骤（实时，与聊天窗口一致） */}
+                {pendingTools.length > 0 && (
+                  <div style={{ margin: '0 0 2px' }}>
+                    {pendingTools.map((t) => (
+                      <ToolStep key={t.callId} trace={t} />
+                    ))}
+                  </div>
+                )}
+                {streaming.reasoning && <ReasoningBlock content={streaming.reasoning} streaming />}
+                {streamedText && (
+                  <div style={{ minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents((url) => setPreviewImage(url))}>
+                      {normalizeTreeBlocks(stripWrappedRecordTag(streamedText))}
+                    </ReactMarkdown>
+                    <span style={{ animation: 'blink 1s step-start infinite' }}>▌</span>
+                  </div>
+                )}
+                <div style={{ display: 'block', color: 'var(--text-muted)', fontSize: 12, marginTop: 4 }}>
+                  思考中
+                  <ThinkingDots />
                 </div>
               </div>
-            )}
-          </>
-        )}
-      </div>
+            </div>
+          ) : null
+        }
+        style={{
+          flex: 1,
+          minHeight: 0,
+          width: '100%',
+          maxWidth: '100%',
+          minWidth: 0,
+          boxSizing: 'border-box',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'stretch',
+          overflowY: 'auto',
+          overflowX: 'hidden',
+          padding: 16,
+          background: 'var(--bg-sidebar)',
+          contain: 'layout',
+        }}
+      />
 
       {/* 输入区：自包含 SupervisorComposer（附件 / 模型 / 安全模式 / 麦克风 / 发送），键入只重渲染本子树 */}
       <SupervisorComposer

@@ -126,6 +126,11 @@ export function App() {
   const [previewImage, setPreviewImage] = useState<string | null>(null)
   // 跟踪当前会话 id（供审批回调等闭包读取最新值，避免捕获旧 state）
   const currentSessionIdRef = useRef('')
+  // 切换令牌：每次切换/新建会话递增。只有「最新令牌」对应的 switchToSession 才能写「会话级全局状态」
+  // （currentSessionId / approvalPolicy / selectedModel / browserWindows / retryPrompt / queueCount）。
+  // 前一次切换的异步读取（审批策略/模型/浏览器窗口/重试快照/排队数）晚返回时据此放弃写入，
+  // 避免快速连续切换会话时旧值覆盖新值，导致聊天记录 / 安全模式 / 模型 / 浏览器标签等串台。
+  const switchSeqRef = useRef(0)
   // 每个会话的输入框草稿（输入到一半切换会话，切回来草稿不丢）
   const draftRef = useRef<Record<string, { input: string; attachments: AttachmentItem[] }>>({})
   // —— 输入态下沉：input / attachments 等高频输入态已移入 ChatComposer 组件，这里只保留 ——
@@ -164,7 +169,9 @@ export function App() {
     return () => ro.disconnect()
   }, [])
 
-  const cur = sessionMap[currentSessionId] ?? EMPTY_SESSION
+  // 健壮化：sessionMap[currentSessionId] 可能是残缺对象（patchSession 只发 patch 字段、首次写入不补全时），
+  // 用 EMPTY_SESSION 兜底 items/streaming/busy 等字段，避免 cur.items.length 抛 undefined 白屏。
+  const cur = { ...EMPTY_SESSION, ...(sessionMap[currentSessionId] ?? {}) }
   // 「继续执行」入口状态：从当前会话读取（会话级隔离，避免多会话/后台任务下按钮串扰）
   const incompleteTurn = cur.incompleteTurn
   // 当前会话的待审批请求（会话级隔离：只显示当前会话队列的头一个，并行会话互不串扰）
@@ -187,10 +194,12 @@ export function App() {
       // 字段级 patch：只发送 patch 显式指定的字段，不展开已有 base（否则会把本地旧的 items 整体覆盖到主进程，
       // 覆盖掉 onSessionActivity('end') 刚重建的含正文 items，导致「执行完正文消失、重启后才出现」的竞态）。
       const next = typeof patch === 'function' ? patch(base) : patch
-      // 会话首次写入：若 store 中尚无该会话（如切会话先写 incompleteTurn、再异步拉历史），字段级 patch
-      // 会被 deepMerge 直接把 sessionMap[id] 置为仅含 patch 字段的残缺对象（缺 items/streaming/busy），
-      // 渲染时 cur.items.length 抛 undefined 导致白屏。故首次写入必须补全 EMPTY_SESSION 的完整字段。
-      patchUiStore({ sessionMap: { [id]: existing ? next : { ...EMPTY_SESSION, ...next } } })
+      // 修复（快速切换显示欢迎界面）：不再「补全 EMPTY_SESSION」——那会引入 items=[] 通过 IPC deepMerge
+      // 覆盖主进程已填充的完整 items。根因：chat 窗口广播快照经 filterUiStateForWindow 过滤后只保留当前会话，
+      // 本地 snapshot 缺其他会话，「切会话先写 incompleteTurn」时 existing 被误判为 undefined，触发补全 items=[]，
+      // 覆盖主进程 sessionMap[id].items → 切到有数据会话却显示「欢迎界面」。改为只发 patch 字段，主进程 deepMerge
+      // 保留已填充 items；本地残缺对象由 cur 读取处健壮化兜底（不白屏）。
+      patchUiStore({ sessionMap: { [id]: next } })
     },
     [],
   )
@@ -205,13 +214,17 @@ export function App() {
     [patchSession],
   )
 
-  /** 重取模型列表并同步下拉框（启动 / 刷新 / 模型列表变化时调用） */
-  const refreshModelsList = useCallback(async () => {
+  /** 重取模型列表并同步下拉框（启动 / 刷新 / 模型列表变化时调用）。
+   *  切会话时传 switchToken：每次 await 后校验令牌是否仍是最新，过期则放弃写入 selectedModel，
+   *  避免快速切换会话时前一次切换的模型读取晚返回、覆盖最后切换会话的模型下拉框（模型串台）。 */
+  const refreshModelsList = useCallback(async (switchToken?: number) => {
     const api = window.shanhai
     if (!api) return
     const list = await api.listModels()
+    if (switchToken !== undefined && switchToken !== switchSeqRef.current) return
     setModels(list)
     const current = await api.getCurrentModelId()
+    if (switchToken !== undefined && switchToken !== switchSeqRef.current) return
     const prev = getUiStoreSnapshot().selectedModel
     setSelectedModel(current && list.some((m) => m.id === current) ? current : list.some((m) => m.id === prev) ? prev : (list[0]?.id ?? ''))
   }, [])
@@ -312,10 +325,12 @@ export function App() {
     patchUiStore({ sessions: list })
   }, [])
 
-  /** 刷新当前会话的浏览器窗口列表（会话级隔离，agent 打开/关闭窗口后同步到标签区） */
-  async function refreshBrowserWindows(sessionId?: string): Promise<void> {
+  /** 刷新当前会话的浏览器窗口列表（会话级隔离，agent 打开/关闭窗口后同步到标签区）。
+   *  切会话时传 switchToken：过期则放弃写入 browserWindows，避免快速切换时旧会话浏览器标签覆盖新会话。 */
+  async function refreshBrowserWindows(sessionId?: string, switchToken?: number): Promise<void> {
     const sid = sessionId ?? currentSessionId ?? ''
     const wins = (await window.shanhai?.listBrowserWindows(sid)) ?? []
+    if (switchToken !== undefined && switchToken !== switchSeqRef.current) return
     setBrowserWindows(wins)
   }
 
@@ -331,34 +346,47 @@ export function App() {
   }
 
   async function switchToSession(id: string): Promise<void> {
+    // 切换令牌：本次切换的序号，只有仍是最新时才允许写「会话级全局状态」。
+    const token = ++switchSeqRef.current
     // 保存当前会话输入框草稿，切回来不丢（从 composerRef 读当前输入真值）
     if (currentSessionId) {
       draftRef.current[currentSessionId] = composerRef.current
     }
-    setCurrentSessionId(id)
     currentSessionIdRef.current = id
     // 终端面板开关已会话级隔离（SessionUIState.terminalPanelOpen），切会话时 cur 自动切换，无需手动收起
     // 恢复目标会话草稿（若有），否则清空输入框（通过 resetComposer 触发 ChatComposer 重同步）
     const draft = draftRef.current[id]
     resetComposer(draft?.input ?? '', draft?.attachments ?? [])
+    // 先切主进程（currentSessionId 权威更新 + onCurrentSessionChanged 广播填充 sessionMap），
+    // 再本地同步 currentSessionId，避免「本地乐观 setCurrentSessionId」与「主进程旧广播」竞态导致
+    // 快速切换会话时 currentSessionId 被回退、聊天记录串台。
     await window.shanhai?.switchSession(id)
-    // 会话级审批策略：切到该会话时同步其安全模式到 UI
-    void window.shanhai?.getApprovalPolicy().then((p) => setApprovalPolicyState(p)).catch(() => undefined)
+    // 过期保护：切换期间用户又点了别的会话/新建会话，本分支放弃后续所有全局写入，避免旧值覆盖新值串台。
+    if (token !== switchSeqRef.current) return
+    setCurrentSessionId(id)
+    // 会话级审批策略：切到该会话时同步其安全模式到 UI（传 sid 读该会话 meta.approvalPolicy，避免读全局当前会话串台）
+    void window.shanhai?.getApprovalPolicy(id).then((p) => {
+      if (token === switchSeqRef.current) setApprovalPolicyState(p)
+    }).catch(() => undefined)
     // 会话级模型：切会话后同步该会话的模型到下拉框选中态（后端 switchSession 已回放 model/select）
-    void refreshModelsList()
-    // 会话级 token 统计：切会话后拉取该会话的用量（底部状态栏隔离）
-    void window.shanhai?.getTokenStats().then((s) => patchUiStore({ tokenStatsBySession: { [id]: s } })).catch(() => undefined)
+    void refreshModelsList(token)
+    // 会话级 token 统计：切会话后拉取该会话的用量（底部状态栏隔离，按 id 写入不串台）
+    void window.shanhai?.getTokenStats().then((s) => {
+      if (token === switchSeqRef.current) patchUiStore({ tokenStatsBySession: { [id]: s } })
+    }).catch(() => undefined)
     // 会话级浏览器窗口：切会话后同步该会话打开的浏览器窗口到标签区
-    void refreshBrowserWindows(id)
-    // 检查是否有未完成的消息（决定是否显示「继续执行」按钮），会话级写入，不污染其他会话
+    void refreshBrowserWindows(id, token)
+    // 检查是否有未完成的消息（决定是否显示「继续执行」按钮），会话级写入 sessionMap[id]，按 id 隔离，不污染其他会话
     const incomplete = (await window.shanhai?.hasIncompleteTurn(id)) ?? false
     patchSession(id, { incompleteTurn: incomplete })
     // 重启恢复：检测是否有失败重试挂起快照，有则恢复「重试/取消」弹窗（与进程内失败交互一致）
     const snap = (await window.shanhai?.hasRetrySnapshot(id)) ?? null
-    if (snap) {
+    if (snap && token === switchSeqRef.current) {
       setRetryPrompt({ sessionId: id, message: snap.reason ?? '任务上次因网络/服务异常中断，是否重试？' })
     }
-    setQueueCount(pendingQueue.current[id]?.length ?? 0)
+    if (token === switchSeqRef.current) {
+      setQueueCount(pendingQueue.current[id]?.length ?? 0)
+    }
     if (loadedSessions.current.has(id)) return
     loadedSessions.current.add(id)
     const history = (await window.shanhai?.getSessionHistory(id)) ?? []
@@ -374,6 +402,8 @@ export function App() {
   async function createSession(): Promise<void> {
     const id = await window.shanhai?.createSession()
     if (!id) return
+    // 新建会话是权威切换：递增令牌，让任何仍在途的 switchToSession 过期，避免其晚返回覆盖新建会话的 currentSessionId
+    switchSeqRef.current++
     loadedSessions.current.add(id)
     patchSession(id, { items: [], streaming: '', streamingReasoning: '', busy: false })
     // 保存当前会话草稿，新建会话输入框清空（从 composerRef 读数，resetComposer 触发 ChatComposer 清空）
@@ -1002,6 +1032,8 @@ function userItemIndex(items: ChatItem[], userIndex: number): number {
 
 function historyToItems(history: HistoryItem[]): ChatItem[] {
   const out: ChatItem[] = []
+  // tool-call 的 callId → 在 out 中的下标：避免每条 tool-result 都 reverse+findIndex 的 O(n²)
+  const toolCallIndex = new Map<string, number>()
   for (const h of history) {
     if (h.kind === 'user') {
       const images = (h.attachments ?? [])
@@ -1013,14 +1045,14 @@ function historyToItems(history: HistoryItem[]): ChatItem[] {
     } else if (h.trace) {
       const trace = h.trace
       if (trace.kind === 'tool-result') {
-        // 合并到同 callId 的 tool-call 条目（否则同一工具调用会显示「执行中」+「已完成」两条）
-        const idx = [...out].reverse().findIndex((it) => it.kind === 'tool' && it.trace.kind === 'tool-call' && it.trace.callId === trace.callId)
-        if (idx >= 0) {
-          const realIdx = out.length - 1 - idx
+        const realIdx = toolCallIndex.get(trace.callId)
+        if (realIdx !== undefined) {
           const base = (out[realIdx] as Extract<ChatItem, { kind: 'tool' }>).trace
           out[realIdx] = { kind: 'tool', trace: { ...base, kind: 'tool-result', result: trace.result, error: trace.error } }
           continue
         }
+      } else if (trace.kind === 'tool-call') {
+        toolCallIndex.set(trace.callId, out.length)
       }
       out.push({ kind: 'tool', trace })
     }

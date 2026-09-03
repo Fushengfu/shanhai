@@ -72,7 +72,7 @@ portable:
 # 递增 build code（根配置字段，映射 macOS 的 CFBundleVersion / Windows 的 FileVersion）
 # 与网关 version_code（递增整数）同量纲，供版本检查「版本字符串相同但 build code 更高」场景比较
 # （app-updater 读 CFBundleVersion）。每次发版手动 +1。
-buildVersion: "2"
+buildVersion: "3"
 
 # 原生模块在打包前手动 @electron/rebuild（pnpm 下 npmRebuild 不可靠，故关闭）
 npmRebuild: false

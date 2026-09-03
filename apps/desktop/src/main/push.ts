@@ -1,7 +1,7 @@
 import { BrowserWindow } from 'electron'
 import { safeSend } from './safe-send'
 import { getRuntime } from './runtime'
-import { getUiState, subscribeUiState, filterUiStateForWindow, windowConsumesUiState } from './ui-store'
+import { getUiState, getUiStateRev, subscribeUiState, filterUiStateForWindow, windowConsumesUiState } from './ui-store'
 import { getWindowType, openApp, closeApp } from './window-manager'
 import { registerPluginApp, unregisterPluginApp, listPluginApps } from './plugin-apps'
 import { refreshDockMenu } from './dock-menu'
@@ -71,11 +71,13 @@ export function registerPush(): void {
     const timer = setTimeout(() => {
       uiStatePending = false
       const full = getUiState()
+      const rev = getUiStateRev()
       for (const win of BrowserWindow.getAllWindows()) {
         if (win.isDestroyed()) continue
         const type = getWindowType(win)
         if (!windowConsumesUiState(type)) continue
-        safeSend(win, 'ui:state', filterUiStateForWindow(type, full))
+        // 带单调版本号下发：渲染进程据此丢弃过期快照（rev <= 已应用 rev），避免旧广播覆盖新状态导致串台
+        safeSend(win, 'ui:state', { rev, state: filterUiStateForWindow(type, full) })
       }
     }, 16)
     timer.unref?.()

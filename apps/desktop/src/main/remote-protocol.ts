@@ -108,17 +108,14 @@ export function sanitizeHistory(
   items: Array<{ kind: 'user' | 'assistant' | 'tool'; content?: string; reasoningContent?: string; trace?: ToolTrace; attachments?: unknown[]; turnSeq?: number; turnDuration?: number }>,
 ): unknown[] {
   const out: unknown[] = []
+  // tool-call 的 callId → 在 out 中的下标：避免每条 tool-result 都 reverse+findIndex 的 O(n²)
+  const toolCallIndex = new Map<string, number>()
   for (const item of items) {
     if (item.kind === 'tool' && item.trace) {
       const trace = item.trace
       if (trace.kind === 'tool-result') {
-        // 从后往前找同 callId 的 tool-call，找到则合并（保留 tool-call 的 name/args/reasoning/startTs）
-        const idx = [...out].reverse().findIndex((it) => {
-          const t = (it as { kind?: string; trace?: ToolTrace }).trace
-          return (it as { kind?: string }).kind === 'tool' && t?.kind === 'tool-call' && t.callId === trace.callId
-        })
-        if (idx >= 0) {
-          const realIdx = out.length - 1 - idx
+        const realIdx = toolCallIndex.get(trace.callId)
+        if (realIdx !== undefined) {
           const base = (out[realIdx] as { kind: string; trace: ToolTrace }).trace
           out[realIdx] = {
             kind: 'tool',
@@ -132,6 +129,8 @@ export function sanitizeHistory(
           }
           continue
         }
+      } else if (trace.kind === 'tool-call') {
+        toolCallIndex.set(trace.callId, out.length)
       }
       out.push({ ...item, trace: sanitizeTrace(trace) })
     } else {

@@ -19,7 +19,7 @@ import type { ApprovalPolicy } from '@shanhai/session'
 import { createSupervisorTools, SUPERVISOR_ID, SUPERVISOR_MAX_HISTORY_TURNS, type SessionStateSummary } from './supervisor'
 import { createSupervisorLedgerTools } from './supervisor-workspace'
 import { modelSupportsVision } from './models'
-import { sessionContext, type RuntimeContext } from './context'
+import { sessionContext, type RuntimeContext, type SessionMeta } from './context'
 import type { TokenStatsModule } from './token-stats'
 import type { PromptsModule } from './prompts'
 import type { ModelProviderModule } from './model-provider'
@@ -61,6 +61,18 @@ export function createExecutionModule(
 ): ExecutionModule {
   const { sessions, tokenStats, prompts, modelProvider, allModels, wrapTool } = deps
 
+  // 统计会话内「非 injected 的 user/message」数量（turnSeq 计算用）。用 size + at 无复制遍历，
+  // 替代 meta.session.list().filter(...).length 的全量复制，消掉 run 前热路径的 O(N) 拷贝。
+  const countNonInjectedUserMessages = (session: SessionMeta['session']): number => {
+    const total = session.size
+    let count = 0
+    for (let i = 0; i < total; i++) {
+      const e = session.at(i)
+      if (e?.type === 'user/message' && !(e.data as { injected?: boolean }).injected) count++
+    }
+    return count
+  }
+
   const runInSession = async (
     sid: string,
     message: string,
@@ -100,6 +112,12 @@ export function createExecutionModule(
     }
     const loop = new AgentLoop(effModel, isSupervisorRun ? ctx.supervisorLoopTools : ctx.tools, targetSession, ctx.approval, sid, tokenStats.currentContextBudget(effModelId), visionCapable, tokenStats.currentApiKey(effModelId), modelProvider.resolveCompactModel())
     ctx.runningLoops.set(sid, loop)
+    // 发新任务前，物理清理上一个「未完成轮次」的半截事件（普通会话与管家会话一致清理）。
+    // 网络中断会把「只有 user、无最终 assistant 正文、无 turn/end 收尾」的半截事件留在事件日志，
+    // 污染后续回放/续跑。发新任务(run)即代表放弃对上一个中断任务的断点续跑，故可安全物理删除；
+    // 完整轮次（含成对 tool/result、usage/record、model/select 等正常事件）全部保留。
+    // dropIncompleteTurn（回放层剔除）仍保留作兜底，与本处落盘清理互补。
+    cleanupIncompleteTurnLog(meta)
     let suspended = false
     // 内核事件总线：消息到达（用户消息提交 → assistant 回复完成）都广播给 host 半插件（ctx.on 订阅）。
     // 单个插件监听器异常不影响会话编排主流程（try-catch 吞掉）。
@@ -120,6 +138,9 @@ export function createExecutionModule(
           modelContent,
           // 管家历史回放轮数比普通会话多（30 vs 20），便于跨会话编排时保留更长上下文主线
           maxHistoryTurns: isSupervisorRun ? SUPERVISOR_MAX_HISTORY_TURNS : undefined,
+          // 发新任务（run）时，普通会话与管家会话一致剔除「最后一个未完成轮次」：网络中断遗留的孤立 user（其后无 assistant 正文）。
+          // resume 续跑走 resumeRun 不传此标志，天然不受影响。
+          dropIncompleteTurn: true,
           // 管家历史回放与普通会话一致：只回放 user + 最终 assistant 正文，不保留工具调用过程（tool/call + tool/result）。
           // 曾用 preserveToolCalls: isSupervisorRun 完整回放工具调用，但会把历史里反复出现的重复工具调用（如 ledger(write) 反复写 _index.json）
           // 回放给模型、强化重复行为，诱发「连续几十次写同一台账文件」的死循环，故取消（走缺省 false）。
@@ -191,7 +212,7 @@ export function createExecutionModule(
 
     const title = meta.title
     const targetModelId = meta.modelId ?? ctx.defaultModelId
-    const turnSeq = meta.session.list().filter((e) => e.type === 'user/message' && !(e.data as { injected?: boolean }).injected).length + 1
+    const turnSeq = countNonInjectedUserMessages(meta.session) + 1
     ctx.userMessageCallbacks.forEach((cb) => cb(sid, content, turnSeq))
     void (async () => {
       try {
@@ -392,7 +413,7 @@ export function createExecutionModule(
       `若风险过高或参数可疑请拒绝；不要替该会话执行具体操作。`
     ctx.supervisorWakeQueue.push(prompt)
     const supMeta = ctx.sessions.get(SUPERVISOR_ID)
-    const turnSeq = supMeta ? supMeta.session.list().filter((e) => e.type === 'user/message' && !(e.data as { injected?: boolean }).injected).length + 1 : 1
+    const turnSeq = supMeta ? countNonInjectedUserMessages(supMeta.session) + 1 : 1
     ctx.userMessageCallbacks.forEach((cb) => cb(SUPERVISOR_ID, prompt, turnSeq))
     console.log('[supervisor-wake] 审批请求入队：', req.id, req.toolName, 'queue=', ctx.supervisorWakeQueue.length, 'supervisorWaking=', ctx.supervisorWaking, 'runningLoops.has=', ctx.runningLoops.has(SUPERVISOR_ID))
     void drainSupervisorWake()
@@ -408,7 +429,7 @@ export function createExecutionModule(
       `有可选项时从可选项里选一个最合适的作为 answer；无选项时给出简短明确的文字回答。不要替该会话执行具体操作。`
     ctx.supervisorWakeQueue.push(prompt)
     const supMeta = ctx.sessions.get(SUPERVISOR_ID)
-    const turnSeq = supMeta ? supMeta.session.list().filter((e) => e.type === 'user/message' && !(e.data as { injected?: boolean }).injected).length + 1 : 1
+    const turnSeq = supMeta ? countNonInjectedUserMessages(supMeta.session) + 1 : 1
     ctx.userMessageCallbacks.forEach((cb) => cb(SUPERVISOR_ID, prompt, turnSeq))
     console.log('[supervisor-wake] 提问请求入队：', req.id, 'queue=', ctx.supervisorWakeQueue.length, 'supervisorWaking=', ctx.supervisorWaking, 'runningLoops.has=', ctx.runningLoops.has(SUPERVISOR_ID))
     void drainSupervisorWake()
@@ -425,7 +446,7 @@ export function createExecutionModule(
       `3. 若清单已全部 done、或该会话本就没有任务清单（只是简单转发），更新必要状态后结束本轮，不要重复下发、不要空转。`
     ctx.supervisorWakeQueue.push(prompt)
     const supMeta = ctx.sessions.get(SUPERVISOR_ID)
-    const turnSeq = supMeta ? supMeta.session.list().filter((e) => e.type === 'user/message' && !(e.data as { injected?: boolean }).injected).length + 1 : 1
+    const turnSeq = supMeta ? countNonInjectedUserMessages(supMeta.session) + 1 : 1
     ctx.userMessageCallbacks.forEach((cb) => cb(SUPERVISOR_ID, prompt, turnSeq))
     console.log('[supervisor-wake] 任务回传入队：', sid, 'queue=', ctx.supervisorWakeQueue.length, 'supervisorWaking=', ctx.supervisorWaking, 'runningLoops.has=', ctx.runningLoops.has(SUPERVISOR_ID))
     void drainSupervisorWake()
@@ -442,7 +463,7 @@ export function createExecutionModule(
       `这是把插件界面代码投递到界面执行的安全敏感操作，用途可疑请拒绝；不要替该会话执行具体操作。`
     ctx.supervisorWakeQueue.push(prompt)
     const supMeta = ctx.sessions.get(SUPERVISOR_ID)
-    const turnSeq = supMeta ? supMeta.session.list().filter((e) => e.type === 'user/message' && !(e.data as { injected?: boolean }).injected).length + 1 : 1
+    const turnSeq = supMeta ? countNonInjectedUserMessages(supMeta.session) + 1 : 1
     ctx.userMessageCallbacks.forEach((cb) => cb(SUPERVISOR_ID, prompt, turnSeq))
     console.log('[supervisor-wake] 投递请求入队：', req.requestId, 'pkg=', req.pkgId, 'queue=', ctx.supervisorWakeQueue.length, 'supervisorWaking=', ctx.supervisorWaking, 'runningLoops.has=', ctx.runningLoops.has(SUPERVISOR_ID))
     void drainSupervisorWake()
@@ -515,6 +536,10 @@ export function createExecutionModule(
       modelProvider.resolveCompactModel(),
     )
     ctx.runningLoops.set(sid, loop)
+    // 断点续跑前，剔除「最后一个任务」内的孤立 tool/call（有 callId 无配对 tool/result），
+    // 避免回放成「assistant 空 content + 无结果 tool」污染续跑上下文；成对 tool/call+tool/result 保留（恢复现场依据）。
+    // 普通会话与管家会话一致处理。
+    meta.session.removeOrphanToolCalls(lastUserIdx + 1)
     ctx.sessionActivityCallbacks.forEach((cb) => cb(sid, 'start'))
     let suspended = false
     try {
@@ -657,6 +682,37 @@ export function createExecutionModule(
       if (t === 'assistant/message' || t === 'turn/end') return false
     }
     return true
+  }
+
+  /**
+   * 发新任务(run)前，物理清理上一个「未完成轮次」的半截事件（普通会话与管家会话一致调用）。
+   * 网络中断会在事件日志留下「只有 user、无最终 assistant 正文、无 turn/end 收尾」的半截事件，
+   * 污染后续回放/续跑。发新任务即代表放弃对上一个中断任务的断点续跑，故可安全物理删除。
+   * 判定：最后一个非 injected 的 user/message 之后没有 assistant/message（最终正文）或 turn/end → 未完成轮次。
+   * 清理：truncate 到该 user/message 之前，删掉这条孤立 user + 其后的 turn/start、孤立/成对 tool/call+tool/result
+   *       等半截事件；完整轮次（含成对 tool/result、usage/record、model/select 等正常事件）全部保留。
+   * 落盘：truncate 会置 Session.requireRewrite=true，persistSession 随后全量重写 events.jsonl 实现物理清理。
+   */
+  const cleanupIncompleteTurnLog = (meta: SessionMeta): void => {
+    const total = meta.session.size
+    let lastUserIdx = -1
+    for (let i = total - 1; i >= 0; i--) {
+      const e = meta.session.at(i)
+      if (e?.type === 'user/message') {
+        const d = e.data as { injected?: boolean }
+        if (d.injected) continue
+        lastUserIdx = i
+        break
+      }
+    }
+    if (lastUserIdx < 0) return
+    // 该 user 之后若有最终 assistant 正文或 turn/end 收尾，说明是完整轮次，无需清理
+    for (let i = lastUserIdx + 1; i < total; i++) {
+      const t = meta.session.at(i)?.type
+      if (t === 'assistant/message' || t === 'turn/end') return
+    }
+    // 未完成轮次：truncate 删掉 [lastUserIdx, end) 全部半截事件（孤立 user + turn/start + 工具过程）
+    meta.session.truncate(lastUserIdx)
   }
 
   return {

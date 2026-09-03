@@ -44,13 +44,29 @@ export interface MarketPlugin {
   installed?: boolean
 }
 
-/** 解析网关响应信封（兼容 { data } / 直接数组 / { list } / { items } 等形态） */
+/** 解析网关响应信封（兼容 { data } / 直接数组 / { list } / { items } / { data:{list} } 等形态） */
 function unwrapList(json: unknown): { list: unknown[]; total: number } {
   if (Array.isArray(json)) return { list: json, total: json.length }
   const obj = json as Record<string, unknown>
-  const maybe = obj?.data ?? obj?.list ?? obj?.items ?? obj?.plugins
+  const data = obj?.data
+  let maybe: unknown
+  let total: number
+  if (Array.isArray(data)) {
+    // 形态 { data: [...] }
+    maybe = data
+    total = typeof obj?.total === 'number' ? obj.total : data.length
+  } else if (data !== null && typeof data === 'object') {
+    // 形态 { code, data: { list: [...] , total } }（网关公开接口信封：数组在 data 对象内一层）
+    const d = data as Record<string, unknown>
+    maybe = d.list ?? d.items ?? d.plugins ?? d.records ?? d.rows
+    total = typeof d.total === 'number' ? d.total : typeof obj?.total === 'number' ? (obj.total as number) : 0
+  } else {
+    // 形态 { list: [...] } / { items: [...] } / { plugins: [...] }
+    maybe = obj?.list ?? obj?.items ?? obj?.plugins
+    total = typeof obj?.total === 'number' ? obj.total : 0
+  }
   const arr = Array.isArray(maybe) ? maybe : []
-  const total = typeof obj?.total === 'number' ? obj.total : arr.length
+  if (arr.length && total === 0) total = arr.length
   return { list: arr, total }
 }
 
@@ -252,6 +268,23 @@ export async function downloadAndInstallPlugin(pluginId: string): Promise<{
     return { ok: false, message: `安装失败：${err instanceof Error ? err.message : String(err)}` }
   } finally {
     await fs.rm(tmpBase, { recursive: true, force: true }).catch(() => undefined)
+  }
+}
+
+/**
+ * 卸载已安装插件（用户点「我已安装」卡片的「卸载」按钮）：撤销运行 + 删除 ~/.shanhai/plugins/<id>/ 目录。
+ * 走 runtime 的 selfmod.uninstall（撤销 disposer + removeClient + 删除持久化目录），不可恢复。
+ */
+export async function uninstallMarketPlugin(pluginId: string): Promise<{ ok: boolean; message: string }> {
+  const id = String(pluginId ?? '').trim()
+  if (!id || !/^[a-zA-Z0-9_-]+$/.test(id)) {
+    return { ok: false, message: `非法插件 id: ${pluginId}` }
+  }
+  try {
+    await getRuntime().uninstallMarketPlugin(id)
+    return { ok: true, message: `已卸载插件「${id}」` }
+  } catch (err) {
+    return { ok: false, message: `卸载失败：${err instanceof Error ? err.message : String(err)}` }
   }
 }
 

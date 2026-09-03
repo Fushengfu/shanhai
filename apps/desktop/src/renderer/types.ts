@@ -383,10 +383,12 @@ declare global {
       submitPluginToMarket(pluginDirOrId: string, categories?: string[]): Promise<{ ok: boolean; message: string; zipPath?: string; data?: unknown }>
       /** 插件市场：列出「我已安装」插件（含自研标记 + 网关提交状态） */
       listMyPlugins(): Promise<{ ok: boolean; plugins: Array<{ id: string; name: string; purpose?: string; version?: string; selfMade: boolean; installed: boolean; submitted: boolean; gatewayVersion?: string; gatewayStatus?: string; hasApproved?: boolean }>; mineError?: string }>
-      /** 读取全局 UI 共享状态快照 */
-      getUiState(): Promise<GlobalUiState>
-      /** 订阅全局 UI 共享状态变化 */
-      onUiState(cb: (state: GlobalUiState) => void): () => void
+      /** 插件市场：卸载已安装插件（撤销运行 + 删除 ~/.shanhai/plugins/<id>/ 目录，不可恢复） */
+      uninstallMarketPlugin(pluginId: string): Promise<{ ok: boolean; message: string }>
+      /** 读取全局 UI 共享状态快照，返回 { rev, state } 信封 */
+      getUiState(): Promise<UiStateEnvelope>
+      /** 订阅全局 UI 共享状态变化（推送 { rev, state } 信封） */
+      onUiState(cb: (payload: UiStateEnvelope) => void): () => void
       /** 更新全局 UI 共享状态（字段级 patch） */
       patchUiState(patch: Partial<GlobalUiState>): Promise<void>
       status(): Promise<{ loggedIn: boolean; username: string | null }>
@@ -442,7 +444,7 @@ declare global {
       injectMessage(sessionId: string, message: string): Promise<boolean>
       hasIncompleteTurn(sessionId: string): Promise<boolean>
       hasRetrySnapshot(sessionId: string): Promise<{ reason?: string } | null>
-      getApprovalPolicy(): Promise<'ask' | 'workdir' | 'never'>
+      getApprovalPolicy(sid?: string): Promise<'ask' | 'workdir' | 'never'>
       setApprovalPolicy(policy: 'ask' | 'workdir' | 'never'): Promise<void>
       onApprovalRequest(cb: (req: ApprovalRequest) => void): () => void
       onToolTrace(cb: (trace: ToolTrace) => void): () => void
@@ -487,6 +489,12 @@ export interface SessionListItem {
   workDir: string
   lastActiveAt: number
   busy: boolean
+}
+
+/** ui:state / ui:getState 信封：rev 为单调递增版本号（渲染进程据此丢弃过期快照），state 为按窗口过滤后的快照 */
+export interface UiStateEnvelope {
+  rev: number
+  state: GlobalUiState
 }
 
 /** 全局 UI 共享状态（多窗口桌面系统的跨窗口上下文，与主进程 ui-store / preload 对齐） */

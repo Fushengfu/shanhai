@@ -436,7 +436,10 @@ export function createSessionsModule(
     let userSeq = 0
     let turnStartTs = 0
     const toolStartMap = new Map<string, number>()
-    for (const e of target.session.list()) {
+    const eventCount = target.session.size
+    for (let i = 0; i < eventCount; i++) {
+      const e = target.session.at(i)
+      if (!e) continue
       if (e.type === 'user/message') {
         const d = e.data as { content: string; attachments?: unknown[]; injected?: boolean }
         if (d.injected) continue

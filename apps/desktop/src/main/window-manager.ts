@@ -167,6 +167,10 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
       preload: join(__dirname, isPlugin ? '../preload/plugin.cjs' : '../preload/index.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      // 管家窗口禁用 Chromium 后台节流：管家常驻但经常非焦点，Electron 默认 backgroundThrottling=true 会暂停其
+      // rAF / 定时器，导致流式输出、子会话回传通知(✅完成)、输入反馈等渲染被推迟到回前台才一次性 flush，
+      // 表现为「迟迟不显示、突然蹦出来」。禁用后这些 UI 刷新即时生效，与其它窗口保持一致的跟手体验。
+      ...(type === 'supervisor' ? { backgroundThrottling: false } : {}),
       additionalArguments: [
         `${WINDOW_TYPE_ARG}${type}`,
         ...(appId ? [`${APP_ID_ARG}${appId}`] : []),
@@ -206,6 +210,7 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
   })
 
   registerContextMenu(win)
+  attachSnapToWindow(win, type)
   return win
 }
 
@@ -510,4 +515,139 @@ export function listWindows(): Array<{ type: WindowType; appId?: string }> {
     if (!meta.win.isDestroyed()) out.push({ type: meta.type, appId: meta.appId })
   }
   return out
+}
+
+// ==================== 窗口磁吸 + 联动移动（snap & dock）====================
+
+/** 参与磁吸联动的窗口类型：管家窗口（supervisor）↔ 子会话窗口（chat） */
+const SNAP_TYPES: ReadonlySet<WindowType> = new Set<WindowType>(['chat', 'supervisor'])
+
+/** 磁吸阈值（px）：窗口边距小于此值触发吸附对齐 */
+const SNAP_THRESHOLD = 16
+/** 解绑阈值（px）：已绑定窗口边距超过此值自动解绑（实践中表现为「快速甩开」） */
+const DETACH_THRESHOLD = 32
+/** move 事件节流间隔（ms，约 60fps） */
+const SNAP_THROTTLE_MS = 16
+
+/** 程序性移动标记：setPosition 触发的 move 事件被跳过，防递归死循环（key = BrowserWindow.id） */
+const programmaticMove = new Set<number>()
+
+/** 绑定关系：windowId -> { partnerId, dx, dy }，dx/dy 为 partner 相对自身的偏移 */
+interface SnapBinding { partnerId: number; dx: number; dy: number }
+const snapBindings = new Map<number, SnapBinding>()
+
+/** move 事件节流时间戳（key = BrowserWindow.id） */
+const lastSnapMoveTs = new Map<number, number>()
+
+/**
+ * 程序性移动：移动前打标记，setPosition 触发的自身 move 事件会被 programmaticMove.delete 消费跳过。
+ * setTimeout 兜底清除标记，避免「setPosition 到相同位置不触发 move」时标记残留。
+ */
+function moveProgrammatic(win: BrowserWindow, x: number, y: number): void {
+  const id = win.id
+  programmaticMove.add(id)
+  try {
+    win.setPosition(Math.round(x), Math.round(y))
+  } finally {
+    setTimeout(() => programmaticMove.delete(id), SNAP_THROTTLE_MS)
+  }
+}
+
+/** 找到与 win 配对的另一个磁吸窗口（chat ↔ supervisor） */
+function findSnapPartner(win: BrowserWindow, type: WindowType): BrowserWindow | undefined {
+  const targetType: WindowType = type === 'supervisor' ? 'chat' : 'supervisor'
+  const found = findWindow(targetType)
+  if (!found || found.win.id === win.id || found.win.isDestroyed() || !found.win.isVisible()) return undefined
+  return found.win
+}
+
+/** 两个矩形是否落在同一显示器（跨屏不参与磁吸联动，避免乱吸） */
+function sameDisplay(a: Electron.Rectangle, b: Electron.Rectangle): boolean {
+  try {
+    return screen.getDisplayMatching(a).id === screen.getDisplayMatching(b).id
+  } catch {
+    return false
+  }
+}
+
+/** 两窗口最近边距（水平/垂直方向各取最小 gap，再取全局最小） */
+function minEdgeGap(a: Electron.Rectangle, b: Electron.Rectangle): number {
+  const hGap = Math.min(Math.abs(b.x - (a.x + a.width)), Math.abs(a.x - (b.x + b.width)))
+  const vGap = Math.min(Math.abs(b.y - (a.y + a.height)), Math.abs(a.y - (b.y + b.height)))
+  return Math.min(hGap, vGap)
+}
+
+/** 计算吸附目标位置（win 贴到 partner 最近的一条边，另一维度保持不动） */
+function computeSnap(a: Electron.Rectangle, b: Electron.Rectangle): { x: number; y: number } | undefined {
+  const candidates: Array<{ gap: number; x: number; y: number }> = [
+    { gap: Math.abs(b.x - (a.x + a.width)), x: b.x - a.width, y: a.y }, // A 右贴 B 左
+    { gap: Math.abs(a.x - (b.x + b.width)), x: b.x + b.width, y: a.y }, // A 左贴 B 右
+    { gap: Math.abs(b.y - (a.y + a.height)), x: a.x, y: b.y - a.height }, // A 底贴 B 顶
+    { gap: Math.abs(a.y - (b.y + b.height)), x: a.x, y: b.y + b.height }, // A 顶贴 B 底
+  ]
+  let best: { x: number; y: number } | undefined
+  let bestGap = Infinity
+  for (const c of candidates) {
+    if (c.gap < SNAP_THRESHOLD && c.gap < bestGap) {
+      bestGap = c.gap
+      best = { x: c.x, y: c.y }
+    }
+  }
+  return best
+}
+
+/** 解除两个窗口的绑定关系 */
+function unbindSnap(a: number, b: number): void {
+  snapBindings.delete(a)
+  snapBindings.delete(b)
+}
+
+/** move 事件处理：节流 + 边界态过滤后，执行联动或吸附 */
+function handleSnapMove(win: BrowserWindow, type: WindowType): void {
+  const partner = findSnapPartner(win, type)
+  if (!partner) return
+  const wb = win.getBounds()
+  const pb = partner.getBounds()
+  if (!sameDisplay(wb, pb)) return
+
+  const binding = snapBindings.get(win.id)
+  if (binding) {
+    // 已绑定：边距超过阈值 → 解绑；否则联动 partner 保持相对位置
+    if (minEdgeGap(wb, pb) > DETACH_THRESHOLD) {
+      unbindSnap(win.id, binding.partnerId)
+      return
+    }
+    moveProgrammatic(partner, wb.x + binding.dx, wb.y + binding.dy)
+    return
+  }
+
+  // 未绑定：检测吸附，命中则吸附对齐并建立双向绑定
+  const snap = computeSnap(wb, pb)
+  if (!snap) return
+  moveProgrammatic(win, snap.x, snap.y)
+  const nwb = win.getBounds()
+  const npb = partner.getBounds()
+  snapBindings.set(win.id, { partnerId: partner.id, dx: npb.x - nwb.x, dy: npb.y - nwb.y })
+  snapBindings.set(partner.id, { partnerId: win.id, dx: nwb.x - npb.x, dy: nwb.y - npb.y })
+}
+
+/** 给参与磁吸的窗口挂 move 监听（chat/supervisor 创建时调用，窗口重建也自动覆盖） */
+function attachSnapToWindow(win: BrowserWindow, type: WindowType): void {
+  if (!SNAP_TYPES.has(type)) return
+  win.on('move', () => {
+    if (programmaticMove.delete(win.id)) return // 程序性移动，跳过（防递归）
+    if (win.isDestroyed()) return
+    // 边界态：全屏/最大化/最小化不参与磁吸联动
+    if (win.isMaximized() || win.isMinimized() || win.isFullScreen()) return
+    const now = Date.now()
+    const last = lastSnapMoveTs.get(win.id) ?? 0
+    if (now - last < SNAP_THROTTLE_MS) return
+    lastSnapMoveTs.set(win.id, now)
+    handleSnapMove(win, type)
+  })
+  win.on('closed', () => {
+    snapBindings.delete(win.id)
+    programmaticMove.delete(win.id)
+    lastSnapMoveTs.delete(win.id)
+  })
 }

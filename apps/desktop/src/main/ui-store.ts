@@ -76,6 +76,8 @@ function truncateToolResult(result: unknown): unknown {
 /** 把后端历史消息（HistoryItem[]）转换为消息流 items（ChatItem[]）：tool-result 合并到同 callId 的 tool-call */
 function historyToChatItems(history: HistoryItem[]): ChatItem[] {
   const out: ChatItem[] = []
+  // tool-call 的 callId → 在 out 中的下标：避免每条 tool-result 都 reverse+findIndex 的 O(n²)
+  const toolCallIndex = new Map<string, number>()
   for (const h of history) {
     if (h.kind === 'user') {
       const images = ((h.attachments ?? []) as Array<{ image_url?: { url?: string } }>)
@@ -87,13 +89,14 @@ function historyToChatItems(history: HistoryItem[]): ChatItem[] {
     } else if (h.trace) {
       const trace = h.trace
       if (trace.kind === 'tool-result') {
-        const idx = [...out].reverse().findIndex((it) => it.kind === 'tool' && it.trace.kind === 'tool-call' && it.trace.callId === trace.callId)
-        if (idx >= 0) {
-          const realIdx = out.length - 1 - idx
+        const realIdx = toolCallIndex.get(trace.callId)
+        if (realIdx !== undefined) {
           const base = (out[realIdx] as Extract<ChatItem, { kind: 'tool' }>).trace
           out[realIdx] = { kind: 'tool', trace: { ...base, kind: 'tool-result', result: truncateToolResult(trace.result), error: trace.error } }
           continue
         }
+      } else if (trace.kind === 'tool-call') {
+        toolCallIndex.set(trace.callId, out.length)
       }
       out.push({ kind: 'tool', trace })
     }
@@ -214,8 +217,17 @@ export function setWallpaper(wallpaper: string | null): void {
 
 const listeners = new Set<() => void>()
 
+/** 单调递增的 UI 状态版本号：每次 mutate / patchUiState 递增，随 ui:state 广播下发。
+ *  渲染进程据此丢弃「过期快照」（rev <= 已应用 rev），避免主进程广播与渲染进程本地乐观更新竞态导致状态回退串台。 */
+let rev = 0
+
 export function getUiState(): UiStoreState {
   return state
+}
+
+/** 当前 UI 状态版本号（随 ui:state / ui:getState 一并下发给渲染进程做过期快照丢弃） */
+export function getUiStateRev(): number {
+  return rev
 }
 
 /**
@@ -233,9 +245,35 @@ export function filterUiStateForWindow(type: WindowType | undefined, s: UiStoreS
       return { ...INITIAL_STATE, loggedIn: s.loggedIn, username: s.username, loginOpen: s.loginOpen, appMenuOpen: s.appMenuOpen }
     case 'supervisor-bubble':
       return { ...INITIAL_STATE }
-    case 'chat':
-    case 'supervisor':
-    case 'app':
+    case 'supervisor': {
+      // 管家窗口精简快照：只保留管家会话自身(sessionMap[SUPERVISOR_ID])的完整消息流，剔除其它会话的完整历史 items。
+      // 其它会话的 items 是重字段，随每次 ui:state 全量快照广播 + 渲染进程反序列化，会阻塞管家窗口渲染（表现为输入/通知延迟）。
+      // 其它会话的轻量元信息(标题/id/busy 等)由独立的 sessions 列表(SessionListItem[])承载，管家会话列表展示不受影响。
+      const self = s.sessionMap[SUPERVISOR_ID]
+      return {
+        ...s,
+        sessionMap: self ? { [SUPERVISOR_ID]: self } : {},
+      }
+    }
+    case 'chat': {
+      // 普通聊天窗口：只需当前会话(sessionMap[currentSessionId])的完整消息流。
+      // 其它会话的 items 是重字段，多窗口同开时主进程每次广播都要对整棵 sessionMap 结构化克隆、拖慢事件循环。
+      // 会话列表排序依赖的 busy 由 sessions 列表(SessionListItem.busy，与 sessionMap 同步维护)承载，不需其它会话的 items。
+      const sid = s.currentSessionId
+      const self = sid ? s.sessionMap[sid] : undefined
+      return {
+        ...s,
+        sessionMap: self ? { [sid]: self } : {},
+      }
+    }
+    case 'app': {
+      // 应用窗口（终端/轨迹/记忆/模型/设置/壁纸/插件市场）不消费 sessionMap，只消费 currentSessionId/models/selectedModel/loggedIn 等轻字段。
+      // 清空 sessionMap，避免把含所有会话完整历史的重快照发给不消费它的应用窗口。
+      return {
+        ...s,
+        sessionMap: {},
+      }
+    }
     default:
       return s
   }
@@ -283,12 +321,14 @@ function deepMerge<T>(target: T, patch: unknown): T {
 /** 字段级 patch（深合并 + 广播）。窗口动作后调用，不覆盖主进程事件刚更新的其他字段。 */
 export function patchUiState(patch: DeepPartial<UiStoreState>): void {
   state = deepMerge(state, patch)
+  rev++
   listeners.forEach((l) => l())
 }
 
 /** 内部函数式更新（主进程事件监听用，单一写者无竞态） */
 function mutate(fn: (s: UiStoreState) => UiStoreState): void {
   state = fn(state)
+  rev++
   listeners.forEach((l) => l())
 }
 
@@ -326,9 +366,16 @@ export function initUiStore(runtime: Runtime): void {
       const cur = s.sessionMap[trace.sessionId] ?? EMPTY_SESSION
       let items = cur.items
       if (trace.kind === 'tool-result') {
-        const idx = [...items].reverse().findIndex((it) => it.kind === 'tool' && it.trace.kind === 'tool-call' && it.trace.callId === trace.callId)
-        if (idx >= 0) {
-          const realIdx = items.length - 1 - idx
+        // 从后往前找最后一个同 callId 的 tool-call（语义等价于原 reverse().findIndex，但避免 [...items].reverse() 全量复制）
+        let realIdx = -1
+        for (let i = items.length - 1; i >= 0; i--) {
+          const it = items[i]
+          if (it?.kind === 'tool' && it.trace.kind === 'tool-call' && it.trace.callId === trace.callId) {
+            realIdx = i
+            break
+          }
+        }
+        if (realIdx >= 0) {
           const arr = [...items]
           const base = (arr[realIdx] as Extract<ChatItem, { kind: 'tool' }>).trace
           arr[realIdx] = { kind: 'tool', trace: { ...base, kind: 'tool-result', result: truncateToolResult(trace.result), error: trace.error } }
@@ -437,6 +484,10 @@ export function initUiStore(runtime: Runtime): void {
       mutate((s) => ({
         ...s,
         currentSessionId: sessionId,
+        // 会话级派生全局值（安全模式 / 选中模型）也必须在此同步到 store（单一权威）：
+        // 否则 switchSession 后 store 仍残留上一个会话的值，广播时把渲染进程刚同步的正确值覆盖回旧值（安全模式/模型串台）。
+        approvalPolicy: runtime.getApprovalPolicy(sessionId),
+        selectedModel: runtime.getCurrentModelId(),
         sessionMap: {
           ...s.sessionMap,
           [sessionId]: { ...(s.sessionMap[sessionId] ?? EMPTY_SESSION), items, incompleteTurn },
