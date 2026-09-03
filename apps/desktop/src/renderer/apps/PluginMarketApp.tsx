@@ -536,21 +536,22 @@ function MarketCard({ p, installing, onInstall }: { p: MarketItem; installing: b
         {sizeLabel && <span>{sizeLabel}</span>}
       </div>
 
-      {/* 底部：操作按钮 */}
+      {/* 底部：操作按钮（紧凑尺寸，不占满整卡；已安装 → 置灰描边，未安装 → 主色实心） */}
       <button
         onClick={() => onInstall(p.id)}
         disabled={installing || p.installed}
         style={{
-          width: '100%',
-          padding: '9px 0',
-          borderRadius: 10,
-          border: 'none',
+          alignSelf: 'flex-start',
+          padding: '7px 16px',
+          borderRadius: 8,
+          border: p.installed ? '1px solid var(--border)' : 'none',
           cursor: p.installed ? 'default' : 'pointer',
-          background: p.installed ? 'var(--bg-subtle)' : 'var(--accent)',
+          background: p.installed ? 'transparent' : 'var(--accent)',
           color: p.installed ? 'var(--text-muted)' : '#fff',
           fontSize: 13,
           fontWeight: 600,
           transition: 'background 0.15s ease',
+          opacity: installing ? 0.6 : 1,
         }}
       >
         {installing ? '安装中…' : p.installed ? '已安装' : '下载安装'}
@@ -604,15 +605,16 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
         {p.submitted && p.gatewayVersion && <span>网关 v{p.gatewayVersion}</span>}
       </div>
 
-      {/* 底部：操作按钮（分享 / 提交升级版本共享 / 已安装） */}
+      {/* 底部：操作按钮（分享 / 提交升级版本共享 / 已安装 + 卸载）同一行 */}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
       {action === 'share' && (
         <button
           onClick={() => onShare(p.id)}
           disabled={sharing || !loggedIn}
           style={{
-            width: '100%',
-            padding: '9px 0',
-            borderRadius: 10,
+            alignSelf: 'flex-start',
+            padding: '7px 16px',
+            borderRadius: 8,
             border: '1px solid var(--accent)',
             background: 'var(--tint-blue-soft)',
             color: 'var(--accent)',
@@ -631,9 +633,9 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
           onClick={() => onShare(p.id)}
           disabled={sharing || !loggedIn}
           style={{
-            width: '100%',
-            padding: '9px 0',
-            borderRadius: 10,
+            alignSelf: 'flex-start',
+            padding: '7px 16px',
+            borderRadius: 8,
             border: 'none',
             background: 'var(--accent)',
             color: '#fff',
@@ -651,11 +653,11 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
         <button
           disabled
           style={{
-            width: '100%',
-            padding: '9px 0',
-            borderRadius: 10,
-            border: 'none',
-            background: 'var(--bg-subtle)',
+            alignSelf: 'flex-start',
+            padding: '7px 16px',
+            borderRadius: 8,
+            border: '1px solid var(--border)',
+            background: 'transparent',
             color: 'var(--text-muted)',
             fontSize: 13,
             fontWeight: 600,
@@ -672,9 +674,9 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
           onClick={() => setConfirming(true)}
           disabled={uninstalling}
           style={{
-            width: '100%',
-            padding: '8px 0',
-            borderRadius: 10,
+            alignSelf: 'flex-start',
+            padding: '7px 16px',
+            borderRadius: 8,
             border: '1px solid var(--text-danger, #ef4444)',
             background: 'transparent',
             color: 'var(--text-danger, #ef4444)',
@@ -729,6 +731,7 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
           </div>
         </div>
       )}
+      </div>
     </div>
   )
 }

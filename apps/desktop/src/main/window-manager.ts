@@ -524,13 +524,17 @@ const SNAP_TYPES: ReadonlySet<WindowType> = new Set<WindowType>(['chat', 'superv
 
 /** 磁吸阈值（px）：窗口边距小于此值触发吸附对齐 */
 const SNAP_THRESHOLD = 16
-/** 解绑阈值（px）：已绑定窗口边距超过此值自动解绑（实践中表现为「快速甩开」） */
-const DETACH_THRESHOLD = 32
+/** 解绑阈值（px）：已绑定窗口边距超过此值进入解绑缓冲（不再单帧立即解绑，避免跟随滞后误断开） */
+const DETACH_THRESHOLD = 48
 /** move 事件节流间隔（ms，约 60fps） */
 const SNAP_THROTTLE_MS = 16
+/** 程序性移动目标兜底清除延迟（ms）：setPosition 到相同位置不触发 move 时的标记清理 */
+const PROGRAMMATIC_GRACE_MS = 120
+/** 解绑缓冲：连续 N 次「边距超阈值」才真正解绑（单帧抖动不误断开，快速甩开仍能解绑） */
+const DETACH_STREAK_MAX = 3
 
-/** 程序性移动标记：setPosition 触发的 move 事件被跳过，防递归死循环（key = BrowserWindow.id） */
-const programmaticMove = new Set<number>()
+/** 程序性移动目标：windowId -> 目标坐标。move 事件里仅当「当前 bounds 命中目标」才判定为程序性移动跳过。 */
+const programmaticMove = new Map<number, { x: number; y: number }>()
 
 /** 绑定关系：windowId -> { partnerId, dx, dy }，dx/dy 为 partner 相对自身的偏移 */
 interface SnapBinding { partnerId: number; dx: number; dy: number }
@@ -539,17 +543,26 @@ const snapBindings = new Map<number, SnapBinding>()
 /** move 事件节流时间戳（key = BrowserWindow.id） */
 const lastSnapMoveTs = new Map<number, number>()
 
+/** 解绑缓冲计数（key = BrowserWindow.id）：连续超阈值次数 */
+const detachStreak = new Map<number, number>()
+
 /**
- * 程序性移动：移动前打标记，setPosition 触发的自身 move 事件会被 programmaticMove.delete 消费跳过。
- * setTimeout 兜底清除标记，避免「setPosition 到相同位置不触发 move」时标记残留。
+ * 程序性移动：移动前记录目标坐标，setPosition 触发的自身 move 事件经「坐标命中」判定后跳过（防递归）。
+ * 相比布尔集合 + 短 setTimeout 兜底，坐标匹配不会因 move 事件派发延迟而把后续手拖误判为程序移动，
+ * 从根上消除联动时的抖动；setTimeout 兜底仅用于「setPosition 到相同位置不触发 move」时的标记清理。
  */
 function moveProgrammatic(win: BrowserWindow, x: number, y: number): void {
   const id = win.id
-  programmaticMove.add(id)
+  const nx = Math.round(x)
+  const ny = Math.round(y)
+  programmaticMove.set(id, { x: nx, y: ny })
   try {
-    win.setPosition(Math.round(x), Math.round(y))
+    win.setPosition(nx, ny)
   } finally {
-    setTimeout(() => programmaticMove.delete(id), SNAP_THROTTLE_MS)
+    setTimeout(() => {
+      const t = programmaticMove.get(id)
+      if (t && t.x === nx && t.y === ny) programmaticMove.delete(id)
+    }, PROGRAMMATIC_GRACE_MS)
   }
 }
 
@@ -612,11 +625,19 @@ function handleSnapMove(win: BrowserWindow, type: WindowType): void {
 
   const binding = snapBindings.get(win.id)
   if (binding) {
-    // 已绑定：边距超过阈值 → 解绑；否则联动 partner 保持相对位置
+    // 已绑定：边距超过阈值 → 进入解绑缓冲（连续 N 次才真解绑），否则联动 partner 保持相对位置。
+    // 缓冲可吸收「跟随滞后/单帧抖动」造成的瞬时超阈值，避免联动中误断开；快速甩开仍能解绑。
     if (minEdgeGap(wb, pb) > DETACH_THRESHOLD) {
-      unbindSnap(win.id, binding.partnerId)
+      const streak = (detachStreak.get(win.id) ?? 0) + 1
+      detachStreak.set(win.id, streak)
+      if (streak >= DETACH_STREAK_MAX) {
+        unbindSnap(win.id, binding.partnerId)
+        detachStreak.delete(win.id)
+        detachStreak.delete(binding.partnerId)
+      }
       return
     }
+    detachStreak.delete(win.id)
     moveProgrammatic(partner, wb.x + binding.dx, wb.y + binding.dy)
     return
   }
@@ -635,7 +656,16 @@ function handleSnapMove(win: BrowserWindow, type: WindowType): void {
 function attachSnapToWindow(win: BrowserWindow, type: WindowType): void {
   if (!SNAP_TYPES.has(type)) return
   win.on('move', () => {
-    if (programmaticMove.delete(win.id)) return // 程序性移动，跳过（防递归）
+    // 程序性移动判定：仅当「当前 bounds 命中程序性目标坐标」才跳过（防递归）。
+    // 相比布尔集合 + 短 setTimeout 兜底，坐标匹配不会因 move 事件派发延迟而把后续手拖误判为程序移动，消除抖动。
+    const target = programmaticMove.get(win.id)
+    if (target) {
+      const b = win.getBounds()
+      if (Math.abs(b.x - target.x) <= 1 && Math.abs(b.y - target.y) <= 1) {
+        programmaticMove.delete(win.id)
+        return
+      }
+    }
     if (win.isDestroyed()) return
     // 边界态：全屏/最大化/最小化不参与磁吸联动
     if (win.isMaximized() || win.isMinimized() || win.isFullScreen()) return
@@ -649,5 +679,6 @@ function attachSnapToWindow(win: BrowserWindow, type: WindowType): void {
     snapBindings.delete(win.id)
     programmaticMove.delete(win.id)
     lastSnapMoveTs.delete(win.id)
+    detachStreak.delete(win.id)
   })
 }

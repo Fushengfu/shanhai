@@ -72,7 +72,10 @@ function unwrapList(json: unknown): { list: unknown[]; total: number } {
 
 /** 归一化单个市场插件条目（兼容字段名变体） */
 function normalizeMarketPlugin(raw: Record<string, unknown>): MarketPlugin {
-  const id = String(raw.id ?? raw.plugin_id ?? raw.pluginId ?? '').trim()
+  // 注意：网关列表里 `id` 是数字自增主键，`plugin_id` 才是真正的 kebab-case 插件 id
+  // （与本地 ~/.shanhai/plugins/<id>/ 目录名、下载接口 /plugins/{plugin_id}/download 对齐）。
+  // 因此这里必须优先取 plugin_id，否则「已安装」标记（installed.has(p.id)）和下载安装都会比对到数字 id 而失效。
+  const id = String(raw.plugin_id ?? raw.pluginId ?? raw.id ?? '').trim()
   return {
     id,
     pluginId: id,
