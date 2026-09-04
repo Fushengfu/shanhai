@@ -119,6 +119,9 @@ export function createExecutionModule(
     // dropIncompleteTurn（回放层剔除）仍保留作兜底，与本处落盘清理互补。
     cleanupIncompleteTurnLog(meta)
     let suspended = false
+    // 用户显式点「停止」导致的中断（区别于网络失败挂起 suspended）：置真后 finally 不再自动唤醒管家，
+    // 否则 supervisorWakeQueue 里排着的唤醒请求会让管家在用户刚按下停止的瞬间又开一轮（表现＝停不住）。
+    let stoppedByUser = false
     // 内核事件总线：消息到达（用户消息提交 → assistant 回复完成）都广播给 host 半插件（ctx.on 订阅）。
     // 单个插件监听器异常不影响会话编排主流程（try-catch 吞掉）。
     const safeEmit = (name: string, payload: unknown): void => {
@@ -157,6 +160,7 @@ export function createExecutionModule(
       return result
     } catch (err) {
       if (err instanceof Error && err.message === '__stopped__') {
+        stoppedByUser = true
         return '（已中断，历史已保留，可点击「继续执行」续跑）'
       }
       if (err instanceof Error && err.message.startsWith('__retry_exhausted__')) {
@@ -173,11 +177,12 @@ export function createExecutionModule(
       await sessions.persistSession(meta)
       tokenStats.emitTokenStats()
       drainSupervisorQueue(sid)
-      if (sid === SUPERVISOR_ID && !suspended) {
+      if (sid === SUPERVISOR_ID && !suspended && !stoppedByUser) {
         console.log('[supervisor-wake] 管家 loop 结束（finally），触发 drain，suspended=', suspended)
         void drainSupervisorWake()
       } else if (sid === SUPERVISOR_ID) {
-        console.log('[supervisor-wake] 管家 loop 结束但 suspended=true，不触发 drain')
+        // 用户显式停止（stoppedByUser）同样不触发 drain：唤醒队列原样保留，下次自然唤醒或用户再发起时处理
+        console.log('[supervisor-wake] 管家 loop 结束但不触发 drain：suspended=', suspended, 'stoppedByUser=', stoppedByUser)
       }
     }
   }

@@ -3,6 +3,13 @@ import { BrowserWindow } from 'electron'
 import { safeSend } from './safe-send'
 import { getRuntime } from './runtime'
 import { handleCommand, subscribeRuntimeEvents } from './remote-protocol'
+import {
+  getMemberAccessToken,
+  handleAuthRejected,
+  readRejectBody,
+  getCredentialSnapshot,
+  describeCredentialState,
+} from './member-credentials'
 
 /**
  * 远程连接（方式二：网关中继，外网可达）。
@@ -49,6 +56,11 @@ let reconnectAttempts = 0
 let relayError: string | null = null
 /** 是否因登录凭证失效（401）被网关拒绝：true 时不再自动重连，避免反复 401 刷屏 */
 let authFailed = false
+/**
+ * 是否正在「401 → 续签 → 重连」的恢复流程中：期间抑制 close 触发的自动重连，
+ * 避免续签还没完成就用旧 token 再握手一次（旧 token 必然再 401，形成退避期内的空转）。
+ */
+let pendingAuthRecovery = false
 
 function sendToRelay(obj: unknown): void {
   if (hostWs && hostWs.readyState === WebSocket.OPEN) {
@@ -83,8 +95,8 @@ function broadcastRelayStatus(): void {
 }
 
 function connect(): void {
-  const runtime = getRuntime()
-  const token = runtime.getMemberToken()
+  // 凭证统一从 member-credentials 取（续签后的新 token 会自动生效，不需要本模块感知）
+  const token = getMemberAccessToken()
   if (!token) {
     // 未登录：无法鉴权，等待用户登录后重新开启
     connected = false
@@ -92,7 +104,7 @@ function connect(): void {
   }
 
   // 多设备：带上设备标识，网关按 memberID + deviceId 双维索引，同账号多台电脑互不顶替
-  const info = runtime.getDeviceInfo()
+  const info = getRuntime().getDeviceInfo()
   const params = new URLSearchParams({
     role: 'host',
     token,
@@ -110,6 +122,7 @@ function connect(): void {
     clientCount = 0 // 重连后重置客户端计数，等网关重新下发 client_connected 再同步
     relayError = null // 连接成功，清除上次错误
     authFailed = false
+    pendingAuthRecovery = false
     startPing() // 心跳保活
     unsubscribeSync() // 数据同步延迟到手机连上后再建立
     broadcastRelayStatus()
@@ -135,6 +148,23 @@ function connect(): void {
     // 网关控制消息（connected / host_disconnected / error 等）忽略
   })
 
+  /**
+   * 【握手被 HTTP 拒绝（含 401）】网关已把 ws 401 从纯文本改成 JSON body {code: token_missing|token_expired|token_invalid}。
+   * Node ws 客户端在升级响应非 101 时触发 'unexpected-response'，此时可以读到 body（err.message 只有
+   * 「Unexpected server response: 401」，不含 code，所以必须走这条路径才能区分「可续签的过期」与「无效凭证」）。
+   * 注意：注册了本监听后 ws 不再自行 abort 握手，必须自己 abort（否则连接卡在 CONNECTING）。
+   */
+  ws.on('unexpected-response', (req, res) => {
+    void readRejectBody(res).then(({ status, code }) => {
+      try {
+        req.abort()
+      } catch {
+        // 忽略：连接已由 ws 内部清理
+      }
+      void onRejected(status, code)
+    })
+  })
+
   ws.on('close', () => {
     connected = false
     hostWs = null
@@ -146,20 +176,85 @@ function connect(): void {
   ws.on('error', (err) => {
     const msg = err instanceof Error ? err.message : String(err)
     console.error('[relay] 网关连接错误:', msg)
-    // 401 = 网关鉴权拒绝（登录凭证失效/过期），不再自动重连，避免反复 401 刷屏；
-    // 其它错误（网络抖动/网关宕机）保留重连。
-    const is401 = /401/i.test(msg)
-    authFailed = is401
-    relayError = is401
-      ? '登录凭证已失效或未授权（401），请重新登录后再使用外网远程'
-      : `网关连接失败：${msg}`
+    // 走到这里的常见情形：网络错误、或握手被拒后 abort 触发的 aborted。
+    // 401 的权威判定在 unexpected-response（能读到 JSON body 的 code）；这里只做兜底分类。
+    const is401 = /401|unauthorized/i.test(msg)
     if (is401) {
-      // 立即停止后续重连（close 里的 scheduleReconnect 会因 authFailed 而跳过）
-      reconnectAttempts = 0
+      void onRejected(401, null)
+      return
     }
-    broadcastRelayStatus()
-    // close 随后触发，401 时不再重连
+    if (!pendingAuthRecovery) {
+      relayError = `网关连接失败：${msg}`
+      broadcastRelayStatus()
+    }
   })
+}
+
+/**
+ * 【401 处理状态机（改造前：401 → 直接 authFailed 停止重连 → 关机过夜必死）】
+ * 现在：401 → 置 pendingAuthRecovery 抑制本次自动重连 → 交给 member-credentials 先试 refresh
+ *   - rotated  → 带新 token 立即重连（重置退避计数）
+ *   - invalid  → authFailed=true，如实提示「凭证失效，请重新登录」（member-credentials 已联动全局登录态）
+ *   - transient（网关未部署 / 断网 / 5xx）→ 不登出，按原有指数退避继续重连
+ */
+async function onRejected(status: number, code: string | null): Promise<void> {
+  if (pendingAuthRecovery) return
+  pendingAuthRecovery = true
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+  const snap = getCredentialSnapshot()
+  relayError = `网关拒绝连接（HTTP ${status || 401}${code ? ` ${code}` : ''}），正在尝试自动续签凭证；当前凭证状态：${describeCredentialState(snap)}`
+  broadcastRelayStatus()
+  const outcome = await handleAuthRejected({ source: 'relay', status, code })
+  pendingAuthRecovery = false
+  if (outcome === 'rotated') {
+    console.log('[relay] 凭证续签成功，带新 token 立即重连')
+    authFailed = false
+    relayError = null
+    reconnectAttempts = 0
+    if (enabled) connect()
+    return
+  }
+  if (outcome === 'invalid') {
+    authFailed = true
+    relayError = '登录凭证已失效且无法自动续签（超出宽限期或凭证无效），请重新登录后再使用外网远程'
+    broadcastRelayStatus()
+    return
+  }
+  // transient / no_token：保留登录态，继续按退避重连（不误登出）
+  relayError = `凭证自动续签未完成（网络或网关异常），稍后随重连继续尝试；${describeCredentialState(getCredentialSnapshot())}`
+  if (enabled) scheduleReconnect()
+  broadcastRelayStatus()
+}
+
+/**
+ * 凭证轮换后的重连入口（index.ts 订阅 credential 状态变化时调用）：
+ * 主动续签成功时连接可能仍是「用旧 token 建立的、还活着」或「正在退避等待」，
+ * 这里取消排队、立即用新 token 重连，避免等到下一次退避才生效。
+ */
+export function reconnectWithFreshCredential(): RelayStatus {
+  if (!enabled) return getRelayStatus()
+  if (pendingAuthRecovery) return getRelayStatus()
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+  reconnectAttempts = 0
+  authFailed = false
+  const old = hostWs
+  hostWs = null
+  connected = false
+  if (old) {
+    try {
+      old.close()
+    } catch {
+      // 忽略关闭旧连接的异常
+    }
+  }
+  connect()
+  return getRelayStatus()
 }
 
 /** 启动心跳：定时发 WebSocket 协议层 ping 帧保活（网关协议栈自动回 pong，不进入应用层消息解析，因此不会被误转发、不会触发 host_offline 报错） */

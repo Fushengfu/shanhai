@@ -103,6 +103,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   ctx.gatewayApiKey = ''
   ctx.gatewayBaseUrl = ''
   ctx.memberToken = ''
+  // 会员 JWT 有效期：null = 未知（老 config 无字段时保持未知，不判过期）
+  ctx.memberTokenExpiresAt = null as number | null
+  ctx.memberTokenTtlSeconds = null as number | null
   ctx.gatewayModels = [] as GatewayModel[]
   ctx.customModels = [] as GatewayModel[]
   ctx.deepseekBridgeModel = null as GatewayModel | null
@@ -944,6 +947,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
     getMemberToken() {
       return ctx.memberToken
+    },
+    getMemberTokenExpiry() {
+      return { expiresAt: ctx.memberTokenExpiresAt, ttlSeconds: ctx.memberTokenTtlSeconds }
+    },
+    async applyMemberToken(token, expiresAt, ttlSeconds) {
+      await modelProviderModule.applyMemberToken(token, expiresAt, ttlSeconds)
     },
     getDeviceInfo() {
       return getDeviceInfoState() ?? {

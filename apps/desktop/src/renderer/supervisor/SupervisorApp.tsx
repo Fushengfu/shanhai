@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as React from 'react'
 import { createPortal } from 'react-dom'
 import { getUiStoreSnapshot, patchUiStore, useUiStoreSelector, useStreaming } from '../store-client'
-import { EMPTY_SESSION, type ChatItem, type ContentPart, type HistoryItem, type SessionListItem, type SessionUIState } from '../types'
+import { EMPTY_SESSION, type ChatItem, type ContentPart, type DmQuotePayload, type HistoryItem, type SessionListItem, type SessionUIState } from '../types'
 import { WindowTitleBar } from '../components/WindowTitleBar'
 import { AiOrb } from '../components/AiOrb'
 import { AssistantMessage } from '../components/AssistantMessage'
@@ -18,6 +18,7 @@ import { SessionPicker } from '../components/SessionPicker'
 import { ModelPicker } from '../components/ModelPicker'
 import { SupervisorComposer, type SupervisorComposerHandle } from './SupervisorComposer'
 import { TokenStatusBar } from '../components/TokenStatusBar'
+import { DmEntryButton } from '../components/DmEntryButton'
 import { VirtualList } from '../components/VirtualList'
 import { IconMonitor, IconWarn, IconMoon, IconSun } from '../components/icons'
 import { btn, formatBytes, prettyValue, LiveDuration, ThinkingDots } from '../components/ui'
@@ -186,6 +187,13 @@ export function SupervisorApp(): React.JSX.Element {
   // 卡顿优化（P1）：onPreviewImage useCallback 稳定化，避免 nodes 重建时所有消息 memo 失效
   const handlePreviewImage = useCallback((url: string) => setPreviewImage(url), [])
   const composerRef = useRef<SupervisorComposerHandle>(null)
+  // 【安全红线】最近一次「引用到会话管家」的私信来源（null = 没有）：只显示提示条 + 追加输入框，
+  // 不自动发送、不进消息流、不进 Agent 上下文、不触发工具执行或审批。
+  const [dmQuote, setDmQuote] = useState<DmQuotePayload | null>(null)
+  // 点「停止」后的如实反馈（warn=管家停了但还有别的会话在跑 / ok=干净停了 / error=指令本身失败）。
+  // 用本地 state 而不是往 items 里塞：items 会被主进程 onSessionActivity('end') 用 getSessionHistory 整体重建，
+  // 塞进去的提示会被抹掉（该重建发生在 stop 之后、run 返回之前）。
+  const [stopNotice, setStopNotice] = useState<{ level: 'ok' | 'warn' | 'error'; text: string } | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
   // 是否在底部：仅由滚动事件维护（对齐 ChatPlugin 已被验证正常的吸底写法）。
   // 初始为 true：窗口首次加载历史时（cur.items 从空 → 填充）自动滚到底部最新消息。
@@ -218,6 +226,21 @@ export function SupervisorApp(): React.JSX.Element {
     }
     window.shanhai?.setTheme(next)
   }, [theme])
+
+  /**
+   * 【安全红线唯一入口】私信「引用到会话管家」的落点。
+   * 主进程只在本地用户于私信面板显式点击「引用到会话（会话管家）」时，才定向投递本事件。
+   * 这里只做一件事：把私信原文**追加**进管家输入框（等价于本地用户自己敲进去这段话），
+   * 并显示来源提示条。明确不做：不自动发送、不写 items、不进 Agent 上下文、不触发工具执行或审批。
+   */
+  useEffect(() => {
+    const off = window.shanhai?.onDmQuoteToSession((payload) => {
+      if (!payload?.text) return
+      composerRef.current?.appendInput(payload.text)
+      setDmQuote(payload)
+    })
+    return off
+  }, [])
 
   // 启动时加载管家会话历史（跨重启保留）+ 管家工作目录
   useEffect(() => {
@@ -315,9 +338,41 @@ export function SupervisorApp(): React.JSX.Element {
     // 此处不再手动 patchUiStore 移除，避免与 resolved 事件双重移除。
   }
 
+  /** 停止管家的本轮调度。
+   * ⚠️ 必须把 SUPERVISOR_SID 显式传给主进程：不传时 runtime.stop() 停的是 ctx.currentSessionId，
+   * 而管家会话永远不会成为 currentSessionId（sessions.ts:396 拒绝 isSupervisor）→ 旧写法既停不掉管家，
+   * 还可能误停用户正在聊天窗口看的另一个会话。 */
   const stopSend = useCallback((): void => {
     patchSession({ busy: false, streaming: '', streamingReasoning: '' })
-    void window.shanhai?.stop()
+    void (async (): Promise<void> => {
+      if (!window.shanhai?.stop) {
+        setStopNotice({ level: 'error', text: '本窗口拿不到停止通道（window.shanhai.stop 不可用），管家仍在执行：请用聊天窗口侧边栏停止或重启应用' })
+        return
+      }
+      try {
+        await window.shanhai.stop(SUPERVISOR_SID)
+      } catch (err) {
+        setStopNotice({ level: 'error', text: `停止指令发送失败：${err instanceof Error ? err.message : String(err)}；管家可能仍在执行，可再点一次停止` })
+        return
+      }
+      // 如实反馈（产品语义，不是缺陷）：管家自己停了 ≠ 全部停了。
+      // 它此前用 send_message 派发给别的会话的需求，是由目标会话独立执行的，停管家用不着也无能力回滚。
+      // 把真相摊开并列出仍在跑的会话，避免用户误以为「整个系统都停了」。
+      try {
+        const list = await window.shanhai.listSessions()
+        const running = (list ?? []).filter((s) => s.busy)
+        setStopNotice(
+          running.length > 0
+            ? {
+                level: 'warn',
+                text: `已停止管家的调度。但已派发给以下 ${running.length} 个会话的任务仍在各自独立执行，需到对应会话里停止：${running.map((s) => s.title).join('、')}`,
+              }
+            : { level: 'ok', text: '已停止管家的调度；当前没有其它会话在执行任务。已执行的历史与结果都保留。' },
+        )
+      } catch {
+        setStopNotice({ level: 'ok', text: '已停止管家的调度（未能读取其它会话的执行状态，无法确认是否还有任务在后台跑，可在侧边栏看哪些会话仍显示「执行中」）' })
+      }
+    })()
   }, [patchSession])
 
   /** 重新发送：截断到该用户消息重新生成（对齐聊天窗口 resendMessage，直接重发不填回输入框） */
@@ -412,6 +467,7 @@ export function SupervisorApp(): React.JSX.Element {
     }
     const finalText = fileNotes.length > 0 ? `${text}${text ? '\n\n' : ''}[已附加文件]\n${fileNotes.join('\n')}` : text
     composerRef.current?.clearInput()
+    setStopNotice(null)
     const startTs = Date.now()
     patchSession((s) => ({
       items: [...s.items, { kind: 'user', content: text, images, turnSeq: s.items.filter((it) => it.kind === 'user').length + 1 }],
@@ -432,8 +488,14 @@ export function SupervisorApp(): React.JSX.Element {
     }
     let interrupted = false
     try {
-      const result = (await window.shanhai?.supervisorRun(finalText, parts)) ?? ''
-      interrupted = result.startsWith('（已中断')
+      const raw = (await window.shanhai?.supervisorRun(finalText, parts)) ?? ''
+      interrupted = raw.startsWith('（已中断')
+      // runtime 的通用中断文案写着「可点击「继续执行」续跑」，那是聊天窗口 ChatPlugin 的入口；
+      // 管家窗口没有这个按钮（断点续跑 resume(SUPERVISOR_ID) 后端支持但 GUI 无入口）→ 按本窗口真实能力改写，
+      // 只改显示文案、不改执行语义，也不伪造「什么都没发生」。
+      const result = interrupted
+        ? '（已停止本轮调度：已执行的历史与结果都保留。管家窗口没有「继续执行」入口，想接着做直接在输入框补一句即可，历史会带上下文回放）'
+        : raw
       if (!interrupted && result.trim()) void speakResult(result)
       // 正常完成：assistant 正文由主进程 ui-store 的 onSessionActivity('end') 用 getSessionHistory 重建，
       // 这里不再重复 push（否则会出现「带工具调用」+「纯正文」两个重复气泡）。仅中断时补「已中断」提示气泡。
@@ -529,15 +591,53 @@ export function SupervisorApp(): React.JSX.Element {
         tone="purple"
         onClose={() => void window.shanhai?.hideSupervisorToBubble()}
         actions={
-          <button
-            onClick={toggleTheme}
-            title={theme === 'light' ? '切换到暗色模式' : '切换到亮色模式'}
-            style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 10px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer' }}
-          >
-            {theme === 'light' ? <IconMoon /> : <IconSun />}
-          </button>
+          <>
+            {/* 私信入口：与聊天窗口顶栏同一个组件、同一真值源（member:unread / member:friends 广播），
+                管家窗口较窄用仅图标形态；未登录/凭证失效时按钮置红 + 红点，不显示「0 未读」假装正常 */}
+            <DmEntryButton loggedIn={ui.loggedIn} />
+            <button
+              onClick={toggleTheme}
+              title={theme === 'light' ? '切换到暗色模式' : '切换到亮色模式'}
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 10px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer' }}
+            >
+              {theme === 'light' ? <IconMoon /> : <IconSun />}
+            </button>
+          </>
         }
       />
+
+      {stopNotice && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'flex-start',
+            gap: 8,
+            margin: '0 12px 8px',
+            padding: '8px 10px',
+            borderRadius: 10,
+            fontSize: 12,
+            lineHeight: 1.6,
+            color: stopNotice.level === 'error' ? 'var(--danger)' : stopNotice.level === 'warn' ? 'var(--warning-text)' : 'var(--text-secondary)',
+            background: stopNotice.level === 'error' ? 'var(--tint-red)' : stopNotice.level === 'warn' ? 'var(--tint-orange)' : 'var(--bg-panel)',
+            border: '1px solid var(--border)',
+            flexShrink: 0,
+          }}
+        >
+          {stopNotice.level !== 'ok' && (
+            <span style={{ display: 'inline-flex', marginTop: 1, flexShrink: 0 }}>
+              <IconWarn />
+            </span>
+          )}
+          <span style={{ minWidth: 0, overflowWrap: 'break-word', wordBreak: 'break-word' }}>{stopNotice.text}</span>
+          <button
+            onClick={() => setStopNotice(null)}
+            title="关闭这条提示"
+            style={{ marginLeft: 'auto', flexShrink: 0, border: 'none', background: 'transparent', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 12, lineHeight: '18px', padding: '0 2px' }}
+          >
+            ×
+          </button>
+        </div>
+      )}
 
       <VirtualList
         containerRef={listRef}
@@ -614,6 +714,8 @@ export function SupervisorApp(): React.JSX.Element {
       {/* 输入区：自包含 SupervisorComposer（附件 / 模型 / 安全模式 / 麦克风 / 发送），键入只重渲染本子树 */}
       <SupervisorComposer
         ref={composerRef}
+        quote={dmQuote}
+        onClearQuote={() => setDmQuote(null)}
         busy={cur.busy}
         models={ui.models}
         defaultSelectedModel={ui.selectedModel}

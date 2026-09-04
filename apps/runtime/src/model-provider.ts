@@ -15,7 +15,7 @@ import type { Model } from '@shanhai/llm'
 import { createModelProvider } from '@shanhai/llm'
 import { createDeepSeekModel } from '@shanhai/deepseek-bridge'
 import { createGatewayModel, inferTier, fetchGatewayModels } from './models'
-import { persistLoginToken, persistCustomModels, persistSelectedModel, withConfigFile } from './config'
+import { persistLoginToken, persistCustomModels, persistSelectedModel, withConfigFile, persistMemberTokenRotation } from './config'
 import type { RuntimeContext } from './context'
 import type { CustomModelInput } from './types'
 import type { TokenStatsModule } from './token-stats'
@@ -54,6 +54,14 @@ export interface ModelProviderModule {
   getCurrentModelId(): string
   /** 解析统一压缩模型：配置了则返回其 provider，否则 undefined（AgentLoop 回退会话模型） */
   resolveCompactModel(): Model | undefined
+  /**
+   * 应用续签得到的新会员 JWT：更新内存 ctx + 落盘（只动 memberToken 与有效期字段）。
+   * 供主进程续签模块（apps/desktop member-credentials.ts）在 refresh 成功后调用，
+   * 使所有 getMemberToken() 使用方（relay / member-channel / 上传 / 模型列表）立刻读到新值。
+   */
+  applyMemberToken(token: string, expiresAt: number | null, ttlSeconds: number | null): Promise<void>
+  /** 会员 JWT 有效期（null = 未知，不得据此判过期） */
+  getMemberTokenExpiry(): { expiresAt: number | null; ttlSeconds: number | null }
 }
 
 /** 把网关/自定义模型的 temperature（string|number|undefined）安全转成 number；空串/非法值返回 undefined（不下发，用上游默认） */
@@ -62,6 +70,29 @@ function toTemperature(v: string | number | undefined): number | undefined {
   const n = typeof v === 'number' ? v : Number(v)
   if (!Number.isFinite(n)) return undefined
   return n
+}
+
+/**
+ * 从会员 JWT 的 payload 里解出有效期（exp / iat，单位秒 → 毫秒）。
+ * 只读本地已有 token 的 payload，不校验签名、不外发；解不出返回 { expiresAt: null, ttlSeconds: null }。
+ * 为什么需要它：@shanhai/auth 的 AuthSession 目前不透传网关登录响应的 expires_at/expires_in（本轮不允许改 packages/*），
+ * 而 JWT 的 exp 声明本身就是网关签发的权威有效期，二者等价（网关侧已核对 exp = iat + member_expire_hour）。
+ * 老 config（无 memberTokenExpiresAt 字段）也靠它降级拿到过期时间，避免「缺字段就判未知」。
+ */
+function jwtExpiryOf(token: string): { expiresAt: number | null; ttlSeconds: number | null } {
+  const payload = typeof token === 'string' ? token.split('.')[1] : undefined
+  if (!payload) return { expiresAt: null, ttlSeconds: null }
+  try {
+    const json = JSON.parse(Buffer.from(payload.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')) as Record<string, unknown>
+    const exp = typeof json.exp === 'number' && Number.isFinite(json.exp) ? json.exp : null
+    const iat = typeof json.iat === 'number' && Number.isFinite(json.iat) ? json.iat : null
+    return {
+      expiresAt: exp !== null ? exp * 1000 : null,
+      ttlSeconds: exp !== null && iat !== null && exp > iat ? exp - iat : null,
+    }
+  } catch {
+    return { expiresAt: null, ttlSeconds: null }
+  }
 }
 
 /** 把网关/自定义模型的 reasoningEffort（string|undefined）安全归一；空串/非法返回 undefined（不下发，用模型默认）。档位规范化（medium/xhigh→high 等）在 provider 层按协议处理 */
@@ -116,12 +147,21 @@ export function createModelProviderModule(
           models?: GatewayModel[]
           customModels?: GatewayModel[]
           approvalPolicy?: string
+          memberTokenExpiresAt?: number
+          memberTokenTtlSeconds?: number
         }
         settings?: Record<string, unknown>
       }
       const g = cfg.gateway
       // memberToken 与 apiKey 解耦：JWT 是远程连接(relay)鉴权凭证，apiKey 是模型调用凭证，二者相互独立。
       ctx.memberToken = g?.memberToken ?? ''
+      // 会员 JWT 有效期：优先读落盘值（登录 / 续签时写入），老 config 无该字段则从 JWT exp 降级解出，
+      // 两者都拿不到才记为「未知」（null）。⚠️ 未知 ≠ 已过期：不得因缺字段就判过期或拒绝续签（见 member-credentials.ts）。
+      const persistedExpiresAt = typeof g?.memberTokenExpiresAt === 'number' && Number.isFinite(g.memberTokenExpiresAt) ? g.memberTokenExpiresAt : null
+      const persistedTtl = typeof g?.memberTokenTtlSeconds === 'number' && Number.isFinite(g.memberTokenTtlSeconds) ? g.memberTokenTtlSeconds : null
+      const derived = ctx.memberToken ? jwtExpiryOf(ctx.memberToken) : { expiresAt: null, ttlSeconds: null }
+      ctx.memberTokenExpiresAt = persistedExpiresAt ?? derived.expiresAt
+      ctx.memberTokenTtlSeconds = persistedTtl ?? derived.ttlSeconds
       if (g?.apiKey) {
         ctx.loggedIn = true
         ctx.username = g.account?.nickname ?? g.account?.username ?? null
@@ -215,11 +255,15 @@ export function createModelProviderModule(
       }
     }
     tokenStats.refreshContextLength()
+    // 会员 JWT 有效期：登录/注册响应即落盘（网关未透传 expires_at 时从 JWT exp 降级解出，见 jwtExpiryOf）
+    const expiry = jwtExpiryOf(s.token)
+    ctx.memberTokenExpiresAt = expiry.expiresAt
+    ctx.memberTokenTtlSeconds = expiry.ttlSeconds
     await persistLoginToken(s.token, s.username, { nickname: s.nickname, avatar: s.avatar }, {
       apiKey: ctx.gatewayApiKey,
       baseUrl: ctx.gatewayBaseUrl,
       selectedModelId: ctx.currentModelId,
-    })
+    }, expiry)
     return { username: s.nickname ?? s.username, nickname: s.nickname }
   }
 
@@ -239,12 +283,16 @@ export function createModelProviderModule(
     ctx.gatewayApiKey = ''
     ctx.gatewayBaseUrl = ''
     ctx.memberToken = ''
+    ctx.memberTokenExpiresAt = null
+    ctx.memberTokenTtlSeconds = null
     ctx.gatewayModels = []
     // 只清除登录凭证字段，保留用户自定义模型 + 选中模型偏好
     try {
       await withConfigFile((cfg) => {
         const g = (cfg.gateway as Record<string, unknown> | undefined) ?? {}
         delete g.memberToken
+        delete g.memberTokenExpiresAt
+        delete g.memberTokenTtlSeconds
         delete g.apiKey
         delete g.baseUrl
         delete g.account
@@ -351,6 +399,22 @@ export function createModelProviderModule(
     return resolveProvider(id)
   }
 
+  const applyMemberToken = async (token: string, expiresAt: number | null, ttlSeconds: number | null): Promise<void> => {
+    const clean = typeof token === 'string' ? token.trim() : ''
+    if (!clean) throw new Error('applyMemberToken: 新 token 为空')
+    ctx.memberToken = clean
+    // 网关未回传过期时间时从新 JWT 的 exp 降级解出（与登录路径同一口径）
+    const derived = jwtExpiryOf(clean)
+    ctx.memberTokenExpiresAt = typeof expiresAt === 'number' && Number.isFinite(expiresAt) ? expiresAt : derived.expiresAt
+    ctx.memberTokenTtlSeconds = typeof ttlSeconds === 'number' && Number.isFinite(ttlSeconds) ? ttlSeconds : derived.ttlSeconds
+    await persistMemberTokenRotation(clean, { expiresAt: ctx.memberTokenExpiresAt, ttlSeconds: ctx.memberTokenTtlSeconds })
+  }
+
+  const getMemberTokenExpiry = (): { expiresAt: number | null; ttlSeconds: number | null } => ({
+    expiresAt: ctx.memberTokenExpiresAt,
+    ttlSeconds: ctx.memberTokenTtlSeconds,
+  })
+
   return {
     resolveProvider,
     applyModel,
@@ -368,5 +432,7 @@ export function createModelProviderModule(
     removeCustomModel,
     getCurrentModelId,
     resolveCompactModel,
+    applyMemberToken,
+    getMemberTokenExpiry,
   }
 }

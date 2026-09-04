@@ -9,6 +9,7 @@ import { CustomModelDrawer } from '../components/CustomModelDrawer'
 import { TerminalPanel } from '../components/TerminalPanel'
 import { WallpaperPanel } from '../components/WallpaperPanel'
 import { PluginMarketApp } from '../apps/PluginMarketApp'
+import { MemberPanel } from '../components/MemberPanel'
 import { useThemeSync } from '../theme'
 
 /**
@@ -106,6 +107,9 @@ export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
       return <WallpaperPanel variant="window" onClose={close} />
     case 'marketplace':
       return <PluginMarketApp onClose={close} />
+    case 'messages':
+      // 会员私信与好友（内置 App 窗口，走 window.shanhai 的 member:* 接口，不经插件白名单）
+      return <MemberPanel onClose={close} />
     default:
       return (
         <div

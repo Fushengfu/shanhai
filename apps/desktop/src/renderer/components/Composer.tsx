@@ -2,7 +2,8 @@ import * as React from 'react'
 import { IconCheck, IconChevronDown, IconClock, IconFile, IconFolder, IconMic, IconMonitor, IconPaperclip, IconPlus, IconRefresh, IconSend, IconShield, IconStop } from './icons'
 import { iconBtn } from './ui'
 import { AppendSlotView } from '../slots'
-import type { AttachmentItem, GatewayModel } from '../types'
+import type { AttachmentItem, DmQuotePayload, GatewayModel } from '../types'
+import { DmQuoteBanner } from './DmQuoteBanner'
 
 /**
  * 统一的输入框组件（props 驱动）：聊天窗口（ComposerSlot）与「会话管家」窗口共用，
@@ -44,6 +45,13 @@ export interface ComposerProps {
   busy: boolean
   send: () => Promise<void>
   stopSend: () => void
+  /**
+   * 【安全红线】私信「引用到会话」的来源提示条（可选）。
+   * 外部文本由用户显式点击才会被追加进输入框，这里只负责把「它是谁发来的」显示给人看；
+   * 不自动发送、不进 Agent 上下文、不触发任何工具执行或审批。
+   */
+  quote?: DmQuotePayload | null
+  onClearQuote?: () => void
 }
 
 export const Composer = React.memo(function Composer(p: ComposerProps): React.JSX.Element {
@@ -116,6 +124,7 @@ export const Composer = React.memo(function Composer(p: ComposerProps): React.JS
             排队中 {p.queueCount} 条消息，将在当前任务完成后自动执行
           </div>
         )}
+        {p.quote && <DmQuoteBanner quote={p.quote} onDismiss={() => p.onClearQuote?.()} />}
         {p.voiceNotice && (
           <div style={{ marginBottom: 6, fontSize: 12, color: 'var(--warning)', display: 'flex', alignItems: 'center', gap: 4 }}>
             <IconMic />

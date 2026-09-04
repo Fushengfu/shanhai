@@ -1,17 +1,30 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../theme.dart';
+import '../services/member_credentials.dart';
+import '../services/token_store.dart';
 import '../services/update_service.dart';
 import '../services/ws_client.dart';
 import '../widgets/device_picker.dart';
 import '../widgets/update_dialog.dart';
+import 'login_page.dart';
 import 'session_list_page.dart';
 import 'supervisor_page.dart';
 
 /// 首页：底部导航切换「会话模式 / 管家模式」，顶部提供「切换设备」入口（同账号多电脑）。
+///
+/// 与旧版的关键差别（修复「电脑端不在线时手机端无路可走」）：
+/// - 未配对到桌面端（Host 离线 / 连接断开）**不再阻塞进入首页**：首页用顶部横幅如实呈现状态，
+///   并在横幅内常驻「重试 / 切换设备 / 退出登录」三个出口；
+/// - 「切换设备」入口不再只依赖被动等网关下发 devices_list，点了没反馈也会明确提示。
 class HomePage extends StatefulWidget {
   final WsClient ws;
-  const HomePage({super.key, required this.ws});
+
+  /// 从启动页带入的「目标桌面端离线」初值：host_offline 是一次性事件，
+  /// 启动页消费掉后首页不会再收到，必须显式传入，否则横幅不会显示。
+  final bool initialHostOffline;
+
+  const HomePage({super.key, required this.ws, this.initialHostOffline = false});
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -20,31 +33,91 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   int _index = 0;
   bool _hostOffline = false;
+  ConnState _conn = ConnState.disconnected;
   bool _switchingDevice = false;
   bool _checkingUpdate = false;
+  bool _retrying = false;
+  bool _awaitingDevices = false;
   StreamSubscription<ServerEvent>? _eventSub;
   StreamSubscription<ConnState>? _stateSub;
+  StreamSubscription<CredentialSnapshot>? _credSub;
+  Timer? _devicesTimeout;
+
+  // —————————————————— 凭证三态（续签）——————————————————
+  //
+  // 复用同一个顶部横幅组件呈现，**不新增第五种状态**：
+  //   anonymous  → 红色变体「登录已失效，请重新登录」（主出口=重新登录）
+  //   expired    → 「登录凭证已过期，正在自动续签…」
+  //   renewing   → 「登录凭证即将到期，已自动续签」（中性提示）
+  //   unknown    → 中性提示「凭证有效期未知」
+  CredentialSnapshot _cred = MemberCredentials.instance.snapshot;
+
+  /// 续签定时器归属：本页 dispose 时只有 owner 匹配才停表（避免误停/漏停）
+  static const _credOwner = 'home-page';
+
+  /// 凭证是否已确认失效（本地无 token）：横幅要变成红色变体并给「重新登录」出口
+  bool get _authInvalid => _cred.state == CredentialState.anonymous && _conn != ConnState.paired;
+
+  /// 「必须占用横幅」的凭证态：anonymous（已失效，唯一出路是重登）与 expired
+  /// （握手时会被拒，断线后必掉线，需要给用户「立即续签」的主动出口）。
+  bool get _credMustShow =>
+      _cred.state == CredentialState.anonymous || _cred.state == CredentialState.expired;
+
+  /// 「只在横幅已展开时补一行」的凭证态：renewing / unknown。
+  /// 刻意**不**为了它们单独弹出横幅——否则已正常连接的用户会被一条永久提示条长期占位，
+  /// 变成新的骚扰；如实呈现的同时保持界面克制。
+  bool get _credSoftNote =>
+      _cred.state == CredentialState.renewing || _cred.state == CredentialState.unknown;
+
+  /// 是否已配对到具体桌面端（未配对时展示顶部状态横幅）
+  bool get _showBanner => _conn != ConnState.paired || _credMustShow;
 
   @override
   void initState() {
     super.initState();
-    // 桌面端 Host 离线/上线提示 + 设备列表（切换设备用）
+    _conn = widget.ws.state;
+    // 初始状态如实反映当前连接：paired 之外都算「未连上桌面端」。
+    // 之前只靠 host_offline 事件点亮横幅，而该事件在启动页就被消费掉了，
+    // 从启动页带着「离线」跳进来时横幅是空的，用户以为已经连上了。
+    _hostOffline = widget.initialHostOffline || widget.ws.state != ConnState.paired;
+    // 主页存续期间持有续签定时器（owner=home-page）：
+    // 启动页交接过来时 owner 已被本页 start() 覆盖，启动页 dispose 的 stop 是空操作
+    MemberCredentials.instance.start(_credOwner);
+    _credSub = MemberCredentials.instance.status.listen((snap) {
+      if (!mounted) return;
+      setState(() => _cred = snap);
+    });
+    // 桌面端 Host 离线/上线提示 + 设备列表（切换设备用）+ 凭证事件
     _eventSub = widget.ws.events.listen((e) {
+      if (!mounted) return;
       if (e.event == 'host_offline') {
-        if (mounted && !_hostOffline) setState(() => _hostOffline = true);
+        if (!_hostOffline) setState(() => _hostOffline = true);
       } else if (e.event == 'host_online') {
-        if (mounted && _hostOffline) setState(() => _hostOffline = false);
-      } else if (e.event == 'devices_list' && mounted) {
+        if (_hostOffline) setState(() => _hostOffline = false);
+      } else if (e.event == 'auth_renewed') {
+        _snack('登录凭证已自动续签，无需重新登录');
+      } else if (e.event == 'auth_expired') {
+        // 凭证确认不可恢复：横幅转红色变体并给「重新登录」出口（复用同一横幅，不新增状态）
+        setState(() {
+          _cred = MemberCredentials.instance.snapshot;
+          _conn = widget.ws.state;
+          _hostOffline = true;
+        });
+        _snack(e.payload['message']?.toString() ?? '登录已失效，请重新登录');
+      } else if (e.event == 'devices_list') {
+        _awaitingDevices = false;
+        _devicesTimeout?.cancel();
         _showDevicePicker(e.payload['devices'] as List? ?? const []);
       }
     });
-    // 切换到其他设备并成功配对后，清除「离线」横幅。
-    // 之前 _hostOffline 只被 host_online 事件清除，而 switchDevice 配对成功走的是 paired 状态、
-    // 不触发 host_online 事件，导致「当前设备掉线后切到其他设备」时横幅仍显示「桌面端离线，等待重新连接…」。
+    // 连接态变化：paired 清横幅；disconnected 亮横幅（自动重连中也要让用户看到状态）
     _stateSub = widget.ws.stateStream.listen((s) {
-      if (s == ConnState.paired && mounted && _hostOffline) {
-        setState(() => _hostOffline = false);
-      }
+      if (!mounted) return;
+      setState(() {
+        _conn = s;
+        if (s == ConnState.paired) _hostOffline = false;
+        if (s == ConnState.disconnected) _hostOffline = true;
+      });
     });
     // 进入主页后静默检查一次版本更新（有更新才弹窗，无更新不打扰）
     Future.microtask(() => _checkUpdate(silent: true));
@@ -68,25 +141,344 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// 请求设备列表后弹出选择器，选中后切换连接目标设备
+  /// 请求设备列表后弹出选择器，选中后切换连接目标设备。
+  /// 与旧版差别：发不出去（未连上网关）时明确提示，不再「点了图标什么也没发生」；
+  /// 并加等待兜底，网关不回 devices_list 时给提示而不是静默。
   void _requestSwitchDevice() {
-    widget.ws.listDevices();
+    if (!_wsAlive) {
+      _snack('与网关的连接已断开，请先点「重试」再切换设备');
+      return;
+    }
+    if (!widget.ws.listDevices()) {
+      _snack('当前未连上网关，无法获取设备列表');
+      return;
+    }
+    _awaitingDevices = true;
+    _devicesTimeout?.cancel();
+    _devicesTimeout = Timer(const Duration(seconds: 6), () {
+      if (!mounted || !_awaitingDevices) return;
+      _awaitingDevices = false;
+      _snack('暂未收到设备列表，请稍后再试');
+    });
   }
+
+  /// 连接是否还能发命令（未配对但已连上网关时也可查设备列表）
+  bool get _wsAlive =>
+      widget.ws.state == ConnState.connected || widget.ws.state == ConnState.paired;
 
   Future<void> _showDevicePicker(List<dynamic> devices) async {
     if (_switchingDevice) return;
+    if (devices.isEmpty) {
+      // 网关回了空列表：如实提示，不弹空白弹层
+      _snack('该账号下当前没有在线的桌面端设备');
+      return;
+    }
     _switchingDevice = true;
     final chosen = await showDevicePickerSheet(context, devices);
     if (chosen != null && chosen.isNotEmpty) {
+      // switchDevice 内部会取消排队中的自动重连与旧连接，避免旧回调把页面拽回加载态
       await widget.ws.switchDevice(chosen);
     }
     if (mounted) setState(() => _switchingDevice = false);
+  }
+
+  /// 重试当前设备：打断自动重连与旧连接，立即重新握手；配对成功后 stateStream 会自动清横幅
+  Future<void> _retryConnect() async {
+    if (_retrying) return;
+    // 凭证已不可恢复（本地无 token）：重连没意义，直接引导重新登录，不给「点了没反应」的错觉
+    if (!MemberCredentials.instance.isSignedIn) {
+      _snack('登录凭证已失效，请先重新登录');
+      await _logout(skipConfirm: true);
+      return;
+    }
+    setState(() => _retrying = true);
+    final ok = await widget.ws.reconnectNow();
+    if (!mounted) return;
+    setState(() {
+      _retrying = false;
+      _conn = widget.ws.state;
+      _hostOffline = widget.ws.state != ConnState.paired;
+      _cred = MemberCredentials.instance.snapshot;
+    });
+    _snack(ok ? '已重新连接网关，正在尝试配对桌面端' : '仍未能连上网关，已转后台自动重试');
+  }
+
+  /// 凭证过期但仍在宽限期：手动触发一次续签 + 重连（横幅里的「立即续签」出口）
+  Future<void> _renewNow() async {
+    if (_retrying) return;
+    setState(() => _retrying = true);
+    final r = await widget.ws.renewAndReconnect();
+    if (!mounted) return;
+    setState(() {
+      _retrying = false;
+      _conn = widget.ws.state;
+      _cred = MemberCredentials.instance.snapshot;
+      _hostOffline = widget.ws.state != ConnState.paired;
+    });
+    switch (r.outcome) {
+      case RefreshOutcome.rotated:
+        _snack(r.connected ? '续签成功，已用新凭证重连' : '续签成功，正在后台自动重连');
+        break;
+      case RefreshOutcome.invalid:
+        _snack('登录凭证已失效且无法自动续签，请重新登录');
+        break;
+      case RefreshOutcome.noToken:
+        _snack('本地已无登录凭证，请重新登录');
+        break;
+      case RefreshOutcome.transient:
+        _snack('自动续签暂未成功（网关未部署或网络异常），已保留登录态并继续重试');
+        break;
+    }
+  }
+
+  /// 退出登录：清本地登录态并回登录页（换账号的出口，避免「连不上又退不出去」的死局）
+  Future<void> _logout({bool skipConfirm = false}) async {
+    if (!skipConfirm) {
+      final yes = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('退出登录'),
+          content: const Text('退出后需要重新输入账号密码登录。确定退出？'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('退出', style: TextStyle(color: Colors.redAccent)),
+            ),
+          ],
+        ),
+      );
+      if (yes != true || !mounted) return;
+    }
+    // 先停续签定时器（owner=home-page），杜绝「登出后还在打网关续签」
+    MemberCredentials.instance.onLoggedOut();
+    try {
+      await TokenStore.clear();
+    } catch (_) {}
+    final ws = widget.ws;
+    _eventSub?.cancel();
+    _stateSub?.cancel();
+    _credSub?.cancel();
+    _eventSub = null;
+    _stateSub = null;
+    _credSub = null;
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const LoginPage()),
+      (route) => false,
+    );
+    // 页面已切换，再释放旧连接（dispose 会关闭事件流，必须让本页先退订）
+    unawaited(ws.dispose());
+  }
+
+  void _snack(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(text, style: const TextStyle(fontSize: 13)), duration: const Duration(seconds: 3)),
+    );
+  }
+
+  /// 顶部状态横幅：未配对到桌面端 / 凭证需要关注时如实说明卡在哪一步，并**常驻出口按钮**
+  /// （重试当前设备 / 切换其它设备 / 退出登录），杜绝「只能干等、没有任何按钮」的死局。
+  ///
+  /// 凭证三态复用同一个横幅组件（只换文案、配色与出口），**不新增第五种状态**。
+  Widget _buildStatusBanner() {
+    // —— 凭证失效变体（红色）：本地已无可用 token，重连必然被拒，唯一有效出口是重新登录 ——
+    if (_authInvalid) {
+      return Material(
+        color: const Color(0xFF7F1D1D),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 10, 10, 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(Icons.lock_outline, size: 16, color: Color(0xFFFCA5A5)),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      '登录已失效，请重新登录',
+                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFFFEE2E2)),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Padding(
+                padding: const EdgeInsets.only(left: 24),
+                child: Text(
+                  '登录凭证已过期且自动续签未成功（可能已超出网关的续签宽限期），'
+                  '或凭证本身无效/缺失。远程连接与私信都需要重新登录一次。',
+                  style: const TextStyle(fontSize: 11.5, height: 1.4, color: Color(0xFFFEE2E2)),
+                ),
+              ),
+              const SizedBox(height: 6),
+              Padding(
+                padding: const EdgeInsets.only(left: 18),
+                child: Wrap(
+                  spacing: 6,
+                  runSpacing: 2,
+                  children: [
+                    _bannerAction(Icons.replay, '重新登录', false, () => _logout(skipConfirm: true)),
+                    _bannerAction(Icons.refresh, '再试一次续签', _retrying, _renewNow),
+                    _bannerAction(Icons.logout, '退出登录', false, _logout),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    // —— 凭证已过期（仍在自动续签中）：琥珀色 + 「立即续签」出口，连接仍可用 ——
+    if (_credMustShow) {
+      final expired = _cred.state == CredentialState.expired;
+      return Material(
+        color: const Color(0xFF7C4A12),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 10, 10, 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(Icons.shield_outlined, size: 16, color: Color(0xFFFBBF24)),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      expired ? '登录凭证已过期，正在自动续签' : _cred.describe(),
+                      style: const TextStyle(
+                          fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFFFDE68A)),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Padding(
+                padding: const EdgeInsets.only(left: 24),
+                child: Text(
+                  expired
+                      ? '已建立的连接暂时还能用，但断线重连会被拒。山海会在后台按退避自动续签（网关有宽限期，'
+                        '多数情况免密续上）；也可点「立即续签」马上试一次。'
+                      : (_cred.state == CredentialState.unknown
+                          ? '本地没有记录该凭证的过期时间（老版本登录或网关未下发有效期），'
+                            '按可用处理，不做主动续签；若被网关拒绝会自动走续签流程。'
+                          : '山海会在到期前自动续签，无需重新输入密码。'),
+                  style: const TextStyle(fontSize: 11.5, height: 1.4, color: Color(0xFFFDE68A)),
+                ),
+              ),
+              const SizedBox(height: 6),
+              Padding(
+                padding: const EdgeInsets.only(left: 18),
+                child: Wrap(
+                  spacing: 6,
+                  runSpacing: 2,
+                  children: [
+                    _bannerAction(Icons.refresh, '立即续签', _retrying, _renewNow),
+                    _bannerAction(Icons.logout, '退出登录', false, _logout),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    final disconnected = _conn == ConnState.disconnected;
+    final connecting = _conn == ConnState.connecting;
+    final title = disconnected
+        ? '与网关的连接已断开，正在自动重试…'
+        : connecting
+            ? '正在连接网关…'
+            : (_hostOffline
+                ? '该设备当前不在线'
+                : '已连接网关，等待桌面端上线…');
+    final detail = disconnected
+        ? '手机与网关之间的连接断了（网络切换 / 网关重启等）。可以重试，或切换其它在线设备。'
+        : connecting
+            ? '正在与网关建立连接，请稍候；等不及可以切换设备或退出登录。'
+            : '你的账号已登录、网关也正常，只是那台电脑上的山海没在运行（或没登录同一账号）。'
+                '可以重试、改连其它在线设备，或退出登录换账号。';
+    return Material(
+      color: const Color(0xFF7C4A12),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 10, 10, 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Icon(Icons.cloud_off_outlined, size: 16, color: Color(0xFFFBBF24)),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    title,
+                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFFFDE68A)),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Padding(
+              padding: const EdgeInsets.only(left: 24),
+              child: Text(detail, style: const TextStyle(fontSize: 11.5, height: 1.4, color: Color(0xFFFDE68A))),
+            ),
+            // 凭证「即将到期 / 有效期未知」：只在横幅已展开时补一行如实说明，不单独弹横幅
+            if (_credSoftNote)
+              Padding(
+                padding: const EdgeInsets.only(left: 24, top: 2),
+                child: Text(
+                  _cred.describe(),
+                  style: const TextStyle(fontSize: 11, height: 1.4, color: Color(0xFFFDE68A)),
+                ),
+              ),
+            const SizedBox(height: 6),
+            Padding(
+              padding: const EdgeInsets.only(left: 18),
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 2,
+                children: [
+                  _bannerAction(Icons.refresh, '重试', _retrying, _retryConnect),
+                  _bannerAction(Icons.devices_other_outlined, '切换设备', _switchingDevice, _requestSwitchDevice),
+                  _bannerAction(Icons.logout, '退出登录', false, _logout),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _bannerAction(IconData icon, String label, bool busy, VoidCallback onTap) {
+    return TextButton.icon(
+      onPressed: busy ? null : onTap,
+      icon: Icon(icon, size: 15, color: const Color(0xFFFDE68A)),
+      label: Text(busy ? '$label…' : label, style: const TextStyle(fontSize: 12, color: Color(0xFFFDE68A))),
+      style: TextButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        minimumSize: const Size(0, 30),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        foregroundColor: const Color(0xFFFDE68A),
+      ),
+    );
   }
 
   @override
   void dispose() {
     _eventSub?.cancel();
     _stateSub?.cancel();
+    _credSub?.cancel();
+    _devicesTimeout?.cancel();
+    // 本页销毁时取消自己持有的续签定时器（登出路径已在 _logout 里 forceStop，这里是防「页面被 pop 掉但没登出」的泄漏）
+    MemberCredentials.instance.stop(_credOwner);
     super.dispose();
   }
 
@@ -132,28 +524,17 @@ class _HomePageState extends State<HomePage> {
             icon: const Icon(Icons.devices_outlined),
             onPressed: _requestSwitchDevice,
           ),
+          // 退出登录入口：原先主页没有任何登出出口，一旦连不上电脑又退不出去就成了死局
+          IconButton(
+            tooltip: '退出登录',
+            icon: const Icon(Icons.logout_outlined),
+            onPressed: _logout,
+          ),
         ],
       ),
       body: Column(
         children: [
-          if (_hostOffline)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              color: const Color(0xFF7C4A12),
-              child: const Row(
-                children: [
-                  Icon(Icons.cloud_off_outlined, size: 16, color: Color(0xFFFBBF24)),
-                  SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      '桌面端离线，等待重新连接…',
-                      style: TextStyle(fontSize: 13, color: Color(0xFFFDE68A)),
-                    ),
-                  ),
-                ],
-              ),
-            ),
+          if (_showBanner) _buildStatusBanner(),
           Expanded(
             child: IndexedStack(
               index: _index,

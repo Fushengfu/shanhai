@@ -9,7 +9,32 @@ import { getUiState, getUiStateRev, patchUiState, getWallpaper, setWallpaper, fi
 import { listSystemWallpapers, applySystemWallpaper } from './system-wallpaper'
 import { startRemoteServer, stopRemoteServer, getRemoteStatus, refreshPairingCode } from './remote-server'
 import { startRemoteRelay, stopRemoteRelay, getRelayStatus } from './remote-relay'
-import { checkAndPromptForUpdate, getLastUpdateCheckResult, fetchMobileApkInfo } from './app-updater'
+import { startCredentialRenewal, stopCredentialRenewal, getCredentialSnapshot, describeCredentialState } from './member-credentials'
+import {
+  startMemberChannel,
+  stopMemberChannel,
+  retryMemberChannel,
+  getMemberStatus,
+  getFriendsSnapshot,
+  refreshFriends,
+  searchMembers,
+  requestFriend,
+  acceptFriend,
+  rejectFriend,
+  deleteFriend,
+  subscribeChannel,
+  unsubscribeChannel,
+  dropWindowSubscriptions,
+  resolveDmChannelId,
+  listThreads,
+  pullThreads,
+  getHistory,
+  sendDm,
+  markChannelRead,
+  getUnread,
+  quoteDmToSession,
+} from './member-channel'
+import { checkAndPromptForUpdate, getLastUpdateCheckResult, getLastDownloadProgress, cancelUpdateDownload, fetchMobileApkInfo } from './app-updater'
 import { listMarketPlugins, downloadAndInstallPlugin, submitPluginToMarket, listMyPlugins, uninstallMarketPlugin } from './marketplace'
 
 /**
@@ -27,6 +52,10 @@ export function registerIpc(): void {
     // 登录成功后自动开启远程连接（外网中继 + 局域网），不再依赖手动开关
     startRemoteRelay()
     startRemoteServer()
+    // 会员通道（私信/好友）与登录态同生命周期：登录即连（role=member 独立第二条连接）
+    startMemberChannel()
+    // 凭证续签与登录态同生命周期：登录后启动到期前自动续签（含「启动即已过期」的立即检查）
+    startCredentialRenewal()
     return result
   })
   ipcMain.handle('auth:register', async (_e, u: string, p: string, nickname?: string, phone?: string, email?: string) => {
@@ -34,14 +63,21 @@ export function registerIpc(): void {
     // 注册成功即登录：自动开启远程连接（外网中继 + 局域网）
     startRemoteRelay()
     startRemoteServer()
+    startMemberChannel()
+    startCredentialRenewal()
     return result
   })
   ipcMain.handle('auth:logout', async () => {
     await runtime.logout()
-    // 退出登录自动关闭远程连接（外网中继 + 局域网）
+    // 退出登录自动关闭远程连接（外网中继 + 局域网）与会员通道（私信/好友）
     stopRemoteRelay()
     stopRemoteServer()
+    stopMemberChannel()
+    // 退出登录必须清理续签定时器（否则登出后仍在后台拿旧凭证打网关）
+    stopCredentialRenewal()
   })
+  // 凭证三态快照（未登录 / 已登录有效 / 已登录但已过期）：只给状态，绝不给 token 本体
+  ipcMain.handle('auth:credentialStatus', async () => ({ ...getCredentialSnapshot(), text: describeCredentialState(getCredentialSnapshot()) }))
   ipcMain.handle('auth:listModels', async () => runtime.listModels())
   ipcMain.handle('auth:refreshModels', async () => runtime.refreshModels())
 
@@ -144,7 +180,17 @@ export function registerIpc(): void {
   ipcMain.handle('chat:retry', async (_e, sessionId: string) => runtime.retrySession(sessionId))
   ipcMain.handle('chat:abandon', async (_e, sessionId: string) => runtime.abandonSession(sessionId))
   ipcMain.handle('chat:inject', async (_e, sessionId: string, message: string) => runtime.injectMessage(sessionId, message))
-  ipcMain.handle('chat:stop', async () => runtime.stop())
+  // 停止执行：不传 sessionId 保持原语义（停「当前激活会话」，聊天窗口用）；传了则按 id 精确停。
+  // ⚠️ 管家窗口必须显式传 SUPERVISOR_ID：runtime.stop() 停的是 ctx.currentSessionId，而
+  //   switchSessionInternal 明确拒绝把管家会话设为当前会话（apps/runtime/src/sessions.ts:396
+  //   `if (!target || target.isSupervisor) return { ok: false, ... }`）→ currentSessionId 恒不等于
+  //   'supervisor' → 管家窗口的「停止」从来没停到管家自己（这就是「点暂停还在后台继续执行」的根因）。
+  //   信任面未扩大：同族的 chat:resume / chat:retry / chat:inject / chat:resend 本来就接受任意 sessionId。
+  ipcMain.handle('chat:stop', async (_e, sessionId?: string) => {
+    const sid = typeof sessionId === 'string' ? sessionId.trim() : ''
+    if (sid) runtime.stopSession(sid)
+    else runtime.stop()
+  })
 
   // —— 会话管家（主 Agent，独立 supervisor 窗口）——
   ipcMain.handle('supervisor:run', async (_e, message: string, attachments?: Array<Record<string, unknown>>) => {
@@ -163,7 +209,9 @@ export function registerIpc(): void {
   ipcMain.handle('supervisor:setModel', async (_e, id: string) => runtime.setSupervisorModel(id))
   ipcMain.handle('supervisor:setApproval', async (_e, policy: 'ask' | 'workdir' | 'never') => runtime.setSupervisorApprovalPolicy(policy))
   // 管家窗口 ↔ 悬浮图标：关闭→显示图标 / 点击图标→恢复窗口 / 拖动图标移动
-  ipcMain.handle('supervisor:hideToBubble', async () => hideSupervisorToBubble())
+  // ⚠️ 关闭必须把「发起窗口」（e.sender）传给主进程：注册表里若因历史 bug 残留多个 supervisor 条目，
+  // 「按类型找第一个」会关掉用户没点的那个，表现就是「点关闭没反应」。按发起窗口关才可靠。
+  ipcMain.handle('supervisor:hideToBubble', (e) => hideSupervisorToBubble(BrowserWindow.fromWebContents(e.sender) ?? undefined))
   ipcMain.handle('supervisor:showFromBubble', async () => showSupervisorFromBubble())
   ipcMain.on('supervisor:moveBubble', (_e, dx: number, dy: number) => moveSupervisorBubble(dx, dy))
 
@@ -272,12 +320,51 @@ export function registerIpc(): void {
   })
   ipcMain.handle('remote:relayStatus', async () => getRelayStatus())
 
+  // 窗口被销毁时回收它持有的通道订阅（并向网关发 leave），避免死窗口的订阅 id 堆积、通道长期挂着
+  app.on('web-contents-created', (_e, contents) => {
+    contents.on('destroyed', () => dropWindowSubscriptions(contents.id))
+  })
+
+  // —— 会员实时通讯底座（私信 / 好友）——
+  // 内置侧专用：走普通 ipcMain.handle，与插件白名单 plugin:invoke 完全无关（本轮插件不接入通道）。
+  // 凭证（memberToken）只在主进程 member-channel.ts 内使用，渲染层拿不到 token，只拿状态与消息数据。
+  ipcMain.handle('member:status', async () => getMemberStatus())
+  ipcMain.handle('member:retry', async () => retryMemberChannel())
+  // 好友列表 / 检索 / 申请 / 会话列表 / 历史 / 已读：定稿契约全部走 HTTP（主进程持 JWT，渲染层拿不到凭证）
+  ipcMain.handle('member:freshFriends', async () => refreshFriends())
+  ipcMain.handle('member:friends', async () => getFriendsSnapshot())
+  ipcMain.handle('member:threads', async () => listThreads())
+  ipcMain.handle('member:pullThreads', async () => pullThreads())
+  ipcMain.handle('member:unread', async () => getUnread())
+  ipcMain.handle('member:search', async (_e, username: string) => searchMembers(String(username ?? '')))
+  ipcMain.handle('member:requestFriend', async (_e, input: { targetMemberId: string; message?: string }) => requestFriend(input ?? { targetMemberId: '' }))
+  ipcMain.handle('member:acceptFriend', async (_e, targetMemberId: string) => acceptFriend(String(targetMemberId ?? '')))
+  ipcMain.handle('member:rejectFriend', async (_e, targetMemberId: string) => rejectFriend(String(targetMemberId ?? '')))
+  ipcMain.handle('member:deleteFriend', async (_e, memberId: string) => deleteFriend(String(memberId ?? '')))
+  ipcMain.handle('member:subscribe', async (e, channelId: string) => subscribeChannel(String(channelId ?? ''), e.sender.id))
+  // 1v1 通道 id 由主进程算（本账号 memberId 只在主进程可见，渲染层不自己拼字符串）
+  ipcMain.handle('member:channelId', async (_e, peerMemberId: string) => resolveDmChannelId(String(peerMemberId ?? '')))
+  ipcMain.handle('member:unsubscribe', async (e, channelId: string) => unsubscribeChannel(String(channelId ?? ''), e.sender.id))
+  // 定稿 v1.1：历史是 page/pageSize 偏移分页（page=1 最新一页，加载更早=page 递增），不是时间戳游标
+  ipcMain.handle('member:history', async (_e, input: { channelId: string; page?: number; pageSize?: number }) => getHistory(input))
+  ipcMain.handle('member:send', async (_e, input: { peerMemberId?: string; channelId?: string; text: string; peerName?: string }) => sendDm(input ?? { text: '' }))
+  ipcMain.handle('member:markRead', async (_e, channelId: string) => markChannelRead(String(channelId ?? '')))
+  // 【红线入口】把某条私信引用到指定会话的输入框：必须由本地用户在私信面板显式点击才会走到这里，
+  // 主进程只把带来源标记的文本投给聊天窗口写进输入框，不触发任何执行、不进任何 Agent 上下文。
+  ipcMain.handle('member:quoteToSession', async (e, input: { sessionId: string; channelId: string; msgId: string }) =>
+    quoteDmToSession(input ?? { sessionId: '', channelId: '', msgId: '' }, e.sender.id),
+  )
+
   // —— 应用版本更新（复用网关公开版本检查 API，手动检查 + 自动调度推送）——
   ipcMain.handle('app:get-version', async () => app.getVersion())
   ipcMain.handle('app:check-update', async (e) =>
     checkAndPromptForUpdate({ manual: true, parentWindow: BrowserWindow.fromWebContents(e.sender) }),
   )
   ipcMain.handle('app:get-update-status', async () => getLastUpdateCheckResult())
+  // 安装包下载进度：供中途新开的窗口一次性拉取当前快照（实时增量走 app:update-download-progress 广播）
+  ipcMain.handle('app:get-update-download-progress', async () => getLastDownloadProgress())
+  // 取消正在进行的安装包下载（渲染层进度卡片上的「取消下载」按钮）
+  ipcMain.handle('app:cancel-update-download', async () => cancelUpdateDownload())
   ipcMain.handle('mobile:get-apk-info', async (_e, packageName: string) => fetchMobileApkInfo(packageName))
 
   // —— 插件市场（公开列表 / 下载安装 / 提交）——

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { AppSettings, AppSettingsPatch, AppUpdateCheckResult, GatewayModel, HttpTraceRecord, MobileApkInfo, RemoteStatus, RelayStatus } from '../types'
+import type { AppSettings, AppSettingsPatch, AppUpdateCheckResult, AppUpdateDownloadProgress, GatewayModel, HttpTraceRecord, MobileApkInfo, RemoteStatus, RelayStatus } from '../types'
 import { IconActivity, IconGlobe, IconHelp, IconSettings, IconTerminal, IconWrench } from './icons'
-import { smallIconBtn } from './ui'
+import { formatBytes, smallIconBtn } from './ui'
 import { WindowTitleBar } from './WindowTitleBar'
 
 /** 单个开关项：标签 + 描述 + 切换开关 */
@@ -166,6 +166,8 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
   const [version, setVersion] = useState('')
   const [updateStatus, setUpdateStatus] = useState<AppUpdateCheckResult | null>(null)
   const [updateChecking, setUpdateChecking] = useState(false)
+  // 安装包下载进度（主进程广播 app:update-download-progress）：在「关于山海」区就地显示进度条
+  const [updateProgress, setUpdateProgress] = useState<AppUpdateDownloadProgress | null>(null)
   const [mobileApk, setMobileApk] = useState<MobileApkInfo | null>(null)
   const [mobileLoading, setMobileLoading] = useState(false)
   const [mobileError, setMobileError] = useState('')
@@ -319,6 +321,20 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
   useEffect(() => {
     const unsub = window.shanhai?.onRelayStatus((status) => {
       setRelay(status)
+    })
+    return () => unsub?.()
+  }, [])
+
+  // 订阅安装包下载进度：在「关于山海」就地显示进度条；终态（完成/失败/取消）保留展示，不卡在 99%
+  useEffect(() => {
+    void window.shanhai
+      ?.getUpdateDownloadProgress()
+      .then((p) => {
+        if (p) setUpdateProgress(p)
+      })
+      .catch(() => undefined)
+    const unsub = window.shanhai?.onUpdateDownloadProgress((p) => {
+      setUpdateProgress(p)
     })
     return () => unsub?.()
   }, [])
@@ -695,6 +711,75 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                         </span>
                       ) : null}
                     </div>
+
+                    {/* 安装包下载进度（主进程广播 app:update-download-progress，全局浮层之外的就地反馈）
+                        终态里 completed/cancelled 只在 30s 内就地展示（避免长期挂着一块过期卡片）；
+                        failed 一直保留到用户重新检查/关闭窗口，确保能看到失败原因 */}
+                    {updateProgress &&
+                    (updateProgress.phase === 'failed' ||
+                      !(updateProgress.phase === 'completed' || updateProgress.phase === 'cancelled') ||
+                      Date.now() - updateProgress.updatedAt < 30_000) ? (
+                      <div
+                        style={{
+                          marginTop: 10,
+                          padding: '10px 12px',
+                          borderRadius: 8,
+                          border: `1px solid ${updateProgress.phase === 'failed' ? 'var(--tint-red-strong)' : 'var(--border-soft)'}`,
+                          background: 'var(--bg-sidebar)',
+                        }}
+                      >
+                        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>
+                          {updateProgress.phase === 'pending' && '准备下载更新'}
+                          {updateProgress.phase === 'downloading' && `正在下载更新${updateProgress.latestVersion ? ` v${updateProgress.latestVersion}` : ''}`}
+                          {updateProgress.phase === 'verifying' && '正在校验安装包（SHA256）'}
+                          {updateProgress.phase === 'completed' && '更新包下载完成'}
+                          {updateProgress.phase === 'failed' && '更新下载失败'}
+                          {updateProgress.phase === 'cancelled' && '更新下载已取消'}
+                        </div>
+                        <div style={{ marginTop: 8, height: 6, borderRadius: 999, background: 'var(--bg-panel)', overflow: 'hidden' }}>
+                          <div
+                            style={{
+                              height: '100%',
+                              width: updateProgress.percent >= 0 ? `${Math.min(100, Math.max(0, updateProgress.percent))}%` : '40%',
+                              borderRadius: 999,
+                              background: updateProgress.phase === 'failed' ? 'var(--danger-text)' : 'var(--accent)',
+                              transition: 'width 240ms ease',
+                            }}
+                          />
+                        </div>
+                        <div style={{ marginTop: 6, display: 'flex', gap: 8, fontSize: 11, color: 'var(--text-muted)', flexWrap: 'wrap' }}>
+                          <span>{updateProgress.percent >= 0 ? `${updateProgress.percent.toFixed(1)}%` : '进度未知'}</span>
+                          <span>
+                            {formatBytes(updateProgress.receivedBytes)}
+                            {updateProgress.totalBytes > 0 ? ` / ${formatBytes(updateProgress.totalBytes)}` : ''}
+                          </span>
+                          {updateProgress.bytesPerSecond > 0 ? <span>{formatBytes(updateProgress.bytesPerSecond)}/s</span> : null}
+                          {updateProgress.fileName ? <span style={{ color: 'var(--text-faint)' }}>{updateProgress.fileName}</span> : null}
+                        </div>
+                        {updateProgress.message ? (
+                          <div
+                            style={{
+                              marginTop: 6,
+                              fontSize: 11,
+                              lineHeight: 1.5,
+                              whiteSpace: 'pre-wrap',
+                              wordBreak: 'break-word',
+                              color: updateProgress.phase === 'failed' ? 'var(--danger-text)' : 'var(--text-secondary)',
+                            }}
+                          >
+                            {updateProgress.message}
+                          </div>
+                        ) : null}
+                        {updateProgress.phase === 'downloading' || updateProgress.phase === 'pending' ? (
+                          <button
+                            onClick={() => void window.shanhai?.cancelUpdateDownload().catch(() => undefined)}
+                            style={{ ...smallIconBtn, marginTop: 8, padding: '4px 12px', fontSize: 12, border: '1px solid var(--border-soft)', borderRadius: 6 }}
+                          >
+                            取消下载
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
 
                     {/* 手机端下载：二维码 + 下载链接 */}
                     {mobileError ? (

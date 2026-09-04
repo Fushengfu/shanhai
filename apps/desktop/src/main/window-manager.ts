@@ -195,18 +195,27 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
       }
     })
   } else if (type === 'supervisor') {
-    // 管家窗口点关闭：隐藏窗口 + 显示悬浮图标（点击悬浮图标可恢复窗口）
+    // 管家窗口点关闭（渲染层自定义关闭按钮走 IPC hideSupervisorToBubble；这里兜住 win.close() 这条路）：
+    // 隐藏窗口 + 给出悬浮图标。互斥统一由 syncSupervisorBubble 处理，不在这里各写一半，避免与 IPC 路径漂移。
     win.on('close', (e) => {
       if (!isQuitting) {
         e.preventDefault()
         win.hide()
-        showSupervisorBubble()
+        syncSupervisorBubble(false)
       }
     })
   }
 
   win.on('closed', () => {
     windows.delete(key)
+    // 【兜底复位】窗口被销毁（destroy / 渲染进程崩溃后被回收 / 异常退出）时，注册表条目已清掉，
+    // 显隐状态也必须跟着复位，否则会出现「窗口已经没了但状态还认为开着」：
+    // - supervisor 被销毁 → 悬浮图标必须给出（否则用户彻底失去打开管家的入口，只能重启应用）
+    // - supervisor-bubble 被销毁 → 若管家窗口还藏在后台，把它带回前台（否则同样无路可退）
+    // 退出流程（isQuitting）期间一律不复位，避免在 app.quit() 过程中凭空造新窗口。
+    if (isQuitting) return
+    if (type === 'supervisor') syncSupervisorBubble(false)
+    else if (type === 'supervisor-bubble') recoverHiddenSupervisor()
   })
 
   registerContextMenu(win)
@@ -230,12 +239,25 @@ export function getWindowAppId(win: BrowserWindow): string | undefined {
   return undefined
 }
 
-/** 按 type 查找窗口（可选 appId）。返回第一个匹配的存活窗口，无则 undefined */
+/**
+ * 按 type 查找窗口（可选 appId）。返回第一个匹配的存活窗口，无则 undefined。
+ *
+ * ⚠️ appId 语义（「管家窗口关不掉 / 与悬浮图标共存 / 再开一个管家窗口」三个症状的共同根因，改动前务必读）：
+ * - **传 appId**：精确匹配该 appId。只有 'app' 类型用得到（终端/设置/私信等按 appId 单开与复用）。
+ * - **不传 appId**：匹配该 type 下【任意】存活窗口。chat / supervisor / supervisor-bubble / desktop / dock
+ *   这几类是「按类型单例」的常驻窗口，appId 对它们只是创建时打的标签——启动路径给 chat/supervisor 打了
+ *   'subSession' / 'mainSession'（全仓库除创建处没有任何读取方），而 showChatWindow / showSupervisorWindow /
+ *   hideSupervisorToBubble / findSnapPartner 等【所有查找方都不带 appId】。
+ *   旧写法 `meta.appId === appId` 在「创建带 appId、查找不带 appId」的组合下恒为 false → 永远找不到启动时
+ *   创建的那两个窗口：关闭时关不掉（还无条件弹出悬浮图标）、恢复时又 new 一个，于是窗口与图标同时存在、
+ *   屏幕上出现两个管家窗口。故此处语义固定为：appId 省略＝按类型匹配，不比 appId。
+ */
 function findWindow(type: WindowType, appId?: string): { win: BrowserWindow; meta: WindowMeta } | undefined {
   for (const meta of windows.values()) {
-    if (meta.type === type && meta.appId === appId && !meta.win.isDestroyed()) {
-      return { win: meta.win, meta }
-    }
+    if (meta.win.isDestroyed()) continue
+    if (meta.type !== type) continue
+    if (appId !== undefined && meta.appId !== appId) continue
+    return { win: meta.win, meta }
   }
   return undefined
 }
@@ -264,26 +286,42 @@ export function showChatWindow(): void {
   })
 }
 
-/** 显示会话管家窗口（常驻，销毁则重建）；显示窗口时互斥隐藏悬浮图标 */
-export function showSupervisorWindow(): void {
-  const bubble = findWindow('supervisor-bubble')
-  if (bubble && !bubble.win.isDestroyed()) bubble.win.hide()
+/**
+ * 取或建「会话管家」窗口 —— 全进程【唯一】的管家窗口创建入口（严格单例）。
+ *
+ * 任何调用方（启动流程 / Dock 图标 / 悬浮图标 / 托盘 / 主进程内部）都必须经这里拿窗口：
+ * 注册表里已有存活的 supervisor 窗口（哪怕处于 hide 状态）就原样返回，**绝不再 new 一个**。
+ * 旧实现是「启动路径直接 createWindow + showSupervisorWindow 里再 createWindow」两个入口并存，
+ * 且启动那个带了 appId 导致按类型查找失配 → 恢复时判定「不存在」→ 又开一个 → 屏幕上两个管家窗口。
+ *
+ * @returns created=true 表示本次真的新建了窗口，调用方需负责 loadWindowContent。
+ */
+export function getOrCreateSupervisorWindow(size?: { width: number; height: number }): { win: BrowserWindow; created: boolean } {
   const found = findWindow('supervisor')
-  if (found) {
-    showWindow(found.win)
-    return
-  }
-  const win = createWindow({ type: 'supervisor' })
-  void loadWindowContent(win).then(() => {
-    showWindow(win)
-  })
+  if (found) return { win: found.win, created: false }
+  const win = createWindow({ type: 'supervisor', width: size?.width, height: size?.height })
+  return { win, created: true }
 }
 
-/** 显示会话管家悬浮图标（常驻，销毁则重建） */
-function showSupervisorBubble(): void {
-  const found = findWindow('supervisor-bubble')
-  if (found) {
-    showWindow(found.win)
+/**
+ * 管家窗口 ↔ 悬浮图标的【唯一】互斥同步点：两者显隐一律由「管家窗口当前是否可见」推导。
+ *
+ * 旧实现把互斥逻辑拆在两处各写一半（showSupervisorWindow 里 hide 气泡、hideSupervisorToBubble 里
+ * 【无条件】show 气泡），一旦窗口查找失配就退化成「窗口还开着、气泡也冒出来」。现在所有路径
+ * （显示窗口 / 关闭窗口 / close 事件 / closed 销毁兜底）都只调这一个函数，显隐状态不可能漂移。
+ *
+ * @param winVisible true=管家窗口可见 → 气泡必须消失；false=管家窗口不可见 → 气泡必须给出（唯一返回入口）
+ */
+function syncSupervisorBubble(winVisible: boolean): void {
+  const bubble = findWindow('supervisor-bubble')
+  if (winVisible) {
+    if (bubble && bubble.win.isVisible()) bubble.win.hide()
+    return
+  }
+  // 退出流程中不复活悬浮图标：否则会在 app.quit() 期间凭空造一个新窗口
+  if (isQuitting) return
+  if (bubble) {
+    if (!bubble.win.isVisible()) showWindow(bubble.win)
     return
   }
   const win = createWindow({ type: 'supervisor-bubble' })
@@ -292,11 +330,45 @@ function showSupervisorBubble(): void {
   })
 }
 
-/** 管家窗口点关闭 → 隐藏窗口 + 显示悬浮图标 */
-export function hideSupervisorToBubble(): void {
+/** 显示会话管家窗口（常驻，销毁则重建）。与悬浮图标的互斥由 syncSupervisorBubble 统一处理 */
+export function showSupervisorWindow(): void {
+  const { win, created } = getOrCreateSupervisorWindow()
+  if (created) {
+    void loadWindowContent(win).then(() => {
+      showWindow(win)
+      syncSupervisorBubble(true)
+    })
+    return
+  }
+  showWindow(win)
+  syncSupervisorBubble(true)
+}
+
+/**
+ * 管家窗口点关闭 → 隐藏窗口 + 显示悬浮图标。
+ *
+ * @param sender 发起关闭的窗口（IPC 的 e.sender）。**必须优先按它定位**：注册表里可能因历史 bug
+ *   残留多个 supervisor 条目，「按类型找第一个」会把用户没点的那个关掉，表现就是「点关闭没反应」。
+ *   按发起窗口关，才能保证关的一定是用户点的那一个。
+ */
+export function hideSupervisorToBubble(sender?: BrowserWindow): void {
+  const target =
+    sender && !sender.isDestroyed() && getWindowType(sender) === 'supervisor' ? sender : findWindow('supervisor')?.win
+  if (!target || target.isDestroyed()) {
+    // 找不到管家窗口（异常路径）：不谎报「已关闭」，留日志；仍把悬浮图标给出，保证用户有返回入口
+    console.warn('[window] hideSupervisorToBubble：未找到管家窗口，仅显示悬浮图标')
+    syncSupervisorBubble(false)
+    return
+  }
+  target.hide()
+  syncSupervisorBubble(false)
+}
+
+/** 兜底：悬浮图标被销毁而管家窗口仍藏在后台时，把管家窗口带回前台，避免用户失去唯一返回入口 */
+function recoverHiddenSupervisor(): void {
   const found = findWindow('supervisor')
-  if (found && !found.win.isDestroyed()) found.win.hide()
-  showSupervisorBubble()
+  if (!found || found.win.isVisible()) return
+  showWindow(found.win)
 }
 
 /** 点击悬浮图标 → 隐藏图标 + 恢复管家窗口 */

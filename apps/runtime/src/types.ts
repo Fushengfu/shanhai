@@ -197,6 +197,16 @@ export interface Runtime {
   logout(): Promise<void>
   /** 当前会员 JWT（登录后有效，供远程连接走网关 bridge 鉴权；未登录返回空串） */
   getMemberToken(): string
+  /**
+   * 会员 JWT 有效期（毫秒时间戳 + TTL 秒）。null = 未知（老 config 无字段且 JWT 解不出）。
+   * 供主进程续签模块（member-credentials.ts）判断「剩余 < 20% TTL 触发续签」与三态登录判定。
+   */
+  getMemberTokenExpiry(): { expiresAt: number | null; ttlSeconds: number | null }
+  /**
+   * 应用续签得到的新会员 JWT（更新内存 + 落盘 config.json）。
+   * 只允许主进程调用（续签永远在主进程，token 不下发渲染层/插件）；渲染层与插件无此入口。
+   */
+  applyMemberToken(token: string, expiresAt: number | null, ttlSeconds: number | null): Promise<void>
   /** 设备标识信息（远程连接多设备用）：deviceId 首次生成并持久化，deviceName 默认主机名可自定义 */
   getDeviceInfo(): { deviceId: string; deviceName: string; hostname: string; os: string }
   /** 自定义设备显示名（持久化到 config.json） */

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { IconActivity, IconClock, IconClose, IconMaximize, IconMinimize, IconMonitor, IconMoon, IconRestore, IconSettings, IconSidebar, IconSun, IconTerminal } from '../components/icons'
 import { smallIconBtn } from '../components/ui'
 import { WindowControlButton } from '../components/WindowTitleBar'
+import { DmEntryButton } from '../components/DmEntryButton'
 import { registerSlot, AppendSlotView } from '../slots'
 import { useUIContext } from '../ui-context'
 
@@ -16,6 +17,8 @@ function HeaderSlot(): React.JSX.Element {
     const next = await window.shanhai?.toggleMaximizeWindow()
     setMaximized(next ?? false)
   }
+  // 私信入口（含未读/好友申请红点）收敛到共用组件 DmEntryButton：
+  // 管家窗口顶栏用的是同一个组件、同一真值源（member:unread / member:friends 广播），此处不再各算一套。
   return (
     <>
       <header
@@ -34,10 +37,11 @@ function HeaderSlot(): React.JSX.Element {
           <IconSidebar />
         </button>
         <div style={{ fontWeight: 600, fontSize: 14 }}>山海</div>
+        <DmEntryButton loggedIn={ctx.loggedIn} labeled style={{ marginLeft: 'auto' }} />
         <button
           onClick={() => void window.shanhai?.openApp('memory')}
           title="查看长期记忆"
-          style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer', ...({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) }}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer', ...({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) }}
         >
           <IconClock />
           记忆

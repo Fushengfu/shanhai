@@ -25,6 +25,8 @@ function ComposerSlot(): React.JSX.Element {
       stopSend={ctx.stopSend}
       composerRef={ctx.composerRef}
       seed={ctx.composerSeed}
+      quote={ctx.dmQuote}
+      onClearQuote={ctx.clearDmQuote}
     />
   )
 }

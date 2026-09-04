@@ -102,9 +102,11 @@ export const WindowTitleBar = React.memo(function WindowTitleBar(props: {
           {props.icon}
         </span>
       )}
-      <div style={{ minWidth: 0 }}>
-        <div style={{ fontWeight: 600, fontSize: 15, color: 'var(--text)', lineHeight: 1.2 }}>{props.title}</div>
-        {props.subtitle && <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 1 }}>{props.subtitle}</div>}
+      {/* 标题区：窄窗口（如 500px 宽的会话管家）里右侧操作按钮增多时会挤压这里，
+          必须允许收缩并裁切省略，否则副标题会溢出压到右侧按钮上（视觉上重叠）。 */}
+      <div style={{ minWidth: 0, overflow: 'hidden' }}>
+        <div style={{ fontWeight: 600, fontSize: 15, color: 'var(--text)', lineHeight: 1.2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{props.title}</div>
+        {props.subtitle && <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{props.subtitle}</div>}
       </div>
       {props.extra}
       <div style={{ flex: 1 }} />

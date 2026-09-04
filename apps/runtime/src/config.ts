@@ -113,12 +113,25 @@ export async function persistCustomModels(models: GatewayModel[]): Promise<void>
   }
 }
 
-/** 登录成功后合并保存凭证（更新 memberToken + account + 网关模型凭证，密码不落盘） */
+/**
+ * 会员 JWT 的有效期信息（落盘到 config.json 的 gateway.memberTokenExpiresAt / memberTokenTtlSeconds）。
+ * 全部字段可选：老版本 config 没有这两个字段时读出来是 null，按「未知过期时间」处理，
+ * 不得因为缺字段就判定已过期（详见 desktop 侧 member-credentials.ts 的降级策略）。
+ */
+export interface MemberTokenExpiry {
+  /** 绝对过期时间（毫秒时间戳）；null = 未知（老 config 无字段 / 网关未下发 / JWT 无法解码） */
+  expiresAt: number | null
+  /** 该凭证的 TTL（秒），用于按剩余比例触发续签；null = 未知 */
+  ttlSeconds: number | null
+}
+
+/** 登录成功后合并保存凭证（更新 memberToken + account + 网关模型凭证 + JWT 有效期，密码不落盘） */
 export async function persistLoginToken(
   token: string,
   username: string,
   member: { nickname?: string; avatar?: string } | undefined,
   gateway: { apiKey: string; baseUrl: string; selectedModelId: string },
+  expiry?: Partial<MemberTokenExpiry>,
 ): Promise<void> {
   try {
     await withConfigFile((cfg) => {
@@ -128,10 +141,51 @@ export async function persistLoginToken(
       g.apiKey = gateway.apiKey
       g.baseUrl = gateway.baseUrl
       g.selectedModelId = gateway.selectedModelId
+      // 有效期：有值才写，无值删除旧字段（避免残留上一份 token 的过期时间造成误判）
+      if (typeof expiry?.expiresAt === 'number' && Number.isFinite(expiry.expiresAt)) {
+        g.memberTokenExpiresAt = Math.round(expiry.expiresAt)
+      } else {
+        delete g.memberTokenExpiresAt
+      }
+      if (typeof expiry?.ttlSeconds === 'number' && Number.isFinite(expiry.ttlSeconds)) {
+        g.memberTokenTtlSeconds = Math.round(expiry.ttlSeconds)
+      } else {
+        delete g.memberTokenTtlSeconds
+      }
       cfg.gateway = g
     })
   } catch {
     // 忽略持久化失败
+  }
+}
+
+/**
+ * 续签成功后只更新 memberToken + 有效期（不动 account / apiKey / baseUrl / selectedModelId）。
+ * 与 persistLoginToken 分开：续签响应只有新 token，没有 apiKey/模型信息，混写会把它们覆盖成空。
+ * 走 withConfigFile 串行锁，与其它 config 写入互斥（避免后写覆盖丢凭证）。
+ */
+export async function persistMemberTokenRotation(
+  token: string,
+  expiry: Partial<MemberTokenExpiry>,
+): Promise<void> {
+  try {
+    await withConfigFile((cfg) => {
+      const g = (cfg.gateway as Record<string, unknown> | undefined) ?? {}
+      g.memberToken = token
+      if (typeof expiry.expiresAt === 'number' && Number.isFinite(expiry.expiresAt)) {
+        g.memberTokenExpiresAt = Math.round(expiry.expiresAt)
+      } else {
+        delete g.memberTokenExpiresAt
+      }
+      if (typeof expiry.ttlSeconds === 'number' && Number.isFinite(expiry.ttlSeconds)) {
+        g.memberTokenTtlSeconds = Math.round(expiry.ttlSeconds)
+      } else {
+        delete g.memberTokenTtlSeconds
+      }
+      cfg.gateway = g
+    })
+  } catch {
+    // 忽略持久化失败（内存态已更新，下次登录/续签会再落）
   }
 }
 

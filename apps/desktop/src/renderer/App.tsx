@@ -9,6 +9,7 @@ import type {
   ChatItem,
   ClientRunRequest,
   ContentPart,
+  DmQuotePayload,
   GatewayModel,
   HistoryItem,
   RetryPrompt,
@@ -138,14 +139,26 @@ export function App() {
   // ② composerSeed：外部重置信号（草稿恢复 / 新建清空 / 发送清空），seq 递增触发 ChatComposer 重同步自身输入态。
   const composerRef = useRef<{ input: string; attachments: AttachmentItem[] }>({ input: '', attachments: [] })
   const [composerSeed, setComposerSeed] = useState({ seq: 0, input: '', attachments: [] as AttachmentItem[] })
+  // 【安全红线】最近一次「私信引用到本会话」的来源（null = 没有）：只用于在输入区上方显示提示条，
+  // 不代表任何已发送内容，也不会触发发送 / 工具执行 / 审批。
+  const [dmQuote, setDmQuote] = useState<DmQuotePayload | null>(null)
+  const clearDmQuote = useCallback((): void => setDmQuote(null), [])
   // 外部重置 Composer 输入态（草稿恢复 / 新建清空 / 发送清空）
   const resetComposer = useCallback((input: string, attachments: AttachmentItem[]) => {
     composerRef.current = { input, attachments }
     setComposerSeed((prev) => ({ seq: prev.seq + 1, input, attachments }))
   }, [])
-  /** 欢迎页建议点击：把建议文本填入输入框（保留现有附件），触发 ChatComposer 重同步 */
+  /**
+   * 外部把文本送进输入框（欢迎页建议点击 / 私信「引用到会话」）：**追加**而非覆盖。
+   * 之前是替换语义，会把用户已经打了一半的草稿整段吃掉（私信引用场景下等于误删本地输入），
+   * 故对齐语音听写那条的写法 setInput(prev => prev ? prev + text : text)：
+   * 已有草稿时换行接在后面，没有草稿时直接作为输入内容。仍只写输入框，不自动发送。
+   */
   const setComposerInput = useCallback((text: string) => {
-    resetComposer(text, composerRef.current.attachments)
+    if (!text) return
+    const prev = composerRef.current.input
+    const next = prev.trim() ? `${prev.replace(/\s+$/, '')}\n\n${text}` : text
+    resetComposer(next, composerRef.current.attachments)
   }, [resetComposer])
   // 消息队列：任务执行中提交的新消息进入队列，任务完成后自动执行（队列模式）；queueId 用于出队时定位消息流里的「排队中」气泡
   const pendingQueue = useRef<Record<string, Array<{ queueId: string; text: string; parts: ContentPart[]; images: string[] }>>>({})
@@ -353,6 +366,8 @@ export function App() {
       draftRef.current[currentSessionId] = composerRef.current
     }
     currentSessionIdRef.current = id
+    // 切会话即视为放弃上一次私信引用上下文（提示条跟着清，避免把 A 会话的来源标到 B 会话上）
+    setDmQuote((prev) => (prev && prev.sessionId === id ? prev : null))
     // 终端面板开关已会话级隔离（SessionUIState.terminalPanelOpen），切会话时 cur 自动切换，无需手动收起
     // 恢复目标会话草稿（若有），否则清空输入框（通过 resetComposer 触发 ChatComposer 重同步）
     const draft = draftRef.current[id]
@@ -398,6 +413,38 @@ export function App() {
     const busy = (await window.shanhai?.listSessions().then((l) => l?.find((s) => s.id === id)?.busy ?? false)) ?? false
     patchSession(id, { items, streaming: '', streamingReasoning: '', busy })
   }
+
+  /** switchToSession 的最新引用：供私信「引用到会话」异步切到目标会话，避免闭包捕获旧的 currentSessionId */
+  const switchToSessionRef = useRef<(id: string) => Promise<void>>(switchToSession)
+  switchToSessionRef.current = switchToSession
+
+  /**
+   * 【安全红线唯一入口】会员私信「引用到会话」的落点。
+   * 主进程 member-channel 只有在本地用户于私信面板显式点击「引用到会话」时，才会定向投递
+   * dm:quote-to-session（见 main/member-channel.ts 的 quoteDmToSession：只投 chat 窗口、不投回发起窗口）。
+   * 本回调只做一件事：把带来源标记的文本写进目标会话的输入框，等价于本地用户自己敲进去这段话。
+   * 明确不做：不追加到 items、不调 send()/chat:run、不进任何 Agent 上下文、不触发工具执行、不碰审批队列。
+   * 用户必须自己按发送，山海才会把它当成本轮指令。
+   */
+  useEffect(() => {
+    const off = window.shanhai?.onDmQuoteToSession((p) => {
+      if (!p?.text) return
+      const write = (): void => {
+        // setComposerInput 已是追加语义：绝不清掉用户已经打好的草稿（送进去的是私信原文，来源走提示条）
+        setComposerInput(p.text)
+        // 来源提示条：让用户看清「这段是 A 发来的私信，不是我打的」，但发送与否完全由用户决定
+        setDmQuote(p)
+      }
+      const target = p.sessionId
+      if (target && target !== currentSessionIdRef.current) {
+        // 目标会话不是当前会话：先切过去再写（切换会用目标会话的草稿重置输入框，故必须等切换完成）
+        void switchToSessionRef.current(target).then(write)
+      } else {
+        write()
+      }
+    })
+    return off
+  }, [setComposerInput])
 
   async function createSession(): Promise<void> {
     const id = await window.shanhai?.createSession()
@@ -622,6 +669,8 @@ export function App() {
     }
     // 文件说明拼进消息文本（agent 据此 read_file 读取工作目录里的文件）
     const finalText = fileNotes.length > 0 ? `${text}${text ? '\n\n' : ''}[已附加文件]\n${fileNotes.join('\n')}` : text
+    // 用户已按下发送 = 引用上下文已被本人确认采纳，来源提示条随之清除（这条文本已归属为本地用户输入）
+    setDmQuote(null)
     resetComposer('', [])
     delete draftRef.current[sid]
     if (getUiStoreSnapshot().sessionMap[sid]?.busy ?? false) {
@@ -884,6 +933,8 @@ export function App() {
     composerRef,
     composerSeed,
     setComposerInput,
+    dmQuote,
+    clearDmQuote,
     queueCount,
     models,
     selectedModel,

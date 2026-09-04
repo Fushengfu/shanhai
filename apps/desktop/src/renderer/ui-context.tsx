@@ -5,6 +5,7 @@ import type {
   AskRequest,
   BrowserWindowItem,
   ClientRunRequest,
+  DmQuotePayload,
   GatewayModel,
   RetryPrompt,
   SessionListItem,
@@ -78,6 +79,14 @@ export interface UIContextValue {
   composerSeed: ChatComposerSeed
   /** 欢迎页建议点击：把建议文本填入输入框（保留现有附件） */
   setComposerInput: (text: string) => void
+  /**
+   * 【安全红线】最近一次「私信引用到本会话」的来源信息（null = 没有）。
+   * 只在本地用户于私信面板显式点击「引用到会话」后由 App 设置，用于在输入区上方显示来源提示条；
+   * 私信原文是被**追加**进输入框的（等价于本地用户自己打字），本状态不触发任何发送或执行。
+   */
+  dmQuote: DmQuotePayload | null
+  /** 关闭来源提示条（只隐藏提示，不撤销已追加进输入框的文字） */
+  clearDmQuote: () => void
   queueCount: number
   models: GatewayModel[]
   selectedModel: string

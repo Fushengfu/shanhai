@@ -4,6 +4,8 @@ import 'dart:math';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'member_credentials.dart';
+
 /// 连接状态
 enum ConnState { disconnected, connecting, connected, paired }
 
@@ -38,8 +40,109 @@ class WsClient {
   bool _reconnecting = false;
   int _reconnectAttempts = 0;
 
+  /// 连接代数：每次主动新建/切换/重试连接都 +1。旧连接残留的 onDone/onError/message
+  /// 回调携带自己的代数，与当前代数不符时一律忽略——否则「用户主动切设备」后，
+  /// 被丢弃的旧 channel 关闭事件会再调度一次重连，把新页面又拽回加载态（甚至双连接互踢）。
+  int _connSeq = 0;
+
+  /// 可取消的重连定时器。之前用 Future.delayed 调度重连，**无法打断**：
+  /// 用户点「切换设备/重试」直接重连后，那个延迟回调仍会在稍后再连一次，造成双连接。
+  Timer? _reconnectTimer;
+
+  // —————————————————— 凭证失效（401）状态机 ——————————————————
+  //
+  // 【改造前的行为】握手 401（会员 JWT 过期）→ 页面用字符串匹配把 error 当「登录已过期」
+  // 直接 TokenStore.clear() 踢回登录页；电脑/手机关机过夜后必然要重新输密码。
+  // 【现在的行为】401 → 交给 MemberCredentials 先试一次 refresh（网关有 7 天宽限期，多数情况免密续上）
+  //  → 成功就带新 token 立即重连；只有 refresh 也确认「凭证不可恢复」才置 authFailed 并要求重登。
+  // 【降级可用】网关未部署新错误码时（握手失败读不到 JSON body，见 _handshakeStatus 注释），
+  //  任何 401 一律「先试 refresh 一次」，不依赖结构化 code 才工作。
+
+  /// 凭证已确认不可恢复（refresh 也失败）：置 true 后**停止自动重连**，等用户重新登录。
+  bool _authFailed = false;
+  bool get authFailed => _authFailed;
+
+  /// 失效原因文案（界面如实呈现用，不含 token）
+  String? _authReason;
+  String? get authReason => _authReason;
+
+  /// 凭证状态流（转发 MemberCredentials，页面据此显示「有效 / 即将到期 / 已失效 / 有效期未知」）
+  Stream<CredentialSnapshot> get credentialStatus => MemberCredentials.instance.status;
+  CredentialSnapshot get credential => MemberCredentials.instance.snapshot;
+
+  void _emit(String event, [Map<String, dynamic>? payload]) {
+    if (_events.isClosed) return;
+    _events.add(ServerEvent(event, payload ?? const <String, dynamic>{}));
+  }
+
+  /// 握手失败 → 判定是不是「凭证被拒」（401/403）。
+  ///
+  /// Dart 侧事实（已用本地探针核实）：`WebSocket.connect` 在非 101 升级响应时抛
+  /// `WebSocketException(message, httpStatusCode)`，被 web_socket_channel 包成
+  /// `WebSocketChannelException`（`inner` 保留原异常）。
+  /// **能拿到 HTTP 状态码，但拿不到 401 的 JSON body**（toString 只有
+  /// `…was not upgraded to websocket, HTTP status code: 401`），因此网关新下发的结构化错误码
+  /// （token_expired / token_missing / token_invalid）在握手阶段读不到 →
+  /// 走「任何 401 一律先试一次 refresh」的降级路径，由 refresh 接口自己的响应体来区分错误码。
+  static int? _handshakeStatus(Object e) {
+    Object? cur = e;
+    for (var i = 0; i < 4 && cur != null; i++) {
+      try {
+        final code = (cur as dynamic).httpStatusCode;
+        if (code is int && code > 0) return code;
+      } catch (_) {
+        // 该层没有 httpStatusCode，继续往下剥
+      }
+      try {
+        cur = (cur as dynamic).inner;
+      } catch (_) {
+        cur = null;
+      }
+    }
+    final m = RegExp(r'HTTP status code:\s*(\d{3})').firstMatch(e.toString());
+    return m == null ? null : int.tryParse(m.group(1)!);
+  }
+
+  /// 凭证确认不可恢复的统一收尾：停止自动重连 + 发 auth_expired 事件（页面给重登出口）
+  void _failAuth(String reason) {
+    _authFailed = true;
+    _authReason = reason;
+    cancelReconnect();
+    _setState(ConnState.disconnected);
+    _emit('auth_expired', {'message': reason});
+  }
+
+  /// 已建立连接上收到 auth_* 错误码：同样先试续签；成功就带新 token 重连，失败才要求重登。
+  Future<void> _onInBandAuthRejected(String code, String message) async {
+    final outcome = await MemberCredentials.instance.handleAuthRejected(
+      source: 'relay-inband',
+      status: 401,
+      code: code,
+      message: message,
+    );
+    if (outcome == RefreshOutcome.rotated) {
+      _emit('auth_renewed', {'message': '登录凭证已自动更新，正在用新凭证重连…'});
+      // 旧连接的凭证已被网关判死，必须换连接；reconnectNow 会清 authFailed 并立即握手
+      unawaited(reconnectNow());
+      return;
+    }
+    if (outcome == RefreshOutcome.invalid) {
+      _failAuth(MemberCredentials.instance.snapshot.lastError ?? '登录已失效，请重新登录');
+      return;
+    }
+    // transient：保留登录态，交给连接层退避重连
+    _emit('error', {'message': '网关提示登录凭证异常（$code），自动续签暂未成功，正在按退避重试…'});
+    _scheduleReconnect();
+  }
+
   ConnState _state = ConnState.disconnected;
   ConnState get state => _state;
+
+  /// 当前指定的目标设备 id（未指定 = 由网关自动配对/返回设备列表）
+  String? get targetDeviceId => _targetDeviceId;
+
+  /// 是否具备 relay 重连条件（有网关地址 + token）：启动页据此决定「重试」是否可用
+  bool get hasRelaySession => (_relayUrl != null && _relayToken != null);
 
   final _events = StreamController<ServerEvent>.broadcast();
   Stream<ServerEvent> get events => _events.stream;
@@ -63,8 +166,11 @@ class WsClient {
     }
   }
 
-  /// 连接并等待 WebSocket 握手完成
+  /// 连接并等待 WebSocket 握手完成（局域网直连模式）
   Future<void> connect(String host, int port) async {
+    cancelReconnect();
+    _autoReconnect = false; // 局域网模式不自动重连（配对码需用户重新输入）
+    final seq = ++_connSeq;
     _setState(ConnState.connecting);
     final uri = Uri.parse('ws://$host:$port');
     // 用 IOWebSocketChannel 并设 pingInterval：底层定期发协议层 ping 帧保活，
@@ -86,9 +192,9 @@ class WsClient {
     }
     _setState(ConnState.connected);
     _sub = _channel!.stream.listen(
-      _onMessage,
-      onDone: _onDone,
-      onError: _onError,
+      (raw) => _onMessage(seq, raw),
+      onDone: () => _onDone(seq),
+      onError: (Object e) => _onError(seq, e),
       cancelOnError: false,
     );
   }
@@ -105,10 +211,21 @@ class WsClient {
     await _doConnectRelay();
   }
 
-  Future<void> _doConnectRelay() async {
+  Future<void> _doConnectRelay({bool allowAuthRetry = true}) async {
+    // 每次真正发起握手都推进代数，并取消排队中的旧重连：
+    // 保证「同一时刻只有一个连接在跑」，旧连接的关闭回调按代数被忽略。
+    cancelReconnect();
+    final seq = ++_connSeq;
     _setState(ConnState.connecting);
-    final url = _relayUrl!;
-    final token = _relayToken!;
+    final url = _relayUrl;
+    // 每次握手都从凭证层取「当前最新」token：续签成功后一定用新值，
+    // 不会拿页面里缓存的旧 token 反复被网关拒（这是「续签了但还是掉线」的典型成因）。
+    final token = MemberCredentials.instance.accessToken ?? _relayToken;
+    if (url == null || token == null || token.isEmpty) {
+      _failAuth('本地没有可用的登录凭证，请重新登录');
+      throw StateError(_authReason ?? 'no credential');
+    }
+    _relayToken = token;
     final base = url.endsWith('/') ? url.substring(0, url.length - 1) : url;
     final sep = base.contains('?') ? '&' : '?';
     var query = '${sep}role=client&token=${Uri.encodeComponent(token)}';
@@ -132,18 +249,48 @@ class WsClient {
       // 进而使「正在恢复登录」永远不更新（error 事件发不出、rethrow 到不了 _restore 的 catch）。
       _abortChannel();
       _setState(ConnState.disconnected);
-      if (!_events.isClosed) {
-        _events.add(ServerEvent('error', {'message': '连接网关失败：$e'}));
+      final status = _handshakeStatus(e);
+      if (status == 401 || status == 403) {
+        // 【401 改造核心】不再「直接停止重连 + 提示登录过期」，先交给凭证层试一次 refresh：
+        //   rotated   → 带新 token 立即重连一次（本轮只允许一次，防 refresh↔401 死循环）
+        //   invalid   → 才落到「登录已失效，请重新登录」（authFailed + 停重连 + auth_expired 事件）
+        //   transient → 网关未部署 / 断网 / 5xx：保留登录态，按连接层退避继续重连，文案如实说明
+        final outcome = await MemberCredentials.instance.handleAuthRejected(
+          source: 'relay-ws',
+          status: status,
+          message: e.toString(),
+        );
+        if (outcome == RefreshOutcome.rotated) {
+          if (allowAuthRetry) {
+            _emit('auth_renewed', {'message': '登录凭证已自动更新，正在用新凭证重连…'});
+            return _doConnectRelay(allowAuthRetry: false);
+          }
+          _failAuth(MemberCredentials.instance.snapshot.lastError ?? '登录凭证仍被网关拒绝，请重新登录');
+          rethrow;
+        }
+        if (outcome == RefreshOutcome.invalid) {
+          _failAuth(MemberCredentials.instance.snapshot.lastError ?? '登录已失效，请重新登录');
+          rethrow;
+        }
+        _emit('error', {
+          'message': '登录凭证已过期，但自动续签暂未成功（网关未部署 / 网络异常），'
+              '已保留登录态并按退避继续重试',
+        });
+        _scheduleReconnect();
+        rethrow;
       }
+      _emit('error', {'message': '连接网关失败：$e'});
       _scheduleReconnect();
       rethrow;
     }
     _setState(ConnState.connected);
     _reconnectAttempts = 0; // 连接成功，重置退避计数
+    _authFailed = false; // 握手成功即凭证可用，清掉上一轮的失效标记
+    _authReason = null;
     _sub = _channel!.stream.listen(
-      _onMessage,
-      onDone: _onDone,
-      onError: _onError,
+      (raw) => _onMessage(seq, raw),
+      onDone: () => _onDone(seq),
+      onError: (Object e) => _onError(seq, e),
       cancelOnError: false,
     );
   }
@@ -151,10 +298,15 @@ class WsClient {
   /// 切换到指定设备：设置 targetDeviceId 后关闭当前连接，并立即重连。
   /// 注意：_sub.cancel() 之后订阅不会再触发 onDone/onError，因此必须显式重连，
   /// 不能依赖「关闭连接触发自动重连」——那是之前「找不到连接对象」的根因。
+  /// 另外必须 cancelReconnect() + 重置退避计数：否则上一次排队的重连定时器会在切设备后
+  /// 再连一次旧目标，出现双连接被网关互踢、页面被旧回调拽回加载态。
   Future<void> switchDevice(String deviceId) async {
     _targetDeviceId = deviceId;
-    await _sub?.cancel();
+    cancelReconnect();
+    _reconnectAttempts = 0;
+    final sub = _sub;
     _sub = null;
+    if (sub != null) await sub.cancel();
     _abortChannel();
     if (_autoReconnect && _relayUrl != null && _relayToken != null) {
       try {
@@ -167,7 +319,49 @@ class WsClient {
     }
   }
 
-  void _onMessage(dynamic raw) {
+  /// 用户主动「重试」：打断进行中的重连与旧连接，立即重新握手。
+  /// 与 connectRelay 的区别是不改 targetDeviceId（重试当前设备）。
+  /// 返回是否握手成功（失败时内部已交给自动重连兜底，调用方只需更新文案）。
+  Future<bool> reconnectNow() async {
+    if (_relayUrl == null || _relayToken == null) return false;
+    cancelReconnect();
+    _reconnectAttempts = 0;
+    _autoReconnect = true;
+    // 用户主动重试 = 明确授权「再给凭证一次机会」：清掉失效标记，让 401 状态机重新走一遍
+    // （先 refresh，成功重连；仍不可恢复才再次落回 auth_expired 并停重连）。
+    _authFailed = false;
+    _authReason = null;
+    final sub = _sub;
+    _sub = null;
+    if (sub != null) await sub.cancel();
+    _abortChannel();
+    try {
+      await _doConnectRelay();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 主动尝试一次「续签后重连」（主页/启动页的「重新登录」旁路入口用）。
+  /// 与 reconnectNow 的区别：先显式走一次凭证续签，把「网关未部署 / 网络异常」与
+  /// 「凭证真的不可恢复」两种结果如实回传给调用方，便于界面给准确文案。
+  Future<({RefreshOutcome outcome, bool connected})> renewAndReconnect() async {
+    final outcome = await MemberCredentials.instance.refresh('manual');
+    final connected = await reconnectNow();
+    return (outcome: outcome, connected: connected);
+  }
+
+  /// 取消排队中的自动重连（用户主动切设备/重试/退出/跳转时调用）。
+  void cancelReconnect() {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnecting = false;
+  }
+
+  void _onMessage(int seq, dynamic raw) {
+    // 旧连接的迟到消息：丢弃，避免污染当前连接的状态与页面
+    if (seq != _connSeq) return;
     Map<String, dynamic> map;
     try {
       map = jsonDecode(raw as String) as Map<String, dynamic>;
@@ -218,7 +412,19 @@ class WsClient {
         c?.complete(CmdResult(map['ok'] == true, map['data'], map['error'] as String?));
         break;
       case 'error':
-        _events.add(ServerEvent('error', {'message': map['message'] ?? ''}));
+        // 网关在已建立连接上也可能下发带结构化 code 的 error（定稿：auth_failed / token_* ）。
+        // 这类消息**不能**当普通网络错误交给页面做「清 token + 回登录页」，
+        // 必须走同一套 401 状态机：先试续签，救不回来才发 auth_expired。
+        final errCode = (map['code'] ?? map['error_code'] ?? '').toString().trim();
+        final errMsg = (map['message'] ?? '').toString();
+        if (errCode == 'auth_failed' ||
+            errCode == 'token_expired' ||
+            errCode == 'token_invalid' ||
+            errCode == 'token_missing') {
+          unawaited(_onInBandAuthRejected(errCode, errMsg));
+          return;
+        }
+        _emit('error', {'message': errMsg, if (errCode.isNotEmpty) 'code': errCode});
         break;
       default:
         // 网关控制消息（connected / client_connected 等）忽略
@@ -226,26 +432,36 @@ class WsClient {
     }
   }
 
-  void _onDone() {
+  void _onDone(int seq) {
+    // 被主动替换/放弃的旧连接（代数不符）：不置断开态、不调度重连，
+    // 否则切设备/重试后旧 channel 的关闭事件会把新页面又拽回加载态。
+    if (seq != _connSeq) return;
     _setState(ConnState.disconnected);
     _scheduleReconnect();
   }
 
-  void _onError(Object e) {
+  void _onError(int seq, Object e) {
+    if (seq != _connSeq) return;
     if (!_events.isClosed) _events.add(ServerEvent('error', {'message': e.toString()}));
     _scheduleReconnect();
   }
 
-  /// 连接断开后延迟自动重连（仅 relay 模式；局域网模式配对码需用户重新输入，不自动重连）
+  /// 连接断开后延迟自动重连（仅 relay 模式；局域网模式配对码需用户重新输入，不自动重连）。
+  /// 用可取消的 Timer 而非 Future.delayed：用户主动重试/切设备/退出时必须能打断排队中的重连。
   void _scheduleReconnect() {
     if (!_autoReconnect || _reconnecting) return;
+    // 凭证已确认不可恢复（refresh 也失败）：不再空转重连——那只会反复拿同一份废 token 撞 401，
+    // 直到用户点「重新登录」/「重试」（reconnectNow 会清掉这个标记）才恢复。
+    if (_authFailed) return;
     _reconnecting = true;
     // 指数退避 + 随机抖动：避免多台电脑/设备同步惊群重连、反复触发网关踢连接
     final exp = min(2 * pow(2, _reconnectAttempts), 30).toDouble();
     final jitter = exp * (0.8 + Random().nextDouble() * 0.4); // ±20%
     _reconnectAttempts += 1;
-    Future<void>.delayed(Duration(milliseconds: (jitter * 1000).round()), () {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(Duration(milliseconds: (jitter * 1000).round()), () {
       _reconnecting = false;
+      _reconnectTimer = null;
       if (_autoReconnect && _relayUrl != null && _relayToken != null) {
         // 忽略重连失败（_onError 会再次调度重连）
         _doConnectRelay().catchError((_) {});
@@ -253,14 +469,30 @@ class WsClient {
     });
   }
 
-  /// 发送配对码
-  void pair(String code) {
-    _channel?.sink.add(jsonEncode({'type': 'pair', 'code': code}));
+  /// 当前是否处于「可以发命令」的连接态（连上网关或已配对）
+  bool get _canSend => _channel != null && (_state == ConnState.connected || _state == ConnState.paired);
+
+  /// 发送配对码；未连接时返回 false（局域网页据此提示，而不是静默无反应）
+  bool pair(String code) {
+    if (!_canSend) return false;
+    try {
+      _channel!.sink.add(jsonEncode({'type': 'pair', 'code': code}));
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
-  /// 请求设备列表（网关中继多设备：网关返回 devices_list 事件）
-  void listDevices() {
-    _channel?.sink.add(jsonEncode({'type': 'list_devices'}));
+  /// 请求设备列表（网关中继多设备：网关返回 devices_list 事件）。
+  /// 返回 false = 当前没连接可发（调用方需给出提示，不能让用户点了按钮毫无反馈）。
+  bool listDevices() {
+    if (!_canSend) return false;
+    try {
+      _channel!.sink.add(jsonEncode({'type': 'list_devices'}));
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// 查询当前待处理的审批/提问请求（连接后恢复弹窗）。
@@ -270,12 +502,23 @@ class WsClient {
     return sendCommand('get_pending_requests');
   }
 
-  /// 发送命令，返回结果（带超时兜底）
+  /// 发送命令，返回结果（带超时兜底）。
+  /// 未连接时**立即失败返回**：之前把命令写进一个不存在/已关闭的 sink，
+  /// 要么 _channel 为 null 时静默不发、白等 60 秒超时，要么对已关闭 sink add 直接抛异常，
+  /// 在「已登录但未连上任何桌面端」的场景下会让会话列表转圈一分钟。
   Future<CmdResult> sendCommand(String cmd, [Map<String, dynamic>? payload]) {
+    if (!_canSend) {
+      return Future.value(CmdResult(false, null, '未连接桌面端：该设备可能不在线，请重试或切换设备'));
+    }
     final id = ++_cmdSeq;
     final c = Completer<CmdResult>();
     _pending[id] = c;
-    _channel?.sink.add(jsonEncode({'type': 'cmd', 'id': id, 'cmd': cmd, 'payload': payload ?? const {}}));
+    try {
+      _channel!.sink.add(jsonEncode({'type': 'cmd', 'id': id, 'cmd': cmd, 'payload': payload ?? const {}}));
+    } catch (e) {
+      _pending.remove(id);
+      return Future.value(CmdResult(false, null, '发送失败：$e'));
+    }
     return c.future.timeout(const Duration(seconds: 60), onTimeout: () {
       _pending.remove(id);
       return CmdResult(false, null, '命令超时');
@@ -284,7 +527,10 @@ class WsClient {
 
   Future<void> dispose() async {
     _autoReconnect = false; // 主动销毁，停止自动重连
+    cancelReconnect();
+    _connSeq++; // 让所有在途回调按「旧连接」被忽略
     await _sub?.cancel();
+    _sub = null;
     _abortChannel();
     await _events.close();
     await _stateCtrl.close();

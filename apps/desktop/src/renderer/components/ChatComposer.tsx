@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import { Composer } from './Composer'
-import type { AttachmentItem, GatewayModel } from '../types'
+import type { AttachmentItem, DmQuotePayload, GatewayModel } from '../types'
 import { readFileAsDataUrl } from './ui'
 
 /**
@@ -46,6 +46,9 @@ export interface ChatComposerProps {
   composerRef: React.MutableRefObject<ChatComposerState>
   /** 外部重置信号（草稿恢复 / 新建清空 / 发送清空） */
   seed: ChatComposerSeed
+  /** 【红线】私信引用来源提示条（由 App 在用户显式点击「引用到会话」后设置；不自动发送） */
+  quote?: DmQuotePayload | null
+  onClearQuote?: () => void
 }
 
 /** PCM(Float32 16kHz) → 16-bit 单声道 PCM 的 base64 */
@@ -338,6 +341,8 @@ const ChatComposerInner = memo(function ChatComposerInner(p: ChatComposerProps):
       busy={p.busy}
       send={p.send}
       stopSend={p.stopSend}
+      quote={p.quote}
+      onClearQuote={p.onClearQuote}
     />
   )
 })

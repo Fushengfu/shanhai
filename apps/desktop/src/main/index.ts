@@ -4,9 +4,12 @@ import { getRuntime, setRuntime } from './runtime'
 import { initUiStore } from './ui-store'
 import { registerPush } from './push'
 import { registerIpc } from './ipc-handlers'
-import { startRemoteRelay } from './remote-relay'
+import { startRemoteRelay, reconnectWithFreshCredential } from './remote-relay'
+import { startCredentialRenewal, stopCredentialRenewal, onCredentialSnapshot } from './member-credentials'
+import { startMemberChannel, reconnectMemberChannelWithFreshCredential } from './member-channel'
 import { startRemoteServer } from './remote-server'
-import { createWindow, loadWindowContent, showChatWindow, toggleChatWindow, ensureDesktopLayer, ICON_PATH } from './window-manager'
+import { createWindow, loadWindowContent, showChatWindow, toggleChatWindow, ensureDesktopLayer, openApp, getOrCreateSupervisorWindow, ICON_PATH } from './window-manager'
+import { subscribeMemberUnread } from './member-channel'
 import { scheduleStartupUpdateCheck } from './app-updater'
 import { reportDeviceStartup } from './device-report'
 import { refreshDockMenu } from './dock-menu'
@@ -16,6 +19,10 @@ const TOGGLE_SHORTCUT = 'CommandOrControl+Shift+Space'
 
 // 保持引用防止 Tray 被 GC（模块级，仅创建时赋值）
 let tray: Tray | null = null
+/** 会员私信未读订阅的退订句柄（托盘菜单实时刷新未读项用） */
+let memberUnreadOff: (() => void) | null = null
+/** 凭证状态订阅的退订句柄（续签成功后驱动两条连接重连） */
+let credentialSnapshotOff: (() => void) | null = null
 let isQuitting = false
 
 function createTrayIcon(): NativeImage {
@@ -25,22 +32,32 @@ function createTrayIcon(): NativeImage {
   return scaled
 }
 
+/** 托盘菜单：按当前私信未读数重建（未登录/无未读时不显示该项，保持菜单干净） */
+function refreshTrayMenu(unreadTotal: number): void {
+  if (!tray || tray.isDestroyed()) return
+  const template: Electron.MenuItemConstructorOptions[] = [
+    { label: '显示主窗口', click: () => showChatWindow() },
+  ]
+  if (unreadTotal > 0) {
+    template.push({ label: `打开私信（${unreadTotal > 99 ? '99+' : unreadTotal} 条未读）`, click: () => void openApp('messages') })
+  }
+  template.push({ type: 'separator' })
+  template.push({
+    label: '退出山海',
+    click: () => {
+      isQuitting = true
+      app.quit()
+    },
+  })
+  tray.setContextMenu(Menu.buildFromTemplate(template))
+}
+
 function createTray(): void {
   tray = new Tray(createTrayIcon())
   tray.setToolTip('山海 AI 助手')
-  tray.setContextMenu(
-    Menu.buildFromTemplate([
-      { label: '显示主窗口', click: () => showChatWindow() },
-      { type: 'separator' },
-      {
-        label: '退出山海',
-        click: () => {
-          isQuitting = true
-          app.quit()
-        },
-      },
-    ]),
-  )
+  refreshTrayMenu(0)
+  // 订阅会员私信未读变化（主进程内回调，不经渲染层），实时刷新托盘未读项
+  memberUnreadOff = subscribeMemberUnread((u) => refreshTrayMenu(u?.total ?? 0))
   // macOS 左键单击托盘图标唤出窗口（右键仍走 contextMenu）
   tray.on('click', () => showChatWindow())
 }
@@ -75,12 +92,25 @@ if (!gotSingleInstanceLock) {
     // 失败静默、不阻塞启动，这里不 await（否则拖慢窗口创建）。
     void reportDeviceStartup()
 
-    // 启动时若已登录（本地凭证已恢复），自动开启远程连接（外网中继 + 局域网）。
+    // 启动时若已登录（本地凭证已恢复），自动开启远程连接（外网中继 + 局域网）与会员通道（私信/好友）。
     // 未登录则不开启，登录后由 auth:login 触发开启；退出登录由 auth:logout 自动关闭。
+    // 会员通道必须是第二条独立连接（role=member），与上面的 host 远程控制连接互不复用。
     if (getRuntime().loggedIn) {
       startRemoteRelay()
       startRemoteServer()
+      startMemberChannel()
     }
+    // 凭证续签（会员 JWT 到期前自动续签 + 401 时先续签再重连）：
+    // 必须在两条连接之后拉起，让「启动即已过期」的立即检查能顺带把两条连接带新 token 重连。
+    startCredentialRenewal()
+    // 续签成功 → 通知远程控制与私信两条连接立即用新 token 重连（不等下一次退避）
+    let lastRotated: number | null = null
+    credentialSnapshotOff = onCredentialSnapshot((snap) => {
+      if (!snap.lastRotatedAt || snap.lastRotatedAt === lastRotated) return
+      lastRotated = snap.lastRotatedAt
+      reconnectWithFreshCredential()
+      reconnectMemberChannelWithFreshCredential()
+    })
 
     // 桌面壳窗口（全屏壁纸，忽略鼠标作为背景层；先创建，后续窗口浮在其上）
     const desktopWin = createWindow({ type: 'desktop' })
@@ -90,14 +120,19 @@ if (!gotSingleInstanceLock) {
     await loadWindowContent(dockWin)
     // 聊天窗口（浮动在桌面之上，承载对话主界面）：默认隐藏，启动时仅显示桌面壳 + Dock + 会话管家窗口，
     // 用户通过 Dock「聊天」图标 / 托盘 / 全局快捷键打开聊天窗口
-    const chatWin = createWindow({ type: 'chat', appId: 'subSession', show: false })
+    const chatWin = createWindow({ type: 'chat', appId: 'subSession', show: true })
     await loadWindowContent(chatWin)
     // 会话管家窗口（独立常驻，右侧停靠，承载主 Agent 单会话聊天界面）
-    const supervisorWin = createWindow({ type: 'supervisor', width: 500, height: 760, appId: 'mainSession' })
-    await loadWindowContent(supervisorWin)
+    // ⚠️ 必须走 getOrCreateSupervisorWindow（全进程【唯一】创建入口）：旧写法在这里直接 createWindow，
+    // 与 showSupervisorWindow 形成两个入口，且打的 appId 'mainSession' 让按类型查找恒失配 →
+    // 点关闭关不掉（还无条件弹悬浮图标）、点悬浮图标又新建一个 → 「悬浮按钮与窗口共存 + 两个管家窗口」。
+    const { win: supervisorWin, created: supervisorCreated } = getOrCreateSupervisorWindow({ width: 500, height: 760 })
+    if (supervisorCreated) await loadWindowContent(supervisorWin)
     registerPush()
 
-    // 启动应用版本自动检查：1 秒后查一次，之后每 10 分钟查一次（发现新版本主动推送渲染层亮角标）
+    // 启动应用版本自动检查：1 秒后查一次，之后每 10 分钟查一次。
+    // 发现新版本由主进程弹原生对话框提醒（同一版本号只自动弹一次，跨重启持久化）；
+    // 检查结果同时广播到所有窗口，下载过程在渲染层显示进度浮层。
     scheduleStartupUpdateCheck(chatWin)
 
     // 恢复已安装插件（AI 自研应用跨会话/跨重启留存）：在窗口就绪 + 广播注册后执行，
@@ -137,6 +172,12 @@ if (!gotSingleInstanceLock) {
   })
 
   app.on('will-quit', () => {
+    // 退订会员未读监听（托盘菜单 / Dock 角标），避免退出流程里回调打到已销毁的 Tray
+    memberUnreadOff?.()
+    memberUnreadOff = null
+    credentialSnapshotOff?.()
+    credentialSnapshotOff = null
+    stopCredentialRenewal()
     globalShortcut.unregisterAll()
   })
 

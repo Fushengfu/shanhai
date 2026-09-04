@@ -30,6 +30,24 @@ export interface RemoteStatus {
 }
 
 /** 远程连接（网关中继，外网可达）状态 */
+/** 凭证三态快照（与 main/member-credentials.ts 的 CredentialSnapshot 对齐；不含 token 本体） */
+export interface CredentialSnapshot {
+  state: 'anonymous' | 'valid' | 'renewing' | 'expired' | 'unknown'
+  username: string | null
+  expiresAt: number | null
+  ttlSeconds: number | null
+  remainingMs: number | null
+  expiresAtSource: 'config' | 'jwt' | 'none'
+  renewalActive: boolean
+  lastRotatedAt: number | null
+  lastErrorCode: string | null
+  lastError: string | null
+  failureCount: number
+  updatedAt: number
+  /** 主进程算好的人类可读文案（界面直接展示，避免两端各写一套判定） */
+  text?: string
+}
+
 export interface RelayStatus {
   enabled: boolean
   connected: boolean
@@ -53,6 +71,27 @@ export interface AppUpdateCheckResult {
   forceUpdate?: boolean
   downloadTriggered?: boolean
   message?: string
+  /** 失败阶段（success=false 时有值）：check=检查/网络，download=下载，verify=校验，install=安装 */
+  failureStage?: 'check' | 'download' | 'verify' | 'install'
+}
+
+/** 安装包下载进度阶段 */
+export type UpdateDownloadPhase = 'pending' | 'downloading' | 'verifying' | 'completed' | 'failed' | 'cancelled'
+
+/** 安装包下载进度（主进程 → 渲染层，广播到所有内容窗口） */
+export interface AppUpdateDownloadProgress {
+  phase: UpdateDownloadPhase
+  fileName: string
+  receivedBytes: number
+  /** 服务端未返回 Content-Length 时为 0 */
+  totalBytes: number
+  /** 0-100；总量未知时为 -1（渲染层显示不确定态进度条） */
+  percent: number
+  bytesPerSecond: number
+  savePath: string
+  latestVersion?: string
+  message?: string
+  updatedAt: number
 }
 
 /** 手机端（Android）APK 下载信息 */
@@ -299,16 +338,88 @@ export interface ShanhaiBridge {
   relayDisable(): Promise<RelayStatus>
   /** 查询网关中继状态 */
   relayStatus(): Promise<RelayStatus>
+  /** 凭证三态快照（未登录 / 已登录有效 / 已登录但过期） */
+  getCredentialStatus(): Promise<CredentialSnapshot>
+  /** 订阅凭证状态变化（续签成功 / 失败 / 判失效时主进程广播 credential:status） */
+  onCredentialStatus(cb: (snap: CredentialSnapshot) => void): () => void
   /** 订阅网关中继状态变化（连接成功/失败/401 失效时主进程推送），返回取消订阅函数 */
   onRelayStatus(cb: (status: RelayStatus) => void): () => void
+  // —— 会员实时通讯底座（私信 / 好友）：内置侧专用，凭证只在主进程 ——
+  /** 查询会员通道状态（连接中/离线/凭证失效/本账号 memberId） */
+  memberStatus(): Promise<MemberChannelStatus>
+  /** 手动重连会员通道（失败态的「重试」按钮） */
+  memberRetry(): Promise<MemberChannelStatus>
+  /** 主动向网关（HTTP）刷新好友列表 + 待处理申请 + 红点数 */
+  memberRefreshFriends(): Promise<MemberResult>
+  /** 拉取好友 + 待处理申请 + 红点数快照（本地缓存，权威来自 HTTP） */
+  memberFriends(): Promise<{ friends: DmFriend[]; requests: DmFriendRequest[]; requestCount: number }>
+  /** 拉取私信会话列表（本地缓存，按最近活跃倒序） */
+  memberThreads(): Promise<DmThread[]>
+  /** 主动从网关 HTTP 拉会话列表（含每会话未读），返回合并后的会话 */
+  memberPullThreads(): Promise<DmThread[]>
+  /** 未读汇总（总数 + 按通道） */
+  memberUnread(): Promise<DmUnread>
+  /** 会员检索：只支持用户名精确匹配（定稿：不做邀请码入口，防会员枚举） */
+  memberSearch(username: string): Promise<MemberResult & { members: DmFriend[]; notFound?: boolean }>
+  /** 发起好友申请（HTTP POST /friends/request，带申请附言） */
+  memberRequestFriend(input: { targetMemberId: string; message?: string }): Promise<MemberResult>
+  /** 同意好友申请（HTTP；双向确认后才有私信通道） */
+  memberAcceptFriend(targetMemberId: string): Promise<MemberResult>
+  /** 拒绝好友申请（HTTP） */
+  memberRejectFriend(targetMemberId: string): Promise<MemberResult>
+  /** 删除好友（HTTP；定稿：硬删双向解除，历史保留但需重新加好友才能再发） */
+  memberDeleteFriend(memberId: string): Promise<MemberResult>
+  /** 订阅某私信通道（打开会话时调用）：ws subscribe + HTTP 拉一页历史，返回合并后的会话 */
+  memberSubscribe(channelId: string): Promise<DmThread | null>
+  /** 让主进程算出与某好友的 1v1 channelId（本账号 memberId 只在主进程可见） */
+  memberChannelId(peerMemberId: string): Promise<string | null>
+  /** 取消订阅某私信通道（切走/关闭时调用） */
+  memberUnsubscribe(channelId: string): Promise<void>
+  /** 分页拉取历史（HTTP 权威，before=时间戳游标；失败退回本地缓存并带 error） */
+  memberHistory(input: { channelId: string; page?: number; pageSize?: number }): Promise<{ messages: DmMessage[]; hasMore: boolean; total: number; page: number; error: string | null }>
+  /** 发送私信（好友前提 / 4000 字节上限 / 按会员限流 由主进程预检并如实返回原因） */
+  memberSend(input: { peerMemberId?: string; channelId?: string; text: string; peerName?: string }): Promise<MemberResult & { msgId?: string; channelId?: string }>
+  /** 标记某通道已读（HTTP 上报，多设备按会员维度共享：任一设备读过即已读） */
+  memberMarkRead(channelId: string): Promise<MemberResult>
+  /**
+   * 【红线】把某条私信引用到指定会话的输入框：只写输入框，不自动发送、不进任何 Agent 上下文，
+   * 必须由本地用户在私信面板显式点击触发。
+   */
+  memberQuoteToSession(input: { sessionId: string; channelId: string; msgId: string }): Promise<MemberResult>
+  /** 订阅会员通道状态变化（member:status 广播） */
+  onMemberStatus(cb: (status: MemberChannelStatus) => void): () => void
+  /** 订阅私信消息（member:message，仅投递给已订阅该通道的窗口） */
+  onMemberMessage(cb: (msg: DmMessage) => void): () => void
+  /** 订阅好友/申请列表变化（member:friends 广播，含红点数 requestCount） */
+  onMemberFriends(cb: (snapshot: { friends: DmFriend[]; requests: DmFriendRequest[]; requestCount: number; ts: number }) => void): () => void
+  /** 订阅「历史已合并」事件（member:history，HTTP 拉取后定向推给订阅了该通道的窗口） */
+  onMemberHistory(cb: (payload: { channelId: string; messages: DmMessage[]; hasMore: boolean; total: number }) => void): () => void
+  /** 订阅「打开指定会话」指令（点系统通知直达对应私信会话） */
+  onMemberOpenThread(cb: (payload: { channelId: string; ts: number }) => void): () => void
+  /** 订阅「切换面板分区」指令（点好友申请通知直达好友分区） */
+  onMemberOpenTab(cb: (payload: { tab: 'dm' | 'friends'; ts: number }) => void): () => void
+  /** 订阅未读汇总变化（member:unread 广播） */
+  onMemberUnread(cb: (unread: DmUnread) => void): () => void
+  /** 订阅会员通道错误提示（member:error，按真实原因分类，不统一成「连不上服务器」） */
+  onMemberError(cb: (err: MemberErrorPayload) => void): () => void
+  /** 订阅会员通道业务通知（member:notice：申请受理/被删好友/通道接入等） */
+  onMemberNotice(cb: (notice: MemberNotice) => void): () => void
+  /** 订阅「把私信引用到本会话输入框」事件（聊天窗口 / 管家窗口按会话类型二选收到），返回取消订阅函数 */
+  onDmQuoteToSession(cb: (payload: DmQuotePayload) => void): () => void
   /** 获取当前应用版本号（package.json version） */
   getVersion(): Promise<string>
   /** 手动检查更新（弹窗引导下载/安装），返回检查结果 */
   checkUpdate(): Promise<AppUpdateCheckResult>
   /** 获取最近一次版本检查结果（自动检查或手动检查） */
   getUpdateStatus(): Promise<AppUpdateCheckResult | null>
-  /** 订阅主进程自动检查发现新版本时的推送，返回取消订阅函数 */
+  /** 订阅主进程自动检查发现新版本时的推送（现广播到所有窗口），返回取消订阅函数 */
   onUpdateAvailable(cb: (result: AppUpdateCheckResult) => void): () => void
+  /** 订阅安装包下载进度（主进程广播 app:update-download-progress），返回取消订阅函数 */
+  onUpdateDownloadProgress(cb: (progress: AppUpdateDownloadProgress) => void): () => void
+  /** 拉取最近一次下载进度快照（中途新开的窗口据此立刻显示正在进行的下载） */
+  getUpdateDownloadProgress(): Promise<AppUpdateDownloadProgress | null>
+  /** 取消正在进行的安装包下载，返回是否成功发起取消 */
+  cancelUpdateDownload(): Promise<boolean>
   /** 获取手机端（Android）APK 下载信息（下载地址 + 版本号），失败返回 null */
   getMobileApkInfo(packageName: string): Promise<MobileApkInfo | null>
   /** 插件市场：拉取公开插件列表（接口未就绪时返回 ok=false + error） */
@@ -398,7 +509,8 @@ export interface ShanhaiBridge {
   // 模型 / 中断 / 语音 / 电脑
   switchModel(id: string): Promise<void>
   getCurrentModelId(): Promise<string>
-  stop(): Promise<void>
+  /** 停止执行；不传 sessionId = 停「当前激活会话」（聊天窗口），传了 = 按 id 精确停（管家窗口传 'supervisor'） */
+  stop(sessionId?: string): Promise<void>
   speak(text: string): Promise<void>
   transcribeAudio(audioBase64: string, format?: string): Promise<string>
   // token 用量（会话级）
@@ -487,6 +599,122 @@ export interface HttpTraceRecord {
   error?: string
 }
 
+// —————————————————— 会员实时通讯底座（私信 / 好友）类型 ——————————————————
+// 与主进程 apps/desktop/src/main/member-channel.ts 对齐（三处同构声明：main / preload / renderer types）。
+
+/** 会员通道状态 */
+export interface MemberChannelStatus {
+  enabled: boolean
+  connected: boolean
+  /** 能否收发：connected 且已知本账号 memberId */
+  ready: boolean
+  url: string
+  username: string | null
+  memberId: string | null
+  error: string | null
+  authFailed: boolean
+  subscribedChannels: string[]
+  updatedAt: number
+}
+
+/** 好友条目 */
+export interface DmFriend {
+  memberId: string
+  username: string
+  nickname?: string
+  online?: boolean
+}
+
+/** 待处理的好友申请 */
+export interface DmFriendRequest {
+  requestId: string
+  fromMemberId: string
+  fromUsername: string
+  fromNickname?: string
+  /** 对方申请时写的附言（定稿载荷 requestMsg） */
+  message?: string
+  ts: number
+}
+
+/** 一条私信 */
+export interface DmMessage {
+  msgId: string
+  channelId: string
+  from: string
+  fromName: string
+  to?: string
+  text: string
+  ts: number
+  mine: boolean
+  /** 逐条已读回执网关未实现，保持 false（UI 不谎报「已读」） */
+  read?: boolean
+  /**
+   * 网关 messageId（契约 v1 去重键）。网关按 memberID 投递给该会员所有活跃连接，
+   * 自己发的消息自己的其它设备也会收到：本地乐观气泡 serverId 留空，回声到达后回填。
+   */
+  serverId?: string
+  /** 本地乐观气泡：已提交网关、尚未认领到 messageId */
+  pending?: boolean
+  failed?: string | null
+  /** 消息来源：本轮恒为 'dm'（将来插件接入同一条通道时只是多一个枚举值） */
+  origin?: 'dm' | string
+}
+
+/** 私信会话线程 */
+export interface DmThread {
+  channelId: string
+  peerId: string
+  peerName: string
+  messages: DmMessage[]
+  unread: number
+  lastTs: number
+}
+
+/** 未读汇总 */
+export interface DmUnread {
+  total: number
+  byChannel: Record<string, number>
+}
+
+/** 统一返回体 */
+export interface MemberResult {
+  ok: boolean
+  message: string
+}
+
+/** 会员通道错误载荷（按真实原因分类） */
+export interface MemberErrorPayload {
+  code: string
+  message: string
+  channelId: string | null
+}
+
+/** 会员通道业务通知（申请受理 / 被删好友 / 通道接入等） */
+export interface MemberNotice {
+  kind: 'friend_request_result' | 'friend_removed' | 'subscribed'
+  ok?: boolean
+  peer: string
+  message: string
+  ts: number
+}
+
+/** 「把某条私信引用到会话输入框」事件载荷（仅聊天窗口收到） */
+export interface DmQuotePayload {
+  sessionId: string
+  channelId: string
+  msgId: string
+  /** 来源展示名（渲染层引用卡片用，不拼进正文） */
+  fromName: string
+  /** 来源会员 id */
+  fromMemberId: string
+  /** 私信原文（不含任何拼接前缀；追加进输入框的就是它） */
+  text: string
+  /** 私信自身时间 */
+  ts: number
+  /** 本次投递时间 */
+  at: number
+}
+
 /** 从 additionalArguments 读取窗口类型/应用 id（主进程注入，sandbox 下 process.argv 仍含这些值） */
 function readArg(prefix: string): string | undefined {
   const arg = process.argv.find((a) => a.startsWith(prefix))
@@ -563,10 +791,86 @@ const bridge: ShanhaiBridge = {
   relayEnable: (url) => ipcRenderer.invoke('remote:relayEnable', url),
   relayDisable: () => ipcRenderer.invoke('remote:relayDisable'),
   relayStatus: () => ipcRenderer.invoke('remote:relayStatus'),
+  getCredentialStatus: () => ipcRenderer.invoke('auth:credentialStatus'),
+  onCredentialStatus: (cb) => {
+    const listener = (_e: unknown, snap: CredentialSnapshot) => cb(snap)
+    ipcRenderer.on('credential:status', listener)
+    return () => ipcRenderer.removeListener('credential:status', listener)
+  },
   onRelayStatus: (cb) => {
     const listener = (_e: unknown, status: RelayStatus) => cb(status)
     ipcRenderer.on('relay:status', listener)
     return () => ipcRenderer.removeListener('relay:status', listener)
+  },
+  // —— 会员实时通讯底座（私信 / 好友）：内置侧专用（插件物理拿不到本桥，见 window-manager 的 plugin.cjs 分支）——
+  memberStatus: () => ipcRenderer.invoke('member:status'),
+  memberRetry: () => ipcRenderer.invoke('member:retry'),
+  memberRefreshFriends: () => ipcRenderer.invoke('member:freshFriends'),
+  memberFriends: () => ipcRenderer.invoke('member:friends'),
+  memberThreads: () => ipcRenderer.invoke('member:threads'),
+  memberPullThreads: () => ipcRenderer.invoke('member:pullThreads'),
+  memberUnread: () => ipcRenderer.invoke('member:unread'),
+  memberSearch: (username) => ipcRenderer.invoke('member:search', username),
+  memberRequestFriend: (input) => ipcRenderer.invoke('member:requestFriend', input),
+  memberAcceptFriend: (targetMemberId) => ipcRenderer.invoke('member:acceptFriend', targetMemberId),
+  memberRejectFriend: (targetMemberId) => ipcRenderer.invoke('member:rejectFriend', targetMemberId),
+  memberDeleteFriend: (memberId) => ipcRenderer.invoke('member:deleteFriend', memberId),
+  memberSubscribe: (channelId) => ipcRenderer.invoke('member:subscribe', channelId),
+  memberChannelId: (peerMemberId) => ipcRenderer.invoke('member:channelId', peerMemberId),
+  memberUnsubscribe: (channelId) => ipcRenderer.invoke('member:unsubscribe', channelId),
+  memberHistory: (input) => ipcRenderer.invoke('member:history', input),
+  memberSend: (input) => ipcRenderer.invoke('member:send', input),
+  memberMarkRead: (channelId) => ipcRenderer.invoke('member:markRead', channelId),
+  memberQuoteToSession: (input) => ipcRenderer.invoke('member:quoteToSession', input),
+  onMemberStatus: (cb) => {
+    const listener = (_e: unknown, status: MemberChannelStatus) => cb(status)
+    ipcRenderer.on('member:status', listener)
+    return () => ipcRenderer.removeListener('member:status', listener)
+  },
+  onMemberMessage: (cb) => {
+    const listener = (_e: unknown, msg: DmMessage) => cb(msg)
+    ipcRenderer.on('member:message', listener)
+    return () => ipcRenderer.removeListener('member:message', listener)
+  },
+  onMemberFriends: (cb) => {
+    const listener = (_e: unknown, snapshot: { friends: DmFriend[]; requests: DmFriendRequest[]; requestCount: number; ts: number }) => cb(snapshot)
+    ipcRenderer.on('member:friends', listener)
+    return () => ipcRenderer.removeListener('member:friends', listener)
+  },
+  onMemberHistory: (cb) => {
+    const listener = (_e: unknown, payload: { channelId: string; messages: DmMessage[]; hasMore: boolean; total: number }) => cb(payload)
+    ipcRenderer.on('member:history', listener)
+    return () => ipcRenderer.removeListener('member:history', listener)
+  },
+  onMemberOpenThread: (cb) => {
+    const listener = (_e: unknown, payload: { channelId: string; ts: number }) => cb(payload)
+    ipcRenderer.on('member:open-thread', listener)
+    return () => ipcRenderer.removeListener('member:open-thread', listener)
+  },
+  onMemberOpenTab: (cb) => {
+    const listener = (_e: unknown, payload: { tab: 'dm' | 'friends'; ts: number }) => cb(payload)
+    ipcRenderer.on('member:open-tab', listener)
+    return () => ipcRenderer.removeListener('member:open-tab', listener)
+  },
+  onMemberUnread: (cb) => {
+    const listener = (_e: unknown, unread: DmUnread) => cb(unread)
+    ipcRenderer.on('member:unread', listener)
+    return () => ipcRenderer.removeListener('member:unread', listener)
+  },
+  onMemberError: (cb) => {
+    const listener = (_e: unknown, err: MemberErrorPayload) => cb(err)
+    ipcRenderer.on('member:error', listener)
+    return () => ipcRenderer.removeListener('member:error', listener)
+  },
+  onMemberNotice: (cb) => {
+    const listener = (_e: unknown, notice: MemberNotice) => cb(notice)
+    ipcRenderer.on('member:notice', listener)
+    return () => ipcRenderer.removeListener('member:notice', listener)
+  },
+  onDmQuoteToSession: (cb) => {
+    const listener = (_e: unknown, payload: DmQuotePayload) => cb(payload)
+    ipcRenderer.on('dm:quote-to-session', listener)
+    return () => ipcRenderer.removeListener('dm:quote-to-session', listener)
   },
   getVersion: () => ipcRenderer.invoke('app:get-version'),
   checkUpdate: () => ipcRenderer.invoke('app:check-update'),
@@ -576,6 +880,13 @@ const bridge: ShanhaiBridge = {
     ipcRenderer.on('app:update-available', listener)
     return () => ipcRenderer.removeListener('app:update-available', listener)
   },
+  onUpdateDownloadProgress: (cb) => {
+    const listener = (_e: unknown, progress: AppUpdateDownloadProgress) => cb(progress)
+    ipcRenderer.on('app:update-download-progress', listener)
+    return () => ipcRenderer.removeListener('app:update-download-progress', listener)
+  },
+  getUpdateDownloadProgress: () => ipcRenderer.invoke('app:get-update-download-progress'),
+  cancelUpdateDownload: () => ipcRenderer.invoke('app:cancel-update-download'),
   getMobileApkInfo: (packageName) => ipcRenderer.invoke('mobile:get-apk-info', packageName),
   listMarketPlugins: (params) => ipcRenderer.invoke('market:list', params),
   installMarketPlugin: (pluginId) => ipcRenderer.invoke('market:install', pluginId),
@@ -644,7 +955,7 @@ const bridge: ShanhaiBridge = {
   setApprovalPolicy: (policy) => ipcRenderer.invoke('approval:setPolicy', policy),
   switchModel: (id) => ipcRenderer.invoke('model:switch', id),
   getCurrentModelId: () => ipcRenderer.invoke('model:current'),
-  stop: () => ipcRenderer.invoke('chat:stop'),
+  stop: (sessionId?: string) => ipcRenderer.invoke('chat:stop', sessionId),
   speak: (text) => ipcRenderer.invoke('voice:speak', text),
   transcribeAudio: (audioBase64, format) => ipcRenderer.invoke('voice:transcribe', audioBase64, format),
   getTokenStats: (sessionId) => ipcRenderer.invoke('token:stats', sessionId),

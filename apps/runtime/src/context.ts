@@ -93,6 +93,13 @@ export interface RuntimeContext {
   gatewayBaseUrl: string
   /** 会员 JWT（登录后持久化到 config.json，启动时用于重新拉取最新模型列表） */
   memberToken: string
+  /**
+   * 会员 JWT 的绝对过期时间（毫秒时间戳）。null = 未知（老 config 无该字段 / 网关未下发 / 无法解码），
+   * 未知时不得判过期（见 desktop 侧 member-credentials.ts 的三态判定与降级策略）。
+   */
+  memberTokenExpiresAt: number | null
+  /** 会员 JWT 的 TTL（秒），用于「剩余 < 20% 触发续签」的比例阈值；null = 未知 */
+  memberTokenTtlSeconds: number | null
   gatewayModels: GatewayModel[]
   /** 用户自定义模型（OpenAI 兼容端点 + 自有 Key，独立于系统内置模型） */
   customModels: GatewayModel[]

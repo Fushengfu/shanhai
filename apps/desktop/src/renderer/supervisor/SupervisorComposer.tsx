@@ -1,14 +1,21 @@
 import * as React from 'react'
 import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import { Composer } from '../components/Composer'
-import type { AttachmentItem, GatewayModel } from '../types'
+import type { AttachmentItem, DmQuotePayload, GatewayModel } from '../types'
 import { readFileAsDataUrl } from '../components/ui'
+import { useDismissOnClickOutside } from '../components/useDismissOnClickOutside'
 
 /** 通过 ref 暴露给父组件（SupervisorApp）的输入区读取接口：send 时从 ref 取当前输入，使键入不再冒泡到顶层 */
 export interface SupervisorComposerHandle {
   getInput(): string
   getAttachments(): AttachmentItem[]
   clearInput(): void
+  /**
+   * 【安全红线唯一注入口】把外部文本**追加**到管家输入框（等价于本地用户自己敲进去这段话）。
+   * 只写输入框：不发送、不进消息流 items、不进 Agent 上下文、不触发工具执行或审批。
+   * 供「私信 → 引用到会话（会话管家）」在本地用户显式点击后调用。
+   */
+  appendInput(text: string): void
 }
 
 export interface SupervisorComposerProps {
@@ -20,6 +27,9 @@ export interface SupervisorComposerProps {
   setPreviewImage: (v: string | null) => void
   onSend: () => Promise<void>
   onStop: () => void
+  /** 【红线】私信引用来源提示条（由 SupervisorApp 在用户显式点击后设置；不自动发送） */
+  quote?: DmQuotePayload | null
+  onClearQuote?: () => void
 }
 
 /** PCM(Float32 16kHz) → 16-bit 单声道 PCM 的 base64（与聊天窗口一致） */
@@ -55,8 +65,16 @@ const SupervisorComposerInner = forwardRef<SupervisorComposerHandle, SupervisorC
     const [attachments, setAttachments] = useState<AttachmentItem[]>([])
     const [recording, setRecording] = useState(false)
     const [voiceNotice, setVoiceNotice] = useState('')
-    const [modelMenuOpen, setModelMenuOpen] = useState(false)
-    const [approvalMenuOpen, setApprovalMenuOpen] = useState(false)
+    /**
+     * 模型下拉 / 安全模式下拉的开合状态。
+     *
+     * 用**单一真值源** openMenu（'model' | 'approval' | null）而不是两个独立 boolean：
+     * 两个下拉都挂在同一行工具栏、都向上弹出，若允许同时打开会互相重叠遮挡。
+     * 单值天然保证「开一个必关另一个」（互斥），也省掉一对容易写歪的交叉 setState。
+     */
+    const [openMenu, setOpenMenu] = useState<'model' | 'approval' | null>(null)
+    const modelMenuOpen = openMenu === 'model'
+    const approvalMenuOpen = openMenu === 'approval'
     const [supervisorModel, setSupervisorModel] = useState('')
     const [supervisorApproval, setSupervisorApproval] = useState<'ask' | 'workdir' | 'never'>('ask')
 
@@ -66,6 +84,33 @@ const SupervisorComposerInner = forwardRef<SupervisorComposerHandle, SupervisorC
     const isComposingRef = useRef(false)
     const mediaRecorderRef = useRef<{ stop: () => void } | null>(null)
 
+    /**
+     * 下面两个 setter 是 Composer 要求的 `Dispatch<SetStateAction<boolean>>` 形状，
+     * 内部桥接到 openMenu：传函数式更新时按「本菜单当前是否开着」求值，求值为 true 即独占
+     * （自动关掉另一个），为 false 则只在确实开着时收起。这样 Composer 无需任何改动，
+     * 互斥逻辑只作用于管家窗口（普通会话窗口的下拉行为本轮不动）。
+     */
+    const setModelMenuOpen = useCallback((v: React.SetStateAction<boolean>): void => {
+      setOpenMenu((prev) => {
+        const next = typeof v === 'function' ? v(prev === 'model') : v
+        return next ? 'model' : prev === 'model' ? null : prev
+      })
+    }, [])
+    const setApprovalMenuOpen = useCallback((v: React.SetStateAction<boolean>): void => {
+      setOpenMenu((prev) => {
+        const next = typeof v === 'function' ? v(prev === 'approval') : v
+        return next ? 'approval' : prev === 'approval' ? null : prev
+      })
+    }, [])
+    /** 收起当前展开的下拉（点本窗口内外面 / 按 Esc 两条路径共用；两个下拉走同一套机制） */
+    const dismissMenu = useCallback((): void => setOpenMenu(null), [])
+
+    // 两个下拉共用同一个 hook：点**本窗口内**其他位置（mousedown + contains）或按 Esc 才收起；
+    // 点到别的软件 / 系统桌面 / 桌面壳 / Dock（跨窗口）不收起，与普通会话窗口的下拉口径一致。
+    // 监听只在展开期间挂载，收起/卸载即移除，常驻窗口反复开合不会累积监听器。
+    useDismissOnClickOutside({ open: modelMenuOpen, containerRef: modelMenuRef, onDismiss: dismissMenu })
+    useDismissOnClickOutside({ open: approvalMenuOpen, containerRef: approvalMenuRef, onDismiss: dismissMenu })
+
     useImperativeHandle(
       ref,
       () => ({
@@ -74,6 +119,11 @@ const SupervisorComposerInner = forwardRef<SupervisorComposerHandle, SupervisorC
         clearInput: () => {
           setInput('')
           setAttachments([])
+        },
+        // 追加而非覆盖：绝不清掉用户已经打好的草稿（照语音听写那条 setInput(prev => prev ? prev+text : text) 的写法）
+        appendInput: (text: string) => {
+          if (!text) return
+          setInput((prev) => (prev.trim() ? `${prev.replace(/\s+$/, '')}\n\n${text}` : text))
         },
       }),
       [input, attachments],
@@ -301,6 +351,8 @@ const SupervisorComposerInner = forwardRef<SupervisorComposerHandle, SupervisorC
         busy={p.busy}
         send={p.onSend}
         stopSend={p.onStop}
+        quote={p.quote}
+        onClearQuote={p.onClearQuote}
       />
     )
   },

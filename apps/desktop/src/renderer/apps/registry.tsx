@@ -21,6 +21,8 @@ export interface AppManifest {
 
 export const APP_REGISTRY: AppManifest[] = [
   { id: 'marketplace', name: '创意空间', description: '浏览与安装插件', Icon: IconStore },
+  // 私信（会员实时通讯底线的内置 UI）：占 Dock 图标位，便于发现与看到未读红点
+  { id: 'messages', name: '私信', description: '会员之间的好友与私信', Icon: IconChat },
   { id: 'chat', name: '聊天', description: '聊天窗口', Icon: IconChat },
   { id: 'supervisor', name: '管家', description: '会话管家', Icon: IconMonitor },
   { id: 'terminal', name: '终端', description: '命令终端', Icon: IconTerminal },

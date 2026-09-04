@@ -374,7 +374,28 @@ class _ChatViewState extends State<ChatView> {
       _pendingTools = [];
     });
     _scrollToBottom(force: true);
-    await widget.sendFn(content);
+    final r = await widget.sendFn(content);
+    // 发送失败必须收尾：之前 sendFn 结果被丢弃，一旦「未连上桌面端」（sendCommand 立即失败、
+    // 后续也不会有 delta/done 事件回来清 _busy），_busy 会永久停在 true → 输入框被锁死，
+    // 用户既发不出消息也退不出去。现在失败即解锁、撤掉乐观气泡并如实提示。
+    if (!mounted || r.ok) return;
+    setState(() {
+      _busy = false;
+      _streaming = '';
+      _streamingReasoning = '';
+      _pendingTools = [];
+      if (_items.isNotEmpty &&
+          _items.last is UserItem &&
+          (_items.last as UserItem).content == content) {
+        _items.removeLast();
+      }
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(r.error ?? '发送失败：桌面端未在线，请重试或切换设备', style: const TextStyle(fontSize: 13)),
+        duration: const Duration(seconds: 3),
+      ),
+    );
   }
 
   void _stop() {

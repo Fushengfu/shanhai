@@ -76,6 +76,18 @@ export function DockApp(): React.JSX.Element {
     void window.shanhai?.exitToDesktop()
   }
 
+  /**
+   * 私信未读总数（Dock 图标红点）。
+   * 走独立事件通道 member:unread（低频小数据），不进 ui:state 全量快照，避免拖慢其它窗口的快照广播。
+   * 未登录时主通道不会连接、也不会有未读，红点自然为 0，无需额外判断登录态。
+   */
+  const [dmUnread, setDmUnread] = useState(0)
+  useEffect(() => {
+    void window.shanhai?.memberUnread().then((u) => setDmUnread(u?.total ?? 0))
+    const off = window.shanhai?.onMemberUnread((u) => setDmUnread(u?.total ?? 0))
+    return off
+  }, [])
+
   // 自适应：测量图标栏实际内容尺寸，通知主进程调整 Dock 窗口宽高（随应用数量增减自动伸缩）
   useEffect(() => {
     const el = dockRef.current
@@ -185,8 +197,31 @@ export function DockApp(): React.JSX.Element {
               e.currentTarget.style.transform = 'translateY(0)'
             }}
           >
-            <span style={{ transform: 'scale(1.6)', display: 'inline-flex' }}>
+            <span style={{ position: 'relative', display: 'inline-flex', transform: 'scale(1.6)' }}>
               <app.Icon />
+              {/* 私信未读红点：只在「私信」图标上叠加，其它图标不受影响 */}
+              {app.id === 'messages' && dmUnread > 0 && (
+                <span
+                  style={{
+                    position: 'absolute',
+                    top: -6,
+                    right: -10,
+                    minWidth: 15,
+                    height: 15,
+                    padding: '0 3px',
+                    borderRadius: 8,
+                    background: 'var(--danger, #ef4444)',
+                    color: '#fff',
+                    fontSize: 9,
+                    fontWeight: 700,
+                    lineHeight: '15px',
+                    textAlign: 'center',
+                    border: '1px solid var(--bg-sidebar)',
+                  }}
+                >
+                  {dmUnread > 99 ? '99+' : dmUnread}
+                </span>
+              )}
             </span>
             <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{app.name}</span>
           </button>
