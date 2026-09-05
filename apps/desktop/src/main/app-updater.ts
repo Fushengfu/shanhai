@@ -6,6 +6,8 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { safeSend } from './safe-send'
+import { getMainLocale } from './locale-store'
+import { tIn } from '../shared/i18n'
 
 /**
  * 应用版本检查更新（纯手写，不依赖 electron-updater）。
@@ -144,7 +146,9 @@ function resolveUpdateType(): UpdateType {
   if (envType === 'Windows' || envType === 'macOS') return envType
   if (process.platform === 'darwin') return 'macOS'
   if (process.platform === 'win32') return 'Windows'
-  throw new Error(`当前系统 ${process.platform} 暂不支持更新类型映射，仅支持 macOS / Windows`)
+  // 该异常在 checkAndPromptForUpdate 的 try 内被捕获（任务36 修复），会经原生对话框 detail
+  // 与 AppUpdateCheckResult.message 上屏 → 属用户可见文案，必须按当前语言取词
+  throw new Error(tIn(getMainLocale(), 'upd.err.unsupportedPlatform', { platform: process.platform }))
 }
 
 function versionParts(version: string): number[] {
@@ -185,12 +189,17 @@ class UpdateFailure extends Error {
   }
 }
 
-/** 各失败阶段对应的对话框文案（标题 / 正文） */
-const UPDATE_FAILURE_COPY: Record<UpdateFailureStage, { title: string; message: string }> = {
-  check: { title: '检查更新失败', message: '无法连接更新服务器' },
-  download: { title: '下载更新失败', message: '新版本安装包下载未完成' },
-  verify: { title: '安装包校验失败', message: '下载的安装包完整性校验未通过，已删除该文件' },
-  install: { title: '安装启动失败', message: '安装包已就绪，但无法自动打开安装程序' },
+/**
+ * 各失败阶段对应的对话框文案（标题 / 正文）的【词条 key】。
+ * 【期5C 第 10 次同一个坑】模块级常量表在加载期就求值，存中文会让原生对话框在用户
+ * 切语言之后仍然吐中文（历轮 STATUS_LABEL / TOOL_META / SECTIONS / ROLE_META 全是这个坑）。
+ * 展示时机统一 tIn(getMainLocale(), key) —— 语言真相源只有 locale-store 一份。
+ */
+const UPDATE_FAILURE_COPY: Record<UpdateFailureStage, { titleKey: string; messageKey: string }> = {
+  check: { titleKey: 'upd.fail.check.title', messageKey: 'upd.fail.check.body' },
+  download: { titleKey: 'upd.fail.download.title', messageKey: 'upd.fail.download.body' },
+  verify: { titleKey: 'upd.fail.verify.title', messageKey: 'upd.fail.verify.body' },
+  install: { titleKey: 'upd.fail.install.title', messageKey: 'upd.fail.install.body' },
 }
 
 /** 下载进度阶段（渲染层 UpdateProgressOverlay 据此切换文案/收尾） */
@@ -318,8 +327,9 @@ async function fetchVersionCheck(
     throw new UpdateFailure(
       'check',
       isTimeout
-        ? `检查更新超时：${VERSION_CHECK_TIMEOUT_MS / 1000} 秒内未收到更新服务器响应`
-        : `无法连接更新服务器：${detail}`,
+        ? tIn(getMainLocale(), 'upd.err.checkTimeout', { sec: VERSION_CHECK_TIMEOUT_MS / 1000 })
+        // detail 是 fetch/Node 原始错误文本：按口径④作为 {msg} 原样带入，不建映射表
+        : tIn(getMainLocale(), 'upd.err.cannotConnect', { msg: detail }),
     )
   }
 
@@ -329,7 +339,10 @@ async function fetchVersionCheck(
   })
 
   if (!resp.ok) {
-    throw new UpdateFailure('check', `版本检查失败: ${resp.status} ${resp.statusText}`)
+    throw new UpdateFailure(
+      'check',
+      tIn(getMainLocale(), 'upd.err.checkHttp', { status: resp.status, statusText: resp.statusText }),
+    )
   }
 
   const text = await resp.text()
@@ -337,12 +350,13 @@ async function fetchVersionCheck(
   try {
     json = JSON.parse(text)
   } catch {
-    throw new UpdateFailure('check', '版本检查响应不是合法 JSON')
+    throw new UpdateFailure('check', tIn(getMainLocale(), 'upd.err.checkBadJson'))
   }
 
   const envelope = json as ApiEnvelope<VersionCheckData>
   if (envelope.code !== 0 && envelope.code !== undefined) {
-    throw new UpdateFailure('check', `版本检查失败: ${envelope.message || envelope.code}`)
+    // envelope.message 是网关返回原文：按口径④不做客户端映射，作为 {msg} 参数原样带入
+    throw new UpdateFailure('check', tIn(getMainLocale(), 'upd.err.checkFailed', { msg: String(envelope.message || envelope.code) }))
   }
 
   const data = envelope.data ?? (json as VersionCheckData)
@@ -508,7 +522,7 @@ async function downloadUpdatePackage(
 ): Promise<string> {
   const owner = resolveDialogWindow(parentWindow)
   const win = owner ?? BrowserWindow.getAllWindows().find((item) => !item.isDestroyed())
-  if (!win) throw new UpdateFailure('download', '未找到可用窗口，无法下载更新包')
+  if (!win) throw new UpdateFailure('download', tIn(getMainLocale(), 'upd.err.noWindow'))
 
   let normalizedUrl = String(downloadUrl ?? '').trim()
   if (normalizedUrl && !/^https?:\/\//i.test(normalizedUrl)) {
@@ -532,7 +546,8 @@ async function downloadUpdatePackage(
     percent: 0,
     bytesPerSecond: 0,
     latestVersion,
-    message: '正在连接下载服务器…',
+    // 【期5C A 方案】主进程不再下发展示句子；状态行由渲染层按 phase 取词
+    // （panels.updStatusPending 的中文值与这里删掉的句子逐字相同 → 中文态零变化）
   })
 
   return await new Promise<string>((resolve, reject) => {
@@ -559,7 +574,7 @@ async function downloadUpdatePackage(
 
     const timeout = setTimeout(() => {
       cleanup()
-      fail('download', '下载超时：未收到下载启动事件')
+      fail('download', tIn(getMainLocale(), 'upd.err.startTimeout'))
     }, 10_000)
 
     const cleanup = () => {
@@ -580,7 +595,7 @@ async function downloadUpdatePackage(
       if (!win.isDestroyed()) win.setProgressBar(0.01)
 
       pushProgress(
-        { phase: 'downloading', receivedBytes: 0, totalBytes: item.getTotalBytes(), percent: 0, bytesPerSecond: 0, message: '正在下载更新包…' },
+        { phase: 'downloading', receivedBytes: 0, totalBytes: item.getTotalBytes(), percent: 0, bytesPerSecond: 0 },
         true,
       )
 
@@ -618,7 +633,7 @@ async function downloadUpdatePackage(
           void (async () => {
             try {
               if (expectedSha256) {
-                pushProgress({ phase: 'verifying', percent: 99, bytesPerSecond: 0, message: '正在校验安装包（SHA256）…' }, true)
+                pushProgress({ phase: 'verifying', percent: 99, bytesPerSecond: 0 }, true)
                 const fileBuffer = await fs.readFile(finalPath)
                 const actualHash = createHash('sha256').update(fileBuffer).digest('hex')
                 console.log('[app-update] [download] sha256 verify:', {
@@ -628,7 +643,7 @@ async function downloadUpdatePackage(
                 if (actualHash.toLowerCase() !== expectedSha256.toLowerCase()) {
                   // 校验失败：删除已下载的损坏文件，避免残留污染 downloads 目录
                   await fs.rm(finalPath, { force: true }).catch(() => undefined)
-                  fail('verify', `文件校验失败：SHA256 不匹配\n期望: ${expectedSha256}\n实际: ${actualHash}`)
+                  fail('verify', tIn(getMainLocale(), 'upd.err.sha256Mismatch', { expected: expectedSha256, actual: actualHash }))
                   return
                 }
                 console.log('[app-update] [download] sha256 verified OK')
@@ -641,13 +656,12 @@ async function downloadUpdatePackage(
                   totalBytes: size,
                   percent: 100,
                   bytesPerSecond: 0,
-                  message: '下载完成',
                 },
                 true,
               )
               resolve(finalPath)
             } catch (err) {
-              fail('download', `读取下载文件失败：${err instanceof Error ? err.message : String(err)}`)
+              fail('download', tIn(getMainLocale(), 'upd.err.readFileFailed', { msg: err instanceof Error ? err.message : String(err) }))
             }
           })()
           return
@@ -655,10 +669,10 @@ async function downloadUpdatePackage(
         // 下载中断/取消/出错：清理已落盘的半截文件，避免残留污染 downloads 目录
         void fs.rm(finalPath, { force: true }).catch(() => undefined)
         if (state === 'cancelled') {
-          fail('download', '下载已取消（残留文件已清理）', 'cancelled')
+          fail('download', tIn(getMainLocale(), 'upd.err.cancelled'), 'cancelled')
           return
         }
-        fail('download', `下载失败: ${state}`)
+        fail('download', tIn(getMainLocale(), 'upd.err.downloadState', { state }))
       })
     }
 
@@ -674,10 +688,10 @@ async function downloadUpdatePackage(
 
 async function openInstallerPackage(filePath: string): Promise<void> {
   const target = String(filePath ?? '').trim()
-  if (!target) throw new Error('安装包路径为空')
+  if (!target) throw new Error(tIn(getMainLocale(), 'upd.err.emptyPath'))
 
   await fs.access(target).catch(() => {
-    throw new Error(`安装包不存在: ${target}`)
+    throw new Error(tIn(getMainLocale(), 'upd.err.installerMissing', { path: target }))
   })
 
   console.log('[app-update] [install] openPath:', { filePath: target })
@@ -695,7 +709,7 @@ async function openInstallerPackage(filePath: string): Promise<void> {
     return
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err)
-    throw new Error(`打开安装包失败: ${openPathErr || detail}`)
+    throw new Error(tIn(getMainLocale(), 'upd.err.openFailed', { msg: openPathErr || detail }))
   }
 }
 
@@ -741,14 +755,18 @@ async function promptAndInstallUpdate(
     sha256Sum?: string
   },
 ): Promise<boolean> {
+  // 【期5C A 方案】原生对话框不经渲染层 → 必须在主进程按当前语言取词。
+  // 一次弹窗取一次快照：同一弹窗内不会出现半中半英。
+  const L = getMainLocale()
   const detailLines = [
-    `当前版本：v${params.currentVersion}`,
-    `最新版本：v${params.latestVersion}${params.latestVersionCode ? ` (build ${params.latestVersionCode})` : ''}`,
-    params.releaseNotes ? `更新内容：\n${params.releaseNotes}` : '',
-    params.forceUpdate ? '该版本标记为强制更新。' : '',
+    tIn(L, 'upd.dlg.curVersion', { v: params.currentVersion }),
+    tIn(L, 'upd.dlg.latestVersion', { v: params.latestVersion })
+      + (params.latestVersionCode ? tIn(L, 'upd.dlg.buildSuffix', { c: params.latestVersionCode }) : ''),
+    params.releaseNotes ? tIn(L, 'upd.dlg.releaseNotes', { n: params.releaseNotes }) : '',
+    params.forceUpdate ? tIn(L, 'upd.dlg.forceUpdate') : '',
     params.manual
       ? ''
-      : '（同一版本只会自动提醒一次；想再次收到提醒，需等网关发布更高版本；也可随时在「设置 → 关于山海」手动检查。）',
+      : tIn(L, 'upd.dlg.autoOnceNote'),
   ].filter(Boolean)
 
   updateDialogOpen = true
@@ -756,10 +774,10 @@ async function promptAndInstallUpdate(
   try {
     const promptOptions: MessageBoxOptions = {
       type: 'info',
-      title: '发现新版本',
-      message: `检测到新版本 v${params.latestVersion}`,
+      title: tIn(L, 'upd.newVersionTitle'),
+      message: tIn(L, 'upd.dlg.newVersionMsg', { v: params.latestVersion }),
       detail: detailLines.join('\n\n'),
-      buttons: ['稍后', '跳过此版本', '下载更新'],
+      buttons: [tIn(L, 'upd.dlg.btnLater'), tIn(L, 'upd.dlg.btnSkip'), tIn(L, 'upd.dlg.btnDownload')],
       cancelId: 0,
       defaultId: 2,
       noLink: true,
@@ -778,7 +796,7 @@ async function promptAndInstallUpdate(
   }
   if (result.response !== 2) return false
   if (!params.downloadUrl) {
-    throw new UpdateFailure('download', '网关未返回下载地址，无法下载更新包')
+    throw new UpdateFailure('download', tIn(getMainLocale(), 'upd.err.noDownloadUrl'))
   }
 
   const downloadedFile = await downloadUpdatePackage(
@@ -793,12 +811,12 @@ async function promptAndInstallUpdate(
   try {
     const installOptions: MessageBoxOptions = {
       type: 'question',
-      title: '更新包下载完成',
-      message: '安装更新需要先退出山海。是否现在退出并开始安装？',
+      title: tIn(L, 'upd.dlg.installTitle'),
+      message: tIn(L, 'upd.dlg.installMsg'),
       detail: process.platform === 'darwin'
-        ? `${downloadedFile}\n\nmacOS：将为你打开安装包（dmg），请把「山海」拖入「应用程序」覆盖后重新打开。`
+        ? tIn(L, 'upd.dlg.installMacHint', { path: downloadedFile })
         : downloadedFile,
-      buttons: ['稍后安装', '立即安装（退出应用）'],
+      buttons: [tIn(L, 'upd.dlg.btnLaterInstall'), tIn(L, 'upd.dlg.btnInstallNow')],
       cancelId: 0,
       defaultId: 1,
       noLink: true,
@@ -814,7 +832,7 @@ async function promptAndInstallUpdate(
     if (process.platform === 'darwin') {
       const scheduled = scheduleInstallerLaunchAfterQuit(downloadedFile)
       if (!scheduled) {
-        throw new UpdateFailure('install', '安装启动失败：无法安排退出后自动打开安装包')
+        throw new UpdateFailure('install', tIn(L, 'upd.err.scheduleFailed'))
       }
       setTimeout(() => {
         app.quit()
@@ -829,7 +847,7 @@ async function promptAndInstallUpdate(
     }
   } catch (err) {
     if (err instanceof UpdateFailure) throw err
-    throw new UpdateFailure('install', `安装启动失败：${err instanceof Error ? err.message : String(err)}`)
+    throw new UpdateFailure('install', tIn(L, 'upd.err.installFailed', { msg: err instanceof Error ? err.message : String(err) }))
   }
   return true
 }
@@ -840,6 +858,8 @@ export async function checkAndPromptForUpdate(
   const manual = Boolean(options.manual)
   const currentVersion = app.getVersion()
   const checkedAt = Date.now()
+  // 【期5C A 方案】一次检查取一次语言快照，保证对话框、广播结果、日志里引用的是同一份文案
+  const L = getMainLocale()
   const uid = await resolvePersistentDeviceUid()
 
   console.log('[app-update] check start:', { manual, currentVersion, uid })
@@ -890,10 +910,11 @@ export async function checkAndPromptForUpdate(
       try {
         await showDialog(options.parentWindow, {
           type: 'info',
-          title: '检查更新',
-          message: '当前已是最新版本',
-          detail: `当前版本：v${currentVersion}`,
-          buttons: ['知道了'],
+          // 复用既有词条：与设置页按钮、浮层「知道了」同一真值，不登记第二份
+          title: tIn(L, 'settings.about.checkUpdate'),
+          message: tIn(L, 'settings.about.isLatest'),
+          detail: tIn(L, 'upd.dlg.curVersion', { v: currentVersion }),
+          buttons: [tIn(L, 'panels.updGotIt')],
           defaultId: 0,
           cancelId: 0,
           noLink: true,
@@ -914,7 +935,7 @@ export async function checkAndPromptForUpdate(
       downloadUrl: downloadUrl || undefined,
       forceUpdate,
       downloadTriggered,
-      message: hasUpdate ? '发现新版本' : '当前已是最新版本',
+      message: hasUpdate ? tIn(L, 'upd.newVersionTitle') : tIn(L, 'settings.about.isLatest'),
     }
     lastUpdateCheckResult = output
     console.log('[app-update] check result:', output)
@@ -934,10 +955,11 @@ export async function checkAndPromptForUpdate(
       try {
         await showDialog(options.parentWindow, {
           type: 'error',
-          title: copy.title,
-          message: copy.message,
+          title: tIn(L, copy.titleKey),
+          message: tIn(L, copy.messageKey),
+          // detail 是原始错误（Node 异常 / 网关原文）：按口径④原样呈现，不建映射表
           detail: message,
-          buttons: ['知道了'],
+          buttons: [tIn(L, 'panels.updGotIt')],
           defaultId: 0,
           cancelId: 0,
           noLink: true,
@@ -952,7 +974,7 @@ export async function checkAndPromptForUpdate(
       checkedAt,
       currentVersion,
       hasUpdate: false,
-      message: `${copy.title}：${message}`,
+      message: tIn(L, 'upd.res.failedLine', { title: tIn(L, copy.titleKey), msg: message }),
       failureStage: stage,
     }
     lastUpdateCheckResult = failed

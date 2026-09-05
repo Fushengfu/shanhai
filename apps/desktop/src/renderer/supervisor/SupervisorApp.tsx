@@ -18,6 +18,9 @@ import { SessionPicker } from '../components/SessionPicker'
 import { ModelPicker } from '../components/ModelPicker'
 import { SupervisorComposer, type SupervisorComposerHandle } from './SupervisorComposer'
 import { TokenStatusBar } from '../components/TokenStatusBar'
+import { dmContentToPlainText } from '../../shared/dm-attachment'
+import { t as tKey, tf as tfKey } from '../../shared/i18n'
+import { applyLocale, renderRich, useLocaleSync } from '../locale'
 import { DmEntryButton } from '../components/DmEntryButton'
 import { VirtualList } from '../components/VirtualList'
 import { IconMonitor, IconWarn, IconMoon, IconSun } from '../components/icons'
@@ -99,20 +102,24 @@ function userItemIndex(items: ChatItem[], userIndex: number): number {
   return -1
 }
 
-/** 管家工具审批参数 key → 中文标签（未命中则显示原 key，兼容通用工具） */
+/**
+ * 管家工具审批参数 key → **语言包 key**（未命中则显示原 key，兼容通用工具）。
+ * 表里存 key 而不是中文：模块级常量表在加载期就会把中文固化，切语言不会跟着变（期1 STATUS_LABEL、
+ * 期2 TOOL_META 两次实证）。取词一律放到 supervisorArgsSummary 渲染时做。
+ */
 const SUPERVISOR_ARG_LABELS: Record<string, string> = {
-  sessionId: '会话',
-  title: '标题',
-  content: '内容',
-  modelId: '模型',
-  policy: '安全模式',
-  mode: '下发方式',
-  workdir: '工作目录',
+  sessionId: 'sup.arg.sessionId',
+  title: 'sup.arg.title',
+  content: 'sup.arg.content',
+  modelId: 'sup.arg.modelId',
+  policy: 'sup.arg.policy',
+  mode: 'sup.arg.mode',
+  workdir: 'sup.arg.workdir',
 }
 
 /** 把管家工具的审批参数渲染成用户可读的键值对：sessionId 翻译成会话标题、枚举值翻译成中文，避免暴露技术 id / 英文枚举 */
 function supervisorArgsSummary(args: Record<string, unknown>, sessions: SessionListItem[]): React.ReactNode {
-  if (!args || Object.keys(args).length === 0) return <span style={{ color: 'var(--text-muted)' }}>（无参数）</span>
+  if (!args || Object.keys(args).length === 0) return <span style={{ color: 'var(--text-muted)' }}>{tKey('chat.approval.noArgs')}</span>
   const entries = Object.entries(args)
   return (
     <div>
@@ -121,15 +128,18 @@ function supervisorArgsSummary(args: Record<string, unknown>, sessions: SessionL
         if (k === 'sessionId') {
           const sid = String(v)
           const t = sessions.find((s) => s.id === sid)
-          display = t ? `「${t.title}」` : `（未知会话 ${sid}）`
+          display = t ? tKey('sup.arg.sessionTitle', { title: t.title }) : tKey('sup.arg.unknownSession', { sid })
         } else if (k === 'policy') {
-          display = ({ ask: '每次询问', workdir: '仅工作区内自动放行', never: '从不询问' } as Record<string, string>)[String(v)] ?? String(v)
+          // 表里存 key，渲染时取词（同上：常量表存中文会被固化）
+          const pk = ({ ask: 'sup.policy.ask', workdir: 'sup.policy.workdir', never: 'sup.policy.never' } as Record<string, string>)[String(v)]
+          display = pk ? tKey(pk) : String(v)
         } else if (k === 'mode') {
-          display = ({ insert: '追加（不打断）', queue: '排队（等当前任务结束）' } as Record<string, string>)[String(v)] ?? String(v)
+          const mk = ({ insert: 'sup.mode.insert', queue: 'sup.mode.queue' } as Record<string, string>)[String(v)]
+          display = mk ? tKey(mk) : String(v)
         }
         return (
           <div key={k} style={{ marginBottom: 2 }}>
-            <span style={{ color: 'var(--text-muted)' }}>{SUPERVISOR_ARG_LABELS[k] ?? k}：</span>
+            <span style={{ color: 'var(--text-muted)' }}>{tKey('sup.arg.labelLine', { label: SUPERVISOR_ARG_LABELS[k] ? tKey(SUPERVISOR_ARG_LABELS[k]) : k })}</span>
             <span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>{display}</span>
           </div>
         )
@@ -182,6 +192,15 @@ export function SupervisorApp(): React.JSX.Element {
 
   const [isSpeaking, setIsSpeaking] = useState(false)
   const [previewImage, setPreviewImage] = useState<string | null>(null)
+  /** 点「发送」被本地闸门拦下时的可见原因（与聊天窗口同一处修复，同因同修） */
+  const [sendNotice, setSendNotice] = useState('')
+
+  // 6 秒自动收起（与聊天窗口一致）
+  useEffect(() => {
+    if (!sendNotice) return
+    const t = setTimeout(() => setSendNotice(''), 6000)
+    return () => clearTimeout(t)
+  }, [sendNotice])
   // 能力级审批「本会话记住此授权」勾选（阶段3c remember）：用户允许时勾选则写 session 级授权白名单
   const [rememberCapability, setRememberCapability] = useState(false)
   // 卡顿优化（P1）：onPreviewImage useCallback 稳定化，避免 nodes 重建时所有消息 memo 失效
@@ -208,6 +227,16 @@ export function SupervisorApp(): React.JSX.Element {
 
   // 主题：订阅主进程广播，跟随聊天窗口切换（亮/暗实时同步）
   useThemeSync()
+  // 语言（i18n 期3）：两层都要，缺一不可 ——
+  // ① 窗口级：订阅主进程 ui:locale 广播，把新语言写进本窗口的取词镜像。本窗口不是 AppWindow，
+  //    不订阅就只在挂载时 initLocale() 读一次，「聊天窗口切英文、管家窗口还是中文」就是这么来的。
+  // ② 组件级：本组件渲染期直接取词（含 toolDisplayName / riskLevelLabel 这两个内部取词的函数），
+  //    必须 useLocaleSync 订阅镜像变化才会重渲染；applyLocale 相同值 bail out，不会与自身广播形成回环。
+  useLocaleSync()
+  useEffect(() => {
+    const off = window.shanhai?.onLocaleChange((l) => applyLocale(l))
+    return off
+  }, [])
 
   // 管家窗口的主题切换入口：读取当前主题用于按钮图标，切换时写 localStorage + 应用 + 广播给所有窗口
   const [theme, setThemeMode] = useState<ThemeMode>(() => readTheme())
@@ -236,7 +265,11 @@ export function SupervisorApp(): React.JSX.Element {
   useEffect(() => {
     const off = window.shanhai?.onDmQuoteToSession((payload) => {
       if (!payload?.text) return
-      composerRef.current?.appendInput(payload.text)
+      // 【真机 bug 兜底】与聊天窗口 App.tsx 同一处修法：主进程 quoteDmToSession 已把附件私信的
+      // 紧凑 JSON 引用展开成「正文 + [图片] 名字 → URL」，但主进程只在 app 启动时读一次 dist/main，
+      // 渲染层每次开窗口都读最新 dist/renderer —— 版本偏斜时投来的就是裸 JSON。
+      // dmContentToPlainText「形态不符一律原样交回」，对已展开的文本是幂等的，故新旧主进程都正确。
+      composerRef.current?.appendInput(dmContentToPlainText(payload.text))
       setDmQuote(payload)
     })
     return off
@@ -283,7 +316,7 @@ export function SupervisorApp(): React.JSX.Element {
       const settings = await window.shanhai?.getSettings()
       if (!settings?.voice?.enabled) return
       const cleaned = text
-        .replace(/```[\s\S]*?```/g, '（代码略）')
+        .replace(/```[\s\S]*?```/g, tKey('chat.shell.voiceCodeOmitted'))
         .replace(/`([^`]+)`/g, '$1')
         .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
         .replace(/[#>*_~|]/g, '')
@@ -291,7 +324,7 @@ export function SupervisorApp(): React.JSX.Element {
         .trim()
       if (!cleaned) return
       const MAX = 500
-      const snippet = cleaned.length > MAX ? `${cleaned.slice(0, MAX)}，等` : cleaned
+      const snippet = cleaned.length > MAX ? cleaned.slice(0, MAX) + tKey('chat.shell.voiceAndSoOn') : cleaned
       setIsSpeaking(true)
       try {
         await window.shanhai?.speak(snippet)
@@ -346,13 +379,13 @@ export function SupervisorApp(): React.JSX.Element {
     patchSession({ busy: false, streaming: '', streamingReasoning: '' })
     void (async (): Promise<void> => {
       if (!window.shanhai?.stop) {
-        setStopNotice({ level: 'error', text: '本窗口拿不到停止通道（window.shanhai.stop 不可用），管家仍在执行：请用聊天窗口侧边栏停止或重启应用' })
+        setStopNotice({ level: 'error', text: tKey('sup.stop.noChannel') })
         return
       }
       try {
         await window.shanhai.stop(SUPERVISOR_SID)
       } catch (err) {
-        setStopNotice({ level: 'error', text: `停止指令发送失败：${err instanceof Error ? err.message : String(err)}；管家可能仍在执行，可再点一次停止` })
+        setStopNotice({ level: 'error', text: tKey('sup.stop.sendFailed', { err: err instanceof Error ? err.message : String(err) }) })
         return
       }
       // 如实反馈（产品语义，不是缺陷）：管家自己停了 ≠ 全部停了。
@@ -365,12 +398,13 @@ export function SupervisorApp(): React.JSX.Element {
           running.length > 0
             ? {
                 level: 'warn',
-                text: `已停止管家的调度。但已派发给以下 ${running.length} 个会话的任务仍在各自独立执行，需到对应会话里停止：${running.map((s) => s.title).join('、')}`,
+                // 「N 个会话」是量词：走 {n} 占位符 + one/other 复数形态，禁止在代码里拼量词（英文无量词）
+                text: tKey('sup.stop.runningOthers', { n: running.length, list: running.map((s) => s.title).join(tKey('common.sepEnumeration')) }),
               }
-            : { level: 'ok', text: '已停止管家的调度；当前没有其它会话在执行任务。已执行的历史与结果都保留。' },
+            : { level: 'ok', text: tKey('sup.stop.allClear') },
         )
       } catch {
-        setStopNotice({ level: 'ok', text: '已停止管家的调度（未能读取其它会话的执行状态，无法确认是否还有任务在后台跑，可在侧边栏看哪些会话仍显示「执行中」）' })
+        setStopNotice({ level: 'ok', text: tKey('sup.stop.unknownState') })
       }
     })()
   }, [patchSession])
@@ -393,7 +427,7 @@ export function SupervisorApp(): React.JSX.Element {
       })
       .catch((err) => {
         patchSession((s) => ({
-          items: [...s.items, { kind: 'assistant', content: `错误：${err instanceof Error ? err.message : String(err)}`, turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: 0 }],
+          items: [...s.items, { kind: 'assistant', content: tKey('chat.shell.errorPrefix', { msg: err instanceof Error ? err.message : String(err) }), turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: 0 }],
           streaming: '',
           streamingReasoning: '',
           busy: false,
@@ -420,7 +454,7 @@ export function SupervisorApp(): React.JSX.Element {
       })
       .catch((err) => {
         patchSession((s) => ({
-          items: [...s.items, { kind: 'assistant', content: `错误：${err instanceof Error ? err.message : String(err)}`, turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: 0 }],
+          items: [...s.items, { kind: 'assistant', content: tKey('chat.shell.errorPrefix', { msg: err instanceof Error ? err.message : String(err) }), turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: 0 }],
           streaming: '',
           streamingReasoning: '',
           busy: false,
@@ -434,7 +468,18 @@ export function SupervisorApp(): React.JSX.Element {
     const attachments = composerRef.current?.getAttachments() ?? []
     const text = input.trim()
     if (!text || cur.busy) return
-    if (attachments.some((a) => a.type === 'image' && a.uploadStatus !== 'done')) return
+    // 【P3 修静默失败·与聊天窗口同一根因】判定条件一字未改，只把「静默 return」换成可见原因
+    const notReady = attachments.filter((a) => a.type === 'image' && a.uploadStatus !== 'done')
+    if (notReady.length > 0) {
+      const uploading = notReady.filter((a) => a.uploadStatus === 'uploading').length
+      const failed = notReady.length - uploading
+      const bits: string[] = []
+      if (uploading > 0) bits.push(tKey('chat.shell.notReadyUploading', { n: uploading }))
+      if (failed > 0) bits.push(tKey('chat.shell.notReadyFailed', { n: failed }))
+      setSendNotice(bits.join(tKey('common.sepSemicolon')) + tKey('chat.shell.notReadyTail'))
+      return
+    }
+    setSendNotice('')
     const images = attachments.filter((a) => a.type === 'image').map((a) => a.dataUrl)
     const parts: ContentPart[] = []
     const fileNotes: string[] = []
@@ -449,9 +494,9 @@ export function SupervisorApp(): React.JSX.Element {
         const base64 = a.dataUrl.replace(/^data:[^;]+;base64,/, '')
         try {
           const savedPath = (await window.shanhai?.saveUploadedFile(a.name, base64)) ?? a.name
-          fileNotes.push(`${a.name}（${formatBytes(a.size)}）→ ${savedPath}`)
+          fileNotes.push(tKey('chat.shell.fileNoteWithSaved', { name: a.name, size: formatBytes(a.size), path: savedPath }))
         } catch {
-          fileNotes.push(`${a.name}（${formatBytes(a.size)}）`)
+          fileNotes.push(tKey('chat.shell.fileNote', { name: a.name, size: formatBytes(a.size) }))
         }
         continue
       }
@@ -465,7 +510,7 @@ export function SupervisorApp(): React.JSX.Element {
           : { type: 'input_video', input_video: { data, format } },
       )
     }
-    const finalText = fileNotes.length > 0 ? `${text}${text ? '\n\n' : ''}[已附加文件]\n${fileNotes.join('\n')}` : text
+    const finalText = fileNotes.length > 0 ? `${text}${text ? '\n\n' : ''}${tKey('chat.shell.fileNoteHeader')}\n${fileNotes.join('\n')}` : text
     composerRef.current?.clearInput()
     setStopNotice(null)
     const startTs = Date.now()
@@ -494,7 +539,7 @@ export function SupervisorApp(): React.JSX.Element {
       // 管家窗口没有这个按钮（断点续跑 resume(SUPERVISOR_ID) 后端支持但 GUI 无入口）→ 按本窗口真实能力改写，
       // 只改显示文案、不改执行语义，也不伪造「什么都没发生」。
       const result = interrupted
-        ? '（已停止本轮调度：已执行的历史与结果都保留。管家窗口没有「继续执行」入口，想接着做直接在输入框补一句即可，历史会带上下文回放）'
+        ? tKey('sup.stop.interruptedResult')
         : raw
       if (!interrupted && result.trim()) void speakResult(result)
       // 正常完成：assistant 正文由主进程 ui-store 的 onSessionActivity('end') 用 getSessionHistory 重建，
@@ -505,7 +550,7 @@ export function SupervisorApp(): React.JSX.Element {
       }
     } catch (err) {
       const base = (await authoritativeItems()) ?? getUiStoreSnapshot().sessionMap[SUPERVISOR_SID]?.items ?? []
-      patchSession({ items: [...base, { kind: 'assistant', content: `错误：${err instanceof Error ? err.message : String(err)}`, turnSeq: base.filter((it) => it.kind === 'user').length, turnDuration: Date.now() - startTs }] })
+      patchSession({ items: [...base, { kind: 'assistant', content: tKey('chat.shell.errorPrefix', { msg: err instanceof Error ? err.message : String(err) }), turnSeq: base.filter((it) => it.kind === 'user').length, turnDuration: Date.now() - startTs }] })
     } finally {
       patchSession({ busy: false })
     }
@@ -586,8 +631,8 @@ export function SupervisorApp(): React.JSX.Element {
     >
       <WindowTitleBar
         icon={<IconMonitor />}
-        title="会话管家"
-        subtitle="主 Agent · 监控与调度所有会话"
+        title={tKey('common.supervisorSession')}
+        subtitle={tKey('sup.subtitle')}
         tone="purple"
         onClose={() => void window.shanhai?.hideSupervisorToBubble()}
         actions={
@@ -597,7 +642,7 @@ export function SupervisorApp(): React.JSX.Element {
             <DmEntryButton loggedIn={ui.loggedIn} />
             <button
               onClick={toggleTheme}
-              title={theme === 'light' ? '切换到暗色模式' : '切换到亮色模式'}
+              title={theme === 'light' ? tKey('common.themeToDark') : tKey('common.themeToLight')}
               style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 10px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer' }}
             >
               {theme === 'light' ? <IconMoon /> : <IconSun />}
@@ -631,7 +676,7 @@ export function SupervisorApp(): React.JSX.Element {
           <span style={{ minWidth: 0, overflowWrap: 'break-word', wordBreak: 'break-word' }}>{stopNotice.text}</span>
           <button
             onClick={() => setStopNotice(null)}
-            title="关闭这条提示"
+            title={tKey('common.dismissNotice')}
             style={{ marginLeft: 'auto', flexShrink: 0, border: 'none', background: 'transparent', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 12, lineHeight: '18px', padding: '0 2px' }}
           >
             ×
@@ -649,8 +694,8 @@ export function SupervisorApp(): React.JSX.Element {
             <span style={{ transform: 'scale(1.8)', display: 'inline-flex', color: 'var(--accent)' }}>
               <IconMonitor />
             </span>
-            <div style={{ fontWeight: 600, fontSize: 15, color: 'var(--text)' }}>我是会话管家</div>
-            <div>可以问我「现在有哪些会话在干活」「某个会话做到哪了」，或让我「给会话X新增需求」。</div>
+            <div style={{ fontWeight: 600, fontSize: 15, color: 'var(--text)' }}>{tKey('sup.welcomeTitle')}</div>
+            <div>{tKey('sup.welcomeHint')}</div>
           </div>
         }
         footer={
@@ -662,7 +707,7 @@ export function SupervisorApp(): React.JSX.Element {
                   <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 6 }}>
                     {cur.turnStartTs != null && (
                       <>
-                        耗时 <LiveDuration startTs={cur.turnStartTs} />
+                        {tKey('chat.time.elapsed')} <LiveDuration startTs={cur.turnStartTs} />
                       </>
                     )}
                     <StepStats tools={pendingTools} />
@@ -686,7 +731,7 @@ export function SupervisorApp(): React.JSX.Element {
                   </div>
                 )}
                 <div style={{ display: 'block', color: 'var(--text-muted)', fontSize: 12, marginTop: 4 }}>
-                  思考中
+                  {tKey('chat.plugin.thinking')}
                   <ThinkingDots />
                 </div>
               </div>
@@ -716,6 +761,7 @@ export function SupervisorApp(): React.JSX.Element {
         ref={composerRef}
         quote={dmQuote}
         onClearQuote={() => setDmQuote(null)}
+        sendNotice={sendNotice}
         busy={cur.busy}
         models={ui.models}
         defaultSelectedModel={ui.selectedModel}
@@ -746,21 +792,21 @@ export function SupervisorApp(): React.JSX.Element {
         >
           <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text)' }}>
             <IconWarn />
-            需要你确认以下操作
+            {tKey('sup.approval.title')}
           </div>
           <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>
             {toolDisplayName(curApproval.toolName, curApproval.args)}
-            <span style={{ color: 'var(--tint-red-strong)', marginLeft: 6 }}>（{riskLevelLabel(curApproval.riskLevel)}）</span>
+            <span style={{ color: 'var(--tint-red-strong)', marginLeft: 6 }}>{tKey('sup.approval.riskParen', { risk: riskLevelLabel(curApproval.riskLevel) })}</span>
           </div>
           <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
             {supervisorArgsSummary(curApproval.args, getUiStoreSnapshot().sessions ?? [])}
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
             <button onClick={() => void respondApproval('allowed-once')} style={btn('var(--accent)', '#fff')}>
-              允许一次
+              {tKey('chat.approval.allowOnce')}
             </button>
             <button onClick={() => void respondApproval('rejected')} style={btn('var(--bg-panel)', 'var(--text)', '1px solid var(--border-strong)')}>
-              拒绝
+              {tKey('chat.approval.reject')}
             </button>
           </div>
         </div>
@@ -785,16 +831,18 @@ export function SupervisorApp(): React.JSX.Element {
         >
           <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text)' }}>
             <IconWarn />
-            插件能力调用需要确认
+            {tKey('sup.cap.title')}
           </div>
           <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>
-            插件 <b style={{ color: 'var(--text)' }}>{capabilityApproval.callerPkgId}</b> 请求调用能力：
-            <b style={{ color: 'var(--text)', marginLeft: 6 }}>{capabilityApproval.capability}</b>
+            {renderRich(tfKey('sup.cap.line'), {
+              b1: <b style={{ color: 'var(--text)' }}>{capabilityApproval.callerPkgId}</b>,
+              b2: <b style={{ color: 'var(--text)', marginLeft: 6 }}>{capabilityApproval.capability}</b>,
+            })}
           </div>
           <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12 }}>
-            风险等级：<span style={{ color: 'var(--tint-red-strong)', fontWeight: 600 }}>{capabilityApproval.risk}</span>
+            {tKey('sup.cap.riskLabel')}<span style={{ color: 'var(--tint-red-strong)', fontWeight: 600 }}>{capabilityApproval.risk}</span>
             {capabilityApproval.sessionId && (
-              <span style={{ marginLeft: 8, color: 'var(--text-muted)' }}>会话 {capabilityApproval.sessionId}</span>
+              <span style={{ marginLeft: 8, color: 'var(--text-muted)' }}>{tKey('sup.cap.session', { sid: capabilityApproval.sessionId })}</span>
             )}
           </div>
           <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer' }}>
@@ -804,14 +852,14 @@ export function SupervisorApp(): React.JSX.Element {
               onChange={(e) => setRememberCapability(e.target.checked)}
               style={{ cursor: 'pointer' }}
             />
-            本次会话内记住此授权（同类能力不再逐次弹窗）
+            {tKey('sup.cap.remember')}
           </label>
           <div style={{ display: 'flex', gap: 8 }}>
             <button onClick={() => respondCapabilityApproval(true, rememberCapability)} style={btn('var(--accent)', '#fff')}>
-              允许
+              {tKey('sup.cap.allow')}
             </button>
             <button onClick={() => respondCapabilityApproval(false)} style={btn('var(--bg-panel)', 'var(--text)', '1px solid var(--border-strong)')}>
-              拒绝
+              {tKey('chat.approval.reject')}
             </button>
           </div>
         </div>
@@ -860,7 +908,7 @@ export function SupervisorApp(): React.JSX.Element {
                 boxShadow: '0 4px 20px rgba(0,0,0,0.12)',
               }}
             >
-              AI 正在播报…
+              {tKey('chat.shell.voiceSpeaking')}
             </div>
           </div>,
           document.body,

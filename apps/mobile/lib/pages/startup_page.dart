@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import '../l10n/generated/app_localizations.dart';
+import '../locale.dart';
 import '../theme.dart';
 import '../services/member_credentials.dart';
 import '../services/token_store.dart';
@@ -32,9 +34,14 @@ class StartupPage extends StatefulWidget {
 class _StartupPageState extends State<StartupPage> {
   final _ws = WsClient();
   _StartupPhase _phase = _StartupPhase.restoring;
-  String _status = '正在恢复登录…';
-  String _failTitle = '未能连接到桌面端';
-  String _failDetail = '';
+
+  /// 【为什么是 L10nText 而不是 String】这三个字段都是 state。
+  /// 直接存「已翻译好的字符串」= 把语言烘进 state：用户中途切语言，这里仍是旧语言，
+  /// 正是桌面端历轮反复踩的同一个坑（期4C 的 banner useMemo D1 就是它）。
+  /// 存「怎么取词」、在 build 里才求值，切语言即时生效，且不需要在切语言时回写 state。
+  L10nText _status = (l) => l.startupRestoring;
+  L10nText _failTitle = (l) => l.startupFailTitleDefault;
+  L10nText _failDetail = (l) => '';
 
   /// 是否已经连上网关（区分「压根连不上网关」与「网关正常、只是电脑不在线」两种如实文案）
   bool _gatewayReached = false;
@@ -57,7 +64,8 @@ class _StartupPageState extends State<StartupPage> {
   bool _authExpired = false;
 
   /// 凭证状态提示（三态如实呈现）
-  String _credHint = '';
+  // 存「怎么取词」而不是「取到的词」（同 login_page，期7C）
+  L10nText? _credHint;
 
   /// 续签定时器归属标记（owner 不匹配时 stop 是空操作，不会误停主页的定时器）
   static const _credOwner = 'startup-page';
@@ -73,7 +81,7 @@ class _StartupPageState extends State<StartupPage> {
     super.initState();
     _credSub = MemberCredentials.instance.status.listen((snap) {
       if (!mounted || _navigated) return;
-      setState(() => _credHint = snap.state == CredentialState.anonymous ? '' : snap.describe());
+      setState(() => _credHint = snap.state == CredentialState.anonymous ? null : snap.describe());
     });
     _stateSub = _ws.stateStream.listen((s) {
       if (_navigated || !mounted) return;
@@ -87,14 +95,15 @@ class _StartupPageState extends State<StartupPage> {
           // 连上了网关但尚未配对：可能处于「Host 离线」或「多设备待选」，
           // 这里只更新文案，跳转交给 host_offline / devices_list / 超时三条明确路径处理。
           _gatewayReached = true;
-          setState(() => _status = '已连接网关，等待桌面端上线…');
+          setState(() => _status = (l) => l.commonGwConnectedWaitingHost);
           break;
         case ConnState.connecting:
-          if (mounted) setState(() => _status = '正在连接网关…');
+          if (mounted) setState(() => _status = (l) => l.startupConnectingGw);
           break;
         case ConnState.disconnected:
           if (mounted) {
-            setState(() => _status = _gatewayReached ? '与网关的连接已断开，正在自动重试…' : '正在连接网关…');
+            setState(() => _status =
+                _gatewayReached ? (l) => l.startupGwDisconnected : (l) => l.startupConnectingGw);
           }
           break;
       }
@@ -102,20 +111,24 @@ class _StartupPageState extends State<StartupPage> {
     _eventSub = _ws.events.listen((e) {
       if (_navigated || !mounted) return;
       if (e.event == 'auth_renewed') {
-        setState(() => _status = '登录凭证已自动续签，正在用新凭证连接…');
+        setState(() => _status = (l) => l.commonCredAutoRenewed);
       } else if (e.event == 'auth_expired') {
         // 【401 改造】凭证层已试过 refresh 且确认不可恢复（本地 token 也已被清）。
         // **复用既有失败态**（_StartupPhase.failed），只把标题/详情/主出口换成「重新登录」，
         // 不新增第五个阶段，避免与上一轮的「失败态四出口」互相矛盾。
-        final msg = e.payload['message']?.toString() ?? '登录已失效，请重新登录';
+        final raw = e.payload['message']?.toString();
         _authExpired = true;
         _pairTimeout?.cancel();
-        _enterFailed('登录已失效', '$msg\n\n需要重新输入账号密码登录。你仍可先切换设备或进入主界面看看。');
+        // 服务端原文原样带入 {msg}（口径④不建映射表）；整句结构由我们自己的词条决定
+        _enterFailed(
+          (l) => l.startupAuthExpiredTitle,
+          (l) => l.startupAuthExpiredDetail(raw ?? l.commonLoginExpiredFallback),
+        );
       } else if (e.event == 'error') {
-        final msg = e.payload['message']?.toString() ?? '';
+        final raw = e.payload['message']?.toString() ?? '';
         // 普通网络错误 / 「续签暂未完成」都交给 ws 自动重连，这里仅展示状态；
         // 不再像旧版那样靠字符串匹配就把本地 token 清掉、把人踢回登录页。
-        setState(() => _status = msg);
+        setState(() => _status = rawText(raw));
       } else if (e.event == 'devices_list') {
         _awaitingDevices = false;
         _devicesTimeout?.cancel();
@@ -126,13 +139,13 @@ class _StartupPageState extends State<StartupPage> {
         _gatewayReached = true;
         if (_pendingDeviceChoice) {
           // 用户正在选设备：不打断弹层，等选择结果
-          setState(() => _status = '桌面端离线，请在上方选择要连接的设备');
+          setState(() => _status = (l) => l.commonHostOfflinePickDevice);
           return;
         }
         _pairTimeout?.cancel();
         _goHome(hostOffline: true);
       } else if (e.event == 'host_online') {
-        setState(() => _status = '桌面端已上线，正在配对…');
+        setState(() => _status = (l) => l.startupHostOnlinePairing);
       }
     });
     _restore();
@@ -146,15 +159,15 @@ class _StartupPageState extends State<StartupPage> {
       // 弹层开着时不抢页面，等用户操作完（超时会在下一次动作重新武装）
       if (_pendingDeviceChoice) return;
       _enterFailed(
-        _gatewayReached ? '已连接网关，但未找到可配对的桌面端' : '连接网关超时',
+        _gatewayReached ? (l) => l.startupTimeoutConnected : (l) => l.startupTimeoutUnreachable,
         _gatewayReached
-            ? '你的账号已登录成功，网关也正常，只是那台电脑当前不在线（未开机 / 山海桌面端未运行 / 桌面端未登录同一账号）。\n\n可以重试、改连其它在线设备，或先进入主界面。'
-            : '无法与网关建立连接，可能是当前网络不可用或网关暂时不可达。\n\n可以重试、改连其它设备，或先进入主界面。',
+            ? (l) => l.startupTimeoutConnectedDetail
+            : (l) => l.startupTimeoutUnreachableDetail,
       );
     });
   }
 
-  void _enterFailed(String title, String detail) {
+  void _enterFailed(L10nText title, L10nText detail) {
     if (!mounted || _navigated) return;
     setState(() {
       _phase = _StartupPhase.failed;
@@ -193,21 +206,21 @@ class _StartupPageState extends State<StartupPage> {
     MemberCredentials.instance.start(_credOwner);
     // 【补的缺口】本地已判定过期 → 不拿过期 token 去撞 401，先续签再连
     if (cred.state == CredentialState.expired) {
-      setState(() => _status = '登录凭证已过期，正在尝试自动续签…');
+      setState(() => _status = (l) => l.startupCredExpiredRenewing);
       final outcome = await MemberCredentials.instance.refresh('startup-expired');
       if (!mounted || _navigated) return;
       if (outcome == RefreshOutcome.invalid) {
         _authExpired = true;
+        final lastErr = MemberCredentials.instance.snapshot.lastError;
         _enterFailed(
-          '登录已失效',
-          '${MemberCredentials.instance.snapshot.lastError ?? '凭证已过期且超出续签宽限期'}\n\n'
-          '需要重新输入账号密码登录。你仍可先切换设备或进入主界面看看。',
+          (l) => l.startupAuthExpiredTitle,
+          (l) => l.startupAuthExpiredDetail(lastErr ?? l.startupCredGraceOver),
         );
         return;
       }
       if (outcome == RefreshOutcome.transient) {
         // 网关未部署 / 断网：不登出，继续尝试连接（可能仍会 401，由连接层退避兜底）
-        if (mounted && !_navigated) setState(() => _status = '凭证已过期且自动续签暂未成功，正在尝试连接…');
+        if (mounted && !_navigated) setState(() => _status = (l) => l.startupRenewPending);
       }
     }
     // 有可用 token：自动连网关。失效/失败在事件监听里处理；
@@ -221,7 +234,7 @@ class _StartupPageState extends State<StartupPage> {
       // ws 内部已触发自动重连并发出 error 事件；这里给一个明确的等待文案，
       // 最终由超时兜底转失败态（带出口按钮），不再只靠一行灰字提示。
       if (mounted && !_navigated) {
-        setState(() => _status = '连接网关失败，正在自动重试…');
+        setState(() => _status = (l) => l.startupGwFailedRetrying);
       }
     }
   }
@@ -234,14 +247,14 @@ class _StartupPageState extends State<StartupPage> {
     setState(() {
       _busy = true;
       _phase = _StartupPhase.restoring;
-      _status = '正在重试连接…';
+      _status = (l) => l.startupRetrying;
     });
     _armTimeout();
     final ok = await _ws.reconnectNow();
     if (!mounted || _navigated) return;
     setState(() {
       _busy = false;
-      if (!ok) _status = '重试仍未连上网关，正在后台自动重连…';
+      if (!ok) _status = (l) => l.startupRetryStillFailed;
     });
     // 握手成功后是否配对，交给 paired / host_offline / 超时三条路径决定
     if (ok) _maybeGoHomeIfPaired();
@@ -252,11 +265,14 @@ class _StartupPageState extends State<StartupPage> {
     if (_busy) return;
     if (!_ws.listDevices()) {
       // 当前没有可用连接（网关都没连上）：明确告知并顺手重试，不给「点了没反应」的死局
-      _snack('当前未连上网关，正在重试；连上后即可选择设备');
+      _snack((l) => l.startupSnackNoGw);
       await _retry();
       final ok2 = _ws.listDevices();
       if (!ok2) {
-        _enterFailed('暂时无法获取设备列表', '与网关的连接尚未建立，无法查询该账号下在线的桌面端设备。\n\n请确认网络可用后重试，或先退出登录换账号。');
+        _enterFailed(
+          (l) => l.startupNoDeviceListTitle,
+          (l) => l.startupNoDeviceListDetail,
+        );
         return;
       }
     }
@@ -265,7 +281,7 @@ class _StartupPageState extends State<StartupPage> {
       _busy = true;
       _awaitingDevices = true;
       _phase = _StartupPhase.restoring;
-      _status = '正在获取在线设备列表…';
+      _status = (l) => l.startupFetchingDevices;
     });
     _armTimeout();
     _devicesTimeout?.cancel();
@@ -275,7 +291,7 @@ class _StartupPageState extends State<StartupPage> {
         _awaitingDevices = false;
         _busy = false;
       });
-      _snack('暂未收到设备列表，可稍后再试或先退出登录');
+      _snack((l) => l.startupDevicesTimeoutSnack);
     });
   }
 
@@ -335,14 +351,14 @@ class _StartupPageState extends State<StartupPage> {
         _busy = false;
         _awaitingDevices = false;
       });
-      _snack('该账号下当前没有在线的桌面端设备');
+      _snack((l) => l.startupNoOnlineDevices);
       return;
     }
     setState(() {
       _busy = false;
       _awaitingDevices = false;
       _pendingDeviceChoice = true;
-      _status = '检测到多台桌面端设备，请选择要连接的设备';
+      _status = (l) => l.commonMultiDevicesPick;
     });
     final chosen = await showDevicePickerSheet(context, devices);
     if (!mounted || _navigated) return;
@@ -352,12 +368,15 @@ class _StartupPageState extends State<StartupPage> {
         _pendingDeviceChoice = false;
         _busy = false;
       });
-      _enterFailed('未选择设备', '你取消了设备选择。可以重新获取设备列表再选，或先进入主界面（届时仍可切换设备）。');
+      _enterFailed(
+        (l) => l.startupNoDeviceChosenTitle,
+        (l) => l.startupNoDeviceChosenDetail,
+      );
       return;
     }
     setState(() {
       _phase = _StartupPhase.restoring;
-      _status = '正在连接所选设备…';
+      _status = (l) => l.commonConnectingChosenDevice;
     });
     _armTimeout();
     await _ws.switchDevice(chosen);
@@ -368,10 +387,14 @@ class _StartupPageState extends State<StartupPage> {
     _maybeGoHomeIfPaired();
   }
 
-  void _snack(String text) {
+  void _snack(L10nText text) {
     if (!mounted) return;
+    // SnackBar 是即时事件：在弹出的那一刻按当前语言取词（与桌面端系统通知同一口径 ——
+    // 已经弹出去的提示条不会随之后的语言切换而改变，这是物理事实）
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(text, style: const TextStyle(fontSize: 13)), duration: const Duration(seconds: 3)),
+      SnackBar(
+          content: Text(text(AppLocalizations.of(context)), style: const TextStyle(fontSize: 13)),
+          duration: const Duration(seconds: 3)),
     );
   }
 
@@ -410,6 +433,7 @@ class _StartupPageState extends State<StartupPage> {
 
   /// 等待态：转圈 + 文案 + **常驻次要出口**（绝不出现「只有一个转圈」的死局）
   Widget _buildRestoring() {
+    final l = AppLocalizations.of(context);
     final accent = Theme.of(context).colorScheme.primary;
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -417,26 +441,27 @@ class _StartupPageState extends State<StartupPage> {
       children: [
         Center(child: SizedBox(width: 34, height: 34, child: CircularProgressIndicator(color: accent, strokeWidth: 3))),
         const SizedBox(height: 18),
-        Text(_status, textAlign: TextAlign.center, style: TextStyle(fontSize: 13, color: Colors.grey)),
+        Text(_status(l), textAlign: TextAlign.center, style: const TextStyle(fontSize: 13, color: Colors.grey)),
         const SizedBox(height: 6),
-        Text('等待约 ${kStartupPairTimeout.inSeconds} 秒仍未连上会自动给出重试与切换设备的选项',
+        // 数量走 ARB plural（禁止代码里拼「N 秒」）：中文 one/other 同值但形态保留
+        Text(l.startupWaitHint(kStartupPairTimeout.inSeconds),
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
         const SizedBox(height: 22),
         OutlinedButton.icon(
           onPressed: _busy ? null : _switchDevice,
           icon: const Icon(Icons.devices_other_outlined, size: 18),
-          label: const Text('切换其它设备'),
+          label: Text(l.commonSwitchDevice),
           style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 13)),
         ),
         const SizedBox(height: 10),
         TextButton(
           onPressed: _skipToHome,
-          child: Text('先跳过，直接进入主界面', style: TextStyle(fontSize: 13, color: Colors.grey.shade400)),
+          child: Text(l.startupSkipToHome, style: TextStyle(fontSize: 13, color: Colors.grey.shade400)),
         ),
         TextButton(
           onPressed: _logout,
-          child: Text('退出登录', style: TextStyle(fontSize: 13, color: Colors.grey.shade500)),
+          child: Text(l.commonLogout, style: TextStyle(fontSize: 13, color: Colors.grey.shade500)),
         ),
       ],
     );
@@ -444,6 +469,7 @@ class _StartupPageState extends State<StartupPage> {
 
   /// 失败态：如实说明卡在哪一步 + 四个出口（重试 / 切设备 / 进主界面 / 退出登录）
   Widget _buildFailed() {
+    final l = AppLocalizations.of(context);
     final c = context.appColors;
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -464,16 +490,16 @@ class _StartupPageState extends State<StartupPage> {
                   Icon(Icons.cloud_off_outlined, size: 22, color: c.pending),
                   const SizedBox(width: 10),
                   Expanded(
-                    child: Text(_failTitle,
+                    child: Text(_failTitle(l),
                         style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
                   ),
                 ],
               ),
               const SizedBox(height: 10),
-              Text(_failDetail, style: TextStyle(fontSize: 13, height: 1.5, color: c.textSecondary)),
+              Text(_failDetail(l), style: TextStyle(fontSize: 13, height: 1.5, color: c.textSecondary)),
               if (_ws.targetDeviceId != null && _ws.targetDeviceId!.isNotEmpty) ...[
                 const SizedBox(height: 10),
-                Text('上次连接的设备：${_ws.targetDeviceId}',
+                Text(l.startupLastDevice(_ws.targetDeviceId!),
                     style: TextStyle(fontSize: 12, color: c.textMuted)),
               ],
             ],
@@ -486,14 +512,14 @@ class _StartupPageState extends State<StartupPage> {
           FilledButton.icon(
             onPressed: _busy ? null : _logout,
             icon: const Icon(Icons.replay, size: 18),
-            label: Text(_busy ? '处理中…' : '重新登录'),
+            label: Text(_busy ? l.commonBusyProcessing : l.startupRelogin),
             style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 15)),
           )
         else
           FilledButton.icon(
             onPressed: _busy ? null : _retry,
             icon: const Icon(Icons.refresh, size: 18),
-            label: Text(_busy ? '处理中…' : '重试当前设备'),
+            label: Text(_busy ? l.commonBusyProcessing : l.startupRetryCurrentDevice),
             style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 15)),
           ),
         const SizedBox(height: 10),
@@ -501,32 +527,32 @@ class _StartupPageState extends State<StartupPage> {
           OutlinedButton.icon(
             onPressed: _busy ? null : _retry,
             icon: const Icon(Icons.refresh, size: 18),
-            label: const Text('再试一次自动续签'),
+            label: Text(l.startupRetryAutoRenew),
             style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 14)),
           )
         else
           OutlinedButton.icon(
             onPressed: _busy ? null : _switchDevice,
             icon: const Icon(Icons.devices_other_outlined, size: 18),
-            label: const Text('切换其它设备'),
+            label: Text(l.commonSwitchDevice),
             style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 14)),
           ),
         const SizedBox(height: 10),
         OutlinedButton.icon(
           onPressed: _authExpired ? null : _skipToHome,
           icon: const Icon(Icons.login_outlined, size: 18),
-          label: Text(_authExpired ? '凭证已失效，无法进入主界面' : '先进入主界面'),
+          label: Text(_authExpired ? l.startupCredExpiredNoHome : l.startupEnterHome),
           style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 14)),
         ),
         const SizedBox(height: 6),
         TextButton(
           onPressed: _logout,
-          child: Text(_authExpired ? '换个账号登录' : '退出登录',
+          child: Text(_authExpired ? l.startupSwitchAccount : l.commonLogout,
               style: TextStyle(fontSize: 13, color: Colors.grey.shade500)),
         ),
-        if (_credHint.isNotEmpty) ...[
+        if (_credHint != null) ...[
           const SizedBox(height: 8),
-          Text(_credHint, textAlign: TextAlign.center, style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
+          Text(_credHint!(AppLocalizations.of(context)), textAlign: TextAlign.center, style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
         ],
       ],
     );

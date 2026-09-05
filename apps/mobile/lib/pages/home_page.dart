@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import '../l10n/generated/app_localizations.dart';
+import '../locale.dart';
 import '../theme.dart';
 import '../services/member_credentials.dart';
 import '../services/token_store.dart';
@@ -95,7 +97,7 @@ class _HomePageState extends State<HomePage> {
       } else if (e.event == 'host_online') {
         if (_hostOffline) setState(() => _hostOffline = false);
       } else if (e.event == 'auth_renewed') {
-        _snack('登录凭证已自动续签，无需重新登录');
+        _snack((l) => l.homeSnackRenewed);
       } else if (e.event == 'auth_expired') {
         // 凭证确认不可恢复：横幅转红色变体并给「重新登录」出口（复用同一横幅，不新增状态）
         setState(() {
@@ -103,7 +105,10 @@ class _HomePageState extends State<HomePage> {
           _conn = widget.ws.state;
           _hostOffline = true;
         });
-        _snack(e.payload['message']?.toString() ?? '登录已失效，请重新登录');
+        // 服务端带回的 message 原样呈现（口径④：不建映射表）；只有它没带回时
+        // 才用山海自己的兜底文案 —— 顺序与改前 ?? 完全一致
+        final gwMsg = e.payload['message']?.toString();
+        _snack(gwMsg == null ? (l) => l.commonLoginExpiredFallback : rawText(gwMsg));
       } else if (e.event == 'devices_list') {
         _awaitingDevices = false;
         _devicesTimeout?.cancel();
@@ -134,7 +139,8 @@ class _HomePageState extends State<HomePage> {
     if (result.hasUpdate && result.update != null) {
       await showUpdateDialog(context, result.update!);
     } else if (!silent) {
-      final msg = result.error ?? '当前已是最新版本';
+      final gwErr = result.error;
+      final msg = gwErr ?? AppLocalizations.of(context).homeLatestVersion;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(msg, style: const TextStyle(fontSize: 13))),
       );
@@ -146,11 +152,11 @@ class _HomePageState extends State<HomePage> {
   /// 并加等待兜底，网关不回 devices_list 时给提示而不是静默。
   void _requestSwitchDevice() {
     if (!_wsAlive) {
-      _snack('与网关的连接已断开，请先点「重试」再切换设备');
+      _snack((l) => l.homeSnackWsDown);
       return;
     }
     if (!widget.ws.listDevices()) {
-      _snack('当前未连上网关，无法获取设备列表');
+      _snack((l) => l.homeSnackNoGwList);
       return;
     }
     _awaitingDevices = true;
@@ -158,7 +164,7 @@ class _HomePageState extends State<HomePage> {
     _devicesTimeout = Timer(const Duration(seconds: 6), () {
       if (!mounted || !_awaitingDevices) return;
       _awaitingDevices = false;
-      _snack('暂未收到设备列表，请稍后再试');
+      _snack((l) => l.homeSnackNoDeviceListYet);
     });
   }
 
@@ -170,7 +176,7 @@ class _HomePageState extends State<HomePage> {
     if (_switchingDevice) return;
     if (devices.isEmpty) {
       // 网关回了空列表：如实提示，不弹空白弹层
-      _snack('该账号下当前没有在线的桌面端设备');
+      _snack((l) => l.homeSnackNoOnlineDevice);
       return;
     }
     _switchingDevice = true;
@@ -187,7 +193,7 @@ class _HomePageState extends State<HomePage> {
     if (_retrying) return;
     // 凭证已不可恢复（本地无 token）：重连没意义，直接引导重新登录，不给「点了没反应」的错觉
     if (!MemberCredentials.instance.isSignedIn) {
-      _snack('登录凭证已失效，请先重新登录');
+      _snack((l) => l.homeSnackCredInvalidRetry);
       await _logout(skipConfirm: true);
       return;
     }
@@ -200,7 +206,7 @@ class _HomePageState extends State<HomePage> {
       _hostOffline = widget.ws.state != ConnState.paired;
       _cred = MemberCredentials.instance.snapshot;
     });
-    _snack(ok ? '已重新连接网关，正在尝试配对桌面端' : '仍未能连上网关，已转后台自动重试');
+    _snack(ok ? (l) => l.homeSnackReconnected : (l) => l.homeSnackRetryFailed);
   }
 
   /// 凭证过期但仍在宽限期：手动触发一次续签 + 重连（横幅里的「立即续签」出口）
@@ -217,16 +223,16 @@ class _HomePageState extends State<HomePage> {
     });
     switch (r.outcome) {
       case RefreshOutcome.rotated:
-        _snack(r.connected ? '续签成功，已用新凭证重连' : '续签成功，正在后台自动重连');
+        _snack(r.connected ? (l) => l.homeSnackRenewOkConnected : (l) => l.homeSnackRenewOkBg);
         break;
       case RefreshOutcome.invalid:
-        _snack('登录凭证已失效且无法自动续签，请重新登录');
+        _snack((l) => l.homeSnackRenewInvalid);
         break;
       case RefreshOutcome.noToken:
-        _snack('本地已无登录凭证，请重新登录');
+        _snack((l) => l.homeSnackNoToken);
         break;
       case RefreshOutcome.transient:
-        _snack('自动续签暂未成功（网关未部署或网络异常），已保留登录态并继续重试');
+        _snack((l) => l.homeSnackRenewTransient);
         break;
     }
   }
@@ -237,13 +243,13 @@ class _HomePageState extends State<HomePage> {
       final yes = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: const Text('退出登录'),
-          content: const Text('退出后需要重新输入账号密码登录。确定退出？'),
+          title: Text(AppLocalizations.of(context).commonLogout),
+          content: Text(AppLocalizations.of(context).homeLogoutBody),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text(AppLocalizations.of(ctx).commonCancel)),
             TextButton(
               onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('退出', style: TextStyle(color: Colors.redAccent)),
+              child: Text(AppLocalizations.of(ctx).homeLogoutConfirm, style: const TextStyle(color: Colors.redAccent)),
             ),
           ],
         ),
@@ -271,10 +277,16 @@ class _HomePageState extends State<HomePage> {
     unawaited(ws.dispose());
   }
 
-  void _snack(String text) {
+  /// 提示条。参数是 L10nText（「怎么取词」）而不是已翻译好的 String ——
+  /// 与 7A 的 startup_page 同一口径：在弹出的那一刻按当前语言求值，
+  /// 切语言后新弹出的提示自然是新语言，也不会把译文存进任何长期状态。
+  void _snack(L10nText text) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(text, style: const TextStyle(fontSize: 13)), duration: const Duration(seconds: 3)),
+      SnackBar(
+      content: Text(text(AppLocalizations.of(context)), style: const TextStyle(fontSize: 13)),
+      duration: const Duration(seconds: 3),
+      ),
     );
   }
 
@@ -283,6 +295,10 @@ class _HomePageState extends State<HomePage> {
   ///
   /// 凭证三态复用同一个横幅组件（只换文案、配色与出口），**不新增第五种状态**。
   Widget _buildStatusBanner() {
+  // 【谁取词谁订阅】本方法由 build 调用，这里取一次 of(context)：
+  // 既登记语言依赖（语言变化 → Localizations 通知 → 本页重渲染），
+  // 又让横幅文案在每次渲染时重新求值。
+  final l = AppLocalizations.of(context);
     // —— 凭证失效变体（红色）：本地已无可用 token，重连必然被拒，唯一有效出口是重新登录 ——
     if (_authInvalid) {
       return Material(
@@ -297,10 +313,10 @@ class _HomePageState extends State<HomePage> {
                 children: [
                   const Icon(Icons.lock_outline, size: 16, color: Color(0xFFFCA5A5)),
                   const SizedBox(width: 8),
-                  const Expanded(
+                  Expanded(
                     child: Text(
-                      '登录已失效，请重新登录',
-                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFFFEE2E2)),
+                      l.commonLoginExpiredFallback,
+                      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFFFEE2E2)),
                     ),
                   ),
                 ],
@@ -309,8 +325,8 @@ class _HomePageState extends State<HomePage> {
               Padding(
                 padding: const EdgeInsets.only(left: 24),
                 child: Text(
-                  '登录凭证已过期且自动续签未成功（可能已超出网关的续签宽限期），'
-                  '或凭证本身无效/缺失。远程连接与私信都需要重新登录一次。',
+                  l.homeBannerAuthInvalidDetail,
+                  // 相邻拼接的第二行已并入词条（Dart 'a' 'b' 语法）
                   style: const TextStyle(fontSize: 11.5, height: 1.4, color: Color(0xFFFEE2E2)),
                 ),
               ),
@@ -321,9 +337,10 @@ class _HomePageState extends State<HomePage> {
                   spacing: 6,
                   runSpacing: 2,
                   children: [
-                    _bannerAction(Icons.replay, '重新登录', false, () => _logout(skipConfirm: true)),
-                    _bannerAction(Icons.refresh, '再试一次续签', _retrying, _renewNow),
-                    _bannerAction(Icons.logout, '退出登录', false, _logout),
+                    _bannerAction(Icons.replay, (x) => x.startupRelogin, false, () => _logout(skipConfirm: true)),
+                    _bannerAction(Icons.refresh, (x) => x.homeBannerRetryRenew, _retrying, _renewNow,
+                    busyLabel: (x) => x.homeBusyRetryRenew),
+                    _bannerAction(Icons.logout, (x) => x.commonLogout, false, _logout),
                   ],
                 ),
               ),
@@ -350,7 +367,9 @@ class _HomePageState extends State<HomePage> {
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      expired ? '登录凭证已过期，正在自动续签' : _cred.describe(),
+                      // 期7C：describe() 已改返回闭包（它被存进 state 字段，不能烘译文），
+                      // 这里在渲染期求值 → 凭证三态与横幅其余文案同语言
+                      expired ? l.homeBannerExpiredTitle : _cred.describe()(l),
                       style: const TextStyle(
                           fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFFFDE68A)),
                     ),
@@ -362,12 +381,12 @@ class _HomePageState extends State<HomePage> {
                 padding: const EdgeInsets.only(left: 24),
                 child: Text(
                   expired
-                      ? '已建立的连接暂时还能用，但断线重连会被拒。山海会在后台按退避自动续签（网关有宽限期，'
-                        '多数情况免密续上）；也可点「立即续签」马上试一次。'
+                      ? l.homeBannerExpiredDetail
+                        // 相邻拼接的第二行已并入词条
                       : (_cred.state == CredentialState.unknown
-                          ? '本地没有记录该凭证的过期时间（老版本登录或网关未下发有效期），'
-                            '按可用处理，不做主动续签；若被网关拒绝会自动走续签流程。'
-                          : '山海会在到期前自动续签，无需重新输入密码。'),
+                          ? l.homeBannerUnknownDetail
+                            // 相邻拼接的第二行已并入词条
+                          : l.homeBannerRenewingDetail),
                   style: const TextStyle(fontSize: 11.5, height: 1.4, color: Color(0xFFFDE68A)),
                 ),
               ),
@@ -378,8 +397,9 @@ class _HomePageState extends State<HomePage> {
                   spacing: 6,
                   runSpacing: 2,
                   children: [
-                    _bannerAction(Icons.refresh, '立即续签', _retrying, _renewNow),
-                    _bannerAction(Icons.logout, '退出登录', false, _logout),
+                    _bannerAction(Icons.refresh, (x) => x.homeBannerRenewNow, _retrying, _renewNow,
+                    busyLabel: (x) => x.homeBusyRenewNow),
+                    _bannerAction(Icons.logout, (x) => x.commonLogout, false, _logout),
                   ],
                 ),
               ),
@@ -392,18 +412,19 @@ class _HomePageState extends State<HomePage> {
     final disconnected = _conn == ConnState.disconnected;
     final connecting = _conn == ConnState.connecting;
     final title = disconnected
-        ? '与网关的连接已断开，正在自动重试…'
+        ? l.startupGwDisconnected
         : connecting
-            ? '正在连接网关…'
+            ? l.startupConnectingGw
             : (_hostOffline
-                ? '该设备当前不在线'
-                : '已连接网关，等待桌面端上线…');
+                ? l.homeBannerHostOfflineTitle
+                : l.commonGwConnectedWaitingHost);
     final detail = disconnected
-        ? '手机与网关之间的连接断了（网络切换 / 网关重启等）。可以重试，或切换其它在线设备。'
+        ? l.homeBannerDisconnectedDetail
         : connecting
-            ? '正在与网关建立连接，请稍候；等不及可以切换设备或退出登录。'
-            : '你的账号已登录、网关也正常，只是那台电脑上的山海没在运行（或没登录同一账号）。'
-                '可以重试、改连其它在线设备，或退出登录换账号。';
+            ? l.homeBannerConnectingDetail
+            : l.homeBannerHostOfflineDetail
+                // 相邻拼接的第二行已并入词条
+;
     return Material(
       color: const Color(0xFF7C4A12),
       child: Padding(
@@ -434,7 +455,7 @@ class _HomePageState extends State<HomePage> {
               Padding(
                 padding: const EdgeInsets.only(left: 24, top: 2),
                 child: Text(
-                  _cred.describe(),
+                  _cred.describe()(l),
                   style: const TextStyle(fontSize: 11, height: 1.4, color: Color(0xFFFDE68A)),
                 ),
               ),
@@ -445,9 +466,15 @@ class _HomePageState extends State<HomePage> {
                 spacing: 6,
                 runSpacing: 2,
                 children: [
-                  _bannerAction(Icons.refresh, '重试', _retrying, _retryConnect),
-                  _bannerAction(Icons.devices_other_outlined, '切换设备', _switchingDevice, _requestSwitchDevice),
-                  _bannerAction(Icons.logout, '退出登录', false, _logout),
+                  _bannerAction(Icons.refresh, (x) => x.homeActionRetry, _retrying, _retryConnect,
+                  busyLabel: (x) => x.homeBusyRetry),
+                  _bannerAction(
+                  Icons.devices_other_outlined,
+                  (x) => x.homeSwitchDeviceTooltip,
+                  _switchingDevice,
+                  _requestSwitchDevice,
+                  busyLabel: (x) => x.homeBusySwitchDevice),
+                  _bannerAction(Icons.logout, (x) => x.commonLogout, false, _logout),
                 ],
               ),
             ),
@@ -457,11 +484,21 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _bannerAction(IconData icon, String label, bool busy, VoidCallback onTap) {
+  /// 横幅里的出口按钮。原来 busy 时是 `'$label…'` 拼出来的 —— 英文会拼成
+  /// `Retry…`，与真正的进行时态（Retrying…）不是一回事，故改成独立词条。
+  /// busyLabel 缺省时退回「原词 + 省略号」，保证不出现静默无反馈。
+  Widget _bannerAction(IconData icon, L10nText label, bool busy, VoidCallback onTap,
+  {L10nText? busyLabel}) {
+  final l = AppLocalizations.of(context);
     return TextButton.icon(
       onPressed: busy ? null : onTap,
       icon: Icon(icon, size: 15, color: const Color(0xFFFDE68A)),
-      label: Text(busy ? '$label…' : label, style: const TextStyle(fontSize: 12, color: Color(0xFFFDE68A))),
+      label: Text(
+      busy
+      ? (busyLabel != null ? busyLabel(l) : '${label(l)}…')
+      : label(l),
+      style: const TextStyle(fontSize: 12, color: Color(0xFFFDE68A)),
+      ),
       style: TextButton.styleFrom(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
         minimumSize: const Size(0, 30),
@@ -486,18 +523,48 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('山海', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+        title: Text(AppLocalizations.of(context).brandShanhai,
+        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
         actions: [
           IconButton(
-            tooltip: '检查更新',
+            tooltip: AppLocalizations.of(context).homeCheckUpdate,
             icon: const Icon(Icons.system_update_alt),
             onPressed: () => _checkUpdate(silent: false),
+          ),
+          // —— 语言切换入口（i18n 期7A）：与下面的主题入口并排、同一套范式 ——
+          // 只有这一个新增控件走 l10n 取词；本文件其余文案属 7B，不在试点范围。
+          ValueListenableBuilder<AppLocale>(
+            valueListenable: LocaleController.instance,
+            builder: (context, pref, _) => PopupMenuButton<AppLocale>(
+              tooltip: AppLocalizations.of(context).localeMenuTooltip,
+              icon: const Icon(Icons.language_outlined),
+              onSelected: (v) => LocaleController.instance.setLocale(v),
+              itemBuilder: (_) => [
+                for (final v in AppLocale.values)
+                  PopupMenuItem(
+                    value: v,
+                    child: Row(
+                      children: [
+                        Icon(v.icon, size: 18),
+                        const SizedBox(width: 10),
+                        // 在弹层构建期才取词 → 切语言后下次打开就是新语言
+                        Text(v.label(AppLocalizations.of(context)),
+                            style: const TextStyle(fontSize: 14)),
+                        if (v == pref) ...[
+                          const SizedBox(width: 8),
+                          const Icon(Icons.check, size: 16, color: Color(0xFF8B5CF6)),
+                        ],
+                      ],
+                    ),
+                  ),
+              ],
+            ),
           ),
           // 主题切换入口：跟随系统 / 亮色 / 暗色（与桌面端主题机制对齐）
           ValueListenableBuilder<AppThemeMode>(
             valueListenable: ThemeController.instance,
             builder: (context, mode, _) => PopupMenuButton<AppThemeMode>(
-              tooltip: '主题',
+              tooltip: AppLocalizations.of(context).homeThemeMenuTooltip,
               icon: Icon(mode.icon),
               onSelected: (m) => ThemeController.instance.setMode(m),
               itemBuilder: (_) => [
@@ -508,7 +575,8 @@ class _HomePageState extends State<HomePage> {
                       children: [
                         Icon(m.icon, size: 18),
                         const SizedBox(width: 10),
-                        Text(m.label, style: const TextStyle(fontSize: 14)),
+                        Text(m.label(AppLocalizations.of(context)),
+                        style: const TextStyle(fontSize: 14)),
                         if (m == mode) ...[
                           const SizedBox(width: 8),
                           const Icon(Icons.check, size: 16, color: Color(0xFF8B5CF6)),
@@ -520,13 +588,13 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
           IconButton(
-            tooltip: '切换设备',
+            tooltip: AppLocalizations.of(context).homeSwitchDeviceTooltip,
             icon: const Icon(Icons.devices_outlined),
             onPressed: _requestSwitchDevice,
           ),
           // 退出登录入口：原先主页没有任何登出出口，一旦连不上电脑又退不出去就成了死局
           IconButton(
-            tooltip: '退出登录',
+            tooltip: AppLocalizations.of(context).commonLogout,
             icon: const Icon(Icons.logout_outlined),
             onPressed: _logout,
           ),
@@ -549,9 +617,15 @@ class _HomePageState extends State<HomePage> {
       bottomNavigationBar: NavigationBar(
         selectedIndex: _index,
         onDestinationSelected: (i) => setState(() => _index = i),
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.forum_outlined), selectedIcon: Icon(Icons.forum), label: '会话'),
-          NavigationDestination(icon: Icon(Icons.supervisor_account_outlined), selectedIcon: Icon(Icons.supervisor_account), label: '管家'),
+        destinations: [
+          NavigationDestination(
+          icon: const Icon(Icons.forum_outlined),
+          selectedIcon: const Icon(Icons.forum),
+          label: AppLocalizations.of(context).homeNavSessions),
+          NavigationDestination(
+          icon: const Icon(Icons.supervisor_account_outlined),
+          selectedIcon: const Icon(Icons.supervisor_account),
+          label: AppLocalizations.of(context).homeNavSupervisor),
         ],
       ),
     );

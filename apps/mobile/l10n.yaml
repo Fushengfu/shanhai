@@ -1,0 +1,15 @@
+# —— i18n 期7A：手机端语言包配置 ——
+# 约定与桌面端 shared/i18n 同构（ARb 语法不允许点号，故「按模块前缀」以 camelCase 实现：
+#   common* / locale* / startup* / login* / connect* …，一个模块一个前缀，禁止跨模块混放）
+#
+# 模板语言 = 中文（app_zh.arb）：
+#   ① 英文漏译时，gen_l10n 生成的 AppLocalizationsEn 不覆写该方法 → 编译期就报错，
+#      运行期不可能出现「界面露出 startupRetrying 这类 key」；
+#   ② fallback-locale = zh：系统语言不在 supportedLocales 内时，整体回退源语言中文。
+arb-dir: lib/l10n
+template-arb-file: app_zh.arb
+output-dir: lib/l10n/generated
+output-localization-file: app_localizations.dart
+output-class: AppLocalizations
+fallback-locale: zh
+nullable-getter: false

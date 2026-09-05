@@ -6,6 +6,20 @@ import { safeSend } from './safe-send'
 import { getRuntime } from './runtime'
 import { getWindowType } from './window-manager'
 import { notifyDmMessage, notifyFriendRequest } from './notifications'
+// 附件引用消息的解码（与渲染层共用一份，避免两套标准）：私信 content 里可能是 {"t":"image",…} 这种引用，
+// 系统通知正文与「引用到会话」的落地文本都不能把这段 JSON 原样甩给用户。
+import { dmContentPreview, dmContentToPlainText } from '../shared/dm-attachment'
+// 【i18n 期5B】本模块的用户可见文案全部走词条，语言只认 main/locale-store.ts 的 getMainLocale()
+// （全仓唯一真相源；本模块绝不读 settings.locale 原文、不读 config.json、不把语言决策渗回渲染层）。
+// ⚠️ 取词时机见下面 ErrSpec 的注释：**存结构、出口求值**，不在模块加载期求值（历轮 9 次同一个坑）。
+import { getMainLocale, onMainLocaleChange } from './locale-store'
+import { tIn } from '../shared/i18n'
+// 【期5B-补漏·用户裁决】会员显示名的判定抽到 shared 层，主进程与渲染层共用同一份实现：
+// 主进程六条路径原先在拿不到昵称/用户名时兜底成对端 memberId，其中 notifyDmMessage /
+// notifyFriendRequest 的标题**根本不经过渲染层** → 英文界面里通知会是一个纯数字 memberId。
+// 分工：落盘/跨进程载荷用 realNameOrEmpty（拿不到就空串，绝不写译文，避免把语言烘进磁盘）；
+//       即时显示（系统通知标题）用 displayNameOf（当前语言的「未知会员」）。
+import { displayNameOf, realNameOrEmpty } from '../shared/member-display'
 import {
   getMemberAccessToken,
   handleAuthRejected,
@@ -56,7 +70,33 @@ const DEFAULT_MEMBER_URL = process.env.SHANHAI_MEMBER_WS_URL?.trim() || 'wss://a
  */
 const MEMBER_API_BASE = process.env.SHANHAI_MEMBER_API_BASE?.trim() || 'https://aigateway.bjctykj.com'
 /** HTTP 请求超时（避免连接挂起长期占住调用） */
+/**
+ * 会员 HTTP 超时。这些接口都是轻量 CRUD（实测 friends/search/history 都在 57~74ms 量级），
+ * 不存在「网关要跑几分钟」的场景，所以**不跟着模型链路一起放大**（真正的阈值倒挂在 packages/llm，已单独修）。
+ * 这里保持 10s，配合下面的重试；最坏总耗时 = 10 + 0.8 + 10 + 1.6 + 10 + 3.2 + 10 ≈ 45.6s，有界可控。
+ */
 const HTTP_TIMEOUT_MS = 10_000
+
+/** 网关超时/不可用的自动重试上限（用户拍板：最多 3 次） */
+const GATEWAY_RETRY_MAX = 3
+/** 指数退避基数（毫秒）：800 → 1600 → 3200 */
+const GATEWAY_RETRY_BASE_MS = 800
+/**
+ * 【识别条件①③】网关把 Go 原生 `context deadline exceeded` 放在 HTTP body 的 message 里透出；
+ * 另有 nginx/网关自己给的 502/503/504（【识别条件②】）。措辞里既没有「超时」也没有 timed out，
+ * 所以必须单独匹配 —— 与 packages/llm、packages/agent 里那两处保持同一组特征。
+ */
+const GATEWAY_DEADLINE_TEXT = /context\s+deadline\s+exceeded|deadline\s+exceeded\s+while\s+reading\s+body|Client\.Timeout\s+exceeded|net\/http:\s+request\s+canceled/i
+/** 【识别条件②】网关门面 5xx：请求没被上游完成，重试安全 */
+const GATEWAY_BAD_GATEWAY = new Set([502, 503, 504])
+
+function isGatewayDeadlineText(text: string | null | undefined): boolean {
+  return !!text && GATEWAY_DEADLINE_TEXT.test(text)
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
 /** 协议版本（契约 v1） */
 const PROTOCOL_V = 1
 /** 断线重连基础间隔（指数退避，上限 60s，带 ±20% 抖动） */
@@ -147,6 +187,12 @@ export interface DmFriend {
   nickname?: string
   /** 网关若下发在线标记则用于展示，未下发为 undefined（如实显示「未知」） */
   online?: boolean
+  /**
+   * 【真头像】网关下发的头像 URL。实测 /members/search 与 conversations 的 peer 对象里都有该字段，
+   * 但值常为**空字符串** → pickStr 把空串归 null → 这里存 undefined，界面按「无头像」处理（回落首字占位）。
+   * ⚠️ 只做显示：它不参与任何请求参数、不进消息体、不进日志。
+   */
+  avatar?: string
 }
 
 /** 待处理的好友申请（别人发给我的） */
@@ -155,6 +201,8 @@ export interface DmFriendRequest {
   fromMemberId: string
   fromUsername: string
   fromNickname?: string
+  /** 【真头像】申请方的头像 URL（网关空串 → undefined），仅用于申请列表显示 */
+  fromAvatar?: string
   /** 对方申请时写的附言（定稿载荷 requestMsg） */
   message?: string
   ts: number
@@ -197,6 +245,8 @@ export interface DmThread {
   channelId: string
   peerId: string
   peerName: string
+  /** 【真头像】对端头像 URL（会话列表 peer 对象，拿不到时用本地好友表兜底）；空串按无头像处理 */
+  peerAvatar?: string
   messages: DmMessage[]
   unread: number
   lastTs: number
@@ -235,7 +285,19 @@ let memberUrl = DEFAULT_MEMBER_URL
 let enabled = false
 let connected = false
 let authFailed = false
-let channelError: string | null = null
+/**
+ * 【i18n 期5B 取词时机】通道错误在状态里存的是**未翻译的结构**（词条 key + 参数），
+ * 不是已经取好的文案。原因：channelError 会进 broadcastStatus 的内容指纹 lastStatusFp ——
+ * 一旦把译文烘进去，就只有两种坏结果：① 切语言后译文还是旧的、界面停在旧语言；
+ * ② 或者每次重连重新求值让指纹变化，把任务59 刚消掉的重复广播请回来。
+ * 现在：指纹用 errFp（结构串，与语言无关）→ 重连风暴照旧被去重；
+ *       译文在出口 errText 现取 → 切语言后由 onMainLocaleChange 强制推一次，界面跟上。
+ */
+type ErrSpec = { k: string; p?: Record<string, string | number> }
+
+/** 发送失败原因落盘用的**词条 key**（不是文案）：见 sendDm 里的注释 */
+const FAILED_CHANNEL_CLOSED = 'dm.failedChannelClosed'
+let channelErrorSpec: ErrSpec | null = null
 let seq = 0
 let ws: WebSocket | null = null
 let reconnectTimer: NodeJS.Timeout | null = null
@@ -267,6 +329,23 @@ const sendWindows = new Map<string, number[]>()
 const unreadWatchers = new Set<(u: DmUnread) => void>()
 /** HTTP 补拉并发去重标记 */
 let pulling = false
+/**
+ * 【闪烁修复·广播去重】会员通道每 ~80 秒被网关断开重连一次（见 close 审计），每次重连都会推
+ * status + 每通道 subscribed + 全量 HTTP 补拉（friends/requests/count/conversations/history/unread），
+ * 于是渲染层每秒收到多条**内容完全一样**的快照 → 反复 setState → 提示条反复出现/消失（肉眼＝闪烁）。
+ * 这里给三类广播加「内容指纹」：指纹没变就不推，从源头掐掉无意义重渲染。
+ * 指纹刻意排除 updatedAt / ts 这类每次都变的时间戳。
+ */
+let lastStatusFp = ''
+let lastUnreadFp = ''
+let lastFriendsFp = ''
+/** 上一次全量补拉时间：重连风暴时最多每 BACKFILL_MIN_INTERVAL_MS 做一次，避免每 80 秒 6 个 HTTP */
+let lastBackfillAt = 0
+const BACKFILL_MIN_INTERVAL_MS = 20000
+/** 用户主动点开会话（渲染层 subscribeChannel）时登记，subscribed 回执才值得提示；重连自动订阅不提示 */
+const userInitiatedSubscribe = new Map<string, number>()
+/** read_update 提示去重：同一会话 5 秒内只提示一次（网关 HTTP 与 ws 各推一次，多端还会叠加） */
+const lastReadUpdateNoticeAt = new Map<string, number>()
 /** 待处理好友申请数（红点权威来自 HTTP /friends/requests/count） */
 let requestsCount = 0
 
@@ -336,7 +415,7 @@ function pickBool(obj: Record<string, unknown> | undefined | null, keys: string[
 /**
  * 本账号会员 id：**只认网关下发值**（契约 v1.1：role=member 握手成功后的 connected 下行必带 payload.selfMemberId）。
  * 已删除「本地解码 memberToken 的 user_id claim」兜底 —— 那是对网关 JWT claim 命名的隐性耦合，
- * v1.1 显式下发后不再需要猜。取不到时如实返回 null（私信会提示「尚未取得本账号会员 id」），
+ * v1.1 显式下发后不再需要猜。取不到时如实返回 null（私信会提示「尚未取得本账号身份」），
  * 绝不用猜出来的 id 去算 channelId，避免算出错误通道把消息发给陌生人。
  */
 function resolveSelfMemberId(): string | null {
@@ -408,6 +487,8 @@ interface HttpResult {
    * 而界面上这两类必须给不同的话（见 searchMembers 的 notFound）。
    */
   status?: number
+  /** 本次失败是「网关超时 / 网关不可用」：上层据此决定是否自动重试，不靠猜文案 */
+  gatewayTimeout?: boolean
 }
 
 /**
@@ -415,12 +496,64 @@ interface HttpResult {
  * 凭证只在主进程取用（getRuntime().getMemberToken()），既不下发渲染层也不给插件；带 10s 超时；
  * 401/403 直接走 handleCredentialRejected 联动全局登录态（不重犯 remote-relay 只改自己状态的老问题）。
  */
+/**
+ * 【网关超时自动重试 · 幂等策略（本轮定稿，逐条对应真实行为）】
+ *  - GET（好友 / 申请 / 计数 / 会话 / 未读 / 历史 / 检索）：无副作用 → 网关超时、5xx、网络错误一律重试，最多 3 次。
+ *  - POST 且「没收到任何响应」（连接失败 / DNS / 10s 内无响应被 abort）：请求没到达网关 → 重试安全。
+ *  - POST 且 HTTP 502/503/504：网关门面明确没把请求转完 → 重试；并且这些写接口本身有幂等保护
+ *    （实测重复 friends/request 回 400「你们已经是好友」，重复 accept/reject/delete 同样只回业务错误，
+ *     messages/read 重复标记已读无害）。
+ *  - POST 且 HTTP 200 但 body 里带 deadline exceeded：**不重试** —— 无法确定副作用是否已落库，
+ *    重放可能造出重复申请/重复记录；改成如实提示（不静默、也不假装成功）。
+ *  - 私信发送本身走 ws（不在这里），由 clientMsgId 去重，见 sendDm。
+ * 重试每次都是全新请求：重新取凭证（getMemberAccessToken 在每次 attempt 内取，续签过就用新 token）、
+ * 重新 fetch（新 AbortController），不复用已失败的连接。
+ */
 async function httpJson(path: string, init: { method?: 'GET' | 'POST'; body?: Record<string, unknown> } = {}): Promise<HttpResult> {
+  const method = init.method ?? 'GET'
+  let last: HttpResult | null = null
+  for (let attempt = 0; attempt <= GATEWAY_RETRY_MAX; attempt += 1) {
+    last = await httpOnce(path, init)
+    if (!shouldRetryGatewayTimeout(method, last)) return last
+    if (attempt === GATEWAY_RETRY_MAX) break
+    // 【重试必须可见】走既有 member:notice 通道（私信面板顶部那条恒定占位的提示条），不新增 IPC/handler
+    broadcast('member:notice', {
+      kind: 'gateway_retry',
+      peer: '',
+      message: tIn(getMainLocale(), 'dm.retryNotice', { n: attempt + 1, max: GATEWAY_RETRY_MAX, req: `${method} ${path.split('?')[0]}` }),
+      ts: Date.now(),
+    })
+    await sleepMs(GATEWAY_RETRY_BASE_MS * 2 ** attempt)
+  }
+  // 耗尽：给准确的**当前语言**文案，不透传网关英文原文（期5B 前是写死中文）
+  audit({ dir: 'out', caller: 'builtin', topic: `http ${method} ${path.split('?')[0]}`, channelId: null, to: null, bytes: 0, result: `gateway_timeout_exhausted:${GATEWAY_RETRY_MAX}` })
+  return {
+    ok: false,
+    code: 'gateway_timeout',
+    message: tIn(getMainLocale(), 'dm.retryExhausted', { max: GATEWAY_RETRY_MAX }),
+    data: null,
+    gatewayTimeout: true,
+  }
+}
+
+/** 这次失败该不该自动重试（幂等策略见 httpJson 注释） */
+function shouldRetryGatewayTimeout(method: string, r: HttpResult): boolean {
+  if (r.ok) return false
+  // 网络层错误 = 请求根本没到达网关（含山海自己 10s abort），任何方法都可以安全重发
+  if (r.code === 'network') return true
+  if (!r.gatewayTimeout) return false
+  if (method === 'GET') return true
+  // POST：只有「网关门面明确没完成转发」（502/503/504）才重放；200 里带 deadline 的不重放
+  return r.status !== undefined && GATEWAY_BAD_GATEWAY.has(r.status)
+}
+
+/** 单次 HTTP 请求（含既有的「401 → 续签 → 重试一次」逻辑，那部分语义完全不变） */
+async function httpOnce(path: string, init: { method?: 'GET' | 'POST'; body?: Record<string, unknown> } = {}): Promise<HttpResult> {
   const method = init.method ?? 'GET'
   // 401 时最多「续签一次 + 重试一次」，避免在网关异常时反复打
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const token = getMemberAccessToken()
-    if (!token) return { ok: false, code: 'auth_failed', message: '未登录会员账号，无法使用好友与私信功能', data: null }
+    if (!token) return { ok: false, code: 'auth_failed', message: tIn(getMainLocale(), 'dm.noTokenHttp'), data: null }
     let res: Response
     try {
       res = await fetch(`${MEMBER_API_BASE}${path}`, {
@@ -430,9 +563,18 @@ async function httpJson(path: string, init: { method?: 'GET' | 'POST'; body?: Re
         signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       })
     } catch (err) {
-      const msg = err instanceof Error ? (err.name === 'TimeoutError' ? `${HTTP_TIMEOUT_MS / 1000} 秒内无响应` : err.message) : String(err)
+      const msg = err instanceof Error ? (err.name === 'TimeoutError' ? tIn(getMainLocale(), 'dm.httpNoResponse', { sec: HTTP_TIMEOUT_MS / 1000 }) : err.message) : String(err)
       audit({ dir: 'out', caller: 'builtin', topic: `http ${method} ${path}`, channelId: null, to: null, bytes: 0, result: 'network_error' })
-      return { ok: false, code: 'network', message: `网络请求失败：${msg}`, data: null }
+      // 归一：山海自己 10s abort 时 msg 已是当前语言；网关侧偶发把 Go 原文塞进 err.message，这里一并转掉
+      return {
+        ok: false,
+        code: 'network',
+        message: isGatewayDeadlineText(msg)
+          ? tIn(getMainLocale(), 'dm.gwNoResult', { sec: HTTP_TIMEOUT_MS / 1000 })
+          : tIn(getMainLocale(), 'dm.netFail', { msg }),
+        data: null,
+        gatewayTimeout: isGatewayDeadlineText(msg),
+      }
     }
     if (res.status === 401 || res.status === 403) {
       if (attempt === 0) {
@@ -440,15 +582,15 @@ async function httpJson(path: string, init: { method?: 'GET' | 'POST'; body?: Re
         const outcome = await handleAuthRejected({ source: 'member-http', status: res.status })
         if (outcome === 'rotated') continue
         if (outcome === 'transient') {
-          return { ok: false, code: 'auth_transient', message: `登录凭证已过期且暂时无法自动续签（${describeCredentialState(getCredentialSnapshot())}）`, data: null }
+          return { ok: false, code: 'auth_transient', message: tIn(getMainLocale(), 'dm.credExpiredTransient', { reason: describeCredentialState(getCredentialSnapshot()) }), data: null }
         }
       }
-      handleCredentialRejected(`登录凭证已失效（HTTP ${res.status}），请重新登录后再使用私信`)
-      return { ok: false, code: 'auth_failed', message: '登录凭证已失效，请重新登录后再使用私信', data: null }
+      handleCredentialRejected({ k: 'dm.credInvalidHttp', p: { status: res.status } })
+      return { ok: false, code: 'auth_failed', message: tIn(getMainLocale(), 'dm.credInvalid'), data: null }
     }
     return await readHttpJson(res, method, path)
   }
-  return { ok: false, code: 'auth_failed', message: '登录凭证已失效，请重新登录后再使用私信', data: null }
+  return { ok: false, code: 'auth_failed', message: tIn(getMainLocale(), 'dm.credInvalid'), data: null }
 }
 
 /** 解析 HTTP 响应体（从 httpJson 拆出，便于「401 → 续签 → 重试」复用同一段解析） */
@@ -462,12 +604,23 @@ async function readHttpJson(res: Response, method: string, path: string): Promis
   const env = (json ?? {}) as Record<string, unknown>
   const code = pickStr(env, ['code', 'error_code', 'errcode'])
   const msg = pickStr(env, ['message', 'msg', 'error']) ?? ''
+  // 【识别条件①】body 的 message 字段里是 Go 原文；【识别条件②】或状态码是 502/503/504
+  const gatewayTimeout = isGatewayDeadlineText(msg) || GATEWAY_BAD_GATEWAY.has(res.status)
   const bizFail = code !== null && code !== '0'
   if (!res.ok || bizFail) {
     // 定稿：HTTP 侧错误码是 {code:-1,message}，限流靠状态码 429 表达 → 单独给如实文案，不混成「请求失败」
-    const known = res.status === 429 ? ERROR_COPY.rate_limited_http : code ? ERROR_COPY[code] : null
-    audit({ dir: 'out', caller: 'builtin', topic: `http ${method} ${path}`, channelId: null, to: null, bytes: 0, result: `fail:${res.status}${code ? ':' + code : ''}` })
-    return { ok: false, code: res.status === 429 ? 'rate_limited' : code ?? String(res.status), message: known ?? (msg || `请求失败（HTTP ${res.status}）`), data: null, status: res.status }
+    const known = res.status === 429 ? errText({ k: 'dm.err.rateLimitedHttp' }) : errText(errorCodeSpec(code))
+    audit({ dir: 'out', caller: 'builtin', topic: `http ${method} ${path}`, channelId: null, to: null, bytes: 0, result: `fail:${res.status}${code ? ':' + code : ''}${gatewayTimeout ? ':gateway_timeout' : ''}` })
+    // 网关超时/不可用一律换成当前语言文案，**不把 Go 原文透到界面上**（用户看到的「context deadline exceeded」就是这里漏的）
+    const gwCopy = tIn(getMainLocale(), 'dm.gwUnavailable', { status: res.status })
+    return {
+      ok: false,
+      code: gatewayTimeout ? 'gateway_timeout' : res.status === 429 ? 'rate_limited' : code ?? String(res.status),
+      message: gatewayTimeout ? gwCopy : known ?? (msg || tIn(getMainLocale(), 'dm.httpFailStatus', { status: res.status })),
+      data: null,
+      status: res.status,
+      gatewayTimeout,
+    }
   }
   audit({ dir: 'out', caller: 'builtin', topic: `http ${method} ${path}`, channelId: null, to: null, bytes: 0, result: 'ok' })
   return { ok: true, code: null, message: msg || 'ok', data: env.data !== undefined ? env.data : json, status: res.status }
@@ -529,6 +682,9 @@ function mapFriend(raw: Record<string, unknown>): DmFriend {
     username: pickStr(raw, ['username', 'account', 'name', 'userName']) ?? '',
     nickname: pickStr(raw, ['nickname', 'nick', 'displayName']) ?? undefined,
     online: pickBool(raw, ['online', 'isOnline', 'active']),
+    // 【真头像】网关字段名实测为 avatar（空串已被 pickStr 归成 null）；顺带兼容几种常见别名写法。
+    // 好友列表 / 检索结果 / 申请方 requester 都走这里 → 一处解析，三处受益。
+    avatar: pickStr(raw, ['avatar', 'avatarUrl', 'avatar_url', 'headImgUrl', 'headimgurl', 'portrait']) ?? undefined,
   }
 }
 
@@ -539,8 +695,11 @@ function mapRequest(raw: Record<string, unknown>): DmFriendRequest {
   return {
     requestId: pickStr(raw, ['requestId', 'request_id', 'id']) ?? `${from.memberId}-${pickNum(raw, ['requestAt', 'createdAt', 'ts']) ?? Date.now()}`,
     fromMemberId: from.memberId,
-    fromUsername: from.username || from.memberId,
+    // 【期5B-补漏】`|| from.memberId` 会把 memberId 直接印到好友申请列表的「账号：X」行
+    // （MemberPanel 的 common.usernameLine）与好友申请通知标题上 → 去掉，拿不到就是空串。
+    fromUsername: realNameOrEmpty(from.username, from.memberId),
     fromNickname: from.nickname,
+    fromAvatar: from.avatar, // 【真头像】requester 里带的头像透传给申请列表
     message: pickStr(raw, ['requestMsg', 'message', 'msg']) ?? undefined,
     // requestAt 走 HTTP 是 Unix 秒、走 ws 通知是毫秒 → 统一归一到毫秒
     ts: toMs(pickNum(raw, ['requestAt', 'createdAt', 'ts', 'time'])),
@@ -573,8 +732,14 @@ async function pullConversations(): Promise<HttpResult> {
     // 定稿 v1.1 结构：{channelId, peer:{memberId,username,nickname,avatar}, lastMsg, lastMsgAt, unreadCount}
     const peerObj = (raw.peer && typeof raw.peer === 'object' ? raw.peer : raw) as Record<string, unknown>
     const peerId = pickStr(peerObj, ['memberId', 'member_id', 'peerMemberId', 'peerId', 'targetMemberId']) ?? ''
-    const peerName = pickStr(peerObj, ['nickname', 'username', 'peerName', 'peerNickname']) ?? friendNameOf(peerId) ?? peerId
-    const t = ensureThread(channelId, peerId, peerName)
+    // 【期5B-补漏】去掉末位 `?? peerId`：peerName 会落盘 dm-store.json 并显示在会话列表，
+    // 之前昵称/用户名/好友表三处都拿不到时就把 memberId 当名字存下来。现在拿不到 → 空串，
+    // 渲染层 displayNameOf(空串, peerId) 显示「未知会员」；peerId 单独存，定位/比对不受影响。
+    const peerName = realNameOrEmpty(pickStr(peerObj, ['nickname', 'username', 'peerName', 'peerNickname']) ?? friendNameOf(peerId) ?? undefined, peerId)
+    // 【真头像】peer.avatar（定稿 v1.1 结构里本来就有这个字段，实测常为空串）→ 空串视为无头像，
+    // 再从本地好友表兜一次；两处都拿不到就交给界面回落首字占位，不猜图。
+    const peerAvatar = pickStr(peerObj, ['avatar', 'avatarUrl', 'avatar_url', 'headImgUrl', 'portrait']) ?? friendAvatarOf(peerId)
+    const t = ensureThread(channelId, peerId, peerName, peerAvatar)
     const unread = pickNum(raw, ['unreadCount', 'unread', 'unread_count'])
     if (unread !== null) t.unread = unread
     // lastMsgAt 是 Unix 秒 → 归一到毫秒后再参与排序（会话列表按 lastTs 倒序）
@@ -589,6 +754,14 @@ async function pullConversations(): Promise<HttpResult> {
 /** 上线补拉（契约 v1：网关无消息队列、member_online/offline 未实现，离线数据只能靠主动 pull） */
 async function backfillFromHttp(): Promise<void> {
   if (pulling) return
+  // 【闪烁修复】重连一次就全量补拉 6+ 个接口并把结果广播出去；通道每 ~80 秒重连时会形成持续风暴。
+  // 距上次补拉不足 BACKFILL_MIN_INTERVAL_MS 直接跳过（数据已在内存/落盘，界面不会因此变旧）。
+  const since = Date.now() - lastBackfillAt
+  if (lastBackfillAt > 0 && since < BACKFILL_MIN_INTERVAL_MS) {
+    audit({ dir: 'out', caller: 'backfill', topic: 'backfill', bytes: 0, result: `skipped_throttle_${Math.round(since)}ms` })
+    return
+  }
+  lastBackfillAt = Date.now()
   pulling = true
   try {
     await pullFriends()
@@ -705,17 +878,50 @@ export function getMemberStatus(): MemberChannelStatus {
     url: memberUrl,
     username: getRuntime().username,
     memberId,
-    error: channelError,
+    error: errText(channelErrorSpec),
     authFailed,
     subscribedChannels: [...subscribers.keys()],
     updatedAt: statusUpdatedAt,
   }
 }
 
-function broadcastStatus(): void {
-  statusUpdatedAt = Date.now()
-  broadcast('member:status', getMemberStatus())
+/** 出口取词：按当前主进程语言把结构还原成文案（null 原样回 null，不造空串） */
+function errText(spec: ErrSpec | null): string | null {
+  return spec ? tIn(getMainLocale(), spec.k, spec.p) : null
 }
+
+/** 内容指纹用的结构串：**与语言无关**，所以切语言不会让指纹变化（去重语义不受影响） */
+function errFp(spec: ErrSpec | null): string {
+  return spec ? `${spec.k}|${JSON.stringify(spec.p ?? {})}` : ''
+}
+
+/**
+ * @param force 语言变化时用：指纹不变也必须推一次，否则界面停在旧语言的错误文案。
+ *              只有「用户主动切语言」会传 true，重连风暴仍走指纹去重。
+ */
+function broadcastStatus(force = false): void {
+  const st = getMemberStatus()
+  const fp = [
+    st.enabled, st.connected, st.ready, st.authFailed,
+    st.username ?? '', st.memberId ?? '', errFp(channelErrorSpec),
+    [...subscribers.keys()].sort().join(','),
+  ].join('|')
+  if (fp === lastStatusFp && !force) return // 内容未变：不推（时间戳不算变化）
+  lastStatusFp = fp
+  statusUpdatedAt = Date.now()
+  broadcast('member:status', { ...st, updatedAt: statusUpdatedAt })
+}
+
+/**
+ * 【i18n 期5B】语言变化时把通道状态重推一次。
+ * 为什么必须推：顶部那条提示条的文字是主进程给的（st.error / cred.text），渲染层没有原文，
+ * 不重推就会一直停在旧语言。为什么不会闪：只有用户主动切语言才走到这里（一次），
+ * 重连风暴仍被 errFp 结构指纹去重 —— 任务59 消掉的重复广播不会被这次改动请回来。
+ */
+onMainLocaleChange(() => {
+  if (!enabled) return // 通道没启用：没有可刷新的文案，也不该凭空推一条 status
+  broadcastStatus(true)
+})
 
 /** 清掉系统级角标（退出登录 / 通道关闭时调用，避免「已退出还挂着未读数」） */
 function clearUnreadBadge(): void {
@@ -737,7 +943,11 @@ function broadcastUnread(): void {
     }
   }
   const snapshot = { total, byChannel } satisfies DmUnread
-  broadcast('member:unread', snapshot)
+  const fp = `${total}|${Object.keys(byChannel).sort().map((k) => `${k}:${byChannel[k]}`).join(',')}`
+  if (fp !== lastUnreadFp) {
+    lastUnreadFp = fp
+    broadcast('member:unread', snapshot)
+  }
   // 系统级徽标：macOS Dock 角标显示未读总数（Windows/Linux 的 setBadgeCount 不支持时静默忽略）
   try {
     if (process.platform === 'darwin' && app.dock) void app.dock.setBadge(total > 0 ? (total > 99 ? '99+' : String(total)) : '')
@@ -766,6 +976,15 @@ export function subscribeMemberUnread(cb: (u: DmUnread) => void): () => void {
 
 function broadcastFriends(): void {
   // 红点单独带上 requestCount：列表可能被分页截断，红点以 /friends/requests/count 为权威
+  // 【真头像·必须纳入指纹】avatar 不在指纹里的话，「好友换了头像」会被判成内容未变而**永不推送**，
+  // 界面头像就再也不更新（任务59 的广播去重反噬）。requests 同理带上 fromAvatar。
+  const fp = [
+    friends.map((f) => `${f.memberId}:${f.nickname ?? ''}:${f.username ?? ''}:${f.avatar ?? ''}`).join(','),
+    requests.map((r) => `${r.requestId}:${r.fromMemberId}:${r.ts}:${r.fromAvatar ?? ''}`).join(','),
+    requestsCount,
+  ].join('#')
+  if (fp === lastFriendsFp) return // 内容未变：不推（ts 不算变化）
+  lastFriendsFp = fp
   broadcast('member:friends', { friends, requests, requestCount: requestsCount, ts: Date.now() })
 }
 
@@ -816,7 +1035,11 @@ function toNumericId(value: string | null | undefined): number | null {
  */
 function requireNumericMemberId(value: string): number {
   const n = toNumericId(value)
-  if (n === null) throw new Error(`会员 id 必须是正整数，收到「${value}」`)
+  if (n === null) {
+    // 【2026-09-04 用户要求：私信界面不再显示会员ID】原始值只进日志，不进用户可见文案
+    console.warn(`[member] 会员标识不是合法正整数，已拒绝发送：${value}`)
+    throw new Error(tIn(getMainLocale(), 'dm.memberIdRejected'))
+  }
   return n
 }
 
@@ -887,6 +1110,7 @@ function scheduleReconnect(): void {
  * 离线期间的消息（契约 v1：网关无消息队列，member_online/offline 也未实现，只能主动 pull）。
  */
 function resubscribeAll(): void {
+  // 重连自动订阅：不登记到 userInitiatedSubscribe → subscribed 回执保持静默（否则每次重连都冒一条提示）
   for (const channelId of threads.keys()) out('subscribe', channelId, { reconnect: true })
   void backfillFromHttp()
 }
@@ -896,13 +1120,13 @@ function connect(): void {
   const token = getMemberAccessToken()
   if (!token) {
     connected = false
-    channelError = '未登录会员账号，私信与好友功能不可用'
+    channelErrorSpec = { k: 'dm.notLoggedInChannel' }
     return
   }
   const snap = getCredentialSnapshot()
   if (snap.state === 'expired') {
     // 【启动即已过期】不直接拿过期 token 去握手（必 401），先交给续签模块试一次宽限期续签
-    channelError = `登录凭证已过期，正在尝试自动续签：${describeCredentialState(snap)}`
+    channelErrorSpec = { k: 'dm.credExpiredRenewing', p: { reason: describeCredentialState(snap) } }
     broadcastStatus()
     void handleAuthRejected({ source: 'member-channel', status: 401, code: 'token_expired' }).then((outcome) => {
       if (outcome === 'rotated' && enabled) connect()
@@ -920,11 +1144,26 @@ function connect(): void {
     os: info.os ?? '',
     v: String(PROTOCOL_V),
   })
+  // 【闪烁修复·socket 泄漏】connect() 此前不关旧连接：任何重复调用（重连与续签重连交叠、
+  // 上一次握手未完成的窗口里又被调一次）都会留下一个「没人持有但仍在收 ping」的旧 socket。
+  // 同账号同 deviceId 的两条 member 连接会被网关逐条替换 → 表现为每 ~80 秒断一次、
+  // 审计里 ping 间隔从 30 秒变成 13-17 秒（两条连接的 ping 交错），每次断连又触发一轮
+  // 状态广播 + 订阅回执 + 全量补拉 → 界面反复重绘与提示条反复出现（用户看到的「一闪一闪」）。
+  if (ws) {
+    const stale = ws
+    ws = null
+    try {
+      stale.removeAllListeners()
+      if (stale.readyState === WebSocket.OPEN || stale.readyState === WebSocket.CONNECTING) stale.terminate()
+    } catch {
+      // 忽略：旧连接清理失败不能挡住新连接建立
+    }
+  }
   let sock: WebSocket
   try {
     sock = new WebSocket(`${memberUrl}?${params.toString()}`)
   } catch (err) {
-    channelError = `会员通道创建失败：${err instanceof Error ? err.message : String(err)}`
+    channelErrorSpec = { k: 'dm.channelCreateFailed', p: { msg: err instanceof Error ? err.message : String(err) } }
     broadcastStatus()
     return
   }
@@ -934,7 +1173,7 @@ function connect(): void {
     connected = true
     reconnectAttempts = 0
     authFailed = false
-    channelError = null
+    channelErrorSpec = null
     startPing()
     startHeartbeat()
     resubscribeAll()
@@ -967,7 +1206,15 @@ function connect(): void {
     })
   })
 
-  sock.on('close', () => {
+  sock.on('close', (code, reason) => {
+    // 【诊断】此前 close 不写审计，导致「通道每 ~80 秒断一次」在日志里完全看不到原因
+    audit({
+      dir: 'in',
+      caller: 'ws',
+      topic: 'close',
+      bytes: 0,
+      result: `code=${code} reason=${(reason?.toString?.() ?? '').slice(0, 80) || '-'}`,
+    })
     connected = false
     ws = null
     stopPing()
@@ -984,7 +1231,7 @@ function connect(): void {
       return
     }
     if (!pendingAuthRecovery) {
-      channelError = `会员通道连接失败：${msg}`
+      channelErrorSpec = { k: 'dm.channelConnectFailed', p: { msg } }
       broadcastStatus()
     }
   })
@@ -1002,13 +1249,13 @@ async function onRejected(status: number, code: string | null): Promise<void> {
     clearTimeout(reconnectTimer)
     reconnectTimer = null
   }
-  channelError = `会员通道被网关拒绝（HTTP ${status || 401}${code ? ` ${code}` : ''}），正在尝试自动续签凭证`
+  channelErrorSpec = { k: 'dm.channelRejected', p: { detail: `HTTP ${status || 401}${code ? ` ${code}` : ''}` } }
   broadcastStatus()
   const outcome = await handleAuthRejected({ source: 'member-channel', status, code })
   pendingAuthRecovery = false
   if (outcome === 'rotated') {
     authFailed = false
-    channelError = null
+    channelErrorSpec = null
     reconnectAttempts = 0
     if (enabled) connect()
     return
@@ -1018,7 +1265,7 @@ async function onRejected(status: number, code: string | null): Promise<void> {
     return
   }
   // transient：网关未部署 / 断网 / 5xx → 保留登录态，按退避继续重连
-  channelError = `凭证自动续签未完成（网络或网关异常），稍后随重连继续尝试；${describeCredentialState(getCredentialSnapshot())}`
+  channelErrorSpec = { k: 'dm.renewIncomplete', p: { reason: describeCredentialState(getCredentialSnapshot()) } }
   if (enabled) scheduleReconnect()
   broadcastStatus()
 }
@@ -1037,30 +1284,47 @@ export function reconnectMemberChannelWithFreshCredential(): MemberChannelStatus
  * 不调用 runtime.logout()：那会删除本地凭证，用户重开应用就得重新输账号密码；
  * 现状 onAuthExpired 同样只翻 UI 状态、保留本地凭证，行为一致。
  */
-function handleCredentialRejected(reason: string, code: string | null = 'auth_failed'): void {
+function handleCredentialRejected(reason: ErrSpec, code: string | null = 'auth_failed'): void {
   authFailed = true
   reconnectAttempts = 0
-  channelError = reason
+  channelErrorSpec = reason
+  // markCredentialInvalid 要的是字符串（它 own 的 lastError 字段属 member-credentials 的文案面）：
+  // 这里在**调用那一刻**求值，与下面 member:error 广播同源同刻，不会出现两条文案打架
+  const reasonText = errText(reason) ?? ''
   // 翻转全局登录态 + 广播一律走 member-credentials 的同一处实现（避免 relay/私信两套行为漂移）
-  markCredentialInvalid(reason, code)
+  markCredentialInvalid(reasonText, code)
   broadcastStatus()
-  broadcast('member:error', { code: code ?? 'auth_failed', message: reason, channelId: null } satisfies MemberErrorPayload)
+  broadcast('member:error', { code: code ?? 'auth_failed', message: reasonText, channelId: null } satisfies MemberErrorPayload)
 }
 
-/** 错误码 → 人类可读文案（如实分类，不统一塞成「连不上服务器」） */
+/**
+ * 错误码 → 词条 key（如实分类，不统一塞成「连不上服务器」）。
+ * 【i18n 期5B】原来这张表存的是**已取好的中文文案**，模块加载期就固化 —— 与历轮 STATUS_LABEL /
+ * TOOL_META / SUPERVISOR_ARG_LABELS 是同一个坑（第 9 次）。现在表里只存 key，
+ * 由 errorCodeSpec/errText 在出口按当前语言求值；带数量的两条（字节上限）走 {n} 参数，
+ * 不在代码里拼「N 字节」（英文无量词，拼出来就是病句）。
+ */
 const ERROR_COPY: Record<string, string> = {
-  auth_failed: '登录凭证已失效，请重新登录后再使用私信',
-  friend_required: '你们还不是好友，无法互发私信（请先添加好友并等待对方同意）',
-  rate_limited: '发送过于频繁，已被限流，请稍后再试',
-  member_not_found: '没有找到这个会员（用户名必须完全一致，注意大小写与空格）',
-  message_too_large: `消息超出长度限制（单条上限 ${MAX_MSG_BYTES} 字节）`,
-  content_too_long: `内容过长：单条上限 ${MAX_MSG_BYTES} 字节，请分段发送`,
-  protocol_unsupported: '网关不支持当前协议版本（v1），请升级山海或联系开发者',
-  channel_not_found: '你不是该会话的成员（可能已被对方删除好友），无法收发这个会话',
-  token_expired: '登录凭证已过期（超出续签宽限期），请重新登录',
-  token_missing: '缺少登录凭证，请重新登录',
-  token_invalid: '登录凭证无效，请重新登录',
-  rate_limited_http: '好友申请过于频繁（限流 5 次/分钟），请稍后再试',
+  auth_failed: 'dm.err.authFailed',
+  friend_required: 'dm.err.friendRequired',
+  rate_limited: 'dm.err.rateLimited',
+  member_not_found: 'dm.err.memberNotFound',
+  message_too_large: 'dm.err.messageTooLarge',
+  content_too_long: 'dm.err.contentTooLong',
+  protocol_unsupported: 'dm.err.protocolUnsupported',
+  channel_not_found: 'dm.err.channelNotFound',
+  token_expired: 'dm.err.tokenExpired',
+  token_missing: 'dm.err.tokenMissing',
+  token_invalid: 'dm.err.tokenInvalid',
+  rate_limited_http: 'dm.err.rateLimitedHttp',
+}
+
+/** 网关 code → 未翻译的错误结构（未知 code 返回 null，交给调用方兜底原样呈现网关 msg） */
+function errorCodeSpec(code: string | null): ErrSpec | null {
+  const k = code ? ERROR_COPY[code] : undefined
+  if (!k) return null
+  // 只有这两条要带字节上限参数；其余无参
+  return code === 'message_too_large' || code === 'content_too_long' ? { k, p: { n: MAX_MSG_BYTES } } : { k }
 }
 
 /** 下行 error 事件载荷 */
@@ -1081,31 +1345,55 @@ export interface MemberErrorPayload {
  *      「凭证失效联动全局登录态」这条路径形同死代码。
  * 现按「顶层优先、payload 兜底」双取，两种帧形都兼容（网关若改回 payload 也不破）。
  */
-function normalizeErrorPayload(env: MemberEnvelope): MemberErrorPayload {
+function normalizeErrorPayload(env: MemberEnvelope): { payload: MemberErrorPayload; spec: ErrSpec } {
   const p = (env.payload ?? {}) as Record<string, unknown>
   const top = env as unknown as Record<string, unknown>
   const code = pickStr(top, ['code', 'errcode', 'error_code']) ?? pickStr(p, ['code', 'errcode', 'error_code', 'reason']) ?? 'unknown'
   const raw = pickStr(top, ['message', 'msg', 'error', 'detail']) ?? pickStr(p, ['message', 'msg', 'error', 'detail']) ?? ''
-  const copy = ERROR_COPY[code] ?? (raw || '会员通道返回错误')
-  return { code, message: copy, channelId: env.channelId ?? pickStr(p, ['channelId', 'channel_id']) ?? null }
+  // 【识别条件③】ws 下行 error 的**顶层** code/message 里可能就是网关的 Go 原文（顶层优先取，这条本项目踩过）。
+  // 命中就换成当前语言文案，绝不透传英文、也绝不退化成「会员通道返回错误」这种笼统话。
+  const gwTimeout = isGatewayDeadlineText(raw) || isGatewayDeadlineText(code)
+  // 先算**结构**：payload 里的译文是「发出那一刻」的语言（一次性事件，渲染层直接显示）；
+  // spec 则会被 channelError 长期持有，切语言时由 onMainLocaleChange 重新求值。
+  const spec: ErrSpec = gwTimeout
+    ? { k: 'dm.err.gwUpstreamTimeout' }
+    : errorCodeSpec(code) ?? (raw ? { k: 'dm.netFail', p: { msg: raw } } : { k: 'dm.err.channelGeneric' })
+  const payload: MemberErrorPayload = {
+    code: gwTimeout ? 'gateway_timeout' : code,
+    message: errText(spec) ?? '',
+    channelId: env.channelId ?? pickStr(p, ['channelId', 'channel_id']) ?? null,
+  }
+  return { payload, spec }
 }
 
 // ————————————————————————————— 下行处理 —————————————————————————————
 
-function ensureThread(channelId: string, peerId: string, peerName: string): DmThread {
+function ensureThread(channelId: string, peerId: string, peerName: string, peerAvatar?: string): DmThread {
   let t = threads.get(channelId)
   if (!t) {
     t = { channelId, peerId, peerName, messages: [], unread: 0, lastTs: 0 }
     threads.set(channelId, t)
   }
   if (peerName && t.peerName !== peerName) t.peerName = peerName
+  // 【真头像】只在拿到非空 URL 时覆盖：网关该字段实测常为空串，若让空串也覆盖会把已有头像抹掉，
+  // 表现为「头像在图与首字之间来回跳」—— 正是任务59 刚消掉的那类闪烁，不能重演。
+  if (peerAvatar && t.peerAvatar !== peerAvatar) t.peerAvatar = peerAvatar
   return t
 }
 
 function friendNameOf(memberId: string): string | null {
   const f = friends.find((x) => x.memberId === memberId)
   if (!f) return null
-  return f.nickname || f.username || f.memberId
+  // 【期5B-补漏】末位 `|| f.memberId` 是**所有 ID 泄漏的源头**：好友昵称与用户名都为空时，
+  // 它把 memberId 当名字返回，再被下面各条路径写进 peerName / fromName / 通知标题。
+  // 改成拿不到真名就返回 null（语义「不知道是谁」），由调用方决定显示兜底。
+  return realNameOrEmpty(f.nickname || f.username, f.memberId) || null
+}
+
+/** 【真头像】从本地好友表取头像（会话/消息路径上没有 peer 对象时兜底）；空串按「无头像」返回 undefined */
+function friendAvatarOf(memberId: string): string | undefined {
+  const f = friends.find((x) => x.memberId === memberId)
+  return f?.avatar || undefined
 }
 
 function handleDownstream(env: MemberEnvelope, rawBytes: number): void {
@@ -1133,7 +1421,11 @@ function handleDownstream(env: MemberEnvelope, rawBytes: number): void {
       requestsCount = requests.length
       saveStore()
       broadcastFriends()
-      notifyFriendRequest(req.fromNickname || req.fromUsername, () => broadcast('member:open-tab', { tab: 'friends', ts: Date.now() }))
+      // 【期5B-补漏】同上：申请方两个名字字段都空时，原先会把 memberId 当标题发进系统通知
+      // （fromUsername 现在虽已不含 memberId，这里仍统一过一层 displayNameOf，判定只留一份实现）。
+      notifyFriendRequest(displayNameOf(req.fromNickname || req.fromUsername, req.fromMemberId), () =>
+        broadcast('member:open-tab', { tab: 'friends', ts: Date.now() }),
+      )
       // 红点策略：事件驱动 —— 收到申请通知后立刻用 HTTP 权威列表校正一次（不轮询，见回传说明）
       void pullFriends()
       return
@@ -1147,7 +1439,10 @@ function handleDownstream(env: MemberEnvelope, rawBytes: number): void {
         kind: 'friend_request_result',
         ok: accepted,
         peer,
-        message: accepted ? `好友申请已通过${peer ? `（${peer}）` : ''}，现在可以互发私信` : '好友申请被拒绝',
+        // 「（对方名）」是中文全角括号包裹，英文要半角 → 括号也进词条，不在代码里拼
+        message: accepted
+          ? tIn(getMainLocale(), 'dm.notice.friendAccepted', { peer: peer ? tIn(getMainLocale(), 'dm.notice.friendAcceptedParen', { peer }) : '' })
+          : tIn(getMainLocale(), 'dm.notice.friendRejected'),
         ts: Date.now(),
       })
       void pullFriends()
@@ -1164,7 +1459,7 @@ function handleDownstream(env: MemberEnvelope, rawBytes: number): void {
       broadcast('member:notice', {
         kind: 'friend_removed',
         peer: by,
-        message: '对方已将你删除好友：历史私信仍保留，但要重新加好友才能再发',
+        message: tIn(getMainLocale(), 'dm.notice.friendRemoved'),
         ts: Date.now(),
       })
       return
@@ -1186,7 +1481,15 @@ function handleDownstream(env: MemberEnvelope, rawBytes: number): void {
     case 'subscribed':
     case 'left': {
       // subscribed：订阅成功；left：取消订阅回执（定稿已实现，无需额外动作，静默处理避免刷屏）
-      if (type === 'subscribed') broadcast('member:notice', { kind: 'subscribed', peer: '', message: '已接入会话通道', ts: Date.now() })
+      if (type === 'subscribed') {
+        // 只有「用户主动点开某个会话」触发的 subscribed 才提示；重连自动订阅一律静默
+        const sid = env.channelId ?? ''
+        const at = sid ? userInitiatedSubscribe.get(sid) : undefined
+        if (at !== undefined) {
+          userInitiatedSubscribe.delete(sid)
+          broadcast('member:notice', { kind: 'subscribed', peer: threads.get(sid)?.peerName ?? '', message: tIn(getMainLocale(), 'dm.notice.subscribed'), ts: Date.now() })
+        }
+      }
       return
     }
 
@@ -1210,7 +1513,12 @@ function handleDownstream(env: MemberEnvelope, rawBytes: number): void {
           saveStore()
           broadcastUnread()
         }
-        broadcast('member:notice', { kind: 'read_update', peer: thread.peerName, message: '你在其它设备已读该会话，本机未读已同步清零', ts: Date.now() })
+        // 网关对同一次已读会推多条（HTTP 与 ws 各一次 × 自己的每条连接）→ 不去重就是连弹提示条
+        const last = lastReadUpdateNoticeAt.get(channelId) ?? 0
+        if (Date.now() - last > 5000) {
+          lastReadUpdateNoticeAt.set(channelId, Date.now())
+          broadcast('member:notice', { kind: 'read_update', peer: thread.peerName, message: tIn(getMainLocale(), 'dm.notice.readUpdateSelf'), ts: Date.now() })
+        }
         return
       }
       // 对端已读：逐条回执网关未实现，这里按「整会话已读」把自己发出的气泡标已读（如实、不过度承诺到条）
@@ -1239,8 +1547,14 @@ function handleDownstream(env: MemberEnvelope, rawBytes: number): void {
       }
       const mine = from !== '' && from === self
       const peerId = mine ? to : from
-      const peerName = (mine ? friendNameOf(to) ?? to : friendNameOf(from) ?? pickStr(p, ['fromName', 'nickname', 'username']) ?? from) || peerId
-      const thread = ensureThread(channelId, peerId, peerName)
+      // 【期5B-补漏】原来 mine 分支 `friendNameOf(to) ?? to`、对方分支 `… ?? from`、外层 `|| peerId`
+      // 三层都会把 memberId 当名字；这个值同时进 peerName（落盘）、msg.fromName（落盘）与
+      // **系统通知标题**（下面 notifyDmMessage）→ 三层全去掉，拿不到真名就是空串。
+      const peerName = realNameOrEmpty(
+        mine ? friendNameOf(to) ?? undefined : friendNameOf(from) ?? pickStr(p, ['fromName', 'nickname', 'username']) ?? undefined,
+        peerId,
+      )
+      const thread = ensureThread(channelId, peerId, peerName, friendAvatarOf(peerId))
       // 【自发消息去重】网关按 memberID 投递给该会员所有活跃连接：自己发的会被回显给自己（含其它设备）。
       // 去重键 = 网关 messageId；本地乐观气泡先占位（serverId 空），回显到达时按「同通道 + 同内容 + 未确认」认领。
       if (serverId && thread.messages.some((m) => m.serverId === serverId)) {
@@ -1270,7 +1584,11 @@ function handleDownstream(env: MemberEnvelope, rawBytes: number): void {
         thread.unread += 1
         saveStore()
         broadcastUnread()
-        notifyDmMessage(peerName, content, () => {
+        // 附件消息的通知正文取可读预览（「[图片] 截图.png」），不能是 {"t":"image","u":"http… 这种串码
+        // 【期5B-补漏·用户裁决】通知标题走「昵称→用户名→未知会员」，与界面同一真相源
+        // （选 common.unknownMember 而不是 5A 的 native.notify.memberFallback「一位会员」：
+        //  同一个人不能界面上叫「未知会员」、通知里叫「一位会员」，两套谓词会互相打脸）。
+        notifyDmMessage(displayNameOf(peerName, peerId), dmContentPreview(content), () => {
           broadcast('member:open-thread', { channelId, ts: Date.now() })
         })
       } else {
@@ -1281,12 +1599,14 @@ function handleDownstream(env: MemberEnvelope, rawBytes: number): void {
     }
 
     case 'error': {
-      const err = normalizeErrorPayload(env)
+      const { payload: err, spec: errSpec } = normalizeErrorPayload(env)
+      // 审计的 topic/result 一律 ASCII 枚举（code），**不写译文** → 切语言不会让审计日志换语言，
+      // 也不存在「一份常量两处用」的冲突（期5B 逐条核实结论）
       audit({ dir: 'in', caller: 'gateway', topic: 'error:' + err.code, channelId: err.channelId, to: null, bytes: 0, result: 'error' })
-      channelError = err.message
+      channelErrorSpec = errSpec
       if (err.code === 'auth_failed' || err.code === 'token_missing' || err.code === 'token_invalid') {
         // 无效/缺失类：refresh 也救不回来，直接判失效（不白试）
-        handleCredentialRejected(err.message, err.code)
+        handleCredentialRejected(errSpec, err.code)
         return
       }
       if (err.code === 'token_expired') {
@@ -1316,10 +1636,10 @@ export function startMemberChannel(url: string = DEFAULT_MEMBER_URL): MemberChan
   loadStore()
   enabled = true
   authFailed = false
-  channelError = null
+  channelErrorSpec = null
   if (!getRuntime().getMemberToken()) {
     connected = false
-    channelError = '未登录会员账号，私信与好友功能不可用'
+    channelErrorSpec = { k: 'dm.notLoggedInChannel' }
     return getMemberStatus()
   }
   connect()
@@ -1345,7 +1665,7 @@ export function stopMemberChannel(): void {
   }
   connected = false
   authFailed = false
-  channelError = null
+  channelErrorSpec = null
   selfMemberId = null
   selfMemberIdFromGateway = false
   void doSave()
@@ -1356,7 +1676,7 @@ export function stopMemberChannel(): void {
 /** 手动重连（失败态里的「重试」按钮）：清除 401 标记并立即握手 */
 export function retryMemberChannel(): MemberChannelStatus {
   authFailed = false
-  channelError = null
+  channelErrorSpec = null
   reconnectAttempts = 0
   if (reconnectTimer) {
     clearTimeout(reconnectTimer)
@@ -1389,7 +1709,7 @@ export function getFriendsSnapshot(): { friends: DmFriend[]; requests: DmFriendR
 /** 拉好友列表 + 待处理申请 + 红点数（打开面板 / 收到好友事件 / 重连时调用） */
 export async function refreshFriends(): Promise<MemberResult> {
   const r = await pullFriends()
-  return { ok: r.ok, message: r.ok ? '好友列表已更新' : r.message }
+  return { ok: r.ok, message: r.ok ? tIn(getMainLocale(), 'dm.friendsUpdated') : r.message }
 }
 
 /**
@@ -1398,24 +1718,24 @@ export async function refreshFriends(): Promise<MemberResult> {
  */
 export async function searchMembers(username: string): Promise<MemberResult & { members: DmFriend[]; notFound?: boolean }> {
   const name = (username ?? '').trim()
-  if (!name) return { ok: false, members: [], message: '请输入要查找的用户名（必须完全一致）' }
+  if (!name) return { ok: false, members: [], message: tIn(getMainLocale(), 'dm.searchNeedName') }
   // 定稿 v1.1：真实参数是 keyword=（username= 只是兼容别名，正式写法用 keyword）；仍是精确匹配，防会员枚举
   const r = await httpJson(`${PATH_MEMBER_SEARCH}?${new URLSearchParams({ keyword: name }).toString()}`)
   if (!r.ok) {
     // 定稿：查无此人 = HTTP 404 + {code:-1,message:"未找到该用户"}。业务 code 全是 -1，只能靠状态码
     // 把「没有这个人」和「请求本身坏了」分开，否则界面会给出一句误导性的红色报错。
     const notFound = r.status === 404
-    return { ok: false, notFound, members: [], message: notFound ? `未找到用户名为「${name}」的会员` : r.message }
+    return { ok: false, notFound, members: [], message: notFound ? tIn(getMainLocale(), 'dm.searchNotFound', { name }) : r.message }
   }
   const members = memberRows(r.data).map(mapFriend).filter((m) => m.memberId)
   if (members.length === 0) {
     // HTTP 200 但一条都没解析出来 = 响应结构与预期不符，不能骗用户说「没这个人」
-    return { ok: false, notFound: false, members: [], message: '网关返回了成功但没带会员信息（响应结构与预期不符），请重试或反馈' }
+    return { ok: false, notFound: false, members: [], message: tIn(getMainLocale(), 'dm.searchBadShape') }
   }
   return {
     ok: true,
     members,
-    message: `找到 ${members.length} 个会员`,
+    message: tIn(getMainLocale(), 'dm.searchFound', { n: members.length }),
   }
 }
 
@@ -1423,9 +1743,9 @@ export async function searchMembers(username: string): Promise<MemberResult & { 
 export async function requestFriend(input: { targetMemberId: string; message?: string }): Promise<MemberResult> {
   try {
     const target = (input.targetMemberId ?? '').trim()
-    if (!target) return { ok: false, message: '缺少目标会员 id（请先搜索用户名）' }
+    if (!target) return { ok: false, message: tIn(getMainLocale(), 'dm.needTargetSearch') }
     const r = await httpJson(PATH_FRIEND_REQUEST, { method: 'POST', body: { targetMemberId: requireNumericMemberId(target), message: (input.message ?? '').trim() } })
-    return { ok: r.ok, message: r.ok ? '好友申请已发出，等待对方同意（对方同意前无法互发私信）' : r.message }
+    return { ok: r.ok, message: r.ok ? tIn(getMainLocale(), 'dm.friendRequestSent') : r.message }
   } catch (err) {
     return { ok: false, message: err instanceof Error ? err.message : String(err) }
   }
@@ -1435,7 +1755,7 @@ export async function requestFriend(input: { targetMemberId: string; message?: s
 export async function acceptFriend(targetMemberId: string): Promise<MemberResult> {
   try {
     const target = (targetMemberId ?? '').trim()
-    if (!target) return { ok: false, message: '缺少会员 id' }
+    if (!target) return { ok: false, message: tIn(getMainLocale(), 'dm.needTargetAccept') }
     const r = await httpJson(PATH_FRIEND_ACCEPT, { method: 'POST', body: { targetMemberId: requireNumericMemberId(target) } })
     if (r.ok) {
       requests = requests.filter((x) => x.fromMemberId !== target)
@@ -1443,7 +1763,7 @@ export async function acceptFriend(targetMemberId: string): Promise<MemberResult
       broadcastFriends()
       void pullFriends()
     }
-    return { ok: r.ok, message: r.ok ? '已同意，你们现在互为好友' : r.message }
+    return { ok: r.ok, message: r.ok ? tIn(getMainLocale(), 'dm.friendAcceptedOk') : r.message }
   } catch (err) {
     return { ok: false, message: err instanceof Error ? err.message : String(err) }
   }
@@ -1453,7 +1773,7 @@ export async function acceptFriend(targetMemberId: string): Promise<MemberResult
 export async function rejectFriend(targetMemberId: string): Promise<MemberResult> {
   try {
     const target = (targetMemberId ?? '').trim()
-    if (!target) return { ok: false, message: '缺少会员 id' }
+    if (!target) return { ok: false, message: tIn(getMainLocale(), 'dm.needTargetReject') }
     const r = await httpJson(PATH_FRIEND_REJECT, { method: 'POST', body: { targetMemberId: requireNumericMemberId(target) } })
     if (r.ok) {
       requests = requests.filter((x) => x.fromMemberId !== target)
@@ -1461,7 +1781,7 @@ export async function rejectFriend(targetMemberId: string): Promise<MemberResult
       broadcastFriends()
       void pullFriends()
     }
-    return { ok: r.ok, message: r.ok ? '已拒绝该好友申请' : r.message }
+    return { ok: r.ok, message: r.ok ? tIn(getMainLocale(), 'dm.friendRejectedOk') : r.message }
   } catch (err) {
     return { ok: false, message: err instanceof Error ? err.message : String(err) }
   }
@@ -1471,14 +1791,14 @@ export async function rejectFriend(targetMemberId: string): Promise<MemberResult
 export async function deleteFriend(memberId: string): Promise<MemberResult> {
   try {
     const target = (memberId ?? '').trim()
-    if (!target) return { ok: false, message: '缺少会员 id' }
+    if (!target) return { ok: false, message: tIn(getMainLocale(), 'dm.needTargetDelete') }
     const r = await httpJson(PATH_FRIEND_DELETE, { method: 'POST', body: { targetMemberId: requireNumericMemberId(target) } })
     if (r.ok) {
       friends = friends.filter((f) => f.memberId !== target)
       saveStore()
       broadcastFriends()
     }
-    return { ok: r.ok, message: r.ok ? '已删除好友：历史私信仍保留在本机，但要重新加好友才能再发' : r.message }
+    return { ok: r.ok, message: r.ok ? tIn(getMainLocale(), 'dm.friendDeleted') : r.message }
   } catch (err) {
     return { ok: false, message: err instanceof Error ? err.message : String(err) }
   }
@@ -1510,7 +1830,15 @@ function mapHistoryMessage(raw: Record<string, unknown>, channelId: string): DmM
     serverId,
     channelId,
     from: from || self,
-    fromName: (mine ? getRuntime().username ?? self : friendNameOf(from) ?? pickStr(raw, ['fromName', 'nickname', 'username']) ?? from) || peerId,
+    // 【期5B-补漏】历史消息的 fromName 与 :1532 同源（三层 ID 兜底全去掉）：它会落盘，
+    // 并且是「引用到会话」载荷的第二兜底（quoteDmToSession），不能带 ID。
+    fromName: realNameOrEmpty(
+      mine ? getRuntime().username : friendNameOf(from) ?? pickStr(raw, ['fromName', 'nickname', 'username']) ?? undefined,
+      // 比对用的 id 必须与名字**同侧**：mine 时名字是自己的用户名 → 该拿 self 比（历史上这里
+      // 兜底过 self）；非 mine 时名字是对端的 → 拿 peerId 比。第一版我两处都传了 peerId，
+      // mine 分支等于拿「我的用户名」去和「对端 id」比，判据错位（自查抓到，已修）。
+      mine ? self : peerId,
+    ),
     to: to || undefined,
     text: content,
     ts: createdAt,
@@ -1531,10 +1859,10 @@ async function pullHistory(input: { channelId: string; peerId?: string; page?: n
   const page = Math.max(1, Math.floor(input.page ?? 1))
   const pageSize = Math.max(1, Math.min(100, Math.floor(input.pageSize ?? HISTORY_PAGE_SIZE)))
   const empty = { messages: [] as DmMessage[], hasMore: false, total: 0, page, error: null as string | null }
-  if (!channelId) return { ...empty, error: '缺少 channelId' }
+  if (!channelId) return { ...empty, error: tIn(getMainLocale(), 'dm.missingChannelId') }
   // 定稿：历史以「对方 memberId」为路径参数（不是 channelId）；channelId 只用于本地线程归属与实时订阅
   const peerId = (input.peerId ?? '').trim() || threads.get(channelId)?.peerId || peerOfChannel(channelId)
-  if (!peerId) return { ...empty, error: '无法确定对方会员 id（会话列表与好友表里都没有该通道），历史暂不可用' }
+  if (!peerId) return { ...empty, error: tIn(getMainLocale(), 'dm.historyNoPeer') }
   const r = await httpJson(`${PATH_CONVERSATIONS}/${encodeURIComponent(peerId)}?${new URLSearchParams({ page: String(page), pageSize: String(pageSize) }).toString()}`)
   if (!r.ok) return { ...empty, error: r.message }
   const raws = listOf(r.data, ['list', 'messages', 'history', 'records'])
@@ -1556,7 +1884,15 @@ async function pullHistory(input: { channelId: string; peerId?: string; page?: n
   // 上面已保证 incoming 非空，这里取最后一条作为「最新一条」的参照
   const newest = incoming[incoming.length - 1] as DmMessage
   const peerIdFromMsg = newest.mine ? newest.to ?? '' : newest.from
-  const thread = ensureThread(channelId, peerId || peerIdFromMsg, friendNameOf(peerId || peerIdFromMsg) ?? (peerId || peerIdFromMsg))
+  // 【期5B-补漏】`?? (peerId || peerIdFromMsg)` 去掉：分页拉历史时若好友表还没到位，
+  // 原先会把 memberId 写进 peerName 并落盘。ensureThread 只在非空时覆盖，所以这里传空串
+  // 不会把后续拿到的真名冲掉。
+  const thread = ensureThread(
+    channelId,
+    peerId || peerIdFromMsg,
+    realNameOrEmpty(friendNameOf(peerId || peerIdFromMsg) ?? undefined, peerId || peerIdFromMsg),
+    friendAvatarOf(peerId || peerIdFromMsg),
+  )
   const byServerId = new Map(thread.messages.filter((m) => m.serverId).map((m) => [m.serverId as string, m]))
   for (const m of incoming) {
     const hit = m.serverId ? byServerId.get(m.serverId) : undefined
@@ -1609,9 +1945,10 @@ export async function subscribeChannel(channelId: string, webContentsId: number)
   const set = subscribers.get(id) ?? new Set<number>()
   set.add(webContentsId)
   subscribers.set(id, set)
+  userInitiatedSubscribe.set(id, Date.now()) // 用户主动点开会话 → subscribed 回执值得给一条提示
   out('subscribe', id)
   const page = await pullHistory({ channelId: id, page: 1, pageSize: HISTORY_PAGE_SIZE })
-  if (page.error) broadcast('member:error', { code: 'history_failed', message: `历史拉取失败：${page.error}`, channelId: id } satisfies MemberErrorPayload)
+  if (page.error) broadcast('member:error', { code: 'history_failed', message: tIn(getMainLocale(), 'dm.historyFailed', { msg: page.error }), channelId: id } satisfies MemberErrorPayload)
   return threads.get(id) ?? null
 }
 
@@ -1643,7 +1980,7 @@ export function listThreads(): DmThread[] {
 /** 主动从网关 HTTP 拉会话列表（含每会话未读），返回合并后的会话；失败也回本地缓存并广播 error */
 export async function pullThreads(): Promise<DmThread[]> {
   const r = await pullConversations()
-  if (!r.ok) broadcast('member:error', { code: 'threads_failed', message: `会话列表拉取失败：${r.message}`, channelId: null } satisfies MemberErrorPayload)
+  if (!r.ok) broadcast('member:error', { code: 'threads_failed', message: tIn(getMainLocale(), 'dm.threadsFailed', { msg: r.message }), channelId: null } satisfies MemberErrorPayload)
   return listThreads()
 }
 
@@ -1690,44 +2027,51 @@ async function pullGlobalUnread(): Promise<void> {
  */
 export function sendDm(input: { peerMemberId?: string; channelId?: string; text: string; peerName?: string }): MemberResult & { msgId?: string; channelId?: string } {
   const text = (input.text ?? '').trim()
-  if (!text) return { ok: false, message: '消息内容为空' }
-  if (!connected) return { ok: false, message: '会员通道未连接，消息未发送（请点「重试」或检查登录状态）' }
+  if (!text) return { ok: false, message: tIn(getMainLocale(), 'dm.sendEmpty') }
+  if (!connected) return { ok: false, message: tIn(getMainLocale(), 'dm.sendNotConnected') }
   const self = resolveSelfMemberId()
-  if (!self) return { ok: false, message: '尚未取得本账号会员 id（网关 connected 回执未到达或连接未就绪），私信暂不可用，请稍后重试' }
+  if (!self) return { ok: false, message: tIn(getMainLocale(), 'dm.sendNoSelf') }
   const peer = (input.peerMemberId ?? '').trim()
-  if (!peer) return { ok: false, message: '缺少接收方会员 id' }
-  if (peer === self) return { ok: false, message: '不能给自己发私信' }
+  if (!peer) return { ok: false, message: tIn(getMainLocale(), 'dm.sendNoPeer') }
+  if (peer === self) return { ok: false, message: tIn(getMainLocale(), 'dm.sendToSelf') }
   // 【硬性前提】互为好友才允许通讯：本地好友表里没有就直接拒发（网关也会回 friend_required）
   if (!friends.some((f) => f.memberId === peer)) {
     audit({ dir: 'out', caller: 'builtin', topic: 'send:rejected', channelId: null, to: peer, bytes: byteLen(text), result: 'not_friends' })
-    return { ok: false, message: '你们还不是好友，无法发送私信（请先添加好友并等待对方同意）' }
+    return { ok: false, message: tIn(getMainLocale(), 'dm.sendNotFriends') }
   }
   const bytes = byteLen(text)
   if (bytes > MAX_MSG_BYTES) {
-    return { ok: false, message: `内容过长：当前 ${bytes} 字节，单条上限 ${MAX_MSG_BYTES} 字节，请分段发送` }
+    return { ok: false, message: tIn(getMainLocale(), 'dm.sendTooLong', { now: bytes, max: MAX_MSG_BYTES }) }
   }
   const channelId = input.channelId?.trim() || computeDmChannelId(self, peer)
   if (!takeSendToken('builtin')) {
     audit({ dir: 'out', caller: 'builtin', topic: 'send:rejected', channelId, to: peer, bytes, result: 'rate_limited' })
-    return { ok: false, message: `发送过于频繁（限流 ${RATE_LIMIT_PER_WINDOW} 条 / ${RATE_WINDOW_MS / 1000} 秒），请稍后再试` }
+    return { ok: false, message: tIn(getMainLocale(), 'dm.sendRateLimited', { n: RATE_LIMIT_PER_WINDOW, sec: RATE_WINDOW_MS / 1000 }) }
   }
   // clientMsgId（契约 v1.1 采纳项）：随 send 上行、被网关原样回显在 message 下行 → 乐观气泡可按它 1:1 认领
   const msgId = newClientMsgId(peer)
-  const thread = ensureThread(channelId, peer, input.peerName ?? friendNameOf(peer) ?? peer)
-  const msg: DmMessage = { msgId, serverId: '', channelId, from: self, fromName: getRuntime().username ?? self, to: peer, text, ts: Date.now(), mine: true, read: false, pending: true, failed: null, origin: 'dm' }
+  // 【期5B-补漏】`?? peer` 去掉。input.peerName 由渲染层传入（active.peerName 原值，
+  // 本期起不再含 ID），但仍要防插件经 member:send 桥传任意字符串当名字 → 过一层判定。
+  const thread = ensureThread(channelId, peer, realNameOrEmpty(input.peerName ?? friendNameOf(peer) ?? undefined, peer), friendAvatarOf(peer))
+  // 【第 7 处，同类问题，一并改掉并单独登记】`?? self` 会把**自己的** memberId 落盘进 fromName。
+  // 渲染层不显示 mine 消息的 fromName，故不是当前泄漏点，但它是同一族兜底，留着迟早漏。
+  const msg: DmMessage = { msgId, serverId: '', channelId, from: self, fromName: realNameOrEmpty(getRuntime().username, self), to: peer, text, ts: Date.now(), mine: true, read: false, pending: true, failed: null, origin: 'dm' }
   thread.messages = [...thread.messages, msg]
   thread.lastTs = msg.ts
   saveStore()
   deliverToSubscribers(channelId, 'member:message', msg)
   const ok = out('send', channelId, { content: text, clientMsgId: msgId }, peer)
   if (!ok) {
-    thread.messages = thread.messages.map((m) => (m.msgId === msgId ? { ...m, pending: false, failed: '会员通道已断开，未送达' } : m))
+    // 【期5B 取词时机】failed 会随消息落盘到 dm-store.json，存已翻译文案等于把语言烘进磁盘
+    // （切语言后历史气泡的失败原因永远停在旧语言）。现在落盘的是词条 key，渲染层按当前语言还原；
+    // 老数据里已经是中文的（历史遗留）由渲染层兜底原样显示，不做迁移（本期边界禁止动渲染层）。
+    thread.messages = thread.messages.map((m) => (m.msgId === msgId ? { ...m, pending: false, failed: FAILED_CHANNEL_CLOSED } : m))
     saveStore()
-    deliverToSubscribers(channelId, 'member:message', { ...msg, pending: false, failed: '会员通道已断开，未送达' })
-    return { ok: false, message: '发送失败：会员通道已断开（消息未送达，请重试）', msgId, channelId }
+    deliverToSubscribers(channelId, 'member:message', { ...msg, pending: false, failed: FAILED_CHANNEL_CLOSED })
+    return { ok: false, message: tIn(getMainLocale(), 'dm.sendFailedDisconnected'), msgId, channelId }
   }
   // 送达确认靠 message 下行回显（定稿无 ack）：这里只代表「已提交网关」，UI 显示「发送中」直到认领到 messageId
-  return { ok: true, message: '已提交网关，等待送达回显', msgId, channelId }
+  return { ok: true, message: tIn(getMainLocale(), 'dm.sendSubmitted'), msgId, channelId }
 }
 
 /**
@@ -1737,7 +2081,7 @@ export function sendDm(input: { peerMemberId?: string; channelId?: string; text:
 export async function markChannelRead(channelId: string): Promise<MemberResult> {
   const id = (channelId ?? '').trim()
   const thread = threads.get(id)
-  if (!thread) return { ok: false, message: '会话不存在' }
+  if (!thread) return { ok: false, message: tIn(getMainLocale(), 'dm.threadMissing') }
   const last = thread.messages[thread.messages.length - 1]
   thread.unread = 0
   saveStore()
@@ -1746,8 +2090,8 @@ export async function markChannelRead(channelId: string): Promise<MemberResult> 
   const r = await httpJson(PATH_MESSAGE_READ, { method: 'POST', body: { channelId: id, messageId: last?.serverId ?? '', ts: last?.ts ?? Date.now() } })
   // 本地未读已清零（用户体感正确），HTTP 失败只提示未同步的副作用，不回滚
   return r.ok
-    ? { ok: true, message: '已标记为已读' }
-    : { ok: false, message: `本机已读已记录，但未能同步网关（${r.message}）：其它设备的未读可能仍显示` }
+    ? { ok: true, message: tIn(getMainLocale(), 'dm.markReadOk') }
+    : { ok: false, message: tIn(getMainLocale(), 'dm.markReadPartial', { msg: r.message }) }
 }
 
 export function getUnread(): DmUnread {
@@ -1775,11 +2119,18 @@ export function quoteDmToSession(input: { sessionId: string; channelId: string; 
   const sessionId = (input.sessionId ?? '').trim()
   const thread = threads.get(input.channelId ?? '')
   const msg = thread?.messages.find((m) => m.msgId === input.msgId || m.serverId === input.msgId)
-  if (!thread || !msg) return { ok: false, message: '找不到该条私信（可能已被本地历史裁剪），无法引用' }
-  if (!sessionId) return { ok: false, message: '请选择要引用到的会话' }
-  const fromLabel = msg.mine ? `${getRuntime().username ?? '我'}（本端发出）` : thread.peerName || msg.fromName || msg.from
+  if (!thread || !msg) return { ok: false, message: tIn(getMainLocale(), 'dm.quoteMissing') }
+  if (!sessionId) return { ok: false, message: tIn(getMainLocale(), 'dm.quoteNeedSession') }
+  // 「（本端发出）」与「我」都进词条：英文是 "Me (sent from this device)"，语序与括号都不同
+  const fromLabel = msg.mine
+    ? tIn(getMainLocale(), 'dm.quoteMineSuffix', { name: getRuntime().username ?? tIn(getMainLocale(), 'dm.quoteSelfName') })
+    // 【期5B-补漏】第三层 `|| msg.from` 是 memberId：它进的是跨进程载荷（不是落盘字段），
+    // 渲染层 DmQuoteBanner 本来就按 fromMemberId 反查挡了一道；现在源头也不吐 memberId，
+    // 载荷里给空串 → 渲染层 !n 分支显示「未知会员」。fromMemberId 仍原样传（它是比对键，不是显示值）。
+    : realNameOrEmpty(thread.peerName, msg.from) || realNameOrEmpty(msg.fromName, msg.from)
   const isSupervisor = sessionId === SUPERVISOR_SESSION_ID
-  const payload: DmQuotePayload = { sessionId, channelId: thread.channelId, msgId: msg.msgId, fromName: fromLabel, fromMemberId: msg.from, text: msg.text, ts: msg.ts, at: Date.now() }
+  // 附件消息引用到会话时展开成「[图片] 名字 → URL」：模型与用户看到的都是可读文本，且 URL 保留（否则引用图片等于丢了内容）
+  const payload: DmQuotePayload = { sessionId, channelId: thread.channelId, msgId: msg.msgId, fromName: fromLabel, fromMemberId: msg.from, text: dmContentToPlainText(msg.text), ts: msg.ts, at: Date.now() }
   let delivered = 0
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed() || win.webContents.isDestroyed()) continue
@@ -1790,8 +2141,8 @@ export function quoteDmToSession(input: { sessionId: string; channelId: string; 
     delivered += 1
   }
   audit({ dir: 'out', caller: 'builtin', topic: 'quote_to_session', channelId: thread.channelId, to: sessionId, bytes: byteLen(msg.text), result: delivered > 0 ? 'injected' : 'no_window' })
-  const where = isSupervisor ? '会话管家的输入框' : '该会话的输入框'
+  const where = tIn(getMainLocale(), isSupervisor ? 'dm.quoteWhereSup' : 'dm.quoteWhereChat')
   return delivered > 0
-    ? { ok: true, message: `已追加到${where}（不会自动发送，请你确认后自行发送）` }
-    : { ok: false, message: isSupervisor ? '会话管家窗口未打开，无法写入输入框（请先打开管家再引用）' : '聊天窗口未打开，无法写入输入框（请先打开聊天窗口再引用）' }
+    ? { ok: true, message: tIn(getMainLocale(), 'dm.quoteAppended', { where }) }
+    : { ok: false, message: tIn(getMainLocale(), isSupervisor ? 'dm.quoteNoSupWindow' : 'dm.quoteNoChatWindow') }
 }

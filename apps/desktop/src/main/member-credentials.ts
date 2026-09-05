@@ -23,6 +23,11 @@
 import { BrowserWindow } from 'electron'
 import { safeSend } from './safe-send'
 import { getRuntime } from './runtime'
+// 【i18n 期5B】凭证状态文案会显示到私信面板顶部条与设置页「连接」分区，必须跟随界面语言。
+// 语言只认 main/locale-store.ts 的 getMainLocale()（全仓唯一真相源），取词一律 tIn(getMainLocale(), …)
+// —— **不在模块加载期求值**（历轮 9 次同一个坑），每次调用现取，所以切语言后下一次广播就是新语言。
+import { getMainLocale } from './locale-store'
+import { tIn } from '../shared/i18n'
 import { patchUiState } from './ui-store'
 
 /**
@@ -237,22 +242,32 @@ export function getCredentialSnapshot(): CredentialSnapshot {
 export function describeCredentialState(snap: CredentialSnapshot): string {
   switch (snap.state) {
     case 'anonymous':
-      return '未登录会员账号'
+      return tIn(getMainLocale(), 'common.cred.anonymous')
     case 'expired':
       return snap.lastErrorCode === 'token_expired'
-        ? '登录凭证已过期且超出续签宽限期，请重新登录'
-        : '登录凭证已过期（正在尝试自动续签，期间远程连接与私信不可用）'
+        ? tIn(getMainLocale(), 'common.cred.expiredHard')
+        : tIn(getMainLocale(), 'common.cred.expiredGrace')
     case 'renewing':
-      return '登录凭证即将到期，已自动续签'
+      return tIn(getMainLocale(), 'common.cred.renewing')
     case 'unknown':
-      return '已登录（凭证有效期未知：本地未记录过期时间，按可用处理）'
+      return tIn(getMainLocale(), 'common.cred.unknown')
     case 'valid':
     default: {
-      if (snap.expiresAt === null) return '已登录'
+      if (snap.expiresAt === null) return tIn(getMainLocale(), 'common.cred.valid')
       const days = Math.floor((snap.expiresAt - Date.now()) / 86400_000)
       const hours = Math.floor(((snap.expiresAt - Date.now()) % 86400_000) / 3600_000)
-      const when = days > 0 ? `${days} 天 ${hours} 小时` : `${hours} 小时`
-      return `已登录（凭证剩余约 ${when}${snap.expiresAtSource === 'jwt' ? '，按 JWT exp 估算' : ''}）`
+      // 【量词进词典】原来在代码里拼 `${days} 天 ${hours} 小时` —— 英文没有量词，拼出来就是病句。
+      // 【两个独立计数必须两条词条】一条 plural 只能按一个计数选形态：旧写法把「天」「小时」塞进
+      //   同一条 {n}{h} 词条，英文态必出 "2 days 1 hours"（h=1 时 hours 不会变单数）。
+      //   现拆成 dhDays + dhHours 两条各自带复数，用 cred.durJoin 连接（zh 空格 / en 逗号+空格）。
+      const when = days > 0
+        ? [tIn(getMainLocale(), 'common.cred.dhDays', { n: days }),
+           tIn(getMainLocale(), 'common.cred.dhHours', { n: hours })].join(tIn(getMainLocale(), 'common.cred.durJoin'))
+        : tIn(getMainLocale(), 'common.cred.dhHours', { n: hours })
+      // 「按 JWT exp 估算」是整句变体而不是前导逗号片段：英文语序与标点不同，碎片拼会顶错位
+      return snap.expiresAtSource === 'jwt'
+        ? tIn(getMainLocale(), 'common.cred.validDaysJwt', { when })
+        : tIn(getMainLocale(), 'common.cred.validDays', { when })
     }
   }
 }
@@ -358,10 +373,10 @@ export function refreshMemberToken(trigger: string): Promise<RefreshOutcome> {
         signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
       })
     } catch (err) {
-      const msg = err instanceof Error ? (err.name === 'TimeoutError' ? `${REFRESH_TIMEOUT_MS / 1000} 秒内无响应` : err.message) : String(err)
+      const msg = err instanceof Error ? (err.name === 'TimeoutError' ? tIn(getMainLocale(), 'common.cred.refreshTimeout', { sec: REFRESH_TIMEOUT_MS / 1000 }) : err.message) : String(err)
       failureCount += 1
       lastErrorCode = 'network'
-      lastError = `续签请求失败：${msg}`
+      lastError = tIn(getMainLocale(), 'common.cred.refreshReqFailed', { msg })
       logRefreshFailure(lastErrorCode, msg)
       broadcastCredentialStatus()
       scheduleRetry()
@@ -381,7 +396,7 @@ export function refreshMemberToken(trigger: string): Promise<RefreshOutcome> {
         // 200 但没给 token：视为暂时性异常（网关实现与契约不符），不误登出
         failureCount += 1
         lastErrorCode = 'bad_response'
-        lastError = '续签响应缺少 token'
+        lastError = tIn(getMainLocale(), 'common.cred.refreshNoToken')
         logRefreshFailure(lastErrorCode, lastError)
         broadcastCredentialStatus()
         scheduleRetry()
@@ -394,7 +409,7 @@ export function refreshMemberToken(trigger: string): Promise<RefreshOutcome> {
         const msg = err instanceof Error ? err.message : String(err)
         failureCount += 1
         lastErrorCode = 'persist_failed'
-        lastError = `新凭证落盘失败：${msg}`
+        lastError = tIn(getMainLocale(), 'common.cred.persistFailed', { msg })
         logRefreshFailure(lastErrorCode, lastError)
         broadcastCredentialStatus()
         scheduleRetry()
@@ -423,19 +438,25 @@ export function refreshMemberToken(trigger: string): Promise<RefreshOutcome> {
       }
       return `HTTP ${res.status}`
     })()
+    // 【识别条件①】网关偶尔把 Go 原文 `context deadline exceeded` 放进 body 的 message 里；
+    // 这个值会经 credential 状态快照显示到界面（私信面板/设置页），不能透传英文。
+    // 只改文案，**不改分类与重试逻辑**：5xx 本来就落到下面的「暂时性 + 指数退避重试」分支。
+    const shownMsg = /context\s+deadline\s+exceeded|Client\.Timeout\s+exceeded|net\/http:\s+request\s+canceled/i.test(rawMsg)
+      ? tIn(getMainLocale(), 'common.cred.gwTimeoutRetry', { code })
+      : rawMsg
     // 分类：只有「凭证本身不可恢复」才登出
     if (code === 'token_expired' || code === 'token_invalid' || code === 'token_missing' || res.status === 403) {
       failureCount += 1
       lastErrorCode = code
-      lastError = rawMsg
+      lastError = shownMsg
       logRefreshFailure(code, rawMsg)
-      markCredentialInvalid(`登录凭证已失效（${code}），请重新登录`, code)
+      markCredentialInvalid(tIn(getMainLocale(), 'common.cred.invalid', { code }), code)
       return 'invalid'
     }
     // 404（网关未部署 / nginx 未暴露）/ 5xx / 其它：暂时性，保留登录态，退避重试
     failureCount += 1
     lastErrorCode = code
-    lastError = rawMsg
+    lastError = shownMsg
     logRefreshFailure(code, rawMsg)
     broadcastCredentialStatus()
     scheduleRetry()
@@ -467,11 +488,11 @@ export async function handleAuthRejected(hint: AuthRejectHint): Promise<RefreshO
   const snap = getCredentialSnapshot()
   // 刚续签成功不到 1 分钟又被拒：说明问题不在过期时间，别再 refresh（防 refresh↔401 死循环）
   if (lastRotationTs > 0 && Date.now() - lastRotationTs < POST_REFRESH_REJECT_COOLDOWN_MS && code !== 'token_expired') {
-    markCredentialInvalid(`使用新凭证仍被网关拒绝（${code || `HTTP ${hint.status ?? 401}`}），请重新登录`, code || 'rejected_after_rotation')
+    markCredentialInvalid(tIn(getMainLocale(), 'common.cred.rejectedAfterRotation', { code: code || `HTTP ${hint.status ?? 401}` }), code || 'rejected_after_rotation')
     return 'invalid'
   }
   if (code === 'token_missing' || code === 'token_invalid') {
-    markCredentialInvalid('登录凭证无效或缺失，请重新登录', code)
+    markCredentialInvalid(tIn(getMainLocale(), 'common.cred.invalidOrMissing'), code)
     return 'invalid'
   }
   if (snap.state === 'anonymous') return 'no_token'

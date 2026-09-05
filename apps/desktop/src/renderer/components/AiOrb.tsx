@@ -1,5 +1,7 @@
 import * as React from 'react'
 import { useEffect, useRef } from 'react'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /**
  * 量子立体粒子特效（Canvas 3D，无第三方依赖）。
@@ -41,6 +43,7 @@ function fibonacciSphere(n: number, radius: number): Particle[] {
 }
 
 export function AiOrb({ speaking = false }: { speaking?: boolean }): React.JSX.Element {
+  useLocaleSync()
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const speakingRef = useRef(speaking)
   speakingRef.current = speaking
@@ -166,7 +169,7 @@ export function AiOrb({ speaking = false }: { speaking?: boolean }): React.JSX.E
     <canvas
       ref={canvasRef}
       style={{ width: SIZE, height: SIZE, display: 'block', pointerEvents: 'none', userSelect: 'none' }}
-      aria-label="AI 语音播报特效"
+      aria-label={t('chat.orb.ariaLabel')}
     />
   )
 }

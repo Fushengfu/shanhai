@@ -136,6 +136,14 @@ export interface AppSettings {
     /** 统一压缩模型 id：上下文超限触发 LLM 摘要时用的模型。空串 = 未配置，回退当前会话模型。 */
     modelId: string
   }
+  /**
+   * 界面语言（i18n 期1）。**全局唯一真相源**：渲染层与主进程都从这里取，不另立 env / 独立 json 第二份。
+   * 空串 = 从未设置；主进程启动时按系统语言解析一次并写回具体值（desktop main/locale-store.ts
+   * 的 ensureLocaleResolved），所以运行期读到的通常是 'zh-CN' | 'en-US'。
+   * 类型故意是 string 而非联合类型：磁盘上可能出现任意历史值，归一化统一交给
+   * shared/i18n 的 normalizeLocale / resolveLocaleSetting，避免两处各判一套。
+   */
+  locale: string
 }
 
 /** 设置补丁：允许只传某个分组的某个字段（嵌套 Partial），setSettings 据此增量合并 */
@@ -148,6 +156,7 @@ export type AppSettingsPatch = {
   supervisorAsk?: Partial<AppSettings['supervisorAsk']>
   supervisorClientRun?: Partial<AppSettings['supervisorClientRun']>
   compaction?: Partial<AppSettings['compaction']>
+  locale?: string
 }
 
 /** 通用设置默认值 */
@@ -160,6 +169,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   supervisorAsk: { enabled: true },
   supervisorClientRun: { enabled: true },
   compaction: { modelId: '' },
+  // 空串 = 从未设置 → 首次跟随系统语言
+  locale: '',
 }
 
 /** 自定义模型输入（OpenAI 兼容或 Anthropic 协议；接口地址 / 密钥 / 模型名均由用户填写） */

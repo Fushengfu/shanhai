@@ -30,6 +30,13 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  # —— i18n 期7A：语言包底座 ——
+  # flutter_localizations 随 SDK 走 path 依赖（本机 SDK 内已有，无需下载）；
+  # intl 版本必须与 SDK 内 flutter_localizations 的 pin 完全一致（0.20.2），
+  # 写 ^0.20.2 会允许 0.20.x 之外解析失败，故直接钉死，离线 pub cache 已有该版本。
+  flutter_localizations:
+    sdk: flutter
+  intl: 0.20.2
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
@@ -62,6 +69,10 @@ dev_dependencies:
 
 # The following section is specific to Flutter packages.
 flutter:
+  # i18n 期7A：由 l10n.yaml 驱动 gen_l10n，从 lib/l10n/*.arb 生成 AppLocalizations。
+  # 生成物落在 lib/l10n/generated/ 并已进 .gitignore —— 它是 ARB 的派生物，
+  # 提交进仓库等于把同一批文案存两份，日后必然漂移（历轮反复强调的「第二份真相」）。
+  generate: true
 
   # The following line ensures that the Material Icons font is
   # included with your application, so that you can use the icons in

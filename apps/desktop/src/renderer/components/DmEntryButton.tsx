@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { IconChat } from './icons'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /**
  * 「私信」顶栏入口按钮 —— 普通会话窗口（plugins/HeaderPlugin.tsx）与会话管家窗口
@@ -29,6 +31,8 @@ export function DmEntryButton(props: {
   /** 追加样式（聊天窗口用 `marginLeft:'auto'` 把入口推到右侧） */
   style?: React.CSSProperties
 }): React.JSX.Element {
+  // 本组件渲染期直接取词（tooltip / 按钮文字 / 未读量词）→ 必须自订阅
+  useLocaleSync()
   const labeled = props.labeled ?? false
   /** 未读私信数（member:unread 广播，主进程权威） */
   const [dmUnread, setDmUnread] = useState(0)
@@ -46,11 +50,12 @@ export function DmEntryButton(props: {
   }, [props.loggedIn])
   // 未读私信 + 待处理好友申请合并计数：两类都需要用户处理，分开两个点反而看不清（与聊天窗口原口径一致）
   const badge = dmUnread + dmRequests
+  const counts = [t('dm.entryUnread', { n: dmUnread }), t('dm.entryRequests', { n: dmRequests })].join(t('common.sepMiddle'))
   const title = !props.loggedIn
-    ? '未登录会员账号：登录后才能使用好友与私信'
+    ? t('dm.entryNotLoggedIn')
     : dmRequests > 0
-      ? `会员好友与私信（需互为好友才能通讯）· ${dmUnread} 条未读私信 · ${dmRequests} 个待处理好友申请`
-      : '会员好友与私信（需互为好友才能通讯）'
+      ? t('dm.entryBase') + t('common.sepMiddle') + counts
+      : t('dm.entryBase')
   return (
     <button
       onClick={() => void window.shanhai?.openApp('messages')}
@@ -75,10 +80,10 @@ export function DmEntryButton(props: {
       }
     >
       <IconChat />
-      {labeled && (props.loggedIn ? '私信' : '私信（未登录）')}
+      {labeled && (props.loggedIn ? t('dm.title') : t('dm.entryLabelNotLoggedIn'))}
       {props.loggedIn && badge > 0 && (
         <span
-          title={dmRequests > 0 ? `${dmUnread} 条未读私信 · ${dmRequests} 个待处理好友申请` : `${dmUnread} 条未读私信`}
+          title={dmRequests > 0 ? counts : t('dm.entryUnread', { n: dmUnread })}
           style={{ marginLeft: 2, minWidth: 16, textAlign: 'center', padding: '0 4px', borderRadius: 8, background: 'var(--danger, #ef4444)', color: '#fff', fontSize: 10, lineHeight: '16px' }}
         >
           {badge > 99 ? '99+' : badge}

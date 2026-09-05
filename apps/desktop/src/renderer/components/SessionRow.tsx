@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { IconEdit, IconTrash } from './icons'
 import { formatRelativeTime } from './ui'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /** 会话列表行：现代卡片式（圆角 + 标题/副标题两行 + 活跃高亮 + hover 显示操作） */
 export function SessionRow(props: {
@@ -55,8 +57,9 @@ export function SessionRow(props: {
   }
 
   // 副标题：执行中显示「处理中」（活跃时间即当前时间，无需显示时间）；空闲后显示最后活跃时间；不再显示工作目录
+  useLocaleSync()
   const relTime = s.lastActiveAt ? formatRelativeTime(s.lastActiveAt) : ''
-  const subtitle = props.busy ? '处理中' : relTime
+  const subtitle = props.busy ? t('chat.sessionRow.processing') : relTime
 
   return (
     <div
@@ -110,7 +113,7 @@ export function SessionRow(props: {
       </div>
       {props.busy && (
         <span
-          title="任务执行中"
+          title={t('chat.sessionRow.runningTitle')}
           style={{
             width: 12,
             height: 12,
@@ -129,7 +132,7 @@ export function SessionRow(props: {
               e.stopPropagation()
               props.onStartEdit()
             }}
-            title="重命名"
+            title={t('chat.sessionRow.renameTitle')}
             style={{
               border: 'none',
               background: 'transparent',
@@ -149,7 +152,7 @@ export function SessionRow(props: {
               e.stopPropagation()
               props.onDelete()
             }}
-            title="删除会话"
+            title={t('chat.sessionRow.deleteTitle')}
             style={{
               border: 'none',
               background: 'transparent',

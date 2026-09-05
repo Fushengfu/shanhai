@@ -3,6 +3,8 @@ import { useState } from 'react'
 import type { AskRequest } from '../types'
 import { IconWrench } from './icons'
 import { btn } from './ui'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 interface ModelPickerProps {
   req: AskRequest
@@ -14,6 +16,8 @@ interface ModelPickerProps {
  * 模型选择器（choose_model 工具专用）：渲染模型列表，单选，选中后把模型 id 回传给 agent；取消走 onCancel。
  */
 export function ModelPicker({ req, onSubmit, onCancel }: ModelPickerProps) {
+  // 谁取词谁订阅
+  useLocaleSync()
   const [selected, setSelected] = useState<string | null>(null)
   const options = req.modelOptions ?? []
   const canSubmit = selected != null
@@ -36,7 +40,7 @@ export function ModelPicker({ req, onSubmit, onCancel }: ModelPickerProps) {
     >
       <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text)', display: 'flex', alignItems: 'center' }}>
         <IconWrench />
-        请选择模型
+        {t('panels.modelPicker.title')}
       </div>
       <div style={{ color: 'var(--text)', marginBottom: 10, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
         {req.question}
@@ -77,15 +81,15 @@ export function ModelPicker({ req, onSubmit, onCancel }: ModelPickerProps) {
             </div>
           )
         })}
-        {options.length === 0 && <div style={{ color: 'var(--text-muted)', padding: 8 }}>暂无可选择的模型</div>}
+        {options.length === 0 && <div style={{ color: 'var(--text-muted)', padding: 8 }}>{t('panels.modelPicker.empty')}</div>}
       </div>
 
       <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
         <button onClick={() => selected && onSubmit(selected)} disabled={!canSubmit} style={{ ...btn('var(--accent)', '#fff'), opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}>
-          选择
+          {t('panels.modelPicker.confirm')}
         </button>
         <button onClick={onCancel} style={btn('var(--bg-panel)', 'var(--text)', '1px solid var(--border-strong)')}>
-          取消
+          {t('common.cancel')}
         </button>
       </div>
     </div>

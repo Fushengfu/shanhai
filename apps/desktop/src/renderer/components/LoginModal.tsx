@@ -1,5 +1,7 @@
 import { useState } from 'react'
 import { IconClose } from './icons'
+import { t as tKey } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 type Tab = 'login' | 'register'
 
@@ -12,6 +14,8 @@ export function LoginModal({
   onLogin: (u: string, p: string) => Promise<void>
   onRegister: (u: string, p: string, nickname?: string, phone?: string, email?: string) => Promise<void>
 }) {
+  // 谁取词谁订阅：本组件渲染期取词，必须自订阅语言变化
+  useLocaleSync()
   const [tab, setTab] = useState<Tab>('login')
   const [u, setU] = useState('')
   const [p, setP] = useState('')
@@ -41,36 +45,36 @@ export function LoginModal({
     try {
       if (tab === 'login') {
         if (!u || !p) {
-          setErr('请输入账号和密码')
+          setErr(tKey('panels.login.errAccountPassword'))
           return
         }
         await onLogin(u, p)
       } else {
         const phone = regPhone.trim()
         if (!phone) {
-          setErr('请输入手机号（将作为登录账号）')
+          setErr(tKey('panels.login.errPhoneRequired'))
           return
         }
         if (phone.length !== 11 || !/^\d{11}$/.test(phone)) {
-          setErr('手机号格式不正确，请输入 11 位数字')
+          setErr(tKey('panels.login.errPhoneFormat'))
           return
         }
         if (!regPassword) {
-          setErr('请输入密码')
+          setErr(tKey('panels.login.errPasswordRequired'))
           return
         }
         if (regPassword.length < 6) {
-          setErr('密码至少 6 个字符')
+          setErr(tKey('panels.login.errPasswordShort'))
           return
         }
         const nickname = regNickname.trim()
         if (!nickname) {
-          setErr('请输入昵称')
+          setErr(tKey('panels.login.errNicknameRequired'))
           return
         }
         const email = regEmail.trim()
         if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-          setErr('邮箱格式不正确')
+          setErr(tKey('panels.login.errEmailFormat'))
           return
         }
         await onRegister(phone, regPassword, nickname, phone, email || undefined)
@@ -91,8 +95,8 @@ export function LoginModal({
         <button onClick={onClose} style={{ position: 'absolute', top: 12, right: 12, border: 'none', background: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 4 }}>
           <IconClose />
         </button>
-        <h1 style={{ fontSize: 20, marginBottom: 4, textAlign: 'center' }}>山海</h1>
-        <p style={{ fontSize: 13, color: 'var(--text-muted)', textAlign: 'center', marginBottom: 16 }}>账号密码登录</p>
+        <h1 style={{ fontSize: 20, marginBottom: 4, textAlign: 'center' }}>{tKey('chat.brand')}</h1>
+        <p style={{ fontSize: 13, color: 'var(--text-muted)', textAlign: 'center', marginBottom: 16 }}>{tKey('panels.login.subtitle')}</p>
 
         {/* 登录 / 注册 tab 切换 */}
         <div style={{ display: 'flex', marginBottom: 20, borderBottom: '1px solid var(--border)' }}>
@@ -116,7 +120,7 @@ export function LoginModal({
                 transition: 'color 0.15s ease, border-color 0.15s ease',
               }}
             >
-              {t === 'login' ? '登录' : '注册'}
+              {t === 'login' ? tKey('panels.login.tabLogin') : tKey('panels.login.tabRegister')}
             </button>
           ))}
         </div>
@@ -126,7 +130,7 @@ export function LoginModal({
             <input
               value={u}
               onChange={(e) => setU(e.target.value)}
-              placeholder="账号"
+              placeholder={tKey('panels.login.account')}
               autoFocus
               style={inputStyle}
             />
@@ -137,7 +141,7 @@ export function LoginModal({
                 if (e.key === 'Enter') void submit()
               }}
               type="password"
-              placeholder="密码"
+              placeholder={tKey('panels.login.password')}
               style={inputStyle}
             />
           </>
@@ -146,7 +150,7 @@ export function LoginModal({
             <input
               value={regPhone}
               onChange={(e) => setRegPhone(e.target.value)}
-              placeholder="手机号（将作为登录账号）"
+              placeholder={tKey('panels.login.phone')}
               autoFocus
               style={inputStyle}
             />
@@ -154,13 +158,13 @@ export function LoginModal({
               value={regPassword}
               onChange={(e) => setRegPassword(e.target.value)}
               type="password"
-              placeholder="密码（至少 6 位）"
+              placeholder={tKey('panels.login.passwordAtLeast')}
               style={inputStyle}
             />
             <input
               value={regNickname}
               onChange={(e) => setRegNickname(e.target.value)}
-              placeholder="昵称（必填）"
+              placeholder={tKey('panels.login.nicknameRequired')}
               style={inputStyle}
             />
             <input
@@ -169,7 +173,7 @@ export function LoginModal({
               onKeyDown={(e) => {
                 if (e.key === 'Enter') void submit()
               }}
-              placeholder="邮箱（可选）"
+              placeholder={tKey('panels.login.emailOptional')}
               style={inputStyle}
             />
           </>
@@ -181,9 +185,9 @@ export function LoginModal({
           disabled={loading}
           style={{ width: '100%', padding: 10, borderRadius: 8, border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 14, cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.6 : 1 }}
         >
-          {loading ? (tab === 'login' ? '登录中…' : '注册中…') : tab === 'login' ? '登录' : '注册'}
+          {loading ? (tab === 'login' ? tKey('panels.login.loggingIn') : tKey('panels.login.registering')) : tab === 'login' ? tKey('panels.login.tabLogin') : tKey('panels.login.tabRegister')}
         </button>
-        <p style={{ fontSize: 11, color: 'var(--text-faint)', textAlign: 'center', marginTop: 16 }}>密码仅在登录/注册瞬间使用，绝不落盘</p>
+        <p style={{ fontSize: 11, color: 'var(--text-faint)', textAlign: 'center', marginTop: 16 }}>{tKey('panels.login.passwordNote')}</p>
       </div>
     </div>
   )

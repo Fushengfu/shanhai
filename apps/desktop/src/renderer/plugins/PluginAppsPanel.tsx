@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { PluginAppIcon } from '../components/PluginAppIcon'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /** 与 preload listPluginApps 返回项对齐的插件应用信息 */
 export interface PluginAppInfo {
@@ -68,6 +70,8 @@ function savePosition(appId: string, pos: Position): void {
  * 卡片自身 pointerEvents:auto，点击空白壁纸仍能透传到桌面壳的 restoreAboveDesktop。
  */
 export function PluginAppsPanel(): React.JSX.Element | null {
+  // 谁取词谁订阅（title 属性在渲染期求值）
+  useLocaleSync()
   const [apps, setApps] = useState<PluginAppInfo[]>([])
   const [positions, setPositions] = useState<Record<string, Position>>(() => loadPositions())
   const [draggingId, setDraggingId] = useState<string | null>(null)
@@ -173,7 +177,7 @@ export function PluginAppsPanel(): React.JSX.Element | null {
                 moved: false,
               }
             }}
-            title={`${app.name}（插件应用，点击打开；拖拽到任意位置摆放，拖到 Dock 固定）`}
+            title={t('panels.pluginApps.appTip', { name: app.name })}
             style={{
               position: 'absolute',
               left: pos.x,

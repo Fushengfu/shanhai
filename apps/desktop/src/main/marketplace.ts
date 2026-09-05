@@ -8,6 +8,8 @@ import { getRuntime } from './runtime'
 import { packagePluginShare, SCAFFOLD_WORKSPACE_DIR } from '@shanhai/selfmod'
 import { uploadToQiniu } from '@shanhai/storage'
 import { PLUGINS_DIR } from './plugin-apps'
+import { getMainLocale } from './locale-store'
+import { tIn } from '../shared/i18n'
 
 const execFileAsync = promisify(execFile)
 
@@ -133,7 +135,7 @@ export async function listMarketPlugins(params: {
     try {
       json = JSON.parse(text)
     } catch {
-      return { ok: false, plugins: [], total: 0, error: '响应不是合法 JSON' }
+      return { ok: false, plugins: [], total: 0, error: tIn(getMainLocale(), 'market.err.badJson') }
     }
     const { list, total } = unwrapList(json)
     const installed = installedPluginIds()
@@ -193,7 +195,7 @@ export async function downloadAndInstallPlugin(pluginId: string): Promise<{
 }> {
   const id = String(pluginId ?? '').trim()
   if (!id || !/^[a-zA-Z0-9_-]+$/.test(id)) {
-    return { ok: false, message: `非法插件 id: ${pluginId}` }
+    return { ok: false, message: tIn(getMainLocale(), 'market.err.illegalId', { id: pluginId }) }
   }
   const downloadUrl = `${MARKET_LIST_URL}/${encodeURIComponent(id)}/download`
 
@@ -201,21 +203,31 @@ export async function downloadAndInstallPlugin(pluginId: string): Promise<{
   try {
     resp = await fetch(downloadUrl, { method: 'GET' })
   } catch (err) {
-    return { ok: false, message: `下载失败：${err instanceof Error ? err.message : String(err)}` }
+    // err.message 是 fetch/Node 原始错误：按口径④作为 {msg} 原样带入，不建映射表
+    return { ok: false, message: tIn(getMainLocale(), 'market.err.downloadFailed', { msg: err instanceof Error ? err.message : String(err) }) }
   }
   if (!resp.ok) {
     const body = await resp.text().catch(() => '')
-    return { ok: false, message: `下载失败：HTTP ${resp.status} ${resp.statusText}${body ? `（${body.slice(0, 160)}）` : ''}` }
+    // 改前是「中文前缀 + HTTP 状态 + 全角括号包原文」三段拼，英文语序不同拼不出来 → 整句词条
+    return {
+      ok: false,
+      message: body
+        ? tIn(getMainLocale(), 'market.err.downloadHttpBody', { status: resp.status, statusText: resp.statusText, body: body.slice(0, 160) })
+        : tIn(getMainLocale(), 'market.err.downloadHttp', { status: resp.status, statusText: resp.statusText }),
+    }
   }
 
   const expectedSha256 = (resp.headers.get('X-SHA256') || resp.headers.get('x-sha256') || '').trim()
   const buf = Buffer.from(await resp.arrayBuffer())
   if (!expectedSha256) {
-    return { ok: false, message: '网关未返回 X-SHA256 校验头，为安全起见拒绝安装（宁缺毋滥）' }
+    return { ok: false, message: tIn(getMainLocale(), 'market.err.noSha256Header') }
   }
   const actualSha256 = createHash('sha256').update(buf).digest('hex')
   if (actualSha256.toLowerCase() !== expectedSha256.toLowerCase()) {
-    return { ok: false, message: `SHA-256 校验失败：下载包不完整或被篡改\n期望 ${expectedSha256}\n实际 ${actualSha256}` }
+    return {
+      ok: false,
+      message: tIn(getMainLocale(), 'market.err.sha256Mismatch', { expected: expectedSha256, actual: actualSha256 }),
+    }
   }
 
   // 解包到临时目录（应用 cache 下），校验 manifest，再覆盖还原到 plugins/<id>/
@@ -230,21 +242,24 @@ export async function downloadAndInstallPlugin(pluginId: string): Promise<{
 
     const manifestPath = join(stagingDir, 'manifest.json')
     if (!existsSync(manifestPath)) {
-      return { ok: false, message: '共享包缺少 manifest.json，无法安装' }
+      return { ok: false, message: tIn(getMainLocale(), 'market.err.noManifest') }
     }
     let manifest: Record<string, unknown>
     try {
       manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as Record<string, unknown>
     } catch {
-      return { ok: false, message: 'manifest.json 解析失败' }
+      return { ok: false, message: tIn(getMainLocale(), 'market.err.manifestParse') }
     }
     const manifestId = String(manifest.id ?? manifest.plugin_id ?? '').trim()
     if (!manifestId || !/^[a-zA-Z0-9_-]+$/.test(manifestId)) {
-      return { ok: false, message: `manifest.json 的 id 非法: ${manifestId || '(空)'}` }
+      return { ok: false, message: tIn(getMainLocale(), 'market.err.manifestIdIllegal', { id: manifestId || tIn(getMainLocale(), 'market.err.idEmpty') }) }
     }
     // manifest id 必须与请求的 pluginId 一致，防止张冠李戴
     if (manifestId !== id) {
-      return { ok: false, message: `manifest id（${manifestId}）与请求的插件 id（${id}）不一致，拒绝安装` }
+      return {
+        ok: false,
+        message: tIn(getMainLocale(), 'market.err.manifestIdMismatch', { manifestId, id }),
+      }
     }
 
     // 覆盖还原到 ~/.shanhai/plugins/<id>/（先删旧的再整目录复制，保证升级时旧文件不残留）
@@ -252,7 +267,7 @@ export async function downloadAndInstallPlugin(pluginId: string): Promise<{
     const resolvedTarget = resolve(targetDir)
     const pluginsRoot = resolve(PLUGINS_DIR)
     if (resolvedTarget !== pluginsRoot && !resolvedTarget.startsWith(pluginsRoot + sep)) {
-      return { ok: false, message: `插件 id 越界: ${id}` }
+      return { ok: false, message: tIn(getMainLocale(), 'market.err.idOutOfRange', { id }) }
     }
     await fs.rm(resolvedTarget, { recursive: true, force: true })
     await fs.mkdir(resolvedTarget, { recursive: true })
@@ -266,9 +281,10 @@ export async function downloadAndInstallPlugin(pluginId: string): Promise<{
       (s) => JSON.parse(s) as { name?: string },
       () => ({} as { name?: string }),
     )
-    return { ok: true, id, name: meta.name ?? id, message: `已安装插件「${meta.name ?? id}」` }
+    // meta.name 是插件 manifest 里的名字（插件生态不纳入 i18n）→ 作为 {name} 原样带入
+    return { ok: true, id, name: meta.name ?? id, message: tIn(getMainLocale(), 'market.msg.installedPlugin', { name: meta.name ?? id }) }
   } catch (err) {
-    return { ok: false, message: `安装失败：${err instanceof Error ? err.message : String(err)}` }
+    return { ok: false, message: tIn(getMainLocale(), 'market.err.installFailed', { msg: err instanceof Error ? err.message : String(err) }) }
   } finally {
     await fs.rm(tmpBase, { recursive: true, force: true }).catch(() => undefined)
   }
@@ -281,13 +297,13 @@ export async function downloadAndInstallPlugin(pluginId: string): Promise<{
 export async function uninstallMarketPlugin(pluginId: string): Promise<{ ok: boolean; message: string }> {
   const id = String(pluginId ?? '').trim()
   if (!id || !/^[a-zA-Z0-9_-]+$/.test(id)) {
-    return { ok: false, message: `非法插件 id: ${pluginId}` }
+    return { ok: false, message: tIn(getMainLocale(), 'market.err.illegalId', { id: pluginId }) }
   }
   try {
     await getRuntime().uninstallMarketPlugin(id)
-    return { ok: true, message: `已卸载插件「${id}」` }
+    return { ok: true, message: tIn(getMainLocale(), 'market.msg.uninstalledPlugin', { id }) }
   } catch (err) {
-    return { ok: false, message: `卸载失败：${err instanceof Error ? err.message : String(err)}` }
+    return { ok: false, message: tIn(getMainLocale(), 'market.err.uninstallFailed', { msg: err instanceof Error ? err.message : String(err) }) }
   }
 }
 
@@ -305,7 +321,7 @@ export async function submitPluginToMarket(pluginDirOrId: string, categories?: s
   const apiKey = getRuntime().getGatewayApiKey()
   if (!apiKey) {
     // 需求：未登录（无登录态网关凭证）时直接拒绝，不发起任何请求；与 UI 前置禁用双保险
-    return { ok: false, message: '请先登录后再提交' }
+    return { ok: false, message: tIn(getMainLocale(), 'market.err.needLogin') }
   }
   let zipPath: string
   let manifest: Record<string, unknown> = {}
@@ -314,7 +330,7 @@ export async function submitPluginToMarket(pluginDirOrId: string, categories?: s
     zipPath = packed.zipPath
     manifest = (packed.manifest ?? {}) as unknown as Record<string, unknown>
   } catch (err) {
-    return { ok: false, message: `打包失败：${err instanceof Error ? err.message : String(err)}` }
+    return { ok: false, message: tIn(getMainLocale(), 'market.err.packFailed', { msg: err instanceof Error ? err.message : String(err) }) }
   }
 
   try {
@@ -331,7 +347,13 @@ export async function submitPluginToMarket(pluginDirOrId: string, categories?: s
     )
     if (!tokenResp.ok) {
       const body = await tokenResp.text().catch(() => '')
-      return { ok: false, message: `获取上传凭证失败：HTTP ${tokenResp.status} ${tokenResp.statusText}${body ? `（${body.slice(0, 160)}）` : ''}`, zipPath }
+      return {
+        ok: false,
+        message: body
+          ? tIn(getMainLocale(), 'market.err.tokenHttpBody', { status: tokenResp.status, statusText: tokenResp.statusText, body: body.slice(0, 160) })
+          : tIn(getMainLocale(), 'market.err.tokenHttp', { status: tokenResp.status, statusText: tokenResp.statusText }),
+        zipPath,
+      }
     }
     const tokenPayload = (await tokenResp.json().catch(() => ({}))) as Record<string, unknown>
     const tokenData = (tokenPayload.data && typeof tokenPayload.data === 'object' ? tokenPayload.data : tokenPayload) as Record<string, unknown>
@@ -340,7 +362,7 @@ export async function submitPluginToMarket(pluginDirOrId: string, categories?: s
     const key = String(tokenData.key ?? '')
     const publicBaseUrl = String(tokenData.public_base_url ?? tokenData.domain ?? '')
     if (!uploadUrl || !token || !key || !publicBaseUrl) {
-      return { ok: false, message: '上传凭证数据不完整（缺 upload_url / token / key / public_base_url）', zipPath }
+      return { ok: false, message: tIn(getMainLocale(), 'market.err.tokenIncomplete'), zipPath }
     }
 
     // 4. 统一七牛直传（@shanhai/storage 的 uploadToQiniu，内置跨区域自愈重试）
@@ -353,7 +375,13 @@ export async function submitPluginToMarket(pluginDirOrId: string, categories?: s
       publicBaseUrl,
     })
     if (!put.ok) {
-      return { ok: false, message: `上传到七牛失败：HTTP ${put.status}${put.body ? `（${put.body.slice(0, 200)}）` : ''}（已按七牛提示自动纠偏上传区域；若仍失败，请排查网关 upload_url 区域与 bucket 是否匹配）`, zipPath }
+      return {
+        ok: false,
+        message: put.body
+          ? tIn(getMainLocale(), 'market.err.qiniuHttpBody', { status: put.status, body: put.body.slice(0, 200) })
+          : tIn(getMainLocale(), 'market.err.qiniuHttp', { status: put.status }),
+        zipPath,
+      }
     }
 
     // 5. 公网 file_url = public_base_url + '/' + key（uploadToQiniu 已拼好；此处兜底手动拼接）
@@ -397,15 +425,21 @@ export async function submitPluginToMarket(pluginDirOrId: string, categories?: s
         const pv = String(manifest.version ?? '')
         return {
           ok: false,
-          message: `提交失败：插件「${pn}」版本 v${pv} 已在创意空间存在（可能是此前已提交过，或由其他账号提交）。同一插件同一版本不能重复提交。如需更新，请把插件版本号升级到更高版本后再点「提交升级版本共享」。`,
+          message: tIn(getMainLocale(), 'market.err.submitDuplicate', { name: pn, version: pv }),
           zipPath,
         }
       }
-      return { ok: false, message: `提交失败：HTTP ${resp.status} ${resp.statusText}${msg ? `（${msg}）` : ''}`, zipPath }
+      return {
+        ok: false,
+        message: msg
+          ? tIn(getMainLocale(), 'market.err.submitHttpBody', { status: resp.status, statusText: resp.statusText, msg })
+          : tIn(getMainLocale(), 'market.err.submitHttp', { status: resp.status, statusText: resp.statusText }),
+        zipPath,
+      }
     }
-    return { ok: true, message: '已提交到创意空间（待网关审批）', zipPath, data: json }
+    return { ok: true, message: tIn(getMainLocale(), 'market.msg.submittedToMarket'), zipPath, data: json }
   } catch (err) {
-    return { ok: false, message: `提交失败：${err instanceof Error ? err.message : String(err)}`, zipPath }
+    return { ok: false, message: tIn(getMainLocale(), 'market.err.submitFailed', { msg: err instanceof Error ? err.message : String(err) }), zipPath }
   }
 }
 
@@ -473,7 +507,7 @@ function readLocalMeta(id: string, selfMade: boolean): { name?: string; version?
 async function fetchMinePlugins(): Promise<{ entries: Map<string, MineEntry>; ok: boolean; error?: string }> {
   const apiKey = getRuntime().getGatewayApiKey()
   if (!apiKey) {
-    return { entries: new Map(), ok: false, error: '未登录或缺少网关 APIKey' }
+    return { entries: new Map(), ok: false, error: tIn(getMainLocale(), 'market.err.noApiKey') }
   }
   try {
     const resp = await fetch(`${API_BASE}/api/v1/plugins/mine`, {
@@ -487,7 +521,7 @@ async function fetchMinePlugins(): Promise<{ entries: Map<string, MineEntry>; ok
     try {
       json = JSON.parse(await resp.text())
     } catch {
-      return { entries: new Map(), ok: false, error: '响应不是合法 JSON' }
+      return { entries: new Map(), ok: false, error: tIn(getMainLocale(), 'market.err.badJson') }
     }
 
     const map = new Map<string, MineEntry>()
@@ -579,7 +613,8 @@ export async function listMyPlugins(): Promise<{ ok: boolean; plugins: MyPluginI
   plugins.sort((a, b) => {
     // 自研在前，其次按名称
     if (a.selfMade !== b.selfMade) return a.selfMade ? -1 : 1
-    return a.name.localeCompare(b.name, 'zh-CN')
+    // 改前写死 'zh-CN' 排序规则：英文界面下按拼音序排英文名会错乱。跟随当前语言。
+    return a.name.localeCompare(b.name, getMainLocale())
   })
   return { ok: true, plugins, mineError: mine.ok ? undefined : mine.error }
 }

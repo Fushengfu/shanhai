@@ -1,7 +1,9 @@
-import { useRef } from 'react'
+import { useEffect, useRef } from 'react'
 import * as React from 'react'
 import { IconMonitor } from '../components/icons'
 import { useThemeSync } from '../theme'
+import { t } from '../../shared/i18n'
+import { applyLocale, useLocaleSync } from '../locale'
 
 /**
  * 会话管家悬浮图标（独立窗口 supervisor-bubble）。
@@ -12,6 +14,13 @@ import { useThemeSync } from '../theme'
 export function SupervisorBubble(): React.JSX.Element {
   // 主题：订阅主进程广播，跟随聊天窗口切换（渐变颜色随亮/暗变化）
   useThemeSync()
+  // 语言（i18n 期3）：本气泡自己取词（title），必须订阅语言变化，否则切了语言 tooltip 还是旧语言。
+  useLocaleSync()
+  // 窗口级：订阅主进程 ui:locale 广播，把语言写进本窗口的取词镜像（气泡是独立窗口，不订阅就永远停在挂载时那份）。
+  useEffect(() => {
+    const off = window.shanhai?.onLocaleChange((l) => applyLocale(l))
+    return off
+  }, [])
   const dragRef = useRef<{ startX: number; startY: number; moved: boolean } | null>(null)
 
   const onMouseDown = (e: React.MouseEvent): void => {
@@ -61,7 +70,7 @@ export function SupervisorBubble(): React.JSX.Element {
     >
       <div
         onMouseDown={onMouseDown}
-        title="会话管家（点击打开，拖动移动）"
+        title={t('sup.bubble.title')}
         style={{
           width: 52,
           height: 52,

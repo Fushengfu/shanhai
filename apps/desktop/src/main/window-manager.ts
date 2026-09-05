@@ -2,6 +2,8 @@ import { app, BrowserWindow, Menu, screen, type MenuItemConstructorOptions } fro
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isPluginApp, resolvePluginEntryHtml } from './plugin-apps'
+import { getMainLocale } from './locale-store'
+import { tIn } from '../shared/i18n'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -41,17 +43,26 @@ app.on('before-quit', () => {
   isQuitting = true
 })
 
-/** 注册右键原生菜单（复制/粘贴/全选）：终端 xterm 自绘 selection 不走这里，由渲染进程 TerminalPanel 自理 */
+/**
+ * 注册右键原生菜单（复制/粘贴/全选）：终端 xterm 自绘 selection 不走这里，由渲染进程 TerminalPanel 自理
+ *
+ * 【i18n 期5A】这三条文案在**每次 context-menu 事件里现取词、现建菜单** →
+ *   语言一变，下一次右键就是新语言，**已开着的窗口不需要重设 menu、也不需要重新注册监听**。
+ *   这是本期三处原生 UI 里唯一「静态即可断定能热更新」的一处（Dock / 托盘是启动时一次性建好的对象，
+ *   要靠 onMainLocaleChange 重建，且 macOS 生效时机需真机验证）。
+ *   取词走 getMainLocale()（主进程唯一真相源），不读 settings 原文、不在渲染层判。
+ */
 function registerContextMenu(win: BrowserWindow): void {
   win.webContents.on('context-menu', (_event, params) => {
+    const L = getMainLocale()
     const items: MenuItemConstructorOptions[] = []
     if (params.selectionText && params.selectionText.trim().length > 0) {
-      items.push({ label: '复制', role: 'copy' })
+      items.push({ label: tIn(L, 'native.menu.copy'), role: 'copy' })
     }
     if (params.isEditable) {
       if (items.length > 0) items.push({ type: 'separator' })
-      items.push({ label: '粘贴', role: 'paste' })
-      items.push({ label: '全选', role: 'selectAll' })
+      items.push({ label: tIn(L, 'native.menu.paste'), role: 'paste' })
+      items.push({ label: tIn(L, 'native.menu.selectAll'), role: 'selectAll' })
     }
     if (items.length === 0) return
     Menu.buildFromTemplate(items).popup({ window: win })

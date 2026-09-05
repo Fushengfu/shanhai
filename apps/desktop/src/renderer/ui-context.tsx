@@ -128,6 +128,8 @@ export interface UIContextValue {
   handleLogin: (u: string, p: string) => Promise<void>
   handleRegister: (u: string, p: string, nickname?: string, phone?: string, email?: string) => Promise<void>
   previewImage: string | null
+  /** 【P3】发送被本地闸门拦下时的可见原因（App 持有，输入区渲染） */
+  sendNotice: string
 }
 
 export const UIContext = createContext<UIContextValue | null>(null)

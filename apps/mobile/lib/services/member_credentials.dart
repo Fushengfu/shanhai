@@ -6,6 +6,8 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import 'token_store.dart';
+import '../l10n/generated/app_localizations.dart';
+import '../locale.dart';
 
 /// 会员登录凭证（JWT）续签的**唯一复用点**（对应桌面端 `apps/desktop/src/main/member-credentials.ts`）。
 ///
@@ -25,6 +27,10 @@ import 'token_store.dart';
 ///   两者只在 401 处交汇（本模块决定「值得重连」还是「该重新登录」），不合并、不互相复制。
 /// - `UpdateService` 的版本检查是一次性请求，无周期计时，与本模块无关。
 /// - 本模块的定时器只在「已登录」时运行，退出登录 / 凭证确认失效时清理。
+
+/// context-free 取词入口（与 7B 的 tool_step.dart、7C 的 update_service 同一形态）：服务层拿不到 BuildContext。
+/// 与 MaterialApp 的 locale 共用 resolvedLocale，语言只跟手机自己（不读桌面端语言）。
+AppLocalizations get _l => lookupAppLocalizations(resolvedLocale(LocaleController.instance.value));
 class MemberCredentials {
   MemberCredentials._();
 
@@ -311,7 +317,10 @@ class MemberCredentials {
           .timeout(refreshTimeout);
     } catch (e) {
       // 网络错误/超时/DNS：暂时性，保留登录态，退避重试，**绝不误登出**
-      final msg = e is TimeoutException ? '续签超时（${refreshTimeout.inSeconds} 秒无响应）' : '续签请求失败：$e';
+      // 这两句会进 _lastError → 被启动页作 {msg} 上屏，所以必须翻（不是纯日志）
+      final msg = e is TimeoutException
+          ? _l.credRenewTimeout('${refreshTimeout.inSeconds}')
+          : _l.credRenewReqFailed('$e');
       _noteFailure('network', msg);
       _scheduleRetry();
       return RefreshOutcome.transient;
@@ -332,7 +341,7 @@ class MemberCredentials {
       final newToken = (data['token'] ?? '').toString().trim();
       if (newToken.isEmpty) {
         // 200 但没给 token：网关实现与契约不符 → 暂时性异常，不误登出
-        _noteFailure('bad_response', '续签响应缺少 token');
+        _noteFailure('bad_response', _l.credRenewNoToken);
         _scheduleRetry();
         return RefreshOutcome.transient;
       }
@@ -366,7 +375,7 @@ class MemberCredentials {
     // 只有「凭证本身不可恢复」才要求重新登录
     if (code == 'token_expired' || code == 'token_invalid' || code == 'token_missing' || res.statusCode == 403) {
       _noteFailure(code, rawMsg);
-      await markCredentialInvalid('登录凭证已失效（$code），请重新登录', code);
+      await markCredentialInvalid(_l.credInvalid(code), code);
       return RefreshOutcome.invalid;
     }
     // 404（网关未部署 / nginx 未暴露）/ 5xx / 其它：暂时性，保留登录态，退避重试
@@ -393,12 +402,13 @@ class MemberCredentials {
     if (_lastRotationTs > 0 &&
         DateTime.now().millisecondsSinceEpoch - _lastRotationTs < postRotationCooldown.inMilliseconds &&
         c != 'token_expired') {
-      await markCredentialInvalid('使用新凭证仍被网关拒绝（${c.isNotEmpty ? c : 'HTTP ${status ?? 401}'}），请重新登录',
+      await markCredentialInvalid(
+        _l.credRejectedAfterRotation(c.isNotEmpty ? c : 'HTTP ${status ?? 401}'),
           c.isNotEmpty ? c : 'rejected_after_rotation');
       return RefreshOutcome.invalid;
     }
     if (c == 'token_missing' || c == 'token_invalid') {
-      await markCredentialInvalid('登录凭证无效或缺失，请重新登录', c);
+      await markCredentialInvalid(_l.credInvalidOrMissing, c);
       return RefreshOutcome.invalid;
     }
     if (accessToken == null) return RefreshOutcome.noToken;
@@ -578,29 +588,31 @@ class CredentialSnapshot {
 
   factory CredentialSnapshot.anonymous() => const CredentialSnapshot(state: CredentialState.anonymous);
 
-  /// 一句人话的状态描述（登录页/主页横幅/关于信息复用，避免各处文案漂移）
-  String describe() {
-    switch (state) {
-      case CredentialState.anonymous:
-        return '未登录会员账号';
-      case CredentialState.valid:
-        return '已登录（凭证剩余约 ${_human(remainingMs)}）';
-      case CredentialState.renewing:
-        return '登录凭证即将到期（剩余约 ${_human(remainingMs)}），已自动续签';
-      case CredentialState.expired:
-        return '登录凭证已过期（正在尝试自动续签，期间远程连接可能不可用）';
-      case CredentialState.unknown:
-        return '已登录（凭证有效期未知：本地未记录过期时间，按可用处理）';
-    }
+  /// 一句人话的状态描述（登录页/主页横幅/关于信息复用，避免各处文案漂移）。
+  /// 【返回闭包而不是字符串】本方法的结果被 login_page / startup_page 存进 `_credHint` 这个
+  /// **state 字段**（在事件回调里 setState 一次），若返回已翻译好的字符串，语言就被烘进 state ——
+  /// 切语言后那行灰字会一直停在旧语言，直到下一次凭证事件。返回 L10nText 后由渲染期求值，
+  /// 与 7A 的 `_status` / 7B 的 `_snack` 同一处理方式（历轮第 12 次踩这个坑，本次起不再犯）。
+  L10nText describe() {
+    return switch (state) {
+      CredentialState.anonymous => (l) => l.credAnonymous,
+      CredentialState.valid => (l) => l.credValidRemaining(_human(l, remainingMs)),
+      CredentialState.renewing => (l) => l.credExpiringSoon(_human(l, remainingMs)),
+      CredentialState.expired => (l) => l.credExpiredGrace,
+      CredentialState.unknown => (l) => l.credUnknownExpiry,
+    };
   }
 
-  static String _human(int? ms) {
-    if (ms == null) return '未知';
+  /// 「N 天 M 小时」这类含**两个计数**的时长：拆成三条独立 plural 词条 + 一个连接符词条。
+  /// ★ 桌面端把整句写成一条 `common.cred.dhDays`（复数只按天数选形态）→ 英文必然出
+  ///   "2 days 1 hours" 这类错。手机端不照抄这个缺陷（任务书二.1），桌面端那条已登记为待修。
+  static String _human(AppLocalizations l, int? ms) {
+    if (ms == null) return l.credDurUnknown;
     final abs = ms.abs();
     final h = abs ~/ Duration.millisecondsPerHour;
     final m = (abs % Duration.millisecondsPerHour) ~/ Duration.millisecondsPerMinute;
-    if (h >= 24) return '${h ~/ 24} 天 ${h % 24} 小时';
-    if (h > 0) return '$h 小时 $m 分钟';
-    return '$m 分钟';
+    if (h >= 24) return '${l.credDurDays(h ~/ 24)}${l.credDurJoin}${l.credDurHours(h % 24)}';
+    if (h > 0) return '${l.credDurHours(h)}${l.credDurJoin}${l.credDurMinutes(m)}';
+    return l.credDurMinutes(m);
   }
 }

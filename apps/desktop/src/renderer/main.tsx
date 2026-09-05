@@ -1,5 +1,6 @@
 import { createRoot } from 'react-dom/client'
 import { UpdateProgressOverlay } from './components/UpdateProgressOverlay'
+import { initLocale } from './locale'
 import './styles/theme.css'
 
 /**
@@ -29,6 +30,11 @@ async function bootstrap(): Promise<void> {
   document.documentElement.dataset.rounded = 'true'
   // 窗口类型标记：供 theme.css 按窗口类型做差异化（如 chat/supervisor/app 内容窗口加可见描边，桌面壳/Dock/悬浮图标不加）
   document.documentElement.dataset.window = windowType
+
+  // 语言（i18n 期1）：所有窗口类型统一在挂载前初始化一次 —— 先用 localStorage 首屏缓存同步定语言
+  // （英文用户不会先看到一屏中文再跳），再向主进程要真相源校正。放在这里而不是各窗口组件里，
+  // 是为了让 chat / app / supervisor / desktop / dock 五种入口共用同一条初始化路径。
+  initLocale()
 
   const withProgress = PROGRESS_OVERLAY_WINDOWS.has(windowType)
   const root = createRoot(container)

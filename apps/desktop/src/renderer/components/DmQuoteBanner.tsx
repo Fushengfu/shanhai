@@ -1,6 +1,11 @@
 import * as React from 'react'
 import { IconClose } from './icons'
 import type { DmQuotePayload } from '../types'
+import { t, getLocale } from '../../shared/i18n'
+// 【期5B-补漏】本文件原先自己抄了第三份「名字等于 id 就当无真名」的判定（displayNameOfQuote），
+// 现在统一用 shared 那一份 —— 三份实现必然漂，这是本项目反复踩的坑。
+import { displayNameOf } from '../../shared/member-display'
+import { useLocaleSync } from '../locale'
 
 /**
  * 私信「引用到会话」的来源提示条（渲染在输入框上方）。
@@ -21,13 +26,26 @@ export interface DmQuoteBannerProps {
 function fmtQuoteTime(ts: number): string {
   if (!ts) return ''
   try {
-    return new Date(ts).toLocaleString()
+    return new Date(ts).toLocaleString(getLocale() === 'en-US' ? 'en-US' : undefined)
   } catch {
     return ''
   }
 }
 
+/**
+ * 【2026-09-04 用户要求：私信界面不再显示 memberId】
+ * 来源名由主进程拼装。【期5B-补漏】主进程已不再把 memberId 当名字塞进载荷，但**历史落盘数据**
+ * （升级前写的 peerName / fromName）里仍可能是 id，所以这里仍按 fromMemberId 反查一次挡历史数据；
+ * 判定本体用 shared/member-display 那一份，不再本地重写。仅影响显示，quote 数据本身未改。
+ */
+function displayNameOfQuote(q: DmQuotePayload): string {
+  return displayNameOf(q.fromName, q.fromMemberId)
+}
+
 export function DmQuoteBanner(p: DmQuoteBannerProps): React.JSX.Element {
+  // 谁取词谁订阅：displayNameOfQuote 是渲染期取词的 helper（期3 supervisorArgsSummary 同款），
+  // 它自己不订阅，靠本组件订阅后重新调用它取到最新语言。
+  useLocaleSync()
   return (
     <div
       style={{
@@ -47,13 +65,15 @@ export function DmQuoteBanner(p: DmQuoteBannerProps): React.JSX.Element {
       }}
     >
       <span style={{ flex: 1, minWidth: 0 }}>
-        已把私信原文追加到输入框 · 来自 <b style={{ color: 'var(--text)' }}>{p.quote.fromName}</b>
-        <span style={{ opacity: 0.75 }}>（会员 id {p.quote.fromMemberId} · {fmtQuoteTime(p.quote.ts)}）</span>
-        <span style={{ opacity: 0.75 }}> · 山海不会自动发送，请你确认后自行发送</span>
+        {t('dm.quote.bannerAdded')}{t('common.sepMiddle')}{t('dm.quote.fromLabel')}<b style={{ color: 'var(--text)' }}>{displayNameOfQuote(p.quote)}</b>
+        {p.quote.ts > 0 && (
+          <span style={{ opacity: 0.75 }}>{t('dm.quote.bannerTime', { time: fmtQuoteTime(p.quote.ts) })}</span>
+        )}
+        <span style={{ opacity: 0.75 }}>{t('common.sepMiddle')}{t('dm.quote.bannerNoAuto')}</span>
       </span>
       <button
         onClick={p.onDismiss}
-        title="关闭这条来源提示（不会撤销已追加到输入框的文字）"
+        title={t('dm.quote.bannerDismissTip')}
         style={{
           display: 'inline-flex',
           alignItems: 'center',

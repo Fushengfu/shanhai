@@ -18,6 +18,10 @@ import type {
   TokenSnapshot,
   ToolTrace,
 } from './types'
+import { dmContentToPlainText } from '../shared/dm-attachment'
+import { t } from '../shared/i18n'
+import { useLocaleSync } from './locale'
+import { applyLocale } from './locale'
 import { EMPTY_SESSION } from './types'
 import { formatBytes } from './components/ui'
 import { SlotView } from './slots'
@@ -35,6 +39,7 @@ import './plugins/ComposerPlugin'
 import './plugins/TerminalPlugin'
 
 export function App() {
+  useLocaleSync()
   const ui = useUiStoreSelector((s) => ({
     loggedIn: s.loggedIn,
     username: s.username,
@@ -104,6 +109,12 @@ export function App() {
     const off = window.shanhai?.onThemeChange((t) => setTheme(t))
     return off
   }, [])
+  // 语言（i18n 期1）：本窗口既可能是写者（设置面板在聊天窗口里打开），也可能收到别的窗口的切换广播，
+  // 所以统一订阅。applyLocale 相同值会 bail out，不会与自身广播形成回环（与上面主题的口径一致）。
+  useEffect(() => {
+    const off = window.shanhai?.onLocaleChange((l) => applyLocale(l))
+    return off
+  }, [])
   const loadedSessions = useRef<Set<string>>(new Set())
   // 会话列表排序：进行中置顶；其余按「最近活跃时间」倒序（发消息/执行任务即刷新 lastActiveAt，最新活跃排最顶）
   const sortedSessions = useMemo(() => {
@@ -164,6 +175,18 @@ export function App() {
   const pendingQueue = useRef<Record<string, Array<{ queueId: string; text: string; parts: ContentPart[]; images: string[] }>>>({})
   // 当前会话排队中的消息数（UI 提示「排队中 N 条」）
   const [queueCount, setQueueCount] = useState(0)
+  /**
+   * 【P3 修静默失败】点「发送」被本地闸门拦下时的可见原因。此前这里直接 `return`、界面零反馈，
+   * 用户看到的就是「点了没反应」。判定条件一字未改，只是把原因说出来（渲染在 Composer 框内，6 秒自动收）。
+   */
+  const [sendNotice, setSendNotice] = useState('')
+
+  // sendNotice 自动收起（不常驻，避免长期挡住输入区）
+  useEffect(() => {
+    if (!sendNotice) return
+    const t = setTimeout(() => setSendNotice(''), 6000)
+    return () => clearTimeout(t)
+  }, [sendNotice])
   // 语音播报中标记：true 时聊天窗口显示 3D AI 特效（声波波纹 + 加速呼吸），播报结束自动复位
   const [isSpeaking, setIsSpeaking] = useState(false)
   // 自修改（K5）：browser 半投递的 round-trip 审批请求队列（按会话隔离）
@@ -197,7 +220,7 @@ export function App() {
   const systemModels = models.filter((m) => !m.custom)
   const customModels = models.filter((m) => m.custom)
   const workDir = sessions.find((s) => s.id === currentSessionId)?.workDir ?? ''
-  const workDirName = workDir ? (workDir.split(/[\\/]/).filter(Boolean).pop() ?? '工作目录') : '选择目录'
+  const workDirName = workDir ? (workDir.split(/[\\/]/).filter(Boolean).pop() ?? t('chat.shell.workDirFallback')) : t('common.chooseDir')
 
   const patchSession = useCallback(
     (id: string, patch: Partial<SessionUIState> | ((s: SessionUIState) => Partial<SessionUIState>)) => {
@@ -397,7 +420,7 @@ export function App() {
     // 重启恢复：检测是否有失败重试挂起快照，有则恢复「重试/取消」弹窗（与进程内失败交互一致）
     const snap = (await window.shanhai?.hasRetrySnapshot(id)) ?? null
     if (snap && token === switchSeqRef.current) {
-      setRetryPrompt({ sessionId: id, message: snap.reason ?? '任务上次因网络/服务异常中断，是否重试？' })
+      setRetryPrompt({ sessionId: id, message: snap.reason ?? t('chat.shell.retryInterrupted') })
     }
     if (token === switchSeqRef.current) {
       setQueueCount(pendingQueue.current[id]?.length ?? 0)
@@ -430,8 +453,15 @@ export function App() {
     const off = window.shanhai?.onDmQuoteToSession((p) => {
       if (!p?.text) return
       const write = (): void => {
+        // 【真机 bug 兜底·必读】附件私信的 content 是紧凑 JSON 引用（{"t":"image",…}）。主进程
+        // quoteDmToSession 负责把它展开成「正文 + [图片] 名字 → URL」，但那是**主进程代码**：
+        // 主进程只在 app 启动时读一次 dist/main，而渲染层每次开窗口都读最新 dist/renderer。
+        // 于是「渲染层已升级、主进程还是旧版」的版本偏斜下，投来的就是裸 JSON —— 用户真机踩到。
+        // 这里再走一遍同一个纯函数：它「形态不符一律原样交回」，对已展开的文本是**幂等**的，
+        // 因此新旧主进程都能得到正确文本，不再依赖主进程版本。
+        const text = dmContentToPlainText(p.text)
         // setComposerInput 已是追加语义：绝不清掉用户已经打好的草稿（送进去的是私信原文，来源走提示条）
-        setComposerInput(p.text)
+        setComposerInput(text)
         // 来源提示条：让用户看清「这段是 A 发来的私信，不是我打的」，但发送与否完全由用户决定
         setDmQuote(p)
       }
@@ -533,7 +563,7 @@ export function App() {
       const settings = await window.shanhai?.getSettings()
       if (!settings?.voice?.enabled) return
       const cleaned = text
-        .replace(/```[\s\S]*?```/g, '（代码略）')
+        .replace(/```[\s\S]*?```/g, t('chat.shell.voiceCodeOmitted'))
         .replace(/`([^`]+)`/g, '$1')
         .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
         .replace(/[#>*_~|]/g, '')
@@ -541,7 +571,7 @@ export function App() {
         .trim()
       if (!cleaned) return
       const MAX = 500
-      const snippet = cleaned.length > MAX ? `${cleaned.slice(0, MAX)}，等` : cleaned
+      const snippet = cleaned.length > MAX ? `${cleaned.slice(0, MAX)}${t('chat.shell.voiceAndSoOn')}` : cleaned
       setIsSpeaking(true)
       try {
         await window.shanhai?.speak(snippet)
@@ -594,7 +624,7 @@ export function App() {
         setRetryPrompt({ sessionId: sid, message: retryExhaustedMessage(err) })
         retryExhausted = true
       } else {
-        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}`, turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: Date.now() - startTs }] }))
+        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: t('chat.shell.errorPrefix', { msg: String(err) }), turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: Date.now() - startTs }] }))
       }
     } finally {
       // 闪屏修复：正常完成/中断/普通错误时，主进程 onSessionActivity('end') 会同步重建 items + 置 busy=false
@@ -633,7 +663,17 @@ export function App() {
     const text = inputText.trim()
     if (!text && attachments.length === 0) return
     // 图片必须已上传（拿到 https 链接）才能发送：上传中/上传失败都阻止，绝不用 base64 data URL（会撑爆上下文）
-    if (attachments.some((a) => a.type === 'image' && a.uploadStatus !== 'done')) return
+    const notReady = attachments.filter((a) => a.type === 'image' && a.uploadStatus !== 'done')
+    if (notReady.length > 0) {
+      const uploading = notReady.filter((a) => a.uploadStatus === 'uploading').length
+      const failed = notReady.length - uploading
+      const bits: string[] = []
+      if (uploading > 0) bits.push(t('chat.shell.notReadyUploading', { n: uploading }))
+      if (failed > 0) bits.push(t('chat.shell.notReadyFailed', { n: failed }))
+      setSendNotice(bits.join(t('common.sepSemicolon')) + t('chat.shell.notReadyTail'))
+      return
+    }
+    setSendNotice('')
     const images = attachments.filter((a) => a.type === 'image').map((a) => a.dataUrl)
     const parts: ContentPart[] = []
     const fileNotes: string[] = []
@@ -650,9 +690,9 @@ export function App() {
         const base64 = a.dataUrl.replace(/^data:[^;]+;base64,/, '')
         try {
           const savedPath = (await window.shanhai?.saveUploadedFile(a.name, base64)) ?? a.name
-          fileNotes.push(`${a.name}（${formatBytes(a.size)}）→ ${savedPath}`)
+          fileNotes.push(t('chat.shell.fileNoteWithSaved', { name: a.name, size: formatBytes(a.size), path: savedPath }))
         } catch {
-          fileNotes.push(`${a.name}（${formatBytes(a.size)}）`)
+          fileNotes.push(t('chat.shell.fileNote', { name: a.name, size: formatBytes(a.size) }))
         }
         continue
       }
@@ -668,7 +708,7 @@ export function App() {
       )
     }
     // 文件说明拼进消息文本（agent 据此 read_file 读取工作目录里的文件）
-    const finalText = fileNotes.length > 0 ? `${text}${text ? '\n\n' : ''}[已附加文件]\n${fileNotes.join('\n')}` : text
+    const finalText = fileNotes.length > 0 ? `${text}${text ? '\n\n' : ''}${t('chat.shell.fileNoteHeader')}\n${fileNotes.join('\n')}` : text
     // 用户已按下发送 = 引用上下文已被本人确认采纳，来源提示条随之清除（这条文本已归属为本地用户输入）
     setDmQuote(null)
     resetComposer('', [])
@@ -775,7 +815,7 @@ export function App() {
         setRetryPrompt({ sessionId: sid, message: retryExhaustedMessage(err) })
         patchSession(sid, { streaming: '', streamingReasoning: '', busy: false })
       } else {
-        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }], streaming: '', streamingReasoning: '', busy: false }))
+        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: t('chat.shell.errorPrefix', { msg: String(err) }) }], streaming: '', streamingReasoning: '', busy: false }))
       }
     })
   }
@@ -799,7 +839,7 @@ export function App() {
         setRetryPrompt({ sessionId: sid, message: retryExhaustedMessage(err) })
         patchSession(sid, { streaming: '', streamingReasoning: '', busy: false })
       } else {
-        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }], streaming: '', streamingReasoning: '', busy: false }))
+        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: t('chat.shell.errorPrefix', { msg: String(err) }) }], streaming: '', streamingReasoning: '', busy: false }))
       }
     })
   }
@@ -818,7 +858,7 @@ export function App() {
         setRetryPrompt({ sessionId: sid, message: retryExhaustedMessage(err) })
         patchSession(sid, { streaming: '', streamingReasoning: '', busy: false })
       } else {
-        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }], streaming: '', streamingReasoning: '', busy: false }))
+        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: t('chat.shell.errorPrefix', { msg: String(err) }) }], streaming: '', streamingReasoning: '', busy: false }))
       }
     })
   }
@@ -838,7 +878,7 @@ export function App() {
         setRetryPrompt({ sessionId: sid, message: retryExhaustedMessage(err) })
         patchSession(sid, { streaming: '', streamingReasoning: '', busy: false })
       } else {
-        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: `错误：${String(err)}` }], streaming: '', streamingReasoning: '', busy: false }))
+        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: t('chat.shell.errorPrefix', { msg: String(err) }) }], streaming: '', streamingReasoning: '', busy: false }))
       }
     })
   }
@@ -969,6 +1009,7 @@ export function App() {
     handleLogin,
     handleRegister,
     previewImage,
+    sendNotice,
   }
 
   return (
@@ -1045,7 +1086,7 @@ export function App() {
                 boxShadow: '0 4px 20px rgba(0,0,0,0.12)',
               }}
             >
-              AI 正在播报…
+              {t('chat.shell.voiceSpeaking')}
             </div>
           </div>,
           document.body,

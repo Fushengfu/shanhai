@@ -208,6 +208,8 @@ export async function readSettings(): Promise<AppSettings> {
       supervisorAsk: { enabled: s?.supervisorAsk?.enabled ?? DEFAULT_SETTINGS.supervisorAsk.enabled },
       supervisorClientRun: { enabled: s?.supervisorClientRun?.enabled ?? DEFAULT_SETTINGS.supervisorClientRun.enabled },
       compaction: { modelId: s?.compaction?.modelId ?? DEFAULT_SETTINGS.compaction.modelId },
+      // 老 config 没有这个字段 → 空串（未设置），由主进程按系统语言解析一次后写回
+      locale: typeof s?.locale === 'string' ? s.locale : DEFAULT_SETTINGS.locale,
     }
   } catch {
     return {
@@ -220,6 +222,7 @@ export async function readSettings(): Promise<AppSettings> {
       supervisorAsk: { ...DEFAULT_SETTINGS.supervisorAsk },
       supervisorClientRun: { ...DEFAULT_SETTINGS.supervisorClientRun },
       compaction: { ...DEFAULT_SETTINGS.compaction },
+      locale: DEFAULT_SETTINGS.locale,
     }
   }
 }
@@ -238,6 +241,8 @@ export async function writeSettings(patch: Partial<AppSettings>): Promise<void> 
         supervisorAsk: { ...DEFAULT_SETTINGS.supervisorAsk, ...(cur.supervisorAsk ?? {}), ...(patch.supervisorAsk ?? {}) },
         supervisorClientRun: { ...DEFAULT_SETTINGS.supervisorClientRun, ...(cur.supervisorClientRun ?? {}), ...(patch.supervisorClientRun ?? {}) },
         compaction: { ...DEFAULT_SETTINGS.compaction, ...(cur.compaction ?? {}), ...(patch.compaction ?? {}) },
+        // locale 是标量：只有显式传了才覆盖，undefined 时保留原值（避免半份 patch 把语言抹回未设置）
+        locale: typeof patch.locale === 'string' ? patch.locale : (cur.locale ?? DEFAULT_SETTINGS.locale),
       }
       cfg.settings = merged
     })

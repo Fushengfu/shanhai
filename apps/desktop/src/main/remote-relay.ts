@@ -1,6 +1,8 @@
 import { WebSocket } from 'ws'
 import { BrowserWindow } from 'electron'
 import { safeSend } from './safe-send'
+import { getMainLocale } from './locale-store'
+import { tIn } from '../shared/i18n'
 import { getRuntime } from './runtime'
 import { handleCommand, subscribeRuntimeEvents } from './remote-protocol'
 import {
@@ -184,7 +186,8 @@ function connect(): void {
       return
     }
     if (!pendingAuthRecovery) {
-      relayError = `网关连接失败：${msg}`
+      // msg 是 ws/Node 的原始错误文本：按口径④作为 {msg} 原样带入，不建映射表
+      relayError = tIn(getMainLocale(), 'relay.connFailed', { msg })
       broadcastRelayStatus()
     }
   })
@@ -205,7 +208,11 @@ async function onRejected(status: number, code: string | null): Promise<void> {
     reconnectTimer = null
   }
   const snap = getCredentialSnapshot()
-  relayError = `网关拒绝连接（HTTP ${status || 401}${code ? ` ${code}` : ''}），正在尝试自动续签凭证；当前凭证状态：${describeCredentialState(snap)}`
+  // 【期5C】改前是「中文前缀硬编码 + 已本地化的 describeCredentialState()」拼在一起，
+  // 英文界面会出现半中半英。整句做成词条，凭证状态作为 {state} 参数带入（它自己已按语言取词）。
+  relayError = code
+    ? tIn(getMainLocale(), 'relay.rejectedCode', { status: status || 401, code, state: describeCredentialState(snap) })
+    : tIn(getMainLocale(), 'relay.rejected', { status: status || 401, state: describeCredentialState(snap) })
   broadcastRelayStatus()
   const outcome = await handleAuthRejected({ source: 'relay', status, code })
   pendingAuthRecovery = false
@@ -219,12 +226,12 @@ async function onRejected(status: number, code: string | null): Promise<void> {
   }
   if (outcome === 'invalid') {
     authFailed = true
-    relayError = '登录凭证已失效且无法自动续签（超出宽限期或凭证无效），请重新登录后再使用外网远程'
+    relayError = tIn(getMainLocale(), 'relay.credentialInvalid')
     broadcastRelayStatus()
     return
   }
   // transient / no_token：保留登录态，继续按退避重连（不误登出）
-  relayError = `凭证自动续签未完成（网络或网关异常），稍后随重连继续尝试；${describeCredentialState(getCredentialSnapshot())}`
+  relayError = tIn(getMainLocale(), 'relay.renewPending', { state: describeCredentialState(getCredentialSnapshot()) })
   if (enabled) scheduleReconnect()
   broadcastRelayStatus()
 }

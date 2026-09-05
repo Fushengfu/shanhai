@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../services/ws_client.dart';
 import '../models/protocol.dart';
 import '../widgets/chat_view.dart';
+import '../l10n/generated/app_localizations.dart';
 
 /// 会话管家页（管家模式）：直接对会话管家负责，由管家调度/配置所有会话。
 class SupervisorPage extends StatelessWidget {
@@ -13,7 +14,7 @@ class SupervisorPage extends StatelessWidget {
     return ChatView(
       ws: ws,
       sessionId: 'supervisor',
-      title: '会话管家',
+      title: AppLocalizations.of(context).supervisorPageTitle,
       isSupervisor: true,
       sendFn: (message) => ws.sendCommand('run_supervisor', {'message': message}),
       loadHistoryFn: ({int? sinceTurnSeq, int? beforeTurnSeq}) async {

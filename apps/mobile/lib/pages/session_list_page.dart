@@ -1,11 +1,20 @@
 import 'dart:async';
+import '../locale.dart';
 import 'package:flutter/material.dart';
 import '../theme.dart';
 import '../services/ws_client.dart';
 import '../models/protocol.dart';
 import 'chat_page.dart';
+import '../l10n/generated/app_localizations.dart';
 
 /// 会话列表页（会话模式入口）：列出桌面端所有会话，点击进入直接对会话负责。
+
+/// context-free 取词入口：沿用 7B 在 tool_step.dart 建立的同一形态（同一 resolvedLocale、同一份 ARB）。
+/// 【为什么不在这里用 AppLocalizations.of(context)】of() 在 nullable-getter:false 下要求祖先必须装好
+/// AppLocalizations.delegates；仓库既有测试 chat_view_scroll_test 就是把本组件挂在只带默认 delegate 的
+/// MaterialApp 下跑的，of() 会直接抛 Null check operator。_l 不依赖祖先节点，且 7B 的 LS3 已实测
+/// 「locale 变化会重建整棵页面子树 → context-free 取词同样跟切」，所以这里不是绕路，是同一套机制。
+AppLocalizations get _l => lookupAppLocalizations(resolvedLocale(LocaleController.instance.value));
 class SessionListPage extends StatefulWidget {
   final WsClient ws;
   const SessionListPage({super.key, required this.ws});
@@ -73,11 +82,12 @@ class _SessionListPageState extends State<SessionListPage> {
     final confirm = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('删除会话'),
-        content: Text('确定删除会话「${s.title}」？此操作不可恢复。'),
+        // 对话框标题复用既有 toolSessionActionDelete（两侧同文，不登记第二份）
+        title: Text(_l.toolSessionActionDelete),
+        content: Text(_l.sessionDeleteConfirm(s.title)),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
-          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('删除', style: TextStyle(color: Colors.redAccent))),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text(_l.commonCancel)),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: Text(_l.commonDelete, style: const TextStyle(color: Colors.redAccent))),
         ],
       ),
     );
@@ -93,18 +103,18 @@ class _SessionListPageState extends State<SessionListPage> {
       final newTitle = await showDialog<String>(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: const Text('重命名会话'),
+          title: Text(_l.toolSessionActionRename),
           content: TextField(
             controller: ctrl,
             autofocus: true,
-            decoration: const InputDecoration(hintText: '输入新名称…'),
+            decoration: InputDecoration(hintText: _l.sessionRenameHint),
             onSubmitted: (v) => Navigator.pop(ctx, v.trim()),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+            TextButton(onPressed: () => Navigator.pop(ctx), child: Text(_l.commonCancel)),
             TextButton(
               onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
-              child: const Text('确定'),
+              child: Text(_l.commonOk),
             ),
           ],
         ),
@@ -127,12 +137,12 @@ class _SessionListPageState extends State<SessionListPage> {
           children: [
             ListTile(
               leading: const Icon(Icons.edit_outlined),
-              title: const Text('重命名'),
+              title: Text(_l.commonRename),
               onTap: () => Navigator.pop(ctx, 'rename'),
             ),
             ListTile(
               leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
-              title: const Text('删除', style: TextStyle(color: Colors.redAccent)),
+              title: Text(_l.commonDelete, style: const TextStyle(color: Colors.redAccent)),
               onTap: () => Navigator.pop(ctx, 'delete'),
             ),
           ],
@@ -151,16 +161,16 @@ class _SessionListPageState extends State<SessionListPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('会话'),
+        title: Text(_l.homeNavSessions),
         backgroundColor: Colors.transparent,
         actions: [
-          IconButton(onPressed: _createSession, icon: const Icon(Icons.add), tooltip: '新建会话'),
+          IconButton(onPressed: _createSession, icon: const Icon(Icons.add), tooltip: _l.toolSessionActionCreate),
         ],
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : _sessions.isEmpty
-              ? const Center(child: Text('暂无会话', style: TextStyle(color: Colors.grey)))
+              ? Center(child: Text(_l.sessionEmpty, style: const TextStyle(color: Colors.grey)))
               : RefreshIndicator(
                   onRefresh: _refresh,
                   child: ListView.builder(
@@ -192,6 +202,7 @@ class _SessionCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final accent = Theme.of(context).colorScheme.primary;
     final c = context.appColors;
+    final l = _l;
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 5),
       color: c.cardBg,
@@ -226,13 +237,14 @@ class _SessionCard extends StatelessWidget {
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                             decoration: BoxDecoration(color: c.running.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(10)),
-                            child: Text('执行中', style: TextStyle(fontSize: 11, color: c.running)),
+                            child: Text(l.sessionRunning, style: TextStyle(fontSize: 11, color: c.running)),
                           ),
                       ],
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      s.currentRequest.isEmpty ? '（无需求）' : s.currentRequest,
+                      // currentRequest 是用户/模型数据，原样呈现；为空才用我们的占位
+                      s.currentRequest.isEmpty ? l.sessionNoRequest : s.currentRequest,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
@@ -243,9 +255,10 @@ class _SessionCard extends StatelessWidget {
                       runSpacing: 4,
                       crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
-                        _meta(Icons.memory, s.modelName.isEmpty ? '默认模型' : s.modelName),
-                        _meta(Icons.tune, '${s.stepCount} 步'),
-                        _meta(Icons.pie_chart_outline, '上下文 ${(s.contextUsageRatio * 100).toStringAsFixed(0)}%'),
+                        // 量词与「上下文 N%」都进词条：英文没有「步」这个量词，拼不出来
+                        _meta(Icons.memory, s.modelName.isEmpty ? l.sessionDefaultModel : s.modelName),
+                        _meta(Icons.tune, l.commonSteps(s.stepCount)),
+                        _meta(Icons.pie_chart_outline, l.sessionContextUsage((s.contextUsageRatio * 100).toStringAsFixed(0))),
                       ],
                     ),
                   ],

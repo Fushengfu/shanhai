@@ -2,161 +2,178 @@ import { memo, useMemo, useState } from 'react'
 import type { ToolTrace } from '../types'
 import { IconActivity, IconAvatar, IconChevronDown, IconClock, IconCode, IconEdit, IconFile, IconGlobe, IconImage, IconMonitor, IconPlus, IconRefresh, IconSend, IconShield, IconTerminal, IconTrash, IconTree, IconUsers, IconWrench } from './icons'
 import { redactSecret, stringifyResult, truncate } from './ui'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 // ===== 工具调用渲染（单行摘要 + 类型卡片，不显示 JSON）=====
 
 /** 已有专门交互 UI 的机制类工具：不在聊天流里以「工具步骤」卡片形式显示（避免暴露内部工具名 + 与专用卡片重复展示） */
 const HIDDEN_STEP_TOOLS = new Set(['ask_user'])
 
-/** 工具名 → 人类可读的中文标题 + 图标（原始工具名对普通人不可读） */
-export const TOOL_META: Record<string, { title: string; icon: React.ReactNode }> = {
-  read_file: { title: '读取文件', icon: <IconFile /> },
-  write_file: { title: '写入文件', icon: <IconEdit /> },
-  edit_file: { title: '编辑文件', icon: <IconEdit /> },
-  run_command: { title: '执行命令', icon: <IconTerminal /> },
-  list_dir: { title: '列出目录', icon: <IconTree /> },
-  image_analyze: { title: '识别图片', icon: <IconImage /> },
-  computer_screenshot: { title: '屏幕截图', icon: <IconMonitor /> },
-  computer_ocr: { title: '文字识别', icon: <IconMonitor /> },
-  computer_action: { title: '电脑操作', icon: <IconMonitor /> },
-  browser_create: { title: '创建浏览器窗口', icon: <IconGlobe /> },
-  browser_list: { title: '列出浏览器窗口', icon: <IconGlobe /> },
-  browser_navigate: { title: '打开网页', icon: <IconGlobe /> },
-  browser_close: { title: '关闭浏览器窗口', icon: <IconGlobe /> },
-  browser_screenshot: { title: '网页截图', icon: <IconGlobe /> },
-  browser_get_info: { title: '读取页面信息', icon: <IconGlobe /> },
-  browser_get_content: { title: '读取页面内容', icon: <IconGlobe /> },
-  browser_evaluate: { title: '执行页面脚本', icon: <IconGlobe /> },
-  browser_click: { title: '点击页面元素', icon: <IconGlobe /> },
-  browser_type: { title: '页面输入', icon: <IconGlobe /> },
-  browser_scroll: { title: '滚动页面', icon: <IconGlobe /> },
-  browser_wait: { title: '等待元素', icon: <IconGlobe /> },
-  browser_get_console_logs: { title: '查看控制台日志', icon: <IconGlobe /> },
-  browser_get_network_requests: { title: '查看网络请求', icon: <IconGlobe /> },
-  browser_get_cookies: { title: '读取 Cookie', icon: <IconGlobe /> },
-  browser_set_cookie: { title: '设置 Cookie', icon: <IconGlobe /> },
-  browser_clear_cookies: { title: '清除 Cookie', icon: <IconGlobe /> },
-  rollback_file: { title: '回滚文件', icon: <IconEdit /> },
-  remember: { title: '保存记忆', icon: <IconClock /> },
-  recall_memory: { title: '召回记忆', icon: <IconClock /> },
-  plugin: { title: '插件', icon: <IconCode /> },
+/**
+ * 工具名 → 图标 + **词条键**（原始工具名对普通人不可读）。
+ *
+ * 【为什么表里存 k 而不是 title】表在模块顶层，若把中文标题写进表里，标题就在**模块加载时**被固化成
+ * 中文，切换语言不会变（期 1 的 STATUS_LABEL 就是这个坑）。所以表只存 key，标题一律在渲染时 t() 取。
+ */
+export const TOOL_META: Record<string, { k: string; icon: React.ReactNode }> = {
+  read_file: { k: 'chat.tool.read_file', icon: <IconFile /> },
+  write_file: { k: 'chat.tool.write_file', icon: <IconEdit /> },
+  edit_file: { k: 'chat.tool.edit_file', icon: <IconEdit /> },
+  run_command: { k: 'chat.tool.run_command', icon: <IconTerminal /> },
+  list_dir: { k: 'chat.tool.list_dir', icon: <IconTree /> },
+  image_analyze: { k: 'chat.tool.image_analyze', icon: <IconImage /> },
+  computer_screenshot: { k: 'chat.tool.computer_screenshot', icon: <IconMonitor /> },
+  computer_ocr: { k: 'chat.tool.computer_ocr', icon: <IconMonitor /> },
+  computer_action: { k: 'chat.tool.computer_action', icon: <IconMonitor /> },
+  browser_create: { k: 'chat.tool.browser_create', icon: <IconGlobe /> },
+  browser_list: { k: 'chat.tool.browser_list', icon: <IconGlobe /> },
+  browser_navigate: { k: 'chat.tool.browser_navigate', icon: <IconGlobe /> },
+  browser_close: { k: 'chat.tool.browser_close', icon: <IconGlobe /> },
+  browser_screenshot: { k: 'chat.tool.browser_screenshot', icon: <IconGlobe /> },
+  browser_get_info: { k: 'chat.tool.browser_get_info', icon: <IconGlobe /> },
+  browser_get_content: { k: 'chat.tool.browser_get_content', icon: <IconGlobe /> },
+  browser_evaluate: { k: 'chat.tool.browser_evaluate', icon: <IconGlobe /> },
+  browser_click: { k: 'chat.tool.browser_click', icon: <IconGlobe /> },
+  browser_type: { k: 'chat.tool.browser_type', icon: <IconGlobe /> },
+  browser_scroll: { k: 'chat.tool.browser_scroll', icon: <IconGlobe /> },
+  browser_wait: { k: 'chat.tool.browser_wait', icon: <IconGlobe /> },
+  browser_get_console_logs: { k: 'chat.tool.browser_get_console_logs', icon: <IconGlobe /> },
+  browser_get_network_requests: { k: 'chat.tool.browser_get_network_requests', icon: <IconGlobe /> },
+  browser_get_cookies: { k: 'chat.tool.browser_get_cookies', icon: <IconGlobe /> },
+  browser_set_cookie: { k: 'chat.tool.browser_set_cookie', icon: <IconGlobe /> },
+  browser_clear_cookies: { k: 'chat.tool.browser_clear_cookies', icon: <IconGlobe /> },
+  rollback_file: { k: 'chat.tool.rollback_file', icon: <IconEdit /> },
+  remember: { k: 'chat.tool.remember', icon: <IconClock /> },
+  recall_memory: { k: 'chat.tool.recall_memory', icon: <IconClock /> },
+  plugin: { k: 'chat.tool.plugin', icon: <IconCode /> },
   // 会话管家（主 Agent）专属工具：用于审批弹窗展示可读名称，避免暴露英文原始名
-  session: { title: '管理会话', icon: <IconUsers /> },
-  list_models: { title: '查看可用模型', icon: <IconActivity /> },
-  send_message: { title: '给会话下发任务', icon: <IconSend /> },
-  inject_message: { title: '给会话追加需求', icon: <IconSend /> },
-  mcp_list_tools: { title: '查看 MCP 工具', icon: <IconWrench /> },
-  mcp_call: { title: '调用 MCP 工具', icon: <IconWrench /> },
-  skill_list: { title: '查看技能列表', icon: <IconWrench /> },
-  skill_read: { title: '查看技能详情', icon: <IconWrench /> },
-  terminal_create: { title: '创建终端', icon: <IconTerminal /> },
-  terminal_run: { title: '终端执行命令', icon: <IconTerminal /> },
-  terminal_list: { title: '列出终端', icon: <IconTerminal /> },
-  terminal_close: { title: '关闭终端', icon: <IconTerminal /> },
-  ledger: { title: '管家台账', icon: <IconFile /> },
-  answer_ask: { title: '代答提问', icon: <IconSend /> },
-  resolve_approval: { title: '决策审批', icon: <IconShield /> },
+  session: { k: 'chat.tool.session', icon: <IconUsers /> },
+  list_models: { k: 'chat.tool.list_models', icon: <IconActivity /> },
+  send_message: { k: 'chat.tool.send_message', icon: <IconSend /> },
+  inject_message: { k: 'chat.tool.inject_message', icon: <IconSend /> },
+  mcp_list_tools: { k: 'chat.tool.mcp_list_tools', icon: <IconWrench /> },
+  mcp_call: { k: 'chat.tool.mcp_call', icon: <IconWrench /> },
+  skill_list: { k: 'chat.tool.skill_list', icon: <IconWrench /> },
+  skill_read: { k: 'chat.tool.skill_read', icon: <IconWrench /> },
+  terminal_create: { k: 'chat.tool.terminal_create', icon: <IconTerminal /> },
+  terminal_run: { k: 'chat.tool.terminal_run', icon: <IconTerminal /> },
+  terminal_list: { k: 'chat.tool.terminal_list', icon: <IconTerminal /> },
+  terminal_close: { k: 'chat.tool.terminal_close', icon: <IconTerminal /> },
+  ledger: { k: 'chat.tool.ledger', icon: <IconFile /> },
+  answer_ask: { k: 'chat.tool.answer_ask', icon: <IconSend /> },
+  resolve_approval: { k: 'chat.tool.resolve_approval', icon: <IconShield /> },
 }
 
 /** skill_run（可执行技能统一入口）的 skillId + action → 中文标题 + 图标 */
-function skillActionMeta(skillId: string, action: string): { title: string; icon: React.ReactNode } {
-  const map: Record<string, { title: string; icon: React.ReactNode }> = {
-    'computer-use:screenshot': { title: '屏幕截图', icon: <IconMonitor /> },
-    'computer-use:ocr': { title: '文字识别', icon: <IconMonitor /> },
-    'computer-use:action': { title: '电脑操作', icon: <IconMonitor /> },
-    'browser-use:create': { title: '创建浏览器窗口', icon: <IconGlobe /> },
-    'browser-use:list': { title: '列出浏览器窗口', icon: <IconGlobe /> },
-    'browser-use:navigate': { title: '打开网页', icon: <IconGlobe /> },
-    'browser-use:close': { title: '关闭浏览器窗口', icon: <IconGlobe /> },
-    'browser-use:screenshot': { title: '网页截图', icon: <IconGlobe /> },
-    'browser-use:get_info': { title: '读取页面信息', icon: <IconGlobe /> },
-    'browser-use:get_content': { title: '读取页面内容', icon: <IconGlobe /> },
-    'browser-use:evaluate': { title: '执行页面脚本', icon: <IconGlobe /> },
-    'browser-use:click': { title: '点击页面元素', icon: <IconGlobe /> },
-    'browser-use:type': { title: '页面输入', icon: <IconGlobe /> },
-    'browser-use:scroll': { title: '滚动页面', icon: <IconGlobe /> },
-    'browser-use:wait': { title: '等待元素', icon: <IconGlobe /> },
-    'browser-use:get_console_logs': { title: '查看控制台日志', icon: <IconGlobe /> },
-    'browser-use:get_network_requests': { title: '查看网络请求', icon: <IconGlobe /> },
-    'browser-use:get_cookies': { title: '读取 Cookie', icon: <IconGlobe /> },
-    'browser-use:set_cookie': { title: '设置 Cookie', icon: <IconGlobe /> },
-    'browser-use:clear_cookies': { title: '清除 Cookie', icon: <IconGlobe /> },
+function skillActionMeta(skillId: string, action: string): { k: string; icon: React.ReactNode } {
+  const map: Record<string, { k: string; icon: React.ReactNode }> = {
+    'computer-use:screenshot': { k: 'chat.tool.computer_screenshot', icon: <IconMonitor /> },
+    'computer-use:ocr': { k: 'chat.tool.computer_ocr', icon: <IconMonitor /> },
+    'computer-use:action': { k: 'chat.tool.computer_action', icon: <IconMonitor /> },
+    'browser-use:create': { k: 'chat.tool.browser_create', icon: <IconGlobe /> },
+    'browser-use:list': { k: 'chat.tool.browser_list', icon: <IconGlobe /> },
+    'browser-use:navigate': { k: 'chat.tool.browser_navigate', icon: <IconGlobe /> },
+    'browser-use:close': { k: 'chat.tool.browser_close', icon: <IconGlobe /> },
+    'browser-use:screenshot': { k: 'chat.tool.browser_screenshot', icon: <IconGlobe /> },
+    'browser-use:get_info': { k: 'chat.tool.browser_get_info', icon: <IconGlobe /> },
+    'browser-use:get_content': { k: 'chat.tool.browser_get_content', icon: <IconGlobe /> },
+    'browser-use:evaluate': { k: 'chat.tool.browser_evaluate', icon: <IconGlobe /> },
+    'browser-use:click': { k: 'chat.tool.browser_click', icon: <IconGlobe /> },
+    'browser-use:type': { k: 'chat.tool.browser_type', icon: <IconGlobe /> },
+    'browser-use:scroll': { k: 'chat.tool.browser_scroll', icon: <IconGlobe /> },
+    'browser-use:wait': { k: 'chat.tool.browser_wait', icon: <IconGlobe /> },
+    'browser-use:get_console_logs': { k: 'chat.tool.browser_get_console_logs', icon: <IconGlobe /> },
+    'browser-use:get_network_requests': { k: 'chat.tool.browser_get_network_requests', icon: <IconGlobe /> },
+    'browser-use:get_cookies': { k: 'chat.tool.browser_get_cookies', icon: <IconGlobe /> },
+    'browser-use:set_cookie': { k: 'chat.tool.browser_set_cookie', icon: <IconGlobe /> },
+    'browser-use:clear_cookies': { k: 'chat.tool.browser_clear_cookies', icon: <IconGlobe /> },
   }
-  return map[`${skillId}:${action}`] ?? { title: '执行技能', icon: <IconWrench /> }
+  return map[`${skillId}:${action}`] ?? { k: 'chat.tool.skillFallback', icon: <IconWrench /> }
 }
 
 /** plugin 顶层工具（插件统一入口）的 action → 中文标题 + 图标 */
-function pluginActionMeta(action: string): { title: string; icon: React.ReactNode } {
-  const map: Record<string, { title: string; icon: React.ReactNode }> = {
-    list: { title: '列出已装插件', icon: <IconCode /> },
-    inspect: { title: '查看插件运行时表', icon: <IconCode /> },
-    scaffold: { title: '生成插件项目', icon: <IconCode /> },
-    build: { title: '编译插件', icon: <IconCode /> },
-    'test-load': { title: '插件干跑加载', icon: <IconCode /> },
-    verify: { title: '验证插件产物', icon: <IconCode /> },
-    install: { title: '安装插件', icon: <IconCode /> },
-    publish: { title: '打包共享插件', icon: <IconCode /> },
-    uninstall: { title: '卸载插件', icon: <IconCode /> },
-    tool: { title: '调用插件工具', icon: <IconWrench /> },
+function pluginActionMeta(action: string): { k: string; icon: React.ReactNode } {
+  const map: Record<string, { k: string; icon: React.ReactNode }> = {
+    list: { k: 'chat.tool.pluginAction.list', icon: <IconCode /> },
+    inspect: { k: 'chat.tool.pluginAction.inspect', icon: <IconCode /> },
+    scaffold: { k: 'chat.tool.pluginAction.scaffold', icon: <IconCode /> },
+    build: { k: 'chat.tool.pluginAction.build', icon: <IconCode /> },
+    'test-load': { k: 'chat.tool.pluginAction.test-load', icon: <IconCode /> },
+    verify: { k: 'chat.tool.pluginAction.verify', icon: <IconCode /> },
+    install: { k: 'chat.tool.pluginAction.install', icon: <IconCode /> },
+    publish: { k: 'chat.tool.pluginAction.publish', icon: <IconCode /> },
+    uninstall: { k: 'chat.tool.pluginAction.uninstall', icon: <IconCode /> },
+    tool: { k: 'chat.tool.pluginAction.tool', icon: <IconWrench /> },
   }
-  return map[action] ?? { title: '插件', icon: <IconCode /> }
+  return map[action] ?? { k: 'chat.tool.plugin', icon: <IconCode /> }
 }
 
 /** ledger 顶层工具（管家台账统一入口）的 action → 中文标题 + 图标 */
-function ledgerActionMeta(action: string): { title: string; icon: React.ReactNode } {
-  const map: Record<string, { title: string; icon: React.ReactNode }> = {
-    list: { title: '查看台账目录', icon: <IconFile /> },
-    read: { title: '读取台账', icon: <IconFile /> },
-    write: { title: '写入台账', icon: <IconFile /> },
-    edit: { title: '编辑台账', icon: <IconFile /> },
+function ledgerActionMeta(action: string): { k: string; icon: React.ReactNode } {
+  const map: Record<string, { k: string; icon: React.ReactNode }> = {
+    list: { k: 'chat.tool.ledgerAction.list', icon: <IconFile /> },
+    read: { k: 'chat.tool.ledgerAction.read', icon: <IconFile /> },
+    write: { k: 'chat.tool.ledgerAction.write', icon: <IconFile /> },
+    edit: { k: 'chat.tool.ledgerAction.edit', icon: <IconFile /> },
   }
-  return map[action] ?? { title: '管家台账', icon: <IconFile /> }
+  return map[action] ?? { k: 'chat.tool.ledger', icon: <IconFile /> }
 }
 
 /** session 顶层工具（会话实体管理统一入口）的 action → 中文标题 + 图标 */
-function sessionActionMeta(action: string): { title: string; icon: React.ReactNode } {
-  const map: Record<string, { title: string; icon: React.ReactNode }> = {
-    list: { title: '查看会话列表', icon: <IconUsers /> },
-    inspect: { title: '查看会话详情', icon: <IconUsers /> },
-    switch: { title: '切换激活会话', icon: <IconRefresh /> },
-    create: { title: '新建会话', icon: <IconPlus /> },
-    rename: { title: '重命名会话', icon: <IconEdit /> },
-    set_workdir: { title: '设置会话工作目录', icon: <IconEdit /> },
-    delete: { title: '删除会话', icon: <IconTrash /> },
-    set_model: { title: '切换会话模型', icon: <IconActivity /> },
-    set_approval: { title: '配置会话安全模式', icon: <IconShield /> },
-    choose: { title: '选择会话', icon: <IconUsers /> },
-    resume: { title: '续跑会话', icon: <IconRefresh /> },
+function sessionActionMeta(action: string): { k: string; icon: React.ReactNode } {
+  const map: Record<string, { k: string; icon: React.ReactNode }> = {
+    list: { k: 'chat.tool.sessionAction.list', icon: <IconUsers /> },
+    inspect: { k: 'chat.tool.sessionAction.inspect', icon: <IconUsers /> },
+    switch: { k: 'chat.tool.sessionAction.switch', icon: <IconRefresh /> },
+    create: { k: 'chat.tool.sessionAction.create', icon: <IconPlus /> },
+    rename: { k: 'chat.tool.sessionAction.rename', icon: <IconEdit /> },
+    set_workdir: { k: 'chat.tool.sessionAction.set_workdir', icon: <IconEdit /> },
+    delete: { k: 'chat.tool.sessionAction.delete', icon: <IconTrash /> },
+    set_model: { k: 'chat.tool.sessionAction.set_model', icon: <IconActivity /> },
+    set_approval: { k: 'chat.tool.sessionAction.set_approval', icon: <IconShield /> },
+    choose: { k: 'chat.tool.sessionAction.choose', icon: <IconUsers /> },
+    resume: { k: 'chat.tool.sessionAction.resume', icon: <IconRefresh /> },
   }
-  return map[action] ?? { title: '管理会话', icon: <IconUsers /> }
+  return map[action] ?? { k: 'chat.tool.session', icon: <IconUsers /> }
 }
 
-/** 工具名 → 中文显示名（用于审批弹窗等需要展示工具名的场景，不暴露英文原始名） */
+/**
+ * 工具名 → **当前语言**的显示名（渲染时取词，切换语言立即跟着变）。
+ * 找不到登记时退回原始工具名（TracePanel 依赖这个行为：调试面板要看真名），全空才用兜底词。
+ */
+export function toolTitle(name: string): string {
+  const k = TOOL_META[name]?.k
+  return k ? t(k) : (name || t('chat.tool.fallback'))
+}
+
+/** 工具名 → 显示名（用于审批弹窗等需要展示工具名的场景，不暴露英文原始名） */
 export function toolDisplayName(name: string, args?: Record<string, unknown>): string {
   if (name === 'skill_run') {
-    return skillActionMeta(String(args?.skillId ?? ''), String(args?.action ?? '')).title
+    return t(skillActionMeta(String(args?.skillId ?? ''), String(args?.action ?? '')).k)
   }
   if (name === 'plugin') {
-    return pluginActionMeta(String(args?.action ?? '')).title
+    return t(pluginActionMeta(String(args?.action ?? '')).k)
   }
   if (name === 'ledger') {
-    return ledgerActionMeta(String(args?.action ?? '')).title
+    return t(ledgerActionMeta(String(args?.action ?? '')).k)
   }
   if (name === 'session') {
-    return sessionActionMeta(String(args?.action ?? '')).title
+    return t(sessionActionMeta(String(args?.action ?? '')).k)
   }
-  return TOOL_META[name]?.title ?? '工具操作'
+  return toolTitle(name)
 }
 
-/** 风险等级 → 中文文案（用于审批弹窗，不暴露英文枚举值） */
+/** 风险等级 → 当前语言文案（用于审批弹窗，不暴露英文枚举值；未登记的等级原样显示） */
 export function riskLevelLabel(level: string): string {
   const map: Record<string, string> = {
-    readonly: '只读',
-    reversible: '可逆修改',
-    irreversible: '不可逆操作',
-    high: '高风险',
+    readonly: 'chat.risk.readonly',
+    reversible: 'chat.risk.reversible',
+    irreversible: 'chat.risk.irreversible',
+    high: 'chat.risk.high',
   }
-  return map[level] ?? level
+  const k = map[level]
+  return k ? t(k) : level
 }
 
 /** skill_run 的 params 提取一行摘要（browser-use → url/selector，computer-use → 动作） */
@@ -194,7 +211,7 @@ export function toolSummary(name: string, args?: Record<string, unknown>): strin
   if (name === 'session') return String(a.sessionId ?? '')
   if (name === 'read_file' || name === 'write_file' || name === 'edit_file' || name === 'rollback_file') return String(a.path ?? '')
   if (name === 'run_command') return String(a.command ?? '')
-  if (name === 'list_dir') return a.path ? String(a.path) : '当前目录'
+  if (name === 'list_dir') return a.path ? String(a.path) : t('chat.tool.currentDir')
   if (name === 'image_analyze') return String(a.imageUrl ?? '').slice(0, 48)
   if (name === 'computer_action') return String(a.action ?? '')
   if (name === 'computer_screenshot' || name === 'computer_ocr') return ''
@@ -235,7 +252,10 @@ type DiffLineType = 'context' | 'add' | 'del' | 'fold'
 
 interface DiffLine {
   type: DiffLineType
+  /** 行原文；fold 类型不用它（文案必须在渲染时取词，见 foldCount） */
   text: string
+  /** 折叠行「未变多少行」的数量：只存数字，语言在渲染时决定 */
+  foldCount?: number
   oldLine?: number
   newLine?: number
 }
@@ -318,7 +338,7 @@ function computeDiff(before: string, after: string): DiffLine[] {
   for (let i = 0; i < lines.length; i++) {
     if (keep.has(i)) {
       if (lastKept >= 0 && i - lastKept > 1) {
-        out.push({ type: 'fold', text: `⋯ ${i - lastKept - 1} 行未变` })
+        out.push({ type: 'fold', text: '', foldCount: i - lastKept - 1 })
       }
       out.push(lines[i]!)
       lastKept = i
@@ -329,6 +349,7 @@ function computeDiff(before: string, after: string): DiffLine[] {
 
 /** 文件变更卡片：git diff 风格（- 红 / + 绿 / 上下文灰），新建与修改文件都适用 */
 export const DiffBlock = memo(function DiffBlock({ before, after, path, isNew }: { before: string; after: string; path?: string; isNew?: boolean }) {
+  useLocaleSync()
   const treatAsNew = isNew || before === ''
   // 卡顿优化：diff 计算（含 O(n·m) 的 lcsDiff）用 useMemo 缓存，仅在 before/after/是否新建变化时重算，
   // 避免编辑/写入文件工具结果在历史消息被反复重渲染时重复做昂贵的行级 diff。
@@ -344,7 +365,7 @@ export const DiffBlock = memo(function DiffBlock({ before, after, path, isNew }:
     <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 12 }}>
       {path && (
         <div style={{ padding: '6px 12px', borderBottom: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {path} · {treatAsNew ? `新建文件，+${addCount}` : `+${addCount} −${delCount}`}
+          {path} · {treatAsNew ? t('chat.diff.newFile', { n: addCount }) : t('chat.diff.stat', { add: addCount, del: delCount })}
         </div>
       )}
       <div style={{ maxHeight: 360, overflowY: 'auto' }}>
@@ -352,7 +373,7 @@ export const DiffBlock = memo(function DiffBlock({ before, after, path, isNew }:
           if (l.type === 'fold') {
             return (
               <div key={i} style={{ padding: '3px 12px', color: 'var(--text-muted)', fontSize: 11, background: 'var(--bg-sidebar)', textAlign: 'center', userSelect: 'none' }}>
-                {l.text}
+                {t('chat.diff.unchanged', { n: l.foldCount ?? 0 })}
               </div>
             )
           }
@@ -376,6 +397,7 @@ export const DiffBlock = memo(function DiffBlock({ before, after, path, isNew }:
 
 /** 文件结果卡片：带行号的只读文件窗口（超长折叠） */
 function FileBlock({ content, path }: { content: string; path?: string }) {
+  useLocaleSync()
   const lines = content.split('\n')
   const MAX = 200
   const shown = lines.slice(0, MAX)
@@ -383,7 +405,7 @@ function FileBlock({ content, path }: { content: string; path?: string }) {
     <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 12 }}>
       {path && (
         <div style={{ padding: '6px 12px', borderBottom: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {path} · {lines.length} 行
+          {path} · {t('chat.file.lineCount', { n: lines.length })}
         </div>
       )}
       <div style={{ maxHeight: 320, overflowY: 'auto', padding: '4px 0' }}>
@@ -394,7 +416,7 @@ function FileBlock({ content, path }: { content: string; path?: string }) {
           </div>
         ))}
         {lines.length > MAX && (
-          <div style={{ color: 'var(--text-muted)', padding: '6px 12px', fontSize: 11 }}>… 共 {lines.length} 行，仅显示前 {MAX} 行</div>
+          <div style={{ color: 'var(--text-muted)', padding: '6px 12px', fontSize: 11 }}>{[t('chat.file.truncatedTotal', { n: lines.length }), t('chat.file.truncatedShown', { n: MAX })].join(t('common.sepComma'))}</div>
         )}
       </div>
     </div>
@@ -435,29 +457,29 @@ export function renderToolResult(name: string, result: unknown, error: string | 
   }
   if (name === 'skill_run' && args?.action === 'screenshot') {
     const src = screenshotSrc(result)
-    return src ? <img src={src} alt="截图" style={{ display: 'block', maxWidth: '100%', maxHeight: 320, objectFit: 'contain' }} /> : null
+    return src ? <img src={src} alt={t('chat.tool.screenshotAlt')} style={{ display: 'block', maxWidth: '100%', maxHeight: 320, objectFit: 'contain' }} /> : null
   }
   if (name === 'computer_screenshot') {
     const src = screenshotSrc(result)
-    return src ? <img src={src} alt="截图" style={{ display: 'block', maxWidth: '100%', maxHeight: 320, objectFit: 'contain' }} /> : null
+    return src ? <img src={src} alt={t('chat.tool.screenshotAlt')} style={{ display: 'block', maxWidth: '100%', maxHeight: 320, objectFit: 'contain' }} /> : null
   }
   if (name === 'browser_screenshot') {
     const src = screenshotSrc(result)
-    return src ? <img src={src} alt="网页截图" style={{ display: 'block', maxWidth: '100%', maxHeight: 320, objectFit: 'contain' }} /> : null
+    return src ? <img src={src} alt={t('chat.tool.pageScreenshotAlt')} style={{ display: 'block', maxWidth: '100%', maxHeight: 320, objectFit: 'contain' }} /> : null
   }
   if (name === 'write_file') {
     const r = result as { ok?: boolean; path?: string; before?: string | null; after?: string; isNew?: boolean }
     if (typeof r.after === 'string') {
       return <DiffBlock before={r.before ?? ''} after={r.after} path={r.path} isNew={!!r.isNew} />
     }
-    return <div style={{ padding: '10px 12px', color: 'var(--success-text)', fontSize: 12 }}>✓ 已写入 {r.path ?? ''}</div>
+    return <div style={{ padding: '10px 12px', color: 'var(--success-text)', fontSize: 12 }}>{t('chat.tool.written', { path: r.path ?? '' })}</div>
   }
   if (name === 'edit_file') {
     const r = result as { ok?: boolean; path?: string; before?: string | null; after?: string; occurrences?: number }
     if (typeof r.after === 'string') {
       return <DiffBlock before={r.before ?? ''} after={r.after} path={r.path} />
     }
-    return <div style={{ padding: '10px 12px', color: 'var(--success-text)', fontSize: 12 }}>✓ 已编辑 {r.path ?? ''}</div>
+    return <div style={{ padding: '10px 12px', color: 'var(--success-text)', fontSize: 12 }}>{t('chat.tool.edited', { path: r.path ?? '' })}</div>
   }
   return (
     <pre style={{ margin: 0, padding: '10px 12px', fontFamily: 'ui-monospace, monospace', fontSize: 12, lineHeight: 1.5, color: 'var(--text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 320, overflowY: 'auto' }}>
@@ -472,6 +494,7 @@ export const ToolStep = memo(function ToolStep({ trace }: { trace: ToolTrace }) 
   if (HIDDEN_STEP_TOOLS.has(trace.name)) return null
   const [expanded, setExpanded] = useState(false)
   const [reasoningOpen, setReasoningOpen] = useState(false)
+  useLocaleSync()
   const isCall = trace.kind === 'tool-call'
   const meta = trace.name === 'skill_run'
     ? skillActionMeta(String(trace.args?.skillId ?? ''), String(trace.args?.action ?? ''))
@@ -481,7 +504,7 @@ export const ToolStep = memo(function ToolStep({ trace }: { trace: ToolTrace }) 
         ? ledgerActionMeta(String(trace.args?.action ?? ''))
         : trace.name === 'session'
           ? sessionActionMeta(String(trace.args?.action ?? ''))
-          : TOOL_META[trace.name] ?? { title: '工具操作', icon: <IconWrench /> }
+          : TOOL_META[trace.name] ?? { k: 'chat.tool.fallback', icon: <IconWrench /> }
   const state = isCall ? 'running' : trace.error ? 'error' : 'ok'
   const summary = toolSummary(trace.name, trace.args)
   const resultBody = !isCall ? renderToolResult(trace.name, trace.result, trace.error, trace.args) : null
@@ -500,7 +523,7 @@ export const ToolStep = memo(function ToolStep({ trace }: { trace: ToolTrace }) 
             <span style={{ display: 'inline-flex', color: 'var(--text-faint)', transform: reasoningOpen ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform .15s' }}>
               <IconChevronDown />
             </span>
-            思考
+            {t('chat.tool.thinking')}
           </button>
           {reasoningOpen && (
             <div style={{ marginTop: 2, paddingLeft: 10, borderLeft: '2px solid var(--border)', color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 200, overflowY: 'auto' }}>
@@ -514,16 +537,16 @@ export const ToolStep = memo(function ToolStep({ trace }: { trace: ToolTrace }) 
         style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0', cursor: expandable ? 'pointer' : 'default' }}
       >
         <span style={{ color: stateColor, display: 'inline-flex', flexShrink: 0 }}>{meta.icon}</span>
-        <b style={{ fontWeight: 600, color: 'var(--text)', fontSize: 13, flexShrink: 0 }}>{meta.title}</b>
+        <b style={{ fontWeight: 600, color: 'var(--text)', fontSize: 13, flexShrink: 0 }}>{t(meta.k)}</b>
         {summary && (
           <>
             <span style={{ color: 'var(--text-faint)', flexShrink: 0 }}>·</span>
             <span style={{ color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>{summary}</span>
           </>
         )}
-        {state === 'running' && <span style={{ color: 'var(--accent)', fontSize: 12, flexShrink: 0 }}>执行中…</span>}
+        {state === 'running' && <span style={{ color: 'var(--accent)', fontSize: 12, flexShrink: 0 }}>{t('chat.tool.running')}</span>}
         {isCall && trace.approvalRequired && (
-          <span style={{ fontSize: 11, padding: '0 6px', borderRadius: 4, background: 'var(--tint-orange)', color: 'var(--warning-text)', flexShrink: 0 }}>待确认</span>
+          <span style={{ fontSize: 11, padding: '0 6px', borderRadius: 4, background: 'var(--tint-orange)', color: 'var(--warning-text)', flexShrink: 0 }}>{t('chat.tool.pendingApproval')}</span>
         )}
         {expandable && (
           <span style={{ marginLeft: 'auto', color: 'var(--text-faint)', display: 'inline-flex', flexShrink: 0, transform: expanded ? 'rotate(180deg)' : 'none', transition: 'transform .15s' }}>
@@ -555,28 +578,29 @@ export function toolStepStats(tools: ToolTrace[]): { total: number; success: num
 
 /** 气泡顶部「步数统计」徽标：X 步 · Y 成功 · Z 失败 · W 执行中（按状态着色，无工具步骤时不渲染） */
 export function StepStats({ tools }: { tools: ToolTrace[] }) {
+  useLocaleSync()
   const { total, success, failed, running } = toolStepStats(tools)
   if (total === 0) return null
   return (
     <>
       <span> · </span>
-      <span>{total} 步</span>
+      <span>{t('chat.step.total', { n: total })}</span>
       {success > 0 && (
         <>
           <span> · </span>
-          <span style={{ color: 'var(--success-text)' }}>{success} 成功</span>
+          <span style={{ color: 'var(--success-text)' }}>{t('chat.step.success', { n: success })}</span>
         </>
       )}
       {failed > 0 && (
         <>
           <span> · </span>
-          <span style={{ color: 'var(--danger-text)' }}>{failed} 失败</span>
+          <span style={{ color: 'var(--danger-text)' }}>{t('chat.step.failed', { n: failed })}</span>
         </>
       )}
       {running > 0 && (
         <>
           <span> · </span>
-          <span style={{ color: 'var(--accent)' }}>{running} 执行中</span>
+          <span style={{ color: 'var(--accent)' }}>{t('chat.step.running', { n: running })}</span>
         </>
       )}
     </>

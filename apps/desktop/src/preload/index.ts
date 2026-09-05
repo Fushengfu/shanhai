@@ -310,6 +310,8 @@ export interface ShanhaiBridge {
   setTheme(theme: 'light' | 'dark'): void
   /** 订阅主题变更（主进程广播 ui:theme），返回取消订阅函数 */
   onThemeChange(cb: (theme: 'light' | 'dark') => void): () => void
+  /** 订阅语言变更（主进程广播 ui:locale），返回取消订阅函数。i18n 期1，与 onThemeChange 同形态 */
+  onLocaleChange(cb: (locale: string) => void): () => void
   /** 读取全局 UI 共享状态快照（当前会话/会话列表/模型/登录态/审批策略），返回 { rev, state } 信封 */
   getUiState(): Promise<UiStateEnvelope>
   /** 订阅全局 UI 共享状态变化（主进程 store 变化时推送 { rev, state } 信封） */
@@ -453,6 +455,13 @@ export interface ShanhaiBridge {
   setSessionWorkdir(id: string, workdir: string): Promise<void>
   saveUploadedFile(fileName: string, dataBase64: string): Promise<string>
   uploadImage(imageBase64: string, mimeType?: string): Promise<string | null>
+  /**
+   * 通用文件上传到云存储（私信附件用）：复用主进程既有的 runtime.uploadFile →
+   * packages/storage 的 doCloudUpload（会员 JWT 换凭证 → 七牛直传，含跨区域自愈与 hash 去重）。
+   * 此前只暴露了 uploadImage（只收图片），文档类附件没有出口 —— 这是本期唯一批准新增的主进程能力。
+   * 返回公网直链；未登录 / 网关异常 / 超时一律返回 null（**调用方必须把 null 翻成可见提示，不许静默**）。
+   */
+  uploadFile(dataBase64: string, mimeType?: string, fileName?: string): Promise<string | null>
   listBrowserWindows(sessionId?: string): Promise<Array<{ appId: string; url: string; title: string; label?: string }>>
   showBrowserWindow(appId: string): Promise<void>
   closeBrowserWindow(appId: string): Promise<void>
@@ -577,6 +586,12 @@ export interface AppSettings {
     /** 任务执行完、输出正文时是否自动语音播报 */
     enabled: boolean
   }
+  /**
+   * 界面语言（i18n 期1）。空串 = 从未设置；主进程启动时按系统语言解析成具体值写回。
+   * 【口径】这里只声明到 preload 实际透出的字段（与 runtime 的 AppSettings 是子集关系），
+   * 新增字段必须三处同步：runtime/types.ts、preload/index.ts、renderer/types.ts。
+   */
+  locale: string
 }
 
 /** 设置补丁：允许只传某个分组的某个字段（嵌套 Partial） */
@@ -585,6 +600,7 @@ export type AppSettingsPatch = {
   messageSubmit?: Partial<AppSettings['messageSubmit']>
   debug?: Partial<AppSettings['debug']>
   voice?: Partial<AppSettings['voice']>
+  locale?: string
 }
 
 /** 一条 HTTP 原始请求/响应记录（排查问题用：请求一条、响应一条，含接口地址与完整 body） */
@@ -773,6 +789,11 @@ const bridge: ShanhaiBridge = {
     ipcRenderer.on('ui:theme', listener)
     return () => ipcRenderer.removeListener('ui:theme', listener)
   },
+  onLocaleChange: (cb) => {
+    const listener = (_e: unknown, locale: string) => cb(locale)
+    ipcRenderer.on('ui:locale', listener)
+    return () => ipcRenderer.removeListener('ui:locale', listener)
+  },
   getUiState: () => ipcRenderer.invoke('ui:getState'),
   onUiState: (cb) => {
     const listener = (_e: unknown, payload: UiStateEnvelope) => cb(payload)
@@ -916,6 +937,7 @@ const bridge: ShanhaiBridge = {
   setSessionWorkdir: (id, workdir) => ipcRenderer.invoke('session:setWorkdir', id, workdir),
   saveUploadedFile: (fileName, dataBase64) => ipcRenderer.invoke('file:saveUpload', fileName, dataBase64),
   uploadImage: (imageBase64, mimeType) => ipcRenderer.invoke('image:upload', imageBase64, mimeType),
+  uploadFile: (dataBase64, mimeType, fileName) => ipcRenderer.invoke('file:upload', dataBase64, mimeType, fileName),
   listBrowserWindows: (sessionId) => ipcRenderer.invoke('browser:list', sessionId),
   showBrowserWindow: (appId) => ipcRenderer.invoke('browser:show', appId),
   closeBrowserWindow: (appId) => ipcRenderer.invoke('browser:close', appId),

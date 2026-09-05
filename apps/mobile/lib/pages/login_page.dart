@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import '../l10n/generated/app_localizations.dart';
+import '../locale.dart';
 import '../theme.dart';
 import '../services/auth_service.dart';
 import '../services/member_credentials.dart';
@@ -30,8 +32,19 @@ class _LoginPageState extends State<LoginPage> {
   final _ws = WsClient();
   final _userCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
-  String _status = '';
+  /// 存「怎么取词」而不是「取到的词」：本字段是 state，若直接存已翻译好的字符串，
+  /// 用户中途切语言后这里仍是旧语言（桌面端历轮反复踩的「文案烘进 state」坑）。
+  L10nText _status = (l) => '';
   bool _busy = false;
+
+  /// 【判定与文案解耦】原实现用 `_status.contains('失败'/'请输入')` 决定红色，
+  /// 即把「是不是错误」寄托在中文文案字面上 —— 文案翻成英文后判定整体失效。
+  /// 改成各赋值点显式声明；服务端原文那两路仍按原中文字面判定（口径④不翻原文），
+  /// 因此中文态的颜色结果与改前逐字一致。
+  bool _statusIsError = false;
+
+  static bool _looksLikeErrorZh(String s) => s.contains('失败') || s.contains('请输入');
+
   bool _pendingDeviceChoice = false;
 
   /// 已连上网关（哪怕目标桌面端离线）：登录页据此决定超时后是「进主界面」还是「留在本页重试」
@@ -48,7 +61,8 @@ class _LoginPageState extends State<LoginPage> {
   static const _credOwner = 'login-page';
 
   /// 凭证状态提示（三态如实呈现：有效 / 即将到期已续签 / 有效期未知）
-  String _credHint = '';
+  // 存「怎么取词」而不是「取到的词」：它在事件回调里被 setState 一次，存字符串会把语言烘进 state
+  L10nText? _credHint;
 
   StreamSubscription<ConnState>? _stateSub;
   StreamSubscription<ServerEvent>? _eventSub;
@@ -61,7 +75,7 @@ class _LoginPageState extends State<LoginPage> {
     // 让用户知道「这次是不是真的登录上了、什么时候会再需要登录」
     _credSub = MemberCredentials.instance.status.listen((snap) {
       if (!mounted || _navigated) return;
-      setState(() => _credHint = snap.state == CredentialState.anonymous ? '' : snap.describe());
+      setState(() => _credHint = snap.state == CredentialState.anonymous ? null : snap.describe());
     });
     _stateSub = _ws.stateStream.listen((s) {
       if (_navigated || !mounted) return;
@@ -73,31 +87,40 @@ class _LoginPageState extends State<LoginPage> {
         // 已连上网关但尚未配对到 Host：明确提示「等待桌面端上线」，
         // 避免握手成功后、网关未下发任何事件时，文案一直卡在「登录成功，连接中…」。
         _gatewayReached = true;
-        setState(() => _status = '已连接网关，等待桌面端上线…');
+        setState(() {
+          _status = (l) => l.commonGwConnectedWaitingHost;
+          _statusIsError = false;
+        });
       }
     });
     _eventSub = _ws.events.listen((e) {
       if (_navigated || !mounted) return;
       if (e.event == 'auth_renewed') {
         // 凭证层自动续签成功：如实提示，不打断连接
-        setState(() => _status = '登录凭证已自动续签，正在用新凭证连接…');
+        setState(() {
+          _status = (l) => l.commonCredAutoRenewed;
+          _statusIsError = false;
+        });
         return;
       }
       if (e.event == 'auth_expired') {
         // 【401 改造】只有「refresh 也确认不可恢复」才会走到这里（凭证层已清掉本地 token）。
         // 之前这里靠字符串匹配 error 就把 token 清了，网关一抖动用户就被踢下线。
-        final msg = e.payload['message']?.toString() ?? '登录已失效，请重新登录';
+        final raw = e.payload['message']?.toString();
         setState(() {
-          _status = msg;
+          // 服务端带回的原文原样呈现（口径④）；没带回才用我们自己的兜底词条
+          _status = raw == null ? (l) => l.commonLoginExpiredFallback : rawText(raw);
+          _statusIsError = raw != null && _looksLikeErrorZh(raw);
           _busy = false;
         });
         return;
       }
       if (e.event == 'error') {
-        final msg = e.payload['message']?.toString() ?? '出错';
+        final raw = e.payload['message']?.toString();
         // 普通网络/网关错误：交给 ws 自动重连，这里只更新文案，**不再清登录态**
         setState(() {
-          _status = msg;
+          _status = raw == null ? (l) => l.commonErrorFallback : rawText(raw);
+          _statusIsError = raw != null && _looksLikeErrorZh(raw);
           _busy = false;
         });
       } else if (e.event == 'devices_list') {
@@ -107,7 +130,10 @@ class _LoginPageState extends State<LoginPage> {
         // 不再把人关在登录页干等，直接放行进主界面（主页有离线横幅 + 重试/切设备/退出入口）。
         _gatewayReached = true;
         if (_pendingDeviceChoice) {
-          setState(() => _status = '桌面端离线，请在上方选择要连接的设备');
+          setState(() {
+            _status = (l) => l.commonHostOfflinePickDevice;
+            _statusIsError = false;
+          });
           return;
         }
         _waitTimeout?.cancel();
@@ -133,7 +159,8 @@ class _LoginPageState extends State<LoginPage> {
       // 连网关都连不上：留在登录页，恢复按钮并给明确指引（表单仍在，不算死局）
       setState(() {
         _busy = false;
-        _status = '无法连接网关：请检查网络后重试，或改用下方「局域网直连」';
+        _status = (l) => l.loginGwUnreachable;
+        _statusIsError = false;
       });
     });
   }
@@ -155,13 +182,15 @@ class _LoginPageState extends State<LoginPage> {
       // 网关回了空列表：如实提示，不弹空白弹层让用户对着空气
       setState(() {
         _busy = false;
-        _status = '该账号下当前没有在线的桌面端设备，可稍后重试或改用局域网直连';
+        _status = (l) => l.loginNoDevices;
+        _statusIsError = false;
       });
       return;
     }
     setState(() {
       _pendingDeviceChoice = true;
-      _status = '检测到多台桌面端设备，请选择要连接的设备';
+      _status = (l) => l.commonMultiDevicesPick;
+      _statusIsError = false;
     });
     final chosen = await showDevicePickerSheet(context, devices);
     if (!mounted || _navigated) return;
@@ -170,11 +199,15 @@ class _LoginPageState extends State<LoginPage> {
       setState(() {
         _pendingDeviceChoice = false;
         _busy = false;
-        _status = '未选择设备，可再次点击「登录并连接」或顶部切换设备重新选择';
+        _status = (l) => l.loginNoDeviceChosen;
+        _statusIsError = false;
       });
       return;
     }
-    setState(() => _status = '正在连接所选设备…');
+    setState(() {
+      _status = (l) => l.commonConnectingChosenDevice;
+      _statusIsError = false;
+    });
     _armWaitTimeout();
     await _ws.switchDevice(chosen);
     if (!mounted || _navigated) return;
@@ -193,13 +226,17 @@ class _LoginPageState extends State<LoginPage> {
     final u = _userCtrl.text.trim();
     final p = _passCtrl.text;
     if (u.isEmpty || p.isEmpty) {
-      setState(() => _status = '请输入账号和密码');
+      setState(() {
+        _status = (l) => l.loginNeedCredentials;
+        _statusIsError = true;
+      });
       return;
     }
     setState(() {
       _busy = true;
       _gatewayReached = false;
-      _status = '登录中…';
+      _status = (l) => l.loginBusy;
+      _statusIsError = false;
     });
     // 超时兜底：登录/连接握手最坏 15s，这里 12s 到点先给出结果，避免按钮永久「连接中…」
     _armWaitTimeout();
@@ -217,9 +254,9 @@ class _LoginPageState extends State<LoginPage> {
         owner: _credOwner,
       );
       setState(() {
-        _status = result.expiryKnown
-            ? '登录成功，连接中…'
-            : '登录成功，连接中…（网关未返回凭证有效期，将按被动续签处理）';
+        final expiryKnown = result.expiryKnown;
+        _status = expiryKnown ? (l) => l.loginSuccess : (l) => l.loginSuccessNoExpiry;
+        _statusIsError = false;
       });
       await _ws.connectRelay(kRelayUrl, result.token);
       if (mounted && !_navigated) _goHomeIfPaired();
@@ -228,7 +265,8 @@ class _LoginPageState extends State<LoginPage> {
         _waitTimeout?.cancel();
         setState(() {
           _busy = false;
-          _status = '登录失败：$e';
+          _status = (l) => l.loginFailed('$e');
+          _statusIsError = true;
         });
       }
     }
@@ -257,6 +295,7 @@ class _LoginPageState extends State<LoginPage> {
 
   @override
   Widget build(BuildContext context) {
+    final l = AppLocalizations.of(context);
     final accent = Theme.of(context).colorScheme.primary;
     return Scaffold(
       body: SafeArea(
@@ -269,28 +308,28 @@ class _LoginPageState extends State<LoginPage> {
                 const SizedBox(height: 16),
                 Icon(Icons.hub_outlined, size: 64, color: accent),
                 const SizedBox(height: 16),
-                const Text(
-                  '山海',
+                Text(
+                  l.brandShanhai,
                   textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 28, fontWeight: FontWeight.w700, letterSpacing: 4),
+                  style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w700, letterSpacing: 4),
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  '登录后远程查看与控制桌面端会话',
+                  l.loginSubtitle,
                   textAlign: TextAlign.center,
                   style: TextStyle(fontSize: 14, color: Colors.grey.shade400),
                 ),
                 const SizedBox(height: 32),
                 _field(
-                  label: '账号',
-                  hint: '会员账号',
+                  label: l.loginAccountLabel,
+                  hint: l.loginAccountHint,
                   controller: _userCtrl,
                   keyboard: TextInputType.text,
                 ),
                 const SizedBox(height: 16),
                 _field(
-                  label: '密码',
-                  hint: '会员密码',
+                  label: l.loginPasswordLabel,
+                  hint: l.loginPasswordHint,
                   controller: _passCtrl,
                   obscure: true,
                 ),
@@ -302,19 +341,21 @@ class _LoginPageState extends State<LoginPage> {
                     backgroundColor: accent,
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                   ),
-                  child: Text(_busy ? '连接中…' : '登录并连接', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                  child: Text(_busy ? l.commonConnecting : l.loginAction,
+                      style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
                 ),
                 const SizedBox(height: 16),
                 Text(
-                  _status,
+                  // 渲染期才求值 → 中途切语言这一行立刻跟着变
+                  _status(l),
                   textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 13, color: _status.contains('失败') || _status.contains('请输入') ? Colors.redAccent : Colors.grey.shade400),
+                  style: TextStyle(fontSize: 13, color: _statusIsError ? Colors.redAccent : Colors.grey.shade400),
                 ),
                 // 凭证三态如实呈现（已登录有效 / 即将到期已续签 / 有效期未知）
-                if (_credHint.isNotEmpty) ...[
+                if (_credHint != null) ...[
                   const SizedBox(height: 6),
                   Text(
-                    _credHint,
+                    _credHint!(AppLocalizations.of(context)),
                     textAlign: TextAlign.center,
                     style: TextStyle(fontSize: 11.5, color: Colors.grey.shade500),
                   ),
@@ -322,7 +363,7 @@ class _LoginPageState extends State<LoginPage> {
                 const SizedBox(height: 24),
                 TextButton(
                   onPressed: _openLan,
-                  child: Text('局域网直连（同一 WiFi）', style: TextStyle(fontSize: 13, color: Colors.grey.shade400)),
+                  child: Text(l.loginLanDirect, style: TextStyle(fontSize: 13, color: Colors.grey.shade400)),
                 ),
               ],
             ),

@@ -3,6 +3,8 @@ import { useEffect, useRef, useState } from 'react'
 import type { AskRequest } from '../types'
 import { IconChevronDown, IconHelp } from './icons'
 import { btn } from './ui'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 interface AskCardProps {
   req: AskRequest
@@ -16,6 +18,7 @@ interface AskCardProps {
  * 有选项时额外提供「其他（自定义填写）」入口：选项都不符合时，用户可自由输入自定义内容。
  */
 export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
+  useLocaleSync()
   const hasOptions = (req.options?.length ?? 0) > 0
   const multiple = req.multiple === true
   const [selected, setSelected] = useState<string[]>([])
@@ -49,7 +52,8 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
 
   const submit = (): void => {
     if (!canSubmit) return
-    const answer = customMode ? text.trim() : hasOptions ? selected.join('、') : text.trim()
+    // 分隔符走词条：英文没有顿号（en 侧给 ', '），在代码里拼 '、' 会把中文标点带进英文界面
+    const answer = customMode ? text.trim() : hasOptions ? selected.join(t('common.sepEnumeration')) : text.trim()
     onSubmit(answer)
   }
 
@@ -72,11 +76,11 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: collapsed ? 0 : 6 }}>
         <div style={{ fontWeight: 600, color: 'var(--text)', display: 'flex', alignItems: 'center', gap: 6 }}>
           <IconHelp />
-          AI 需要你的确认
+          {t('chat.ask.header')}
         </div>
         <button
           onClick={() => setCollapsed((c) => !c)}
-          title={collapsed ? '展开' : '折叠'}
+          title={collapsed ? t('common.expand') : t('common.collapse')}
           style={{
             display: 'inline-flex',
             alignItems: 'center',
@@ -99,12 +103,12 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
       {!collapsed && (
         <>
           <div style={{ color: 'var(--text)', marginBottom: 6, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-            {req.question?.trim() ? req.question : '（AI 未提供说明，请结合下方选项判断）'}
+            {req.question?.trim() ? req.question : t('chat.ask.noQuestion')}
           </div>
           {req.reasoning && (
             <details style={{ marginBottom: 10 }}>
               <summary style={{ cursor: 'pointer', color: 'var(--text-muted)', fontSize: 12, userSelect: 'none' }}>
-                AI 为什么问你（点开看背景）
+                {t('chat.ask.whyBg')}
               </summary>
               <div style={{ marginTop: 6, padding: '8px 10px', borderRadius: 8, background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word', maxHeight: 200, overflowY: 'auto' }}>
                 {req.reasoning}
@@ -169,7 +173,7 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
               </div>
             )
           })}
-          {multiple && <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>可多选，已选 {selected.length} 项</div>}
+          {multiple && <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('chat.ask.multiHint', { n: selected.length })}</div>}
           {/* 选项都不符合时：切换到自定义填写 */}
           <div
             onClick={enterCustom}
@@ -186,8 +190,8 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
               gap: 8,
             }}
           >
-            <span style={{ width: 16, height: 16, flexShrink: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: 13 }}>＋</span>
-            其他（自定义填写）
+            <span style={{ width: 16, height: 16, flexShrink: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: 13 }}>{t('common.plus')}</span>
+            {t('chat.ask.other')}
           </div>
         </div>
       ) : (
@@ -210,7 +214,7 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
               submit()
             }
           }}
-          placeholder={req.placeholder ?? '请输入你的回答'}
+          placeholder={req.placeholder ?? t('chat.ask.placeholder')}
           style={{
             width: '100%',
             padding: '8px 10px',
@@ -234,14 +238,14 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
             }}
             style={btn('var(--bg-panel)', 'var(--text)', '1px solid var(--border-strong)')}
           >
-            返回选项
+            {t('chat.ask.back')}
           </button>
         )}
         <button onClick={submit} disabled={!canSubmit} style={{ ...btn('var(--accent)', '#fff'), opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}>
-          提交
+          {t('chat.ask.submit')}
         </button>
         <button onClick={onCancel} style={btn('var(--bg-panel)', 'var(--text)', '1px solid var(--border-strong)')}>
-          取消
+          {t('common.cancel')}
         </button>
       </div>
         </>

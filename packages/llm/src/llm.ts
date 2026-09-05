@@ -303,8 +303,51 @@ function serializeMessages(messages: ChatMessage[], supportsReasoning = false): 
   })
 }
 
-/** 网关请求超时（毫秒）。模型调用若网关挂起（连接/响应头/完整响应阶段）超时抛错，避免任务永久卡死。 */
-const FETCH_TIMEOUT_MS = 3 * 60 * 1000
+/**
+ * 网关请求超时（毫秒）。模型调用若网关挂起（连接/响应头/完整响应阶段）超时抛错，避免任务永久卡死。
+ *
+ * 【2026-09-04 修正阈值倒挂】改前是 3 分钟，而网关允许这个请求跑更久（只读实测依据）：
+ *   - nginx aigateway.bjctykj.com.conf:44                        proxy_read_timeout 600s
+ *   - backend/internal/gateway/handler/proxy.go:130 / :282 / :870  context.WithTimeout(10 * time.Minute)
+ *   - backend/pkg/llm/http.go:26 / :50                           Client.Timeout = 10min、ResponseHeaderTimeout = 5min
+ * 山海只等 3 分钟 ⇒ 3~10 分钟之间才完成的长推理会被**山海先掐断**，而网关还在继续跑（token 照样计费）；
+ * 另一种表现是网关自己的 ctx 先到期，把 Go 原文 `context deadline exceeded` 回给山海。
+ * 现在取 **11 分钟 = 网关上限 10 分钟 + 60s 余量**：永远让网关先出结论，山海只在它之后兜底，
+ * 不拿重试掩盖阈值配错（重试只用于真正的偶发超时）。
+ */
+const FETCH_TIMEOUT_MS = 11 * 60 * 1000
+
+/**
+ * 网关侧「上下文截止」类错误的 Go 原生文案。真机证据（本机 traces 只读统计）：
+ *   ~/.shanhai/traces/supervisor.http.log 命中 354 次、
+ *   s-1788527541885-*.http.log 232 次、s-1788257095831-*.http.log 105 次。
+ * 注意 `deadline exceeded` 里既没有「超时」也没有 `timed out` 字样 —— 这正是它绕过既有重试判定的原因。
+ */
+const GATEWAY_DEADLINE_TEXT = /context\s+deadline\s+exceeded|deadline\s+exceeded\s+while\s+reading\s+body|Client\.Timeout\s+exceeded|net\/http:\s+request\s+canceled/i
+
+/** 上游不可用 / 排队满：网关自己没算完，是 nginx 或网关进程给的 5xx 门面 */
+const GATEWAY_BAD_GATEWAY_STATUS = new Set([502, 503, 504])
+
+/**
+ * 稳定标记：上层（packages/agent）靠它判定「这是网关超时/不可用 → 该自动重试」，而不是靠猜英文措辞。
+ * 用户看到的永远是中文，**不透传网关英文原文**。
+ */
+export const GATEWAY_ERROR_MARKER = '[gateway_unavailable]'
+
+/**
+ * 把「网关超时 / 网关不可用」两类响应统一成一条中文错误（带标记）；不属于这两类就返回 null，
+ * 由调用方保持原有抛错形态与文案（不改变其它错误的行为）。
+ */
+function gatewayErrorOrNull(vendor: string, status: number, bodyText: string): Error | null {
+  const deadline = GATEWAY_DEADLINE_TEXT.test(bodyText)
+  const badGateway = GATEWAY_BAD_GATEWAY_STATUS.has(status)
+  if (!deadline && !badGateway) return null
+  const who = vendor ? `（${vendor}）` : ''
+  const why = deadline
+    ? `网关处理超时：上游模型在限定时间内没有返回结果（网关侧上限 10 分钟）${who}`
+    : `网关暂时不可用：HTTP ${status}（上游排队满或网关连接被断开）${who}`
+  return new Error(`${GATEWAY_ERROR_MARKER} ${why}。本次请求未完成，山海会自动重试。`)
+}
 
 /** 带超时的 fetch：超时中断连接并抛错（覆盖网关无响应导致的永久 pending，是任务级卡死的最后一道防线） */
 async function fetchWithTimeout(input: Parameters<typeof fetch>[0], init?: RequestInit, timeoutMs = FETCH_TIMEOUT_MS): Promise<Response> {
@@ -366,7 +409,8 @@ export class DeepSeekProvider implements Model {
     const rawText = await res.text()
     if (!res.ok) {
       this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText), responseStatus: res.status, error: `DeepSeek API ${res.status}` })
-      throw new Error(`DeepSeek API ${res.status}: ${rawText}`)
+      // 网关超时/不可用单独成一条中文错误（带标记供上层重试判定）；trace 里仍留原始响应，不丢排障线索
+      throw gatewayErrorOrNull('DeepSeek', res.status, rawText) ?? new Error(`DeepSeek API ${res.status}: ${rawText}`)
     }
     // 网关响应：{ code, data: { choices: [...] } } 包装（兼容裸 OpenAI 格式）
     let raw: {
@@ -389,7 +433,8 @@ export class DeepSeekProvider implements Model {
     // 网关返回错误（如模型不支持 image_url 多模态），响亮抛错，不静默吞
     if (raw.error) {
       const msg = typeof raw.error === 'string' ? raw.error : (raw.error.message ?? JSON.stringify(raw.error))
-      throw new Error(msg)
+      // 【识别条件①】网关把 Go 原文放在 HTTP body 的 error.message 里透出来（真机就是这条路径）
+      throw gatewayErrorOrNull('', res.status, msg) ?? new Error(msg)
     }
     if (raw.code !== undefined && raw.code !== 0) {
       throw new Error(`gateway error code ${raw.code}`)
@@ -459,7 +504,7 @@ export class DeepSeekProvider implements Model {
     if (!res.ok || !res.body) {
       const errText = await res.text()
       this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(errText), responseStatus: res.status, error: `DeepSeek API ${res.status}` })
-      throw new Error(`DeepSeek API ${res.status}: ${errText}`)
+      throw gatewayErrorOrNull('DeepSeek', res.status, errText) ?? new Error(`DeepSeek API ${res.status}: ${errText}`)
     }
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
@@ -625,10 +670,18 @@ function parseSseLine(line: string): SseDeltaEvent | null {
   } catch {
     return null // 非 JSON（如注释行），忽略
   }
-  // 网关返回错误（如模型不支持 image_url 多模态），响亮抛错，不静默吞
+  // 网关返回错误（如模型不支持 image_url 多模态），响亮抛错，不静默吞。
+  // 【为什么这里也要过 gatewayErrorOrNull】网关的流式错误帧是 **HTTP 200 + data: {"error":"…"}**
+  //（backend/internal/gateway/handler/proxy.go:670 实证，帧体键就是 error，值是 Go 原文字符串），
+  // 所以它不会经过 :413/:507 那两处「按 status 判定」的归一入口。此前这里直接 throw new Error(msg)，
+  // 英文原文（context deadline exceeded）会：① 靠 packages/agent 的 Go 原文兜底匹配才被重试；
+  // ② 任何**不经 decideWithRetry** 的调用者（自定义 provider / 插件桥）会把英文透到界面 —— 这是被明令禁止的。
+  // 归一后：命中 deadline/坏网关 → 抛带 GATEWAY_ERROR_MARKER 的中文错误；其它业务错（404/429/不支持多模态…）
+  // gatewayErrorOrNull 返回 null，抛错形态与文案**一字不变**（不会被误标成可重试）。
   if (parsed.error) {
     const msg = typeof parsed.error === 'string' ? parsed.error : (parsed.error.message ?? JSON.stringify(parsed.error))
-    throw new Error(msg)
+    // status 传 200：SSE 帧的 HTTP 状态本来就是 200，只有文本命中 deadline 特征才会归一
+    throw gatewayErrorOrNull('', 200, msg) ?? new Error(msg)
   }
   const delta = parsed.choices?.[0]?.delta
   const text = typeof delta?.content === 'string' && delta.content ? delta.content : undefined
@@ -1072,7 +1125,7 @@ export class AnthropicProvider implements Model {
     const rawText = await res.text()
     if (!res.ok) {
       this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText), responseStatus: res.status, error: `Anthropic API ${res.status}` })
-      throw new Error(`Anthropic API ${res.status}: ${rawText}`)
+      throw gatewayErrorOrNull('Anthropic', res.status, rawText) ?? new Error(`Anthropic API ${res.status}: ${rawText}`)
     }
     let raw: AnthropicResponse
     try {
@@ -1127,7 +1180,7 @@ export class AnthropicProvider implements Model {
     if (!res.ok || !res.body) {
       const errText = await res.text()
       this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(errText), responseStatus: res.status, error: `Anthropic API ${res.status}` })
-      throw new Error(`Anthropic API ${res.status}: ${errText}`)
+      throw gatewayErrorOrNull('Anthropic', res.status, errText) ?? new Error(`Anthropic API ${res.status}: ${errText}`)
     }
     const reader = res.body.getReader()
     const decoder = new TextDecoder()

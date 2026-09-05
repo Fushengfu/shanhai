@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { t } from '../../shared/i18n'
 import { toPng } from 'html-to-image'
 import { IconCheck } from './icons'
 
@@ -11,7 +12,7 @@ export interface MessageAction {
 
 /** 把 AI 回复的气泡 DOM 节点原样截图成图片写入剪贴板（html-to-image 精确还原渲染效果，与界面显示一致，2x 高清） */
 export async function copyAssistantAsImage(node: HTMLElement | null): Promise<void> {
-  if (!node) throw new Error('未找到要复制的消息节点')
+  if (!node) throw new Error(t('chat.msg.nodeMissing'))
 
   const width = node.offsetWidth
   const restorations: { el: HTMLElement; style: string }[] = []

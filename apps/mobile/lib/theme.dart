@@ -1,6 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+// 只用 locale.dart 的 L10nText 类型别名，不直接点名 AppLocalizations →
+// 不 import 生成的 app_localizations.dart（引了会被 analyze 判 unused_import）
+import 'locale.dart';
+
 /// 山海手机端主题支持：
 /// - 跟随系统（ThemeMode.system，默认）/ 亮色 / 暗色 三种模式；
 /// - 偏好持久化（flutter_secure_storage，与桌面端 localStorage 的 shanhai-theme 对应）；
@@ -25,11 +29,14 @@ extension AppThemeModeX on AppThemeMode {
         AppThemeMode.dark => 'dark',
       };
 
-  /// 展示文案（切换入口菜单用）
-  String get label => switch (this) {
-        AppThemeMode.system => '跟随系统',
-        AppThemeMode.light => '亮色',
-        AppThemeMode.dark => '暗色',
+  /// 展示文案（切换入口菜单用）—— 返回「怎么取词」闭包，不在这里写死中文。
+  /// 与 7A 的 AppLocaleX.label 同一形态：枚举扩展里的中文会在加载期固化，
+  /// 切语言不变（历轮已 10 次实证，这是第 11 次）。
+  /// 「跟随系统」与语言菜单逐字相同 → 复用 localeFollowSystem，不登记第二份。
+  L10nText get label => switch (this) {
+        AppThemeMode.system => (l) => l.localeFollowSystem,
+        AppThemeMode.light => (l) => l.themeLight,
+        AppThemeMode.dark => (l) => l.themeDark,
       };
 
   /// 展示图标

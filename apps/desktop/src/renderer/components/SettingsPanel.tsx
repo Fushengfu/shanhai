@@ -4,6 +4,13 @@ import type { AppSettings, AppSettingsPatch, AppUpdateCheckResult, AppUpdateDown
 import { IconActivity, IconGlobe, IconHelp, IconSettings, IconTerminal, IconWrench } from './icons'
 import { formatBytes, smallIconBtn } from './ui'
 import { WindowTitleBar } from './WindowTitleBar'
+// 进度「状态行」文案与全局浮层同源（期5C A 方案：主进程只发 phase，句子在渲染层取词）
+import { updateStatusLine } from './UpdateProgressOverlay'
+import { LOCALE_DISPLAY_NAME } from '../../shared/i18n'
+import { useI18n, useLocaleSync } from '../locale'
+// tKey：httpTraces.map((t, i) => …) 的循环变量叫 t，会在该回调里遮蔽取词函数 →
+// 那几处一律用别名 tKey（同一个函数，只是不被遮蔽）。
+import { t, t as tKey } from '../../shared/i18n'
 
 /** 单个开关项：标签 + 描述 + 切换开关 */
 function ToggleRow({
@@ -17,6 +24,8 @@ function ToggleRow({
   checked: boolean
   onChange: (v: boolean) => void
 }) {
+  // 本组件渲染期直接取词（开关 tooltip）→ 必须自订阅（期2/期3「谁取词谁订阅」）
+  useLocaleSync()
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 0', borderBottom: '1px solid var(--border)' }}>
       <div style={{ flex: 1, minWidth: 0 }}>
@@ -27,7 +36,7 @@ function ToggleRow({
         onClick={() => onChange(!checked)}
         role="switch"
         aria-checked={checked}
-        title={checked ? '已开启' : '已关闭'}
+        title={checked ? t('settings.toggleOn') : t('settings.toggleOff')}
         style={{
           flexShrink: 0,
           width: 40,
@@ -140,17 +149,21 @@ function SectionTitle({ children, first = false }: { children: ReactNode; first?
 /** 设置面板侧边栏分组定义 */
 type SectionId = 'general' | 'model' | 'connection' | 'debug' | 'about'
 
-const SECTIONS: Array<{ id: SectionId; label: string; icon: ReactNode }> = [
-  { id: 'general', label: '通用', icon: <IconWrench /> },
-  { id: 'model', label: '模型', icon: <IconActivity /> },
-  { id: 'connection', label: '连接', icon: <IconGlobe /> },
-  { id: 'debug', label: '调试', icon: <IconTerminal /> },
-  { id: 'about', label: '关于', icon: <IconHelp /> },
+// 表里只存词条键，标签渲染时取词 —— 直接存中文会让侧边栏分组名在模块加载期固化，
+// 切语言不跟着变（期1 STATUS_LABEL / 期2 TOOL_META / 期3 SUPERVISOR_ARG_LABELS 三次实证过的坑）。
+const SECTIONS: Array<{ id: SectionId; k: string; icon: ReactNode }> = [
+  { id: 'general', k: 'settings.section.general', icon: <IconWrench /> },
+  { id: 'model', k: 'settings.section.model', icon: <IconActivity /> },
+  { id: 'connection', k: 'settings.section.connection', icon: <IconGlobe /> },
+  { id: 'debug', k: 'settings.section.debug', icon: <IconTerminal /> },
+  { id: 'about', k: 'settings.section.about', icon: <IconHelp /> },
 ]
 
 /** 设置面板：左侧分组导航 + 右侧内容区，配置通用设置（浏览器窗口显示等），持久化到 config.json，跨会话、重启保留。侧滑铺满主区域 */
 export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?: number; top?: number; onClose?: () => void; variant?: 'panel' | 'window' }) {
-  const [settings, setSettings] = useState<AppSettings>({ browser: { showOnCreate: true, enableWebBridge: false }, messageSubmit: { mode: 'queue' }, debug: { traceLlm: false }, voice: { enabled: false }, supervisorApproval: { enabled: true }, supervisorAsk: { enabled: true }, compaction: { modelId: '' } })
+  // 当前生效语言（用于「当前生效」那一行；本面板自身的文案属第 4 期，本期不翻）
+  const { locale, switchLocale } = useI18n()
+  const [settings, setSettings] = useState<AppSettings>({ browser: { showOnCreate: true, enableWebBridge: false }, messageSubmit: { mode: 'queue' }, debug: { traceLlm: false }, voice: { enabled: false }, supervisorApproval: { enabled: true }, supervisorAsk: { enabled: true }, compaction: { modelId: '' }, locale: '' })
   const [models, setModels] = useState<GatewayModel[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -294,7 +307,7 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
     try {
       const info = await window.shanhai?.getMobileApkInfo('com.amulet.shanhai')
       if (info?.downloadUrl) setMobileApk(info)
-      else setMobileError('暂无可用版本，请稍后重试')
+      else setMobileError(t('settings.mobile.noVersion'))
     } catch (e) {
       setMobileError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -362,6 +375,19 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
     [],
   )
 
+  // 语言切换的失败原因（可见呈现，不静默）
+  const [localeError, setLocaleError] = useState('')
+  const onLocaleChange = useCallback(async (v: string): Promise<void> => {
+    setLocaleError('')
+    try {
+      // 'auto' 走 update() 写回空串（跟随系统）；具体语言走 switchLocale（乐观应用 + 失败抛错）
+      if (v === 'auto') { await update({ locale: '' }); return }
+      await switchLocale(v as 'zh-CN' | 'en-US')
+    } catch (e) {
+      setLocaleError(t('settings.lang.saveFailed', { err: e instanceof Error ? e.message : String(e) }))
+    }
+  }, [update, switchLocale])
+
   return (
     <div
       style={{
@@ -376,8 +402,8 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
     >
       <WindowTitleBar
         icon={<IconSettings />}
-        title="设置"
-        subtitle={saving ? '保存中…' : '更改自动保存到本地'}
+        title={t('settings.title')}
+        subtitle={saving ? t('common.saving') : t('settings.subtitleAutoSave')}
         onClose={() => onClose?.()}
       />
 
@@ -419,7 +445,7 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                 }}
               >
                 <span style={{ display: 'inline-flex', width: 16, height: 16, flexShrink: 0, color: active ? 'var(--purple)' : 'var(--text-muted)' }}>{s.icon}</span>
-                <span>{s.label}</span>
+                <span>{t(s.k)}</span>
               </button>
             )
           })}
@@ -428,46 +454,82 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
         {/* 右侧内容区 */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px 40px' }}>
           {loading ? (
-            <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--text-faint)', fontSize: 13 }}>加载中…</div>
+            <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--text-faint)', fontSize: 13 }}>{t('common.loading')}</div>
           ) : (
             <>
               {activeSection === 'general' && (
                 <>
-                  <SectionTitle first>浏览器</SectionTitle>
+                  {/*
+                    【i18n 期1】界面语言开关放在「通用」分区最前面：
+                    - 这是本期唯一的语言切换入口（用户拍板：切换入口放设置面板，不放顶栏）；
+                    - 选项里的「简体中文 / English」用各自语言书写（LOCALE_DISPLAY_NAME 是常量、故意不进语言包），
+                      否则英文用户在一个还没翻译的设置面板里找不到哪个是 English；
+                    - 选「跟随系统」= 把真相源写回空串，下次启动重新按系统语言解析。
+                    期1 因为本面板其余文案未翻，这里临时做了「中英并列」；本期（期4A）面板文案已抽干，
+                    过渡态清掉，标题与说明一律走 t()。
+                    选项里的「简体中文 / English」仍用各自语言书写（LOCALE_DISPLAY_NAME 是常量、故意不进语言包）：
+                    语言自称名必须用本语言显示，否则英文用户认不出哪个是 English。
+                  */}
+                  <SectionTitle first>{t('settings.lang.section')}</SectionTitle>
+                  <RadioGroup
+                    label={t('settings.lang.label')}
+                    description={t('settings.lang.desc')}
+                    value={settings.locale || 'auto'}
+                    onChange={(v) => void onLocaleChange(v)}
+                    options={[
+                      { value: 'auto', label: t('settings.lang.auto'), desc: t('settings.lang.autoDesc') },
+                      { value: 'zh-CN', label: LOCALE_DISPLAY_NAME['zh-CN'], desc: t('settings.lang.zhDesc') },
+                      { value: 'en-US', label: LOCALE_DISPLAY_NAME['en-US'], desc: t('settings.lang.enDesc') },
+                    ]}
+                  />
+                  <div style={{ padding: '0 0 4px', fontSize: 12, color: 'var(--text-muted)' }}>
+                    {t('settings.lang.current', { v: LOCALE_DISPLAY_NAME[locale] })}
+                  </div>
+                  {/*
+                    切换失败必须可见：本面板原有的 update() 是 `catch { 忽略保存失败 }`（既有行为，本期不动其它设置项），
+                    但语言这一项如果写失败 = 用户以为切了、下次启动又变回去，属本项目红线级的静默失败，
+                    所以这里单独走 switchLocale，把失败原因显示在开关下方。
+                  */}
+                  {localeError && (
+                    <div style={{ margin: '0 0 8px', padding: '6px 9px', borderRadius: 8, fontSize: 12, lineHeight: 1.6, color: 'var(--danger-text, #b91c1c)', background: 'var(--tint-red, rgba(239,68,68,0.08))', border: '1px solid var(--border-soft)' }}>
+                      {localeError}
+                    </div>
+                  )}
+                  <SectionTitle>{t('settings.browser.section')}</SectionTitle>
                   <ToggleRow
-                    label="创建窗口时直接显示"
-                    description="开启后，AI 打开内置浏览器窗口会立即弹出到前台；关闭后浏览器在后台静默运行，不打扰当前操作（仍可通过顶部标签或列表唤出）。"
+                    label={t('settings.browser.showOnCreate')}
+                    description={t('settings.browser.showOnCreateDesc')}
                     checked={settings.browser.showOnCreate}
                     onChange={(v) => void update({ browser: { showOnCreate: v } })}
                   />
-                  <SectionTitle>消息</SectionTitle>
+                  <SectionTitle>{t('settings.message.section')}</SectionTitle>
                   <RadioGroup
-                    label="任务执行中发送消息"
-                    description="当一个任务正在执行时，继续发送新消息的处理方式。"
+                    label={t('settings.submit.label')}
+                    description={t('settings.submit.desc')}
                     value={settings.messageSubmit.mode}
                     onChange={(v) => void update({ messageSubmit: { mode: v as 'queue' | 'insert' } })}
                     options={[
-                      { value: 'queue', label: '等待队列模式', desc: '新消息排队，当前任务完成后自动逐条执行，不打断当前任务。' },
-                      { value: 'insert', label: '插入模式', desc: '不打断当前任务，把新消息注入正在执行的任务，在下一步模型调用前追加到上下文（多条都会插入，不丢失）。' },
+                      { value: 'queue', label: t('settings.submit.queue'), desc: t('settings.submit.queueDesc') },
+                      { value: 'insert', label: t('settings.submit.insert'), desc: t('settings.submit.insertDesc') },
                     ]}
                   />
-                  <SectionTitle>语音</SectionTitle>
+                  <SectionTitle>{t('settings.voice.section')}</SectionTitle>
                   <ToggleRow
-                    label="任务完成自动播报"
-                    description="开启后，每次任务执行完、输出正文时会用系统语音（macOS say）朗读结果，同时聊天窗口显示 3D AI 特效（超长正文截断到约 500 字）。默认开启。"
+                    label={t('settings.voice.label')}
+                    description={t('settings.voice.desc')}
                     checked={settings.voice.enabled}
                     onChange={(v) => void update({ voice: { enabled: v } })}
                   />
-                  <SectionTitle>管家</SectionTitle>
+                  <SectionTitle>{t('settings.sup.section')}</SectionTitle>
                   <ToggleRow
-                    label="管家接管审批"
-                    description="开启后，会话管家下发的任务触发的授权确认，由管家代替你决策（管家决策后弹窗自动关闭）；你自己发起的任务仍由你手动点击授权，弹窗始终显示、你始终可以手动点。默认关闭。"
+                    label={t('settings.supApproval.label')}
+                    description={t('settings.supApproval.desc')}
                     checked={settings.supervisorApproval.enabled}
                     onChange={(v) => void update({ supervisorApproval: { enabled: v } })}
                   />
                   <ToggleRow
-                    label="管家接管提问"
-                    description="开启后，会话管家下发的任务里会话发起的提问（ask_user），由管家代替你回答（管家代答后弹窗自动关闭）；你自己发起的任务仍由你手动回答，弹窗始终显示、你始终可以手动点。默认关闭。"
+                    label={t('settings.supAsk.label')}
+                    description={t('settings.supAsk.desc')}
                     checked={settings.supervisorAsk.enabled}
                     onChange={(v) => void update({ supervisorAsk: { enabled: v } })}
                   />
@@ -476,38 +538,38 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
 
               {activeSection === 'model' && (
                 <>
-                  <SectionTitle first>上下文压缩</SectionTitle>
+                  <SectionTitle first>{t('settings.compaction.section')}</SectionTitle>
                   <div style={{ padding: '12px 0', borderBottom: '1px solid var(--border)' }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>统一压缩模型</div>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{t('settings.compaction.model')}</div>
                     <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.5 }}>
-                      上下文超限触发 LLM 摘要时使用的模型。默认「跟随会话模型」（即当前会话选中的模型）；也可指定一个固定模型统一处理所有会话的压缩。
+                      {t('settings.compaction.modelDesc')}
                     </div>
                     <select
                       value={settings.compaction?.modelId ?? ''}
                       onChange={(e) => void update({ compaction: { modelId: e.target.value } })}
                       style={{ marginTop: 8, width: '100%', padding: '6px 8px', fontSize: 13, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text)' }}
                     >
-                      <option value="">跟随会话模型（默认）</option>
+                      <option value="">{t('settings.compaction.follow')}</option>
                       {models.map((m) => (
                         <option key={m.id} value={m.id}>
-                          {m.name}（{m.id}）
+                          {t('settings.modelOptionLine', { name: m.name, id: m.id })}
                         </option>
                       ))}
                     </select>
                   </div>
-                  <SectionTitle>DeepSeek 网页版</SectionTitle>
+                  <SectionTitle>{t('settings.dsb.section')}</SectionTitle>
                   <ToggleRow
-                    label="开启网页版桥接"
-                    description="关闭后不注册「DeepSeek 网页版」模型，也不再为每个会话预创建默认浏览器窗口；仅当 agent 用到浏览器工具时才按需创建窗口。"
+                    label={t('settings.dsb.enable')}
+                    description={t('settings.dsb.enableDesc')}
                     checked={settings.browser.enableWebBridge}
                     onChange={(v) => void update({ browser: { enableWebBridge: v } })}
                   />
                   <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5, margin: '4px 0 8px' }}>
-                    复用已登录的 DeepSeek 网页版作为免费模型来源：在模型下拉框选「DeepSeek 网页版」发消息时，自动创建/复用专用浏览器窗口，通过 CDP 直连页面完成对话（无需本地端口）。
+                    {t('settings.dsb.hint')}
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 12, color: 'var(--text-secondary)' }}>
-                    <span>窗口：{dsb.windowReady ? '已创建' : '未创建'}</span>
-                    <span>桥接：{dsb.bridgeInjected ? '已注入' : '未注入'}</span>
+                    <span>{t('settings.dsb.window', { v: dsb.windowReady ? t('settings.dsb.windowReady') : t('settings.dsb.windowNot') })}</span>
+                    <span>{t('settings.dsb.bridge', { v: dsb.bridgeInjected ? t('settings.dsb.injected') : t('settings.dsb.notInjected') })}</span>
                   </div>
                   <div style={{ padding: '8px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
                     <button
@@ -515,14 +577,14 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                       disabled={dsbBusy}
                       style={{ ...smallIconBtn, padding: '4px 10px', fontSize: 12, border: '1px solid var(--border-soft)', borderRadius: 6 }}
                     >
-                      {dsbBusy ? '处理中…' : '打开并注入桥接'}
+                      {dsbBusy ? t('settings.dsb.busy') : t('settings.dsb.openInject')}
                     </button>
                     <button
                       onClick={() => void injectDsb()}
                       disabled={dsbBusy}
                       style={{ ...smallIconBtn, padding: '4px 10px', fontSize: 12, border: '1px solid var(--border-soft)', borderRadius: 6 }}
                     >
-                      重新注入
+                      {t('settings.dsb.reinject')}
                     </button>
                   </div>
                   {dsbMsg ? (
@@ -535,23 +597,23 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
 
               {activeSection === 'connection' && (
                 <>
-                  <SectionTitle first>局域网远程</SectionTitle>
+                  <SectionTitle first>{t('settings.remote.section')}</SectionTitle>
                   <div style={{ padding: '12px 0', borderBottom: '1px solid var(--border)' }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>手机端局域网直连</div>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{t('settings.remote.lan')}</div>
                     <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.5 }}>
-                      登录后自动开启：桌面端在本机局域网起一个配对码鉴权的 WebSocket 服务，手机 App 连同一 WiFi、输入配对码即可远程查看/控制会话。数据不出局域网。
+                      {t('settings.remote.lanDesc')}
                     </div>
                   </div>
                   {remote?.enabled ? (
                     <div style={{ padding: '8px 0', fontSize: 12, lineHeight: 1.9, color: 'var(--text-secondary)' }}>
                       <div>
-                        本机地址：<span style={{ fontWeight: 600, color: 'var(--text)' }}>{remote.ip}:{remote.port}</span>
+                        {t('settings.remote.ipLabel')}<span style={{ fontWeight: 600, color: 'var(--text)' }}>{remote.ip}:{remote.port}</span>
                       </div>
                       <div>
-                        配对码：<span style={{ fontWeight: 700, fontSize: 16, letterSpacing: 3, color: 'var(--purple)' }}>{remote.pairingCode}</span>
+                        {t('settings.remote.codeLabel')}<span style={{ fontWeight: 700, fontSize: 16, letterSpacing: 3, color: 'var(--purple)' }}>{remote.pairingCode}</span>
                       </div>
-                      <div style={{ color: 'var(--text-muted)' }}>已连接设备：{remote.pairedClients} 台（配对码 5 分钟内有效）</div>
-                      <div style={{ color: 'var(--text-faint)' }}>在手机 App 里输入上述地址和配对码即可连接。</div>
+                      <div style={{ color: 'var(--text-muted)' }}>{t('settings.remote.paired', { n: remote.pairedClients })}</div>
+                      <div style={{ color: 'var(--text-faint)' }}>{t('settings.remote.hint')}</div>
                       <button
                         onClick={() => {
                           if (!refreshBusy) void refreshRemoteCode()
@@ -559,26 +621,26 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                         disabled={refreshBusy}
                         style={{ ...smallIconBtn, marginTop: 8, padding: '4px 12px', fontSize: 12 }}
                       >
-                        {refreshBusy ? '刷新中…' : '刷新配对码'}
+                        {refreshBusy ? t('settings.remote.refreshing') : t('settings.remote.refreshCode')}
                       </button>
                     </div>
                   ) : (
-                    <div style={{ padding: '8px 0', fontSize: 12, color: 'var(--text-muted)' }}>未开启（登录后自动开启）</div>
+                    <div style={{ padding: '8px 0', fontSize: 12, color: 'var(--text-muted)' }}>{t('settings.remote.disabled')}</div>
                   )}
-                  <SectionTitle>网关中继（外网）</SectionTitle>
+                  <SectionTitle>{t('settings.relay.section')}</SectionTitle>
                   <div style={{ padding: '12px 0', borderBottom: '1px solid var(--border)' }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>外网远程（网关中继）</div>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{t('settings.relay.title')}</div>
                     <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.5 }}>
-                      登录后自动开启：桌面端作为 Host 连网关中继服务，手机 App 用同一会员账号登录即可在外网远程查看/控制会话（无需同一 WiFi）。
+                      {t('settings.relay.desc')}
                     </div>
                   </div>
                   {relay?.enabled ? (
                     <div style={{ padding: '8px 0', fontSize: 12, lineHeight: 1.9, color: 'var(--text-secondary)' }}>
                       <div>
-                        连接状态：<span style={{ fontWeight: 600, color: relay.connected ? 'var(--success-text)' : relay.authFailed ? 'var(--danger-text)' : 'var(--danger-text)' }}>{relay.connected ? '已连接网关' : relay.authFailed ? '凭证失效（请重新登录）' : '未连接（需登录会员账号）'}</span>
+                        {t('settings.relay.statusLabel')}<span style={{ fontWeight: 600, color: relay.connected ? 'var(--success-text)' : relay.authFailed ? 'var(--danger-text)' : 'var(--danger-text)' }}>{relay.connected ? t('settings.relay.connected') : relay.authFailed ? t('settings.relay.authFailed') : t('settings.relay.notConnected')}</span>
                       </div>
-                      <div>账号：{relay.username ?? '未登录'}</div>
-                      <div>已连接手机：{relay.clientCount} 台</div>
+                      <div>{t('settings.relay.account', { u: relay.username ?? t('common.notLoggedIn') })}</div>
+                      <div>{t('settings.relay.clients', { n: relay.clientCount })}</div>
                       {relay.error ? (
                         <div
                           style={{
@@ -594,20 +656,20 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                           {relay.error}
                         </div>
                       ) : null}
-                      <div style={{ color: 'var(--text-faint)' }}>手机 App 用同一会员账号登录后即可自动配对连接，无需配对码。</div>
+                      <div style={{ color: 'var(--text-faint)' }}>{t('settings.relay.hint')}</div>
                     </div>
                   ) : (
-                    <div style={{ padding: '8px 0', fontSize: 12, color: 'var(--text-muted)' }}>未开启（登录后自动开启）</div>
+                    <div style={{ padding: '8px 0', fontSize: 12, color: 'var(--text-muted)' }}>{t('settings.remote.disabled')}</div>
                   )}
                 </>
               )}
 
               {activeSection === 'debug' && (
                 <>
-                  <SectionTitle first>调试</SectionTitle>
+                  <SectionTitle first>{t('settings.debug.section')}</SectionTitle>
                   <ToggleRow
-                    label="记录 LLM 请求/响应"
-                    description="开启后，每次调用大模型都会把【接口地址 + 完整原始请求 body + 完整原始响应 body】拆成请求一条、响应一条，追加记录到 ~/.shanhai/traces/<会话id>.http.log（每会话一个文件，会话隔离），用于排查问题。默认关闭，记录会占用磁盘。"
+                    label={t('settings.trace.label')}
+                    description={t('settings.trace.desc')}
                     checked={settings.debug.traceLlm}
                     onChange={(v) => void update({ debug: { traceLlm: v } })}
                   />
@@ -619,7 +681,7 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                       }}
                       style={{ ...smallIconBtn, padding: '4px 10px', fontSize: 12, border: '1px solid var(--border-soft)', borderRadius: 6 }}
                     >
-                      {showHttpTraces ? '收起日志' : '查看原始请求/响应日志'}
+                      {showHttpTraces ? t('settings.trace.collapse') : t('settings.trace.expand')}
                     </button>
                     <button
                       onClick={() => {
@@ -627,7 +689,7 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                       }}
                       style={{ ...smallIconBtn, padding: '4px 10px', fontSize: 12, border: '1px solid var(--border-soft)', borderRadius: 6 }}
                     >
-                      清空日志
+                      {t('settings.trace.clearAll')}
                     </button>
                     <button
                       onClick={() => {
@@ -635,29 +697,29 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                       }}
                       style={{ ...smallIconBtn, padding: '4px 10px', fontSize: 12, border: '1px solid var(--border-soft)', borderRadius: 6 }}
                     >
-                      打开日志目录
+                      {t('settings.trace.openDir')}
                     </button>
                   </div>
                   {showHttpTraces && (
                     <div style={{ maxHeight: 320, overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 8, padding: 8, marginTop: 4 }}>
                       {httpTraces.length === 0 ? (
-                        <div style={{ fontSize: 12, color: 'var(--text-faint)', textAlign: 'center', padding: 16 }}>暂无记录（需先开启上方开关并运行任务）</div>
+                        <div style={{ fontSize: 12, color: 'var(--text-faint)', textAlign: 'center', padding: 16 }}>{t('settings.trace.empty')}</div>
                       ) : (
                         httpTraces.map((t, i) => (
                           <div key={i} style={{ padding: '6px 0', borderBottom: '1px solid var(--border)', fontSize: 12, color: 'var(--text-secondary)' }}>
                             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
                               <span style={{ color: 'var(--text-muted)' }}>#{i + 1}</span>
-                              <span style={{ fontWeight: 600, color: t.phase === 'request' ? 'var(--accent)' : 'var(--success-text)' }}>{t.phase === 'request' ? '请求' : '响应'}</span>
+                              <span style={{ fontWeight: 600, color: t.phase === 'request' ? 'var(--accent)' : 'var(--success-text)' }}>{t.phase === 'request' ? tKey('settings.trace.request') : tKey('settings.trace.response')}</span>
                               <span style={{ color: 'var(--text-muted)' }}>{new Date(t.ts).toLocaleTimeString()}</span>
                               {t.responseStatus != null && <span style={{ color: 'var(--text-muted)' }}>HTTP {t.responseStatus}</span>}
-                              {t.error ? <span style={{ color: 'var(--danger-text)' }}>错误</span> : null}
+                              {t.error ? <span style={{ color: 'var(--danger-text)' }}>{tKey('settings.trace.errorTag')}</span> : null}
                             </div>
                             <div style={{ color: 'var(--text-muted)', fontSize: 11, wordBreak: 'break-all', marginTop: 2 }}>{t.method} {t.url}</div>
                             {t.error ? (
                               <div style={{ color: 'var(--danger-text)', marginTop: 2, wordBreak: 'break-all' }}>{t.error}</div>
                             ) : (
                               <details style={{ marginTop: 2 }}>
-                                <summary style={{ cursor: 'pointer', color: 'var(--text-muted)', fontSize: 11 }}>完整 body</summary>
+                                <summary style={{ cursor: 'pointer', color: 'var(--text-muted)', fontSize: 11 }}>{tKey('settings.trace.fullBody')}</summary>
                                 <pre style={{ margin: '4px 0 0', padding: 6, background: 'var(--bg-sidebar)', borderRadius: 4, overflowX: 'auto', fontSize: 11, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
                                   {typeof t.body === 'string' ? t.body : JSON.stringify(t.body ?? null, null, 2)}
                                 </pre>
@@ -673,17 +735,18 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
 
               {activeSection === 'about' && (
                 <>
-                  <SectionTitle first>关于山海</SectionTitle>
+                  <SectionTitle first>{t('settings.about.section')}</SectionTitle>
                   <div style={{ padding: '12px 0', borderBottom: '1px solid var(--border)' }}>
                     <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>
-                      当前版本 <span style={{ color: 'var(--purple)' }}>v{version || '—'}</span>
+                      {t('settings.about.currentVersion')} <span style={{ color: 'var(--purple)' }}>v{version || '—'}</span>
                     </div>
+                    {/* updateStatus.message 是主进程/网关返回的原文：按口径④不做客户端全量映射，原样呈现 */}
                     <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4, lineHeight: 1.5 }}>
                       {updateStatus?.hasUpdate
-                        ? `发现新版本 v${updateStatus.latestVersion}`
+                        ? t('settings.about.newVersion', { v: updateStatus.latestVersion ?? '' })
                         : updateStatus
-                          ? (updateStatus.message ?? (updateStatus.success ? '当前已是最新版本' : '检查失败'))
-                          : '点击下方按钮检查最新版本'}
+                          ? (updateStatus.message ?? (updateStatus.success ? t('settings.about.isLatest') : t('settings.about.checkFailed')))
+                          : t('settings.about.clickToCheck')}
                     </div>
                     {updateStatus?.releaseNotes ? (
                       <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6, lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
@@ -696,18 +759,18 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                         disabled={updateChecking}
                         style={{ ...smallIconBtn, padding: '4px 12px', fontSize: 12, border: '1px solid var(--border-soft)', borderRadius: 6 }}
                       >
-                        {updateChecking ? '检查中…' : '检查更新'}
+                        {updateChecking ? t('settings.about.checking') : t('settings.about.checkUpdate')}
                       </button>
                       <button
                         onClick={() => void loadMobileApk()}
                         disabled={mobileLoading}
                         style={{ ...smallIconBtn, padding: '4px 12px', fontSize: 12, border: '1px solid var(--border-soft)', borderRadius: 6 }}
                       >
-                        {mobileLoading ? '获取中…' : '下载手机端'}
+                        {mobileLoading ? t('settings.about.fetching') : t('settings.about.downloadMobile')}
                       </button>
                       {updateStatus?.checkedAt ? (
                         <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
-                          上次检查：{new Date(updateStatus.checkedAt).toLocaleString()}
+                          {t('settings.about.lastCheck', { t: new Date(updateStatus.checkedAt).toLocaleString() })}
                         </span>
                       ) : null}
                     </div>
@@ -729,12 +792,15 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                         }}
                       >
                         <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>
-                          {updateProgress.phase === 'pending' && '准备下载更新'}
-                          {updateProgress.phase === 'downloading' && `正在下载更新${updateProgress.latestVersion ? ` v${updateProgress.latestVersion}` : ''}`}
-                          {updateProgress.phase === 'verifying' && '正在校验安装包（SHA256）'}
-                          {updateProgress.phase === 'completed' && '更新包下载完成'}
-                          {updateProgress.phase === 'failed' && '更新下载失败'}
-                          {updateProgress.phase === 'cancelled' && '更新下载已取消'}
+                          {updateProgress.phase === 'pending' && t('settings.upd.pending')}
+                          {updateProgress.phase === 'downloading' &&
+                            (updateProgress.latestVersion
+                              ? t('settings.upd.downloadingV', { v: updateProgress.latestVersion })
+                              : t('panels.updDownloading'))}
+                          {updateProgress.phase === 'verifying' && t('settings.upd.verifying')}
+                          {updateProgress.phase === 'completed' && t('settings.upd.completed')}
+                          {updateProgress.phase === 'failed' && t('panels.updFailed')}
+                          {updateProgress.phase === 'cancelled' && t('panels.updCancelled')}
                         </div>
                         <div style={{ marginTop: 8, height: 6, borderRadius: 999, background: 'var(--bg-panel)', overflow: 'hidden' }}>
                           <div
@@ -748,7 +814,7 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                           />
                         </div>
                         <div style={{ marginTop: 6, display: 'flex', gap: 8, fontSize: 11, color: 'var(--text-muted)', flexWrap: 'wrap' }}>
-                          <span>{updateProgress.percent >= 0 ? `${updateProgress.percent.toFixed(1)}%` : '进度未知'}</span>
+                          <span>{updateProgress.percent >= 0 ? `${updateProgress.percent.toFixed(1)}%` : t('settings.upd.progressUnknown')}</span>
                           <span>
                             {formatBytes(updateProgress.receivedBytes)}
                             {updateProgress.totalBytes > 0 ? ` / ${formatBytes(updateProgress.totalBytes)}` : ''}
@@ -756,7 +822,7 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                           {updateProgress.bytesPerSecond > 0 ? <span>{formatBytes(updateProgress.bytesPerSecond)}/s</span> : null}
                           {updateProgress.fileName ? <span style={{ color: 'var(--text-faint)' }}>{updateProgress.fileName}</span> : null}
                         </div>
-                        {updateProgress.message ? (
+                        {updateStatusLine(updateProgress) ? (
                           <div
                             style={{
                               marginTop: 6,
@@ -767,7 +833,7 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                               color: updateProgress.phase === 'failed' ? 'var(--danger-text)' : 'var(--text-secondary)',
                             }}
                           >
-                            {updateProgress.message}
+                            {updateStatusLine(updateProgress)}
                           </div>
                         ) : null}
                         {updateProgress.phase === 'downloading' || updateProgress.phase === 'pending' ? (
@@ -775,7 +841,7 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                             onClick={() => void window.shanhai?.cancelUpdateDownload().catch(() => undefined)}
                             style={{ ...smallIconBtn, marginTop: 8, padding: '4px 12px', fontSize: 12, border: '1px solid var(--border-soft)', borderRadius: 6 }}
                           >
-                            取消下载
+                            {t('panels.updCancelDownload')}
                           </button>
                         ) : null}
                       </div>
@@ -789,13 +855,13 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                       <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 10 }}>
                         <img
                           src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(mobileApk.downloadUrl)}`}
-                          alt="手机端下载二维码"
+                          alt={t('settings.apk.qrAlt')}
                           width={160}
                           height={160}
                           style={{ borderRadius: 8, border: '1px solid var(--border-soft)' }}
                         />
                         <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-                          使用手机扫描二维码下载安装山海手机端{mobileApk.version ? `（v${mobileApk.version}）` : ''}
+                          {mobileApk.version ? t('settings.apk.scanHintV', { v: mobileApk.version }) : t('settings.apk.scanHint')}
                         </div>
                         <a
                           href={mobileApk.downloadUrl}
@@ -804,7 +870,7 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                           rel="noopener noreferrer"
                           style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 12px', borderRadius: 6, border: '1px solid var(--border-soft)', background: 'var(--accent)', color: '#fff', fontSize: 12, textDecoration: 'none', cursor: 'pointer' }}
                         >
-                          下载 Android 安装包
+                          {t('settings.apk.download')}
                         </a>
                       </div>
                     ) : null}

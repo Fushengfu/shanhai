@@ -2,6 +2,8 @@ import * as React from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { AppUpdateDownloadProgress } from '../types'
 import { formatBytes } from './ui'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /**
  * 更新安装包下载进度浮层（应用内可见反馈）。
@@ -15,14 +17,41 @@ import { formatBytes } from './ui'
  * completed / cancelled 会在若干秒后自动收起；failed 保留到用户手动关闭（便于看清原因）。
  */
 
-/** 各阶段的标题文案 */
-const PHASE_TITLE: Record<AppUpdateDownloadProgress['phase'], string> = {
-  pending: '准备下载更新',
-  downloading: '正在下载更新',
-  verifying: '正在校验安装包',
-  completed: '更新包已就绪',
-  failed: '更新下载失败',
-  cancelled: '更新下载已取消',
+/** 各阶段的标题词条 key（期4C：存 key 不存中文，六态判定本身一字未动） */
+const PHASE_TITLE_KEY: Record<AppUpdateDownloadProgress['phase'], string> = {
+  pending: 'panels.updPending',
+  downloading: 'panels.updDownloading',
+  verifying: 'panels.updVerifying',
+  completed: 'panels.updCompleted',
+  failed: 'panels.updFailed',
+  cancelled: 'panels.updCancelled',
+}
+
+/**
+ * 各阶段的「状态行」词条 key（期5C A 方案）。
+ *
+ * 改前这些句子由主进程 app-updater 以 `message` 字段下发（写死中文），于是英文界面会出现
+ * 「英文标题 + 中文状态行」。现在主进程只发 phase 枚举，句子在渲染层按当前语言取。
+ * 中文态四条词条的值与改前主进程下发的句子【逐字相同】（断言 SS1 逐字节比对锁住）。
+ *
+ * failed / cancelled 不在此表：它们的状态行是主进程给的【错误详情】（一次性事件，
+ * 走 progress.message），不是阶段文案。
+ */
+export const PHASE_STATUS_KEY: Partial<Record<AppUpdateDownloadProgress['phase'], string>> = {
+  pending: 'panels.updStatusPending',
+  downloading: 'panels.updStatusDownloading',
+  verifying: 'panels.updStatusVerifying',
+  completed: 'panels.updStatusCompleted',
+}
+
+/**
+ * 状态行文案：主进程给了详情就用详情，否则按 phase 取词。
+ * 导出给设置面板「关于山海」就地进度卡片复用 —— 两处必须同源，不许各写一份。
+ */
+export function updateStatusLine(progress: AppUpdateDownloadProgress): string {
+  if (progress.message) return progress.message
+  const k = PHASE_STATUS_KEY[progress.phase]
+  return k ? t(k) : ''
 }
 
 /** 终态自动收起延时（ms）：completed 留久一点让用户看见，cancelled 快速收起 */
@@ -41,6 +70,9 @@ function formatSpeed(bytesPerSecond: number): string {
 }
 
 export function UpdateProgressOverlay(): React.JSX.Element | null {
+  // 【期4C 谁取词谁订阅】六态标题与终态说明都是渲染期取词 → 必须自订阅，
+  // 否则切语言时浮层若正显示，会停在旧语言（PHASE_TITLE 改成存 key 只解决了加载期固化）。
+  useLocaleSync()
   const [progress, setProgress] = useState<AppUpdateDownloadProgress | null>(null)
   const [dismissed, setDismissed] = useState(false)
   const dismissTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -122,12 +154,12 @@ export function UpdateProgressOverlay(): React.JSX.Element | null {
       {/* 标题 + 关闭 */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
         <div style={{ fontWeight: 600, fontSize: 13 }}>
-          {PHASE_TITLE[progress.phase]}
-          {progress.latestVersion ? ` v${progress.latestVersion}` : ''}
+          {t(PHASE_TITLE_KEY[progress.phase])}
+          {progress.latestVersion ? t('panels.updVersionSuffix', { v: progress.latestVersion }) : ''}
         </div>
         <button
           onClick={close}
-          title="关闭"
+          title={t('common.winClose')}
           style={{
             border: 'none',
             background: 'transparent',
@@ -190,8 +222,9 @@ export function UpdateProgressOverlay(): React.JSX.Element | null {
         </div>
       ) : null}
 
-      {/* 状态/错误文案 */}
-      {progress.message ? (
+      {/* 状态行（期5C A 方案：pending/downloading/verifying/completed 按 phase 取词；
+          failed / cancelled 用主进程给的错误详情） */}
+      {updateStatusLine(progress) ? (
         <div
           style={{
             marginTop: 6,
@@ -203,13 +236,13 @@ export function UpdateProgressOverlay(): React.JSX.Element | null {
             overflowY: failed ? 'auto' : undefined,
           }}
         >
-          {progress.message}
+          {updateStatusLine(progress)}
         </div>
       ) : null}
 
       {/* 终态补充说明 */}
-      {done ? <div style={{ marginTop: 6, color: 'var(--text-secondary)' }}>请在弹出的对话框中选择「立即安装」，或稍后手动打开安装包。</div> : null}
-      {cancelled ? <div style={{ marginTop: 6, color: 'var(--text-secondary)' }}>已取消下载，残留文件已清理。</div> : null}
+      {done ? <div style={{ marginTop: 6, color: 'var(--text-secondary)' }}>{t('panels.updDoneHint')}</div> : null}
+      {cancelled ? <div style={{ marginTop: 6, color: 'var(--text-secondary)' }}>{t('panels.updCancelledHint')}</div> : null}
 
       {/* 操作：下载中可取消；失败/完成可关闭 */}
       <div style={{ marginTop: 10, display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
@@ -226,7 +259,7 @@ export function UpdateProgressOverlay(): React.JSX.Element | null {
               cursor: 'pointer',
             }}
           >
-            取消下载
+            {t('panels.updCancelDownload')}
           </button>
         ) : null}
         <button
@@ -241,7 +274,7 @@ export function UpdateProgressOverlay(): React.JSX.Element | null {
             cursor: 'pointer',
           }}
         >
-          {failed ? '知道了' : '关闭'}
+          {failed ? t('panels.updGotIt') : t('common.winClose')}
         </button>
       </div>
 

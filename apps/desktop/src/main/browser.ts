@@ -1,5 +1,10 @@
 import { app, BrowserWindow } from 'electron'
 import { registerExternalWindow, unregisterExternalWindow } from './window-manager'
+// 期6 扫尾：本文件 8 条 throw 的文本会经 renderToolResult 的 error 分支直接渲成
+// 工具步骤卡片的红色错误块（ToolStep.tsx:436-441），属「界面可见错误提示」→ 必须取词。
+// 取词时机 = 抛出那一刻（与期5A 通知 / 期5B 私信错误同类：一次性事件）。
+import { getMainLocale } from './locale-store'
+import { tIn } from '../shared/i18n'
 import type {
   BrowserConsoleLog,
   BrowserCookie,
@@ -60,7 +65,7 @@ function loadURLWithTimeout(win: BrowserWindow, url: string): Promise<void> {
       () =>
         reject(
           new Error(
-            `页面加载超时（${LOAD_TIMEOUT_MS / 1000}s）: ${url}。可能网络不通、服务未启动或页面持续加载，可改用 browser_get_console_logs / browser_get_network_requests 排查。`,
+            tIn(getMainLocale(), 'tools.browser.loadTimeout', { sec: LOAD_TIMEOUT_MS / 1000, url }),
           ),
         ),
       LOAD_TIMEOUT_MS,
@@ -87,7 +92,7 @@ async function sendCommandWithTimeout(
 ): Promise<unknown> {
   let timer: ReturnType<typeof setTimeout> | undefined
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`CDP ${method} 超时（${Math.round(timeoutMs / 1000)}s），调试器未响应`)), timeoutMs)
+    timer = setTimeout(() => reject(new Error(tIn(getMainLocale(), 'tools.browser.cdpTimeout', { method, sec: Math.round(timeoutMs / 1000) }))), timeoutMs)
   })
   return Promise.race([dbg.sendCommand(method, params), timeout]).finally(() => {
     if (timer) clearTimeout(timer)
@@ -122,7 +127,7 @@ async function getElementCenter(win: BrowserWindow, selector: string): Promise<{
     return { x: r.left + r.width / 2, y: r.top + r.height / 2 }
   })()`
   const rect = (await win.webContents.executeJavaScript(js)) as { x: number; y: number } | null
-  if (!rect) throw new Error(`未找到元素: ${selector}`)
+  if (!rect) throw new Error(tIn(getMainLocale(), 'tools.browser.elementNotFound', { selector }))
   return rect
 }
 
@@ -236,7 +241,7 @@ export function createElectronBrowserService(opts?: { show?: boolean }): Browser
       // url 必填：不传网址就不建窗口，避免「创建一个空白窗口（about:blank）弹给用户看」。
       // 工具层（browser_create）已强制必填，这里是后端兜底，防内部误调用直接 create 不传 url。
       if (!url) {
-        throw new Error('browser_create 需要 url 参数：创建浏览器窗口必须指定要打开的网址，避免打开空白窗口')
+        throw new Error(tIn(getMainLocale(), 'tools.browser.createNeedsUrl'))
       }
       let id = appId
       if (!id) {
@@ -308,7 +313,7 @@ export function createElectronBrowserService(opts?: { show?: boolean }): Browser
         return true
       })()`
       const focused = (await st.win.webContents.executeJavaScript(focusJs)) as boolean
-      if (!focused) throw new Error(`未找到输入元素: ${selector}`)
+      if (!focused) throw new Error(tIn(getMainLocale(), 'tools.browser.inputNotFound', { selector }))
       await sendCommandWithTimeout(st.win.webContents.debugger, 'Input.insertText', { text })
     },
 
@@ -333,7 +338,7 @@ export function createElectronBrowserService(opts?: { show?: boolean }): Browser
       const js = `window.__dsChat(${JSON.stringify(prompt)}, ${JSON.stringify(opts)})`
       let timer: ReturnType<typeof setTimeout> | undefined
       const timeout = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`页面桥接超时（${Math.round(BRIDGE_CHAT_TIMEOUT_MS / 1000)}s），DeepSeek 页面未返回结果`)), BRIDGE_CHAT_TIMEOUT_MS)
+        timer = setTimeout(() => reject(new Error(tIn(getMainLocale(), 'tools.browser.bridgeTimeout', { sec: Math.round(BRIDGE_CHAT_TIMEOUT_MS / 1000) }))), BRIDGE_CHAT_TIMEOUT_MS)
       })
       try {
         return await Promise.race([st.win.webContents.executeJavaScript(js) as Promise<string>, timeout])
@@ -365,7 +370,7 @@ export function createElectronBrowserService(opts?: { show?: boolean }): Browser
         if (found) return
         await new Promise((r) => setTimeout(r, 200))
       }
-      throw new Error(`等待元素超时: ${selector}`)
+      throw new Error(tIn(getMainLocale(), 'tools.browser.waitForTimeout', { selector }))
     },
 
     async scroll(direction, appId, amount = 300, selector) {
@@ -376,7 +381,12 @@ export function createElectronBrowserService(opts?: { show?: boolean }): Browser
         ? `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false; el.scrollBy(${dx}, ${dy}); return true })()`
         : `(() => { window.scrollBy(${dx}, ${dy}); return true })()`
       const ok = (await st.win.webContents.executeJavaScript(js)) as boolean
-      if (!ok) throw new Error(`未找到滚动容器: ${selector}`)
+      if (!ok) throw new Error(tIn(getMainLocale(), 'tools.browser.scrollContainerNotFound', {
+        // 这里的 selector 类型是 string|undefined（scroll 的可选参数），但走不到 undefined 分支：
+        // selector 缺省时上面的 js 用 window.scrollBy 且必返 true。String(selector) 与改前模板串
+        // `${selector}` 逐字等价（undefined → 'undefined'），保持中文态输出零变化。
+        selector: String(selector),
+      }))
     },
 
     async getConsoleLogs(appId, limit = 50, onlyErrors = false) {

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  应用显示名（默认资源 = 中文）。i18n 期7A。
+
+  【为什么放这里而不是走 Flutter 词条】手机桌面图标名 / 系统设置里的应用名由
+  Android PackageManager 渲染，发生在 Flutter 引擎启动之前，读不到 Dart 侧的
+  AppLocalizations —— 只能走 Android 资源。
+
+  【代价，必须知情】Android 资源按【系统语言】解析（values/ 与 values-en/），
+  不跟随 App 内的语言开关：用户在 App 里切英文，桌面图标名仍是系统语言的那一个，
+  要连图标名一起变只能改系统语言或引入 activity-alias 那类额外机制（本轮不做）。
+  Flutter 侧的 MaterialApp.title 与登录页大标题仍走 ARB（那是 App 内可见的「自称名」）。
+-->
+<resources>
+    <string name="app_name">山海</string>
+</resources>

@@ -4,8 +4,15 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
+import '../l10n/generated/app_localizations.dart';
+import '../locale.dart';
 
 /// 单次版本检查返回的最新版本信息。
+
+/// context-free 取词入口（与 7B 的 tool_step.dart 同一形态）：本文件是纯服务层，拿不到 BuildContext。
+/// 只读 LocaleController 的当前偏好，与 MaterialApp 的 locale 共用 resolvedLocale → 不可能不一致。
+/// 取词时机 = 字符串产生那一刻（一次性事件），与桌面端期5A 通知 / 期5B 私信错误同类。
+AppLocalizations get _l => lookupAppLocalizations(resolvedLocale(LocaleController.instance.value));
 class UpdateInfo {
   final String version;
   final int? versionCode;
@@ -84,7 +91,7 @@ class UpdateService {
       if (res.statusCode < 200 || res.statusCode >= 300) {
         return UpdateCheckResult(
           hasUpdate: false,
-          error: '版本检查失败：HTTP ${res.statusCode}',
+          error: _l.updSvcCheckFailed('HTTP ${res.statusCode}'),
         );
       }
 
@@ -92,9 +99,9 @@ class UpdateService {
       try {
         body = jsonDecode(res.body) as Map<String, dynamic>;
       } catch (_) {
-        return const UpdateCheckResult(
+        return UpdateCheckResult(
           hasUpdate: false,
-          error: '版本检查响应解析失败',
+          error: _l.updSvcBadJson,
         );
       }
 
@@ -102,7 +109,8 @@ class UpdateService {
       if (code != null && code is int && code != 0) {
         return UpdateCheckResult(
           hasUpdate: false,
-          error: '版本检查失败：${body['message'] ?? code}',
+          // body['message'] 是网关原文（口径④），整体作为 {msg} 带入我们的整句结构
+          error: _l.updSvcCheckFailed('${body['message'] ?? code}'),
         );
       }
 
@@ -111,9 +119,9 @@ class UpdateService {
       final downloadUrl =
           _str(data['download_url'] ?? data['downloadUrl']);
       if (downloadUrl.isEmpty) {
-        return const UpdateCheckResult(
+        return UpdateCheckResult(
           hasUpdate: false,
-          error: '网关未下发可下载的安装包',
+          error: _l.updSvcNoPackage,
         );
       }
 
@@ -167,7 +175,7 @@ class UpdateService {
       final streamed =
           await client.send(request).timeout(const Duration(seconds: 30));
       if (streamed.statusCode < 200 || streamed.statusCode >= 300) {
-        throw HttpException('下载失败：HTTP ${streamed.statusCode}');
+        throw HttpException(_l.updSvcDownloadFailed('HTTP ${streamed.statusCode}'));
       }
       final total = streamed.contentLength ?? -1;
       final file = File(targetPath);
@@ -212,9 +220,9 @@ class UpdateService {
           .invokeMethod('installApk', {'path': apk.path});
     } on PlatformException catch (e) {
       if (e.code == 'UNKNOWN_SOURCE') {
-        throw Exception('需要允许安装未知应用后才能升级，请到系统设置开启「允许安装此来源的应用」后重试');
+        throw Exception(_l.updSvcUnknownSource);
       }
-      throw Exception('调用系统安装器失败：${e.message ?? e.code}');
+      throw Exception(_l.updSvcInstallerFailed(e.message ?? e.code));
     }
   }
 

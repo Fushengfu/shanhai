@@ -1,6 +1,7 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
 import { SUPERVISOR_ID } from '@shanhai/runtime'
 import { safeSend } from './safe-send'
+import { syncLocaleFromSettings } from './locale-store'
 import { getRuntime } from './runtime'
 import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow, toggleMaximizeWindow, resizeDockWindow, hideSupervisorToBubble, showSupervisorFromBubble, moveSupervisorBubble, hideToSystemDesktop, getWindowType, getWindowAppId, getDockTopOffset } from './window-manager'
 import { getPluginApp, listPluginApps, resolvePluginIconDataUrl } from './plugin-apps'
@@ -8,6 +9,10 @@ import { listDockPluginApps, beginPluginDrag, cancelPluginDrag, completePluginDr
 import { getUiState, getUiStateRev, patchUiState, getWallpaper, setWallpaper, filterUiStateForWindow, filterUiStateForPlugin, type UiStoreState } from './ui-store'
 import { listSystemWallpapers, applySystemWallpaper } from './system-wallpaper'
 import { startRemoteServer, stopRemoteServer, getRemoteStatus, refreshPairingCode } from './remote-server'
+// 期6 扫尾：dialog.showOpenDialog 的 title 是 macOS 原生面板标题（用户可见），
+// 与期5A 的 Dock/托盘/右键菜单同类 → 走 getMainLocale()+tIn，不走渲染层。
+import { getMainLocale } from './locale-store'
+import { tIn } from '../shared/i18n'
 import { startRemoteRelay, stopRemoteRelay, getRelayStatus } from './remote-relay'
 import { startCredentialRenewal, stopCredentialRenewal, getCredentialSnapshot, describeCredentialState } from './member-credentials'
 import {
@@ -95,6 +100,9 @@ export function registerIpc(): void {
   ipcMain.handle('session:retry-snapshot', async (_e, sessionId: string) => runtime.hasRetrySnapshot(sessionId))
   ipcMain.handle('file:saveUpload', async (_e, fileName: string, dataBase64: string) => runtime.saveUploadedFile(fileName, dataBase64))
   ipcMain.handle('image:upload', async (_e, imageBase64: string, mimeType?: string) => runtime.uploadImage(imageBase64, mimeType))
+  // 通用文件上传（私信文档类附件用）：转发到 runtime 既有的 uploadFile（会员 JWT 换凭证 → 七牛直传）。
+  // 会员 JWT 只在主进程，渲染层拿不到凭证 —— 这是本期唯一批准新增的主进程能力。
+  ipcMain.handle('file:upload', async (_e, dataBase64: string, mimeType?: string, fileName?: string) => runtime.uploadFile(dataBase64, mimeType, fileName))
   ipcMain.handle('browser:list', async (_e, sessionId?: string) => runtime.listBrowserWindows(sessionId))
   ipcMain.handle('browser:show', async (_e, appId: string) => runtime.showBrowserWindow(appId))
   ipcMain.handle('browser:close', async (_e, appId: string) => runtime.closeBrowserWindow(appId))
@@ -147,7 +155,14 @@ export function registerIpc(): void {
 
   // —— 通用设置 ——
   ipcMain.handle('settings:get', async () => runtime.getSettings())
-  ipcMain.handle('settings:set', async (_e, patch: Partial<import('@shanhai/runtime').AppSettings>) => runtime.setSettings(patch))
+  ipcMain.handle('settings:set', async (_e, patch: Partial<import('@shanhai/runtime').AppSettings>) => {
+    const next = await runtime.setSettings(patch)
+    // 【i18n 期1】语言变了要广播给所有窗口（照 theme:set → ui:theme 的形态）。
+    // 刻意不新开 locale:set 通道：写设置已有现成通道，再开一条就是同一份数据两条路（第二套真相源），
+    // 而且会让 ipcMain.handle 计数从 125 涨上去（历轮台账锁的就是 125）。
+    if (patch && typeof patch.locale === 'string') syncLocaleFromSettings(next.locale)
+    return next
+  })
 
   // —— HTTP 原始请求/响应记录（排查问题用，含接口地址与完整 body）——
   ipcMain.handle('trace:http-list', async (_e, id?: string) => runtime.getHttpTrace(id))
@@ -238,7 +253,7 @@ export function registerIpc(): void {
   // —— 系统目录选择器 ——
   ipcMain.handle('dialog:selectDirectory', async (e, defaultPath?: string) => {
     const options: Electron.OpenDialogOptions = {
-      title: '选择工作目录',
+      title: tIn(getMainLocale(), 'native.dialog.selectWorkDir'),
       defaultPath: defaultPath || app.getPath('home'),
       properties: ['openDirectory', 'createDirectory'],
     }
@@ -417,7 +432,7 @@ export function registerIpc(): void {
         return
       case 'selectDirectory': {
         const options: Electron.OpenDialogOptions = {
-          title: '选择目录',
+          title: tIn(getMainLocale(), 'native.dialog.selectDir'),
           defaultPath: (typeof args[0] === 'string' ? args[0] : '') || app.getPath('home'),
           properties: ['openDirectory', 'createDirectory'],
         }

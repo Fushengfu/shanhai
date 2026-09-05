@@ -7,6 +7,8 @@ import '@xterm/xterm/css/xterm.css'
 import type { UserTerminalInfo } from '../types'
 import { IconClose, IconPlus, IconTerminal } from './icons'
 import { WindowTitleBar } from './WindowTitleBar'
+import { t as tKey } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /** 从完整 terminalId 提取短名（去掉会话前缀），供标签页显示 */
 function shortName(terminalId: string, sessionId: string): string {
@@ -234,6 +236,8 @@ function TerminalView({ sessionId, terminalId, active }: { sessionId: string; te
 /** 会话级交互式终端面板：底部可折叠、多标签多开，用户手动执行命令。
  * 通过 props 注入会话与开关状态（panel 模式由 TerminalPlugin 传 useUIContext，window 模式由 AppWindow 传 store）。 */
 export function TerminalPanel({ sessionId, open, onToggle, onClose, variant = 'panel' }: { sessionId: string; open: boolean; onToggle?: () => void; onClose?: () => void; variant?: 'panel' | 'window' }) {
+  // 【期4C 谁取词谁订阅】标题栏与四个 tooltip 都在渲染期取词 → 必须自订阅
+  useLocaleSync()
   const [terminals, setTerminals] = useState<UserTerminalInfo[]>([])
   const [activeId, setActiveId] = useState('')
   // 面板高度：支持顶部把手上下拖动调整（最小 120，最大 600）
@@ -276,9 +280,9 @@ export function TerminalPanel({ sessionId, open, onToggle, onClose, variant = 'p
 
   const createTerminal = useCallback(async () => {
     if (!sessionId) return
-    const id = await window.shanhai?.userTerminalCreate(sessionId, '终端')
+    const id = await window.shanhai?.userTerminalCreate(sessionId, tKey('panels.terminalName'))
     if (!id) return
-    setTerminals((prev) => [...prev, { terminalId: id, name: '终端' }])
+    setTerminals((prev) => [...prev, { terminalId: id, name: tKey('panels.terminalName') }])
     setActiveId(id)
   }, [sessionId])
 
@@ -328,11 +332,11 @@ export function TerminalPanel({ sessionId, open, onToggle, onClose, variant = 'p
     >
       {/* 顶部：window 模式显示统一标题栏（可拖动 + 关闭窗口）；panel 模式显示拖动把手（上下调整高度） */}
       {variant === 'window' ? (
-        <WindowTitleBar icon={<IconTerminal />} title="终端" onClose={() => onClose?.()} />
+        <WindowTitleBar icon={<IconTerminal />} title={tKey('panels.terminalName')} onClose={() => onClose?.()} />
       ) : (
         <div
           onMouseDown={beginResize}
-          title="拖动调整终端高度"
+          title={tKey('panels.terminalResizeTip')}
           style={{
             height: 10,
             cursor: 'ns-resize',
@@ -395,7 +399,7 @@ export function TerminalPanel({ sessionId, open, onToggle, onClose, variant = 'p
                   e.stopPropagation()
                   void closeTerminal(t.terminalId)
                 }}
-                title="关闭终端"
+                title={tKey('panels.terminalCloseTip')}
                 style={{ border: 'none', background: 'transparent', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 14, padding: 0, lineHeight: 1, flexShrink: 0 }}
               >
                 ×
@@ -405,7 +409,7 @@ export function TerminalPanel({ sessionId, open, onToggle, onClose, variant = 'p
         })}
         <button
           onClick={() => void createTerminal()}
-          title="新建终端"
+          title={tKey('panels.terminalNewTip')}
           style={{ display: 'inline-flex', alignItems: 'center', padding: '3px 8px', borderRadius: 6, border: '1px solid transparent', background: 'transparent', color: 'var(--text-secondary)', cursor: 'pointer' }}
         >
           <IconPlus />
@@ -414,7 +418,7 @@ export function TerminalPanel({ sessionId, open, onToggle, onClose, variant = 'p
         {variant === 'panel' && (
           <button
             onClick={() => onToggle?.()}
-            title="收起终端"
+            title={tKey('panels.terminalCollapseTip')}
             style={{ display: 'inline-flex', alignItems: 'center', padding: '3px 8px', borderRadius: 6, border: '1px solid transparent', background: 'transparent', color: 'var(--text-secondary)', cursor: 'pointer' }}
           >
             <IconClose />
@@ -434,7 +438,7 @@ export function TerminalPanel({ sessionId, open, onToggle, onClose, variant = 'p
         ))}
         {terminals.length === 0 && (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: 12 }}>
-            点击「+」新建终端
+            {tKey('panels.terminalEmpty')}
           </div>
         )}
       </div>

@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
+import '../locale.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import '../models/protocol.dart';
 import '../theme.dart';
 import 'tool_step.dart';
+import '../l10n/generated/app_localizations.dart';
 
 /// 消息气泡渲染（对齐桌面端 UserMessage / AssistantMessage / ReasoningBlock）。
 /// - 用户气泡：右对齐、主题紫底白字、右下小角。
@@ -12,6 +14,13 @@ import 'tool_step.dart';
 
 /// 用户消息气泡（右对齐、紫底白字、右下小角）。
 /// 长按弹出操作菜单：复制 / 重新生成（重试）/ 编辑并重发（对齐桌面端 UserMessage 的操作）。
+
+/// context-free 取词入口：沿用 7B 在 tool_step.dart 建立的同一形态（同一 resolvedLocale、同一份 ARB）。
+/// 【为什么不在这里用 AppLocalizations.of(context)】of() 在 nullable-getter:false 下要求祖先必须装好
+/// AppLocalizations.delegates；仓库既有测试 chat_view_scroll_test 就是把本组件挂在只带默认 delegate 的
+/// MaterialApp 下跑的，of() 会直接抛 Null check operator。_l 不依赖祖先节点，且 7B 的 LS3 已实测
+/// 「locale 变化会重建整棵页面子树 → context-free 取词同样跟切」，所以这里不是绕路，是同一套机制。
+AppLocalizations get _l => lookupAppLocalizations(resolvedLocale(LocaleController.instance.value));
 class UserBubble extends StatelessWidget {
   final String content;
   /// 重新生成（resend 原内容，不带 newContent）
@@ -33,19 +42,19 @@ class UserBubble extends StatelessWidget {
           children: [
             ListTile(
               leading: Icon(Icons.copy_outlined, size: 20, color: c.textPrimary),
-              title: Text('复制', style: TextStyle(color: c.textPrimary)),
+              title: Text(_l.bubbleCopy, style: TextStyle(color: c.textPrimary)),
               onTap: () => Navigator.pop(ctx, 'copy'),
             ),
             if (onResend != null)
               ListTile(
                 leading: Icon(Icons.refresh, size: 20, color: c.textPrimary),
-                title: Text('重新生成', style: TextStyle(color: c.textPrimary)),
+                title: Text(_l.bubbleRegenerate, style: TextStyle(color: c.textPrimary)),
                 onTap: () => Navigator.pop(ctx, 'resend'),
               ),
             if (onEdit != null)
               ListTile(
                 leading: Icon(Icons.edit_outlined, size: 20, color: c.textPrimary),
-                title: Text('编辑并重发', style: TextStyle(color: c.textPrimary)),
+                title: Text(_l.bubbleEditResend, style: TextStyle(color: c.textPrimary)),
                 onTap: () => Navigator.pop(ctx, 'edit'),
               ),
           ],
@@ -57,7 +66,7 @@ class UserBubble extends StatelessWidget {
     if (action == 'copy') {
       await Clipboard.setData(ClipboardData(text: content));
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已复制')));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(_l.bubbleCopied)));
       }
     } else if (action == 'resend') {
       onResend?.call();
@@ -71,17 +80,17 @@ class UserBubble extends StatelessWidget {
     final newContent = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('编辑并重发'),
+        title: Text(_l.bubbleEditResend),
         content: TextField(
           controller: ctrl,
           autofocus: true,
           minLines: 2,
           maxLines: 6,
-          decoration: const InputDecoration(hintText: '修改后重新发送'),
+          decoration: InputDecoration(hintText: _l.bubbleEditHint),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-          TextButton(onPressed: () => Navigator.pop(ctx, ctrl.text.trim()), child: const Text('发送')),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: Text(_l.commonCancel)),
+          TextButton(onPressed: () => Navigator.pop(ctx, ctrl.text.trim()), child: Text(_l.commonSend)),
         ],
       ),
     );
@@ -145,7 +154,10 @@ class _ReasoningSectionState extends State<ReasoningSection> {
                   child: Icon(Icons.expand_more, size: 15, color: c.textMuted),
                 ),
                 const SizedBox(width: 2),
-                Text(widget.streaming ? '正在思考…' : '思考过程', style: TextStyle(fontSize: 12, color: c.textMuted)),
+                // ★ 三元两支都要在：流式中显示「正在思考…」、结束后显示「思考过程」。
+                // （上一版本期替换时把三元写丢了，只剩流式那一支 —— 由死键断言抓出）
+                Text(widget.streaming ? _l.bubbleThinkingNow : _l.bubbleReasoning,
+                    style: TextStyle(fontSize: 12, color: c.textMuted)),
               ],
             ),
           ),
@@ -206,7 +218,7 @@ class AssistantBubble extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             // 顶部：耗时 + 步数统计（对齐桌面端 StepStats，无工具步骤且无耗时时不渲染）
-            if (turnDuration != null || hasTools) _buildStats(c),
+            if (turnDuration != null || hasTools) _buildStats(context, c),
             // 工具执行步骤（紧凑单行）
             if (hasTools) ...[
               const SizedBox(height: 2),
@@ -230,7 +242,8 @@ class AssistantBubble extends StatelessWidget {
                 children: [
                   const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
                   const SizedBox(width: 8),
-                  Text('思考中…', style: TextStyle(fontSize: 13, color: Colors.grey.shade500)),
+                  Text(_l.bubbleThinkingShort,
+                      style: TextStyle(fontSize: 13, color: Colors.grey.shade500)),
                 ],
               ),
           ],
@@ -239,27 +252,30 @@ class AssistantBubble extends StatelessWidget {
     );
   }
 
-  Widget _buildStats(AppColors c) {
+  Widget _buildStats(BuildContext context, AppColors c) {
+    // 统计行整段在渲染期取词：耗时/步数/成功/失败/执行中 全部走词条，分隔符也走词条
+    final l = _l;
     final stats = toolStepStats(toolSteps);
     final spans = <TextSpan>[];
-    void sep() => spans.add(const TextSpan(text: ' · '));
+    void sep() => spans.add(TextSpan(text: l.sepMiddle));
     if (turnDuration != null) {
-      spans.add(TextSpan(text: '耗时 ${formatDurationMs(turnDuration!)}'));
+      // 原实现是前缀拼接「耗时 X」，英文 Elapsed 在数字前 → 整句词条带 {time}
+      spans.add(TextSpan(text: l.bubbleElapsed(formatDurationMs(turnDuration!))));
     }
     if (stats.total > 0) {
       if (spans.isNotEmpty) sep();
-      spans.add(TextSpan(text: '${stats.total} 步'));
+      spans.add(TextSpan(text: l.commonSteps(stats.total)));
       if (stats.success > 0) {
         sep();
-        spans.add(TextSpan(text: '${stats.success} 成功', style: TextStyle(color: c.success)));
+        spans.add(TextSpan(text: l.commonSuccess(stats.success), style: TextStyle(color: c.success)));
       }
       if (stats.failed > 0) {
         sep();
-        spans.add(TextSpan(text: '${stats.failed} 失败', style: TextStyle(color: c.error)));
+        spans.add(TextSpan(text: l.commonFailed(stats.failed), style: TextStyle(color: c.error)));
       }
       if (stats.running > 0) {
         sep();
-        spans.add(TextSpan(text: '${stats.running} 执行中', style: TextStyle(color: c.running)));
+        spans.add(TextSpan(text: l.commonRunning(stats.running), style: TextStyle(color: c.running)));
       }
     }
     return Padding(

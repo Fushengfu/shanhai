@@ -5,11 +5,17 @@ import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'member_credentials.dart';
+import '../l10n/generated/app_localizations.dart';
+import '../locale.dart';
 
 /// 连接状态
 enum ConnState { disconnected, connecting, connected, paired }
 
 /// 服务端推送的事件
+
+/// context-free 取词入口（与 7B 的 tool_step.dart、7C 的 update_service 同一形态）：服务层拿不到 BuildContext。
+/// 与 MaterialApp 的 locale 共用 resolvedLocale，语言只跟手机自己（不读桌面端语言）。
+AppLocalizations get _l => lookupAppLocalizations(resolvedLocale(LocaleController.instance.value));
 class ServerEvent {
   final String event;
   final Map<String, dynamic> payload;
@@ -121,17 +127,19 @@ class WsClient {
       message: message,
     );
     if (outcome == RefreshOutcome.rotated) {
-      _emit('auth_renewed', {'message': '登录凭证已自动更新，正在用新凭证重连…'});
+      _emit('auth_renewed', {'message': _l.wsCredRenewed});
       // 旧连接的凭证已被网关判死，必须换连接；reconnectNow 会清 authFailed 并立即握手
       unawaited(reconnectNow());
       return;
     }
     if (outcome == RefreshOutcome.invalid) {
-      _failAuth(MemberCredentials.instance.snapshot.lastError ?? '登录已失效，请重新登录');
+      // lastError 有值就原样呈现（口径④）；为空才用我们的兜底。
+      // 兜底复用 7A 已有的 commonLoginExpiredFallback —— 中文逐字相同，不登记第二份。
+      _failAuth(MemberCredentials.instance.snapshot.lastError ?? _l.commonLoginExpiredFallback);
       return;
     }
     // transient：保留登录态，交给连接层退避重连
-    _emit('error', {'message': '网关提示登录凭证异常（$code），自动续签暂未成功，正在按退避重试…'});
+    _emit('error', {'message': _l.wsRenewPendingInBand(code)});
     _scheduleReconnect();
   }
 
@@ -222,7 +230,7 @@ class WsClient {
     // 不会拿页面里缓存的旧 token 反复被网关拒（这是「续签了但还是掉线」的典型成因）。
     final token = MemberCredentials.instance.accessToken ?? _relayToken;
     if (url == null || token == null || token.isEmpty) {
-      _failAuth('本地没有可用的登录凭证，请重新登录');
+      _failAuth(_l.wsNoCredential);
       throw StateError(_authReason ?? 'no credential');
     }
     _relayToken = token;
@@ -262,24 +270,22 @@ class WsClient {
         );
         if (outcome == RefreshOutcome.rotated) {
           if (allowAuthRetry) {
-            _emit('auth_renewed', {'message': '登录凭证已自动更新，正在用新凭证重连…'});
+            _emit('auth_renewed', {'message': _l.wsCredRenewed});
             return _doConnectRelay(allowAuthRetry: false);
           }
-          _failAuth(MemberCredentials.instance.snapshot.lastError ?? '登录凭证仍被网关拒绝，请重新登录');
+          _failAuth(MemberCredentials.instance.snapshot.lastError ?? _l.wsRejectedAfterRotation);
           rethrow;
         }
         if (outcome == RefreshOutcome.invalid) {
-          _failAuth(MemberCredentials.instance.snapshot.lastError ?? '登录已失效，请重新登录');
+          _failAuth(MemberCredentials.instance.snapshot.lastError ?? _l.commonLoginExpiredFallback);
           rethrow;
         }
-        _emit('error', {
-          'message': '登录凭证已过期，但自动续签暂未成功（网关未部署 / 网络异常），'
-              '已保留登录态并按退避继续重试',
-        });
+        // 原实现是相邻字符串拼接两行 → 合并成一条整句词条（英文语序不同，拼接会散架）
+        _emit('error', {'message': _l.wsExpiredTransient});
         _scheduleReconnect();
         rethrow;
       }
-      _emit('error', {'message': '连接网关失败：$e'});
+      _emit('error', {'message': _l.wsConnectFailed('$e')});
       _scheduleReconnect();
       rethrow;
     }
@@ -384,14 +390,15 @@ class WsClient {
           // Host 离线/未上线：通知 UI 展示「桌面端离线」，避免文案卡在「正在恢复登录 / 登录成功连接中」。
           // 之前这里只 setState connected，startup/login 页收不到任何事件，_status 永远停在初始文案，用户以为卡死。
           if (!_events.isClosed) {
-            _events.add(ServerEvent('host_offline', {'message': '桌面端离线，等待重新连接…'}));
+            _events.add(ServerEvent('host_offline', {'message': _l.wsHostOfflineWait}));
           }
         }
         break;
       case 'host_disconnected':
         // 网关中继：桌面端 Host 离线。连接仍保留在 pending 队列，Host 上线后网关会关闭连接触发重连，
         // 这里仅通知 UI 展示提示，不主动断开。
-        _events.add(ServerEvent('host_offline', {'message': map['message'] ?? '桌面端离线'}));
+        // 网关带回的原文优先原样呈现（口径④），没带回才用我们的兜底
+        _events.add(ServerEvent('host_offline', {'message': map['message'] ?? _l.wsHostOffline}));
         break;
       case 'host_connected':
         // 网关中继：Host 已上线，网关随后会关闭本连接触发自动重连进入正常配对流程。
@@ -508,7 +515,7 @@ class WsClient {
   /// 在「已登录但未连上任何桌面端」的场景下会让会话列表转圈一分钟。
   Future<CmdResult> sendCommand(String cmd, [Map<String, dynamic>? payload]) {
     if (!_canSend) {
-      return Future.value(CmdResult(false, null, '未连接桌面端：该设备可能不在线，请重试或切换设备'));
+      return Future.value(CmdResult(false, null, _l.wsNotConnected));
     }
     final id = ++_cmdSeq;
     final c = Completer<CmdResult>();
@@ -517,11 +524,11 @@ class WsClient {
       _channel!.sink.add(jsonEncode({'type': 'cmd', 'id': id, 'cmd': cmd, 'payload': payload ?? const {}}));
     } catch (e) {
       _pending.remove(id);
-      return Future.value(CmdResult(false, null, '发送失败：$e'));
+      return Future.value(CmdResult(false, null, _l.wsSendFailed('$e')));
     }
     return c.future.timeout(const Duration(seconds: 60), onTimeout: () {
       _pending.remove(id);
-      return CmdResult(false, null, '命令超时');
+      return CmdResult(false, null, _l.wsCmdTimeout);
     });
   }
 

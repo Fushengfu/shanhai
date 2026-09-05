@@ -10,6 +10,8 @@ import remarkGfm from 'remark-gfm'
 import { makeMarkdownComponents, normalizeTreeBlocks, stripWrappedRecordTag } from '../components/Markdown'
 import { ReasoningBlock } from '../components/ReasoningBlock'
 import { DiffBlock, StepStats, ToolStep, toolDisplayName, riskLevelLabel } from '../components/ToolStep'
+import { t, tf } from '../../shared/i18n'
+import { renderRich, useLocaleSync } from '../locale'
 import { UserMessage } from '../components/UserMessage'
 import { VirtualList } from '../components/VirtualList'
 import { IconChevronDown, IconCode, IconRefresh, IconWarn } from '../components/icons'
@@ -41,7 +43,7 @@ const AI_BUBBLE_STYLE: React.CSSProperties = {
 
 /** 审批弹窗参数展示：编辑/写入文件渲染 diff 前后对比，执行命令完整显示命令，其余回退友好键值对 */
 function renderApprovalDetail(toolName: string, args: Record<string, unknown>): React.ReactNode {
-  if (!args || Object.keys(args).length === 0) return <span style={{ color: 'var(--text-muted)' }}>（无参数）</span>
+  if (!args || Object.keys(args).length === 0) return <span style={{ color: 'var(--text-muted)' }}>{t('chat.approval.noArgs')}</span>
   if (toolName === 'edit_file') {
     const path = typeof args.path === 'string' ? args.path : ''
     const before = typeof args.oldText === 'string' ? args.oldText : ''
@@ -71,6 +73,7 @@ function renderApprovalDetail(toolName: string, args: Record<string, unknown>): 
 
 /** shell.chat 插件：消息流主体 + 浮动交互层（审批弹窗 / 提问卡片 / browser 半投递弹窗，可被 selfmod 替换） */
 function ChatSlot(): React.JSX.Element {
+  useLocaleSync()
   const ctx = useUIContext()
   const streaming = useStreaming(ctx.currentSessionId)
   const listRef = useRef<HTMLDivElement>(null)
@@ -210,7 +213,7 @@ function ChatSlot(): React.JSX.Element {
                     <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 6 }}>
                       {ctx.cur.turnStartTs != null && (
                         <>
-                          耗时 <LiveDuration startTs={ctx.cur.turnStartTs} />
+                          {t('chat.time.elapsed')} <LiveDuration startTs={ctx.cur.turnStartTs} />
                         </>
                       )}
                       <StepStats tools={history.pendingTools} />
@@ -237,7 +240,7 @@ function ChatSlot(): React.JSX.Element {
                   )}
                   {/* 思考中三点动画：气泡底部（块级换行），任务结束才消失 */}
                   <div style={{ display: 'block', color: 'var(--text-muted)', fontSize: 12, marginTop: 4 }}>
-                    思考中
+                    {t('chat.plugin.thinking')}
                     <ThinkingDots />
                   </div>
                 </div>
@@ -247,11 +250,11 @@ function ChatSlot(): React.JSX.Element {
               <div style={{ marginBottom: 8 }}>
                 <button
                   onClick={ctx.resumeMessage}
-                  title="上次任务未完成，点击继续执行"
+                  title={t('chat.plugin.resumeTitle')}
                   style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 14px', borderRadius: 14, border: '1px solid var(--accent)', background: 'var(--bg-panel)', color: 'var(--accent)', fontSize: 13, cursor: 'pointer' }}
                 >
                   <IconRefresh />
-                  继续执行
+                  {t('chat.plugin.resume')}
                 </button>
               </div>
             )}
@@ -302,11 +305,11 @@ function ChatSlot(): React.JSX.Element {
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: approvalCollapsed ? 0 : 6 }}>
             <div style={{ fontWeight: 600, color: 'var(--text)', display: 'flex', alignItems: 'center', gap: 6 }}>
               <IconWarn />
-              需要确认操作
+              {t('chat.approval.title')}
             </div>
             <button
               onClick={() => setApprovalCollapsed((c) => !c)}
-              title={approvalCollapsed ? '展开' : '折叠'}
+              title={approvalCollapsed ? t('common.expand') : t('common.collapse')}
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -327,16 +330,16 @@ function ChatSlot(): React.JSX.Element {
           </div>
           {!approvalCollapsed && (
             <>
-              <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>工具：{toolDisplayName(ctx.curApproval.toolName, ctx.curApproval.args)}（{riskLevelLabel(ctx.curApproval.riskLevel)}）</div>
+              <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>{t('chat.approval.toolLine', { tool: toolDisplayName(ctx.curApproval.toolName, ctx.curApproval.args), risk: riskLevelLabel(ctx.curApproval.riskLevel) })}</div>
               <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
                 {renderApprovalDetail(ctx.curApproval.toolName, ctx.curApproval.args)}
               </div>
               <div style={{ display: 'flex', gap: 8 }}>
                 <button onClick={() => void ctx.respondApproval('allowed-once')} style={btn('var(--accent)', '#fff')}>
-                  允许一次
+                  {t('chat.approval.allowOnce')}
                 </button>
                 <button onClick={() => void ctx.respondApproval('rejected')} style={btn('var(--bg-panel)', 'var(--text)', '1px solid var(--border-strong)')}>
-                  拒绝
+                  {t('chat.approval.reject')}
                 </button>
               </div>
             </>
@@ -381,20 +384,20 @@ function ChatSlot(): React.JSX.Element {
         >
           <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text)' }}>
             <IconCode />
-            确认投递界面组件
+            {t('chat.clientRun.title')}
           </div>
           <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>
-            动态包：<b>{ctx.curClientRunRequest.name}</b>（{ctx.curClientRunRequest.pkgId}）
+            {renderRich(tf('chat.clientRun.pkg'), { b1: <b>{ctx.curClientRunRequest.name}</b>, pkgId: <>{ctx.curClientRunRequest.pkgId}</> })}
           </div>
           <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-            用途：{ctx.curClientRunRequest.purpose}
+            {t('chat.clientRun.purpose', { purpose: ctx.curClientRunRequest.purpose })}
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
             <button onClick={() => void ctx.respondClientRun(true)} style={btn('var(--accent)', '#fff')}>
-              投递到界面
+              {t('chat.clientRun.deliver')}
             </button>
             <button onClick={() => void ctx.respondClientRun(false)} style={btn('var(--bg-panel)', 'var(--text)', '1px solid var(--border-strong)')}>
-              拒绝
+              {t('chat.approval.reject')}
             </button>
           </div>
         </div>

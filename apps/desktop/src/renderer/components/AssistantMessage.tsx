@@ -7,10 +7,13 @@ import { ReasoningBlock } from './ReasoningBlock'
 import { StepStats, ToolStep } from './ToolStep'
 import { makeMarkdownComponents, normalizeTreeBlocks, stripWrappedRecordTag } from './Markdown'
 import { copyText, formatDuration } from './ui'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 import type { ToolTrace } from '../types'
 
 /** AI 助手消息气泡：左对齐，耗时 + 工具执行步骤（紧凑）+ 思考过程（可折叠）+ 正式回答聚合在一个气泡内，气泡下方固定显示「复制 / 复制为图片」操作 */
 export const AssistantMessage = memo(function AssistantMessage({ content, reasoningContent, toolSteps, turnDuration, onPreviewImage }: { content: string; reasoningContent?: string; toolSteps?: ToolTrace[]; turnDuration?: number; onPreviewImage: (url: string) => void }) {
+  useLocaleSync()
   const bubbleRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const tools = toolSteps ?? []
@@ -26,7 +29,7 @@ export const AssistantMessage = memo(function AssistantMessage({ content, reason
       >
         {(turnDuration != null || hasTools) && (
           <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 6 }}>
-            {turnDuration != null && <>耗时 {formatDuration(turnDuration)}</>}
+            {turnDuration != null && <>{t('chat.time.elapsed')} {formatDuration(turnDuration)}</>}
             <StepStats tools={tools} />
           </div>
         )}
@@ -48,8 +51,8 @@ export const AssistantMessage = memo(function AssistantMessage({ content, reason
       </div>
       <MessageActions
         actions={[
-          { key: 'copy', icon: <IconCopy />, label: '复制', run: () => copyText(displayContent) },
-          { key: 'copyImage', icon: <IconImage />, label: '复制为图片', run: () => copyAssistantAsImage(contentRef.current) },
+          { key: 'copy', icon: <IconCopy />, label: t('common.copy'), run: () => copyText(displayContent) },
+          { key: 'copyImage', icon: <IconImage />, label: t('chat.msg.copyImage'), run: () => copyAssistantAsImage(contentRef.current) },
         ]}
       />
     </div>

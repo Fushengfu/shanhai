@@ -13,6 +13,8 @@ import { subscribeMemberUnread } from './member-channel'
 import { scheduleStartupUpdateCheck } from './app-updater'
 import { reportDeviceStartup } from './device-report'
 import { refreshDockMenu } from './dock-menu'
+import { ensureLocaleResolved, getMainLocale, onMainLocaleChange } from './locale-store'
+import { tIn } from '../shared/i18n'
 
 /** 全局唤起/隐藏主窗口的快捷键（macOS 上 CommandOrControl 即 ⌘，避开 Spotlight 的 ⌘+Space） */
 const TOGGLE_SHORTCUT = 'CommandOrControl+Shift+Space'
@@ -21,6 +23,11 @@ const TOGGLE_SHORTCUT = 'CommandOrControl+Shift+Space'
 let tray: Tray | null = null
 /** 会员私信未读订阅的退订句柄（托盘菜单实时刷新未读项用） */
 let memberUnreadOff: (() => void) | null = null
+/**
+ * 最近一次托盘未读数（i18n 期5A）：托盘菜单是**一次性建好的原生对象**，语言变了要重建，
+ * 重建时得知道「未读项该显示几条」，所以把最后一次的值留在原地。初值 0 = 还没收到过订阅回调。
+ */
+let lastTrayUnread = 0
 /** 凭证状态订阅的退订句柄（续签成功后驱动两条连接重连） */
 let credentialSnapshotOff: (() => void) | null = null
 let isQuitting = false
@@ -35,15 +42,22 @@ function createTrayIcon(): NativeImage {
 /** 托盘菜单：按当前私信未读数重建（未登录/无未读时不显示该项，保持菜单干净） */
 function refreshTrayMenu(unreadTotal: number): void {
   if (!tray || tray.isDestroyed()) return
+  lastTrayUnread = unreadTotal
+  // 【i18n 期5A】取词读 getMainLocale()（主进程唯一真相源）。本函数每次从模板重建整个菜单，
+  // 所以「语言变了」= 「再调一次本函数」+「重设 tooltip」，见下面 onMainLocaleChange 的注册。
+  const L = getMainLocale()
+  // 未读数超过 99 时显示 99+：这是**展示值**，而复数判定要用**真实数字** n
+  // （一条词条里 n 决定单复数、shown 决定文案里出现什么，避免把 '99+' 当数量去判单复数）。
+  const shown = unreadTotal > 99 ? '99+' : String(unreadTotal)
   const template: Electron.MenuItemConstructorOptions[] = [
-    { label: '显示主窗口', click: () => showChatWindow() },
+    { label: tIn(L, 'native.tray.showMain'), click: () => showChatWindow() },
   ]
   if (unreadTotal > 0) {
-    template.push({ label: `打开私信（${unreadTotal > 99 ? '99+' : unreadTotal} 条未读）`, click: () => void openApp('messages') })
+    template.push({ label: tIn(L, 'native.tray.openDm', { n: unreadTotal, shown }), click: () => void openApp('messages') })
   }
   template.push({ type: 'separator' })
   template.push({
-    label: '退出山海',
+    label: tIn(L, 'native.quitApp'),
     click: () => {
       isQuitting = true
       app.quit()
@@ -52,9 +66,15 @@ function refreshTrayMenu(unreadTotal: number): void {
   tray.setContextMenu(Menu.buildFromTemplate(template))
 }
 
+/** 托盘 tooltip（也是原生字符串，语言变了要重设） */
+function refreshTrayTooltip(): void {
+  if (!tray || tray.isDestroyed()) return
+  tray.setToolTip(tIn(getMainLocale(), 'native.tray.tooltip'))
+}
+
 function createTray(): void {
   tray = new Tray(createTrayIcon())
-  tray.setToolTip('山海 AI 助手')
+  refreshTrayTooltip()
   refreshTrayMenu(0)
   // 订阅会员私信未读变化（主进程内回调，不经渲染层），实时刷新托盘未读项
   memberUnreadOff = subscribeMemberUnread((u) => refreshTrayMenu(u?.total ?? 0))
@@ -87,6 +107,10 @@ if (!gotSingleInstanceLock) {
     setRuntime(await bootHost())
     initUiStore(getRuntime())
     registerIpc()
+
+    // 语言（i18n 期1）：必须在任何窗口创建之前把 settings.locale 的「未设置」按系统语言解析成具体值并落盘，
+    // 这样首屏就是用户系统的语言，且 runtime 侧（prompts.ts 决定回复语言）读到的是同一个具体值。
+    await ensureLocaleResolved()
 
     // 启动上报：匿名 POST 设备信息 + 版本到山海后台（AI 网关）。fire-and-forget，
     // 失败静默、不阻塞启动，这里不 await（否则拖慢窗口创建）。
@@ -147,6 +171,18 @@ if (!gotSingleInstanceLock) {
     }
     // Dock 菜单：列出「打开主窗口」+ 已安装插件应用列表（点某项打开对应插件窗口）。在 restore 之后调用，确保插件清单已填充
     refreshDockMenu()
+
+    // 【i18n 期5A · 原生 UI 语言热更新】Dock 菜单 / 托盘菜单是主进程用原生 API 一次性建好的对象，
+    // ui:locale 广播只到得了渲染层，到不了它们 → 必须在主进程侧另走一条注册回调。
+    // 为什么在这里注册而不是让 locale-store 直接 import 这两个模块：
+    //   locale-store 已被 ipc-handlers 依赖，而 dock-menu 依赖 window-manager / plugin-apps，
+    //   反向 import 会形成循环依赖（ESM 下表现为半初始化模块）。注册方留在组装根 index.ts 最安全。
+    // 窗口右键菜单不在此列：它在每次 context-menu 事件里现建，天然跟随语言，无需重建。
+    onMainLocaleChange(() => {
+      refreshDockMenu()
+      refreshTrayTooltip()
+      refreshTrayMenu(lastTrayUnread)
+    })
 
     // 托盘：失败只告警，不影响主窗口使用
     try {

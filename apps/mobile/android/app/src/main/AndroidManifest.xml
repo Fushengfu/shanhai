@@ -2,8 +2,13 @@
     <uses-permission android:name="android.permission.INTERNET"/>
     <!-- 应用内升级：Android 8+（API 26+）安装非商店来源 APK 需要此权限 -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- 应用显示名走 Android 资源（@string/app_name）：桌面图标名由系统渲染，
+         读不到 Flutter 侧词条，只能走 values/ + values-en/ 两套资源。
+         代价见 res/values/strings.xml 顶部注释：它按系统语言生效，不跟 App 内开关。
+         （注释必须放在标签外 —— XML 不允许在开始标签的属性列表里写注释，
+           放进 <application ...> 内部会让整个 manifest 变成非法 XML，flutter build 直接失败。） -->
     <application
-        android:label="山海"
+        android:label="@string/app_name"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true">

@@ -1,6 +1,9 @@
+import { useEffect } from 'react'
 import { useUiStore } from '../store-client'
 import { AiOrb } from '../components/AiOrb'
 import { useThemeSync } from '../theme'
+import { applyLocale, useLocaleSync } from '../locale'
+import { t } from '../../shared/i18n'
 import { PluginAppsPanel } from '../plugins/PluginAppsPanel'
 import { AppMenuPanel } from './AppMenuPanel'
 
@@ -15,6 +18,15 @@ export function DesktopApp(): React.JSX.Element {
 
   // 主题：订阅主进程广播，跟随聊天窗口切换（亮/暗实时同步）
   useThemeSync()
+  // 语言：同上。本组件渲染期直接取词（登录态那一行）→ 必须自订阅
+  useLocaleSync()
+  // 语言（i18n 期4A）：本窗口是独立 BrowserWindow，只在挂载时 initLocale() 读一次是不够的 ——
+  // 别的窗口切语言时必须靠这条广播把本窗口的取词镜像同步过来（期3 移交的欠账，照抄 App.tsx 的写法）。
+  useEffect(() => {
+    const off = window.shanhai?.onLocaleChange((l) => applyLocale(l))
+    return off
+  }, [])
+
 
   // 点击桌面壁纸：把聊天/应用窗口带回前面（桌面自身不抢焦点，故不会触发系统「显示桌面」）
   const handleMouseDown = (): void => {
@@ -56,7 +68,7 @@ export function DesktopApp(): React.JSX.Element {
           color: 'var(--text-secondary)',
         }}
       >
-        <span>{ui.loggedIn ? `已登录：${ui.username ?? ''}` : '未登录'}</span>
+        <span>{ui.loggedIn ? t('common.loggedInAs', { u: ui.username ?? '' }) : t('common.notLoggedIn')}</span>
       </div>
 
       {/* 3D AI 动画（屏幕正中间） */}

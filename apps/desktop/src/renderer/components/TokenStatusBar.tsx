@@ -1,28 +1,31 @@
 import { memo, useState } from 'react'
 import type { TokenSnapshot } from '../types'
 import { fmtTokens } from './ui'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 export const TokenStatusBar = memo(function TokenStatusBar({ stats }: { stats: TokenSnapshot | null }) {
+  useLocaleSync()
   if (!stats) {
-    return <div style={{ padding: '6px 16px', borderTop: '1px solid var(--border)', background: 'var(--bg-panel)', fontSize: 11, color: 'var(--text-faint)' }}>token 用量统计中…</div>
+    return <div style={{ padding: '6px 16px', borderTop: '1px solid var(--border)', background: 'var(--bg-panel)', fontSize: 11, color: 'var(--text-faint)' }}>{t('chat.token.loading')}</div>
   }
   return (
     <div style={{ padding: '6px 16px', borderTop: '1px solid var(--border)', background: 'var(--bg-panel)', fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap', fontFamily: 'ui-monospace, monospace' }}>
-      <span title="本次启动以来累计 token">
-        累计 <b style={{ color: 'var(--text-secondary)' }}>{fmtTokens(stats.total)}</b>
-        <span style={{ color: 'var(--text-faint)' }}>（入 {fmtTokens(stats.totalPrompt)} / 出 {fmtTokens(stats.totalCompletion)}）</span>
+      <span title={t('chat.token.totalTitle')}>
+        {t('chat.token.total')} <b style={{ color: 'var(--text-secondary)' }}>{fmtTokens(stats.total)}</b>
+        <span style={{ color: 'var(--text-faint)' }}>{t('chat.token.inOutParen', { p: fmtTokens(stats.totalPrompt), c: fmtTokens(stats.totalCompletion) })}</span>
       </span>
-      <span title="本轮实时输入/输出 token（模型每次返回 usage 时更新）">
-        本轮 <b style={{ color: 'var(--accent)' }}>入 {fmtTokens(stats.turnPrompt)} / 出 {fmtTokens(stats.turnCompletion)}</b>
+      <span title={t('chat.token.turnTitle')}>
+        {t('chat.token.turn')} <b style={{ color: 'var(--accent)' }}>{t('chat.token.turnInOut', { p: fmtTokens(stats.turnPrompt), c: fmtTokens(stats.turnCompletion) })}</b>
       </span>
-      <span title="最近一次请求的 prompt 缓存命中率（命中缓存 token / 该次输入 token）">
-        缓存命中 <b style={{ color: (stats.cacheHitRatio || 0) > 0 ? 'var(--success)' : 'var(--text-muted)' }}>{Math.round((stats.cacheHitRatio || 0) * 100)}%</b>
+      <span title={t('chat.token.cacheTitle')}>
+        {t('chat.token.cache')} <b style={{ color: (stats.cacheHitRatio || 0) > 0 ? 'var(--success)' : 'var(--text-muted)' }}>{Math.round((stats.cacheHitRatio || 0) * 100)}%</b>
       </span>
-      <span title="当前会话累计完成的任务循环轮次（一次完整的「用户消息 → 最终回复」算一轮）">
-        轮次 <b style={{ color: 'var(--accent)' }}>{stats.turnCount}</b>
+      <span title={t('chat.token.roundTitle')}>
+        {t('chat.token.round')} <b style={{ color: 'var(--accent)' }}>{stats.turnCount}</b>
       </span>
-      <span title="当前会话上下文窗口占用" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-        上下文
+      <span title={t('chat.token.contextTitle')} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+        {t('chat.token.context')}
         <ContextRing stats={stats} />
       </span>
     </div>
@@ -31,6 +34,7 @@ export const TokenStatusBar = memo(function TokenStatusBar({ stats }: { stats: T
 
 /** 上下文窗口占用环形指示器：中间显示百分比，悬停弹出详情（最大窗口/当前占用/剩余可用/占比） */
 export function ContextRing({ stats }: { stats: TokenSnapshot }) {
+  useLocaleSync()
   const [hover, setHover] = useState(false)
   const pct = Math.round((stats.contextUsageRatio || 0) * 100)
   const r = 9
@@ -79,10 +83,10 @@ export function ContextRing({ stats }: { stats: TokenSnapshot }) {
             lineHeight: 1.7,
           }}
         >
-          <div>最大窗口：{stats.contextLength > 0 ? `${fmtTokens(stats.contextLength)} tokens` : '未知'}</div>
-          <div>当前占用：{fmtTokens(stats.lastPrompt)} tokens</div>
-          <div>剩余可用：{stats.contextLength > 0 ? `${fmtTokens(remaining)} tokens` : '未知'}</div>
-          <div>上下文占比：{pct}%</div>
+          <div>{t('chat.token.maxWindow', { v: stats.contextLength > 0 ? `${fmtTokens(stats.contextLength)} tokens` : t('common.unknown') })}</div>
+          <div>{t('chat.token.currentUsed', { v: `${fmtTokens(stats.lastPrompt)} tokens` })}</div>
+          <div>{t('chat.token.remaining', { v: stats.contextLength > 0 ? `${fmtTokens(remaining)} tokens` : t('common.unknown') })}</div>
+          <div>{t('chat.token.ratio', { v: `${pct}%` })}</div>
         </div>
       )}
     </span>

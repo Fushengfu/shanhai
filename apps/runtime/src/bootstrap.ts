@@ -23,7 +23,7 @@ import {
 } from '@shanhai/selfmod'
 import { Session, type ApprovalPolicy, type SessionEvent } from '@shanhai/session'
 import { ApprovalService } from '@shanhai/approval'
-import { AgentLoop, type SuspendedSnapshot } from '@shanhai/agent'
+import { AgentLoop, setAgentRetryNotifier, type SuspendedSnapshot } from '@shanhai/agent'
 import type { Model, ContentPart, TokenUsage, HttpTrace, HttpTraceCallback, ChatMessage } from '@shanhai/llm'
 import { createAtomicTools, createUtilityTools, toolReasoningContext, type ToolContract } from '@shanhai/tools'
 import { createAskTools, AskService, ASK_CANCELLED, type AskRequest } from '@shanhai/ask'
@@ -88,6 +88,26 @@ import { spawnSay, createSystemVoiceService, gatewayAsrTranscribe } from './voic
 const PLUGIN_MODEL_CALL_MAX_PER_MINUTE = 20
 const pluginModelCallWindows = new Map<string, number[]>()
 
+/**
+ * 设置快照（逐字段浅拷贝，避免调用方改到 ctx 里的对象）。
+ * 【i18n 期1 顺手收口】原来 getSettings / setSettings 各抄了一份字段展开清单，
+ * 加一个字段要改两处、漏一处就是「界面读不到新设置」；收敛成这一个函数，
+ * 且它的返回类型是 AppSettings —— 以后再加字段漏在这里，tsc 直接报错。
+ */
+function snapshotSettings(s: AppSettings): AppSettings {
+  return {
+    browser: { ...s.browser },
+    messageSubmit: { ...s.messageSubmit },
+    debug: { ...s.debug },
+    voice: { ...s.voice },
+    supervisorApproval: { ...s.supervisorApproval },
+    supervisorAsk: { ...s.supervisorAsk },
+    supervisorClientRun: { ...s.supervisorClientRun },
+    compaction: { ...s.compaction },
+    locale: s.locale,
+  }
+}
+
 export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime> {
   // 初始化设备标识（远程连接多设备用）：读取/生成 deviceId + 设备名，早于任何 getDeviceInfo 调用
   await ensureDeviceInfo()
@@ -145,6 +165,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     supervisorAsk: { enabled: DEFAULT_SETTINGS.supervisorAsk.enabled },
     supervisorClientRun: { enabled: DEFAULT_SETTINGS.supervisorClientRun.enabled },
     compaction: { modelId: DEFAULT_SETTINGS.compaction.modelId },
+    // 【i18n 期1】这处初始值字面量用了 `as AppSettings`（绕过完整性检查），
+    // 加 locale 时必须手动补 —— 否则 readSettings 之前 ctx.currentSettings.locale 是 undefined。
+    locale: DEFAULT_SETTINGS.locale,
   } as AppSettings
   ctx.askService = new AskService()
   ctx.memoryFile = join(homedir(), '.shanhai', 'memory.json')
@@ -168,6 +191,18 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   ctx.tokenCallbacks = new Set<(sessionId: string, stats: TokenSnapshot) => void>()
   ctx.deltaCallbacks = new Set<(sessionId: string, text: string) => void>()
   ctx.reasoningCallbacks = new Set<(sessionId: string, text: string) => void>()
+  /**
+   * 【网关超时自动重试必须可见】AgentLoop 每次自动重试前播报一条中文提示（「网关处理超时，正在自动重试 1/3…」）。
+   * 走既有 deltaCallbacks 通道，不新增任何 IPC / handler：它只进渲染层的流式缓冲、**不落盘**，
+   * 回合结束时由 getSessionHistory 重建 items 自然消失 —— 它是「正在重试」的临时状态，不是回答正文。
+   * 为什么必须做：静默重试在用户眼里就是卡死，比直接报错更糟（本项目反复踩过静默失败）。
+   */
+  setAgentRetryNotifier((n) => {
+    // 没有 sessionId 就不知道往哪个窗口播报，直接跳过（不广播到全部窗口，免得别的会话凭空冒出一条提示）
+    const sid = n.sessionId
+    if (!sid) return
+    ctx.deltaCallbacks.forEach((cb) => cb(sid, `\n【系统】${n.reason}，正在自动重试 ${n.attempt}/${n.max}…\n`))
+  })
   ctx.modelProviders = new Map<string, Model>()
   ctx.credentials = new FileCredentialStore()
   ctx.authService = new AuthService({ baseUrl: 'https://agent.bjctykj.com' })
@@ -1833,7 +1868,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
 
     getSettings() {
-      return { browser: { ...ctx.currentSettings.browser }, messageSubmit: { ...ctx.currentSettings.messageSubmit }, debug: { ...ctx.currentSettings.debug }, voice: { ...ctx.currentSettings.voice }, supervisorApproval: { ...ctx.currentSettings.supervisorApproval }, supervisorAsk: { ...ctx.currentSettings.supervisorAsk }, supervisorClientRun: { ...ctx.currentSettings.supervisorClientRun }, compaction: { ...ctx.currentSettings.compaction } }
+      return snapshotSettings(ctx.currentSettings)
     },
 
     async getHttpTrace(id) {
@@ -1872,6 +1907,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         supervisorAsk: { ...ctx.currentSettings.supervisorAsk, ...(patch.supervisorAsk ?? {}) },
         supervisorClientRun: { ...ctx.currentSettings.supervisorClientRun, ...(patch.supervisorClientRun ?? {}) },
         compaction: { ...ctx.currentSettings.compaction, ...(patch.compaction ?? {}) },
+        locale: typeof patch.locale === 'string' ? patch.locale : ctx.currentSettings.locale,
       }
       // 实时同步到浏览器后端（影响后续新建窗口是否显示，已存在窗口不受影响）
       ctx.browserUse.setShowOnCreate?.(ctx.currentSettings.browser.showOnCreate)
@@ -1899,7 +1935,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         }
       }
       await writeSettings(ctx.currentSettings)
-      return { browser: { ...ctx.currentSettings.browser }, messageSubmit: { ...ctx.currentSettings.messageSubmit }, debug: { ...ctx.currentSettings.debug }, voice: { ...ctx.currentSettings.voice }, supervisorApproval: { ...ctx.currentSettings.supervisorApproval }, supervisorAsk: { ...ctx.currentSettings.supervisorAsk }, supervisorClientRun: { ...ctx.currentSettings.supervisorClientRun }, compaction: { ...ctx.currentSettings.compaction } }
+      return snapshotSettings(ctx.currentSettings)
     },
   }
 }

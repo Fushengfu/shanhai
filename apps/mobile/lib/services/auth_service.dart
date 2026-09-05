@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
+import '../l10n/generated/app_localizations.dart';
+import '../locale.dart';
 
 /// 登录结果：会员 JWT + （网关新增的）有效期信息。
 ///
@@ -20,6 +22,12 @@ class LoginResult {
 
 /// 会员登录服务：账号密码登录（密码 SHA-256 小写 hex），换取会员 JWT。
 /// 与桌面端 packages/auth 登录协议保持一致：POST /api/member/login，body {username, password}。
+
+/// context-free 取词入口（同 7B 的 tool_step.dart、7C 的 update_service）：纯服务层拿不到 BuildContext。
+/// 与 MaterialApp 的 locale 共用 resolvedLocale；语言只跟手机自己。
+/// 取词时机 = 异常产生那一刻（一次性事件），与桌面端期5A 通知 / 期5B 私信错误同类。
+AppLocalizations get _l => lookupAppLocalizations(resolvedLocale(LocaleController.instance.value));
+
 class AuthService {
   /// 会员体系基地址（登录 / 拉模型列表用）
   final String baseUrl;
@@ -46,7 +54,8 @@ class AuthService {
     try {
       body = jsonDecode(res.body) as Map<String, dynamic>;
     } catch (_) {
-      throw Exception('登录失败：HTTP ${res.statusCode}，响应解析异常');
+      // 整句词条（原实现把 HTTP 状态拼在中文前后，英文语序不同拼不出来）
+      throw Exception(_l.authParseFailed('${res.statusCode}'));
     }
 
     final data = body['data'] as Map<String, dynamic>?;
@@ -59,7 +68,9 @@ class AuthService {
         body['access_token'];
 
     if (token == null || token.toString().isEmpty) {
-      final msg = (body['message'] ?? '登录失败') as String;
+      // 网关带回的 message 原样抛出（口径④不建映射表）；只有它没带回才用我们自己的词条。
+      // 仍保留 as String：message 存在但不是 String 时行为与改前一致（照抛类型错）。
+      final msg = (body['message'] ?? _l.authFailedPlain) as String;
       throw Exception(msg);
     }
     // 网关本轮新增的有效期字段（unix 秒；纯增量，旧字段不变）。

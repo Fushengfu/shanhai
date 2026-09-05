@@ -4,14 +4,17 @@ import { useUiStore } from '../store-client'
 import { IconClock, IconTrash } from './icons'
 import { formatRelativeTime, smallIconBtn } from './ui'
 import { WindowTitleBar } from './WindowTitleBar'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
-const SCOPE_LABEL: Record<string, string> = {
-  user_preference: '用户偏好',
-  environment: '环境',
-  project_knowledge: '项目知识',
-  data_cognition: '数据认知',
-  task_experience: '任务经验',
-  session: '会话',
+// 【i18n 期4C】表里存词条 key 不存中文（第 7 次同一个坑：模块级常量在加载期固化）
+const SCOPE_LABEL_KEY: Record<string, string> = {
+  user_preference: 'panels.scopeUserPreference',
+  environment: 'panels.scopeEnvironment',
+  project_knowledge: 'panels.scopeProjectKnowledge',
+  data_cognition: 'panels.scopeDataCognition',
+  task_experience: 'panels.scopeTaskExperience',
+  session: 'panels.scopeSession',
 }
 
 /** scope → 标签配色（圆点 + 浅色底），按类型区分更直观 */
@@ -26,6 +29,8 @@ const SCOPE_COLOR: Record<string, { dot: string; tint: string }> = {
 
 /** 长期记忆面板：展示当前会话记忆（按会话隔离），支持删除。侧滑铺满主区域（从侧边栏右缘到窗口右缘、状态栏下方到底部） */
 export function MemoryPanel({ left, top, onClose, variant = 'panel' }: { left?: number; top?: number; onClose?: () => void; variant?: 'panel' | 'window' }) {
+  // 【期4C 谁取词谁订阅】本组件渲染期取词（标题/空态/scope 标签）→ 必须自订阅
+  useLocaleSync()
   const currentSessionId = useUiStore().currentSessionId
   const [memories, setMemories] = useState<MemoryEntry[]>([])
   const [hoverId, setHoverId] = useState<number | null>(null)
@@ -65,11 +70,11 @@ export function MemoryPanel({ left, top, onClose, variant = 'panel' }: { left?: 
       <WindowTitleBar
         icon={<IconClock />}
         tone="purple"
-        title="长期记忆"
-        subtitle="当前会话沉淀的偏好与经验"
+        title={t('panels.memoryTitle')}
+        subtitle={t('panels.memorySubtitle')}
         extra={
           <span style={{ marginLeft: 4, fontSize: 11, fontWeight: 600, color: 'var(--purple)', background: 'var(--tint-purple)', padding: '2px 9px', borderRadius: 10, flexShrink: 0 }}>
-            {memories.length} 条
+            {t('panels.memoryCount', { n: memories.length })}
           </span>
         }
         onClose={() => onClose?.()}
@@ -81,12 +86,14 @@ export function MemoryPanel({ left, top, onClose, variant = 'panel' }: { left?: 
               <span style={{ display: 'inline-flex', width: 48, height: 48, borderRadius: '50%', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-subtle)', color: 'var(--text-faint)', marginBottom: 12 }}>
                 <IconClock />
               </span>
-              <div style={{ fontWeight: 600, color: 'var(--text-secondary)', fontSize: 14 }}>暂无长期记忆</div>
-              <div style={{ marginTop: 4 }}>对话中可说「记住我偏好…」，AI 会用 remember 工具保存</div>
+              <div style={{ fontWeight: 600, color: 'var(--text-secondary)', fontSize: 14 }}>{t('panels.memoryEmpty')}</div>
+              <div style={{ marginTop: 4 }}>{t('panels.memoryEmptyHint')}</div>
             </div>
           ) : (
             memories.map((m) => {
               const color = SCOPE_COLOR[m.scope] ?? { dot: 'var(--text-muted)', tint: 'var(--bg-subtle)' }
+              // 期4C：先取 key 再判空（TS 不会穿透三元收窄索引访问），语义与改前 `SCOPE_LABEL[m.scope] ?? m.scope` 一致
+              const scopeKey = SCOPE_LABEL_KEY[m.scope]
               const isHover = hoverId === m.id
               return (
                 <div
@@ -108,7 +115,7 @@ export function MemoryPanel({ left, top, onClose, variant = 'panel' }: { left?: 
                   {/* scope 标签：彩色圆点 + 文字 */}
                   <span style={{ flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', padding: '3px 9px', borderRadius: 8, background: color.tint, marginTop: 0 }}>
                     <span style={{ width: 6, height: 6, borderRadius: '50%', background: color.dot, flexShrink: 0 }} />
-                    {SCOPE_LABEL[m.scope] ?? m.scope}
+                    {scopeKey ? t(scopeKey) : m.scope}
                   </span>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)', marginBottom: 3, wordBreak: 'break-word' }}>{m.key}</div>
@@ -117,13 +124,13 @@ export function MemoryPanel({ left, top, onClose, variant = 'panel' }: { left?: 
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 6, fontSize: 11, color: 'var(--text-faint)' }}>
                       <span>{formatRelativeTime(m.timestamp)}</span>
-                      {m.source ? <span>来源 · {m.source}</span> : null}
-                      {typeof m.confidence === 'number' ? <span>置信度 · {Math.round(m.confidence * 100)}%</span> : null}
+                      {m.source ? <span>{t('panels.memorySource', { source: m.source })}</span> : null}
+                      {typeof m.confidence === 'number' ? <span>{t('panels.memoryConfidence', { pct: Math.round(m.confidence * 100) })}</span> : null}
                     </div>
                   </div>
                   <button
                     onClick={() => void remove(m.id)}
-                    title="删除"
+                    title={t('common.delete')}
                     style={{
                       flexShrink: 0,
                       ...smallIconBtn,

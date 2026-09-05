@@ -90,7 +90,9 @@ export function createPromptsModule(
       shell: process.env.SHELL ?? process.env.ComSpec ?? 'unknown',
       home: homedir(),
       cwd,
-      lang: 'zh-CN',
+      // 【i18n 期1 · 用户批准的唯一提示词改动】语言不再写死：读全局唯一真相源 settings.locale。
+      // 空串（从未设置）由主进程启动时解析成具体值写回，所以这里只需兜一层，不做系统语言判定。
+      lang: ctx.currentSettings.locale === 'en-US' ? 'en-US' : 'zh-CN',
     }
   }
 
@@ -116,7 +118,7 @@ export function createPromptsModule(
       `- Shell：${env.shell}`,
       `- 用户主目录：${env.home}`,
       `- 当前工作目录：${env.cwd}`,
-      `- 语言：${env.lang}（优先用中文回复）`,
+      `- 语言：${env.lang}${env.lang === 'en-US' ? ' (Always answer in English, whatever language the task is written in)' : '（优先用中文回复）'}`,
       '',
       '## 历史回放隔离（防幻觉，务必遵守）',
       '上下文中若出现被 <replay-assistant> ... </replay-assistant> 标签包裹的内容，那是「历史任务的处理结果」——不是你的发言，不代表当前任务的执行结果、也不代表本轮任务的执行结果；禁止模仿其口吻/格式/详略，禁止把它当作你已完成的工作依据。',
@@ -203,7 +205,7 @@ export function createPromptsModule(
       `- 当前时间：${env.time}`,
       `- Shell：${env.shell}`,
       `- 用户主目录：${env.home}`,
-      `- 语言：${env.lang}（优先用中文回复）`,
+      `- 语言：${env.lang}${env.lang === 'en-US' ? ' (Always answer in English, whatever language the task is written in)' : '（优先用中文回复）'}`,
       '',
       '## 历史回放隔离（防幻觉，务必遵守）',
       '上下文中若出现被 <replay-assistant> ... </replay-assistant> 标签包裹的内容，那是「历史任务的处理结果」——不是你的发言，不代表当前任务的执行结果、也不代表本轮任务的执行结果；禁止模仿其口吻/格式/详略，禁止把它当作你已完成的工作依据。',

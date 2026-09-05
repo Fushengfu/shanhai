@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 应用显示名（英文资源限定符）。见 ../values/strings.xml 顶部注释：
+     这一份按【系统语言】生效，不跟随 App 内语言开关。 -->
+<resources>
+    <string name="app_name">Shanhai</string>
+</resources>

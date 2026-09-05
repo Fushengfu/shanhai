@@ -1,13 +1,22 @@
 import 'dart:async';
+import '../locale.dart';
 import 'package:flutter/material.dart';
 import '../theme.dart';
 import '../services/ws_client.dart';
 import '../models/protocol.dart';
 import 'message_bubbles.dart';
 import 'tool_step.dart';
+import '../l10n/generated/app_localizations.dart';
 
 /// 通用聊天视图：历史消息 + 流式渲染 + 工具步骤 + 审批/提问弹窗 + 发送。
 /// 会话模式与管家模式复用（仅发送命令与历史加载回调不同），按 sessionId 过滤事件流。
+
+/// context-free 取词入口：沿用 7B 在 tool_step.dart 建立的同一形态（同一 resolvedLocale、同一份 ARB）。
+/// 【为什么不在这里用 AppLocalizations.of(context)】of() 在 nullable-getter:false 下要求祖先必须装好
+/// AppLocalizations.delegates；仓库既有测试 chat_view_scroll_test 就是把本组件挂在只带默认 delegate 的
+/// MaterialApp 下跑的，of() 会直接抛 Null check operator。_l 不依赖祖先节点，且 7B 的 LS3 已实测
+/// 「locale 变化会重建整棵页面子树 → context-free 取词同样跟切」，所以这里不是绕路，是同一套机制。
+AppLocalizations get _l => lookupAppLocalizations(resolvedLocale(LocaleController.instance.value));
 class ChatView extends StatefulWidget {
   final WsClient ws;
   /// 事件过滤用会话 id（管家模式为 'supervisor'）
@@ -345,7 +354,8 @@ class _ChatViewState extends State<ChatView> {
         break;
       case 'error':
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(e.payload['message']?.toString() ?? '出错')),
+          // 服务端带回的 message 原样呈现（口径④）；没带回才用我们的兜底
+          SnackBar(content: Text(e.payload['message']?.toString() ?? _l.commonErrorFallback)),
         );
         break;
     }
@@ -392,7 +402,8 @@ class _ChatViewState extends State<ChatView> {
     });
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(r.error ?? '发送失败：桌面端未在线，请重试或切换设备', style: const TextStyle(fontSize: 13)),
+        // r.error 有值（含 ws_client 已本地化的句子）原样呈现；为空才用我们的兜底
+        content: Text(r.error ?? _l.chatSendFailedOffline, style: const TextStyle(fontSize: 13)),
         duration: const Duration(seconds: 3),
       ),
     );
@@ -528,12 +539,12 @@ class _ChatViewState extends State<ChatView> {
       titlePadding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
       contentPadding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
       actionsPadding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-      title: const Row(
+      title: Row(
         children: [
           Icon(Icons.warning_amber_rounded, size: 20, color: Color(0xFFF59E0B)),
           SizedBox(width: 10),
           Expanded(
-            child: Text('需要确认操作', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Color(0xFFF2F2F7))),
+            child: Text(_l.chatApprovalTitle, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Color(0xFFF2F2F7))),
           ),
         ],
       ),
@@ -570,14 +581,14 @@ class _ChatViewState extends State<ChatView> {
             Navigator.pop(ctx);
             widget.ws.sendCommand('respond_approval', {'requestId': req.id, 'outcome': 'rejected'});
           },
-          child: const Text('拒绝', style: TextStyle(color: Color(0xFF9CA3AF))),
+          child: Text(_l.chatReject, style: const TextStyle(color: Color(0xFF9CA3AF))),
         ),
         FilledButton(
           onPressed: () {
             Navigator.pop(ctx);
             widget.ws.sendCommand('respond_approval', {'requestId': req.id, 'outcome': 'allowed-once'});
           },
-          child: const Text('允许一次'),
+          child: Text(_l.chatAllowOnce),
         ),
       ],
     ));
@@ -594,12 +605,12 @@ class _ChatViewState extends State<ChatView> {
       titlePadding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
       contentPadding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
       actionsPadding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-      title: const Row(
+      title: Row(
         children: [
           Icon(Icons.help_outline, size: 18, color: Color(0xFF22D3EE)),
           SizedBox(width: 8),
           Expanded(
-            child: Text('AI 需要你的确认', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Color(0xFFF2F2F7))),
+            child: Text(_l.chatAskTitle, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Color(0xFFF2F2F7))),
           ),
         ],
       ),
@@ -652,7 +663,12 @@ class _ChatViewState extends State<ChatView> {
             visualDensity: VisualDensity.compact,
             leading: Icon(s.busy ? Icons.sync : Icons.forum_outlined, size: 18, color: s.busy ? const Color(0xFF22D3EE) : Colors.grey),
             title: Text(s.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 14)),
-            subtitle: Text('${s.modelName} · ${s.stepCount} 步', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12)),
+            // 「步」进词条（plural）；分隔符也进词条，英文不露中点
+            subtitle: Text(
+                '${s.modelName}${_l.sepMiddle}${_l.commonSteps(s.stepCount)}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 12)),
             onTap: () {
               Navigator.pop(ctx);
               widget.ws.sendCommand('respond_ask', {'requestId': req.id, 'answer': s.id});
@@ -666,7 +682,7 @@ class _ChatViewState extends State<ChatView> {
             Navigator.pop(ctx);
             widget.ws.sendCommand('cancel_ask', {'requestId': req.id});
           },
-          child: const Text('取消', style: TextStyle(color: Color(0xFF9CA3AF))),
+          child: Text(_l.commonCancel, style: const TextStyle(color: Color(0xFF9CA3AF))),
         ),
       ],
     ));
@@ -698,7 +714,7 @@ class _ChatViewState extends State<ChatView> {
             Navigator.pop(ctx);
             widget.ws.sendCommand('cancel_ask', {'requestId': req.id});
           },
-          child: const Text('取消', style: TextStyle(color: Color(0xFF9CA3AF))),
+          child: Text(_l.commonCancel, style: const TextStyle(color: Color(0xFF9CA3AF))),
         ),
       ],
     ));
@@ -729,7 +745,7 @@ class _ChatViewState extends State<ChatView> {
         maxLines: 4,
         style: const TextStyle(fontSize: 14, color: Color(0xFFE0E0E0)),
         decoration: InputDecoration(
-          hintText: req.placeholder ?? '请输入你的回答',
+          hintText: req.placeholder ?? _l.chatAnswerHint,  // 模型给的 placeholder 优先原样呈现
           hintStyle: const TextStyle(fontSize: 14, color: Color(0xFF5A5A5A)),
           filled: true,
           fillColor: const Color(0xFF262633),
@@ -747,14 +763,14 @@ class _ChatViewState extends State<ChatView> {
             Navigator.pop(ctx);
             widget.ws.sendCommand('cancel_ask', {'requestId': req.id});
           },
-          child: const Text('取消', style: TextStyle(color: Color(0xFF9CA3AF))),
+          child: Text(_l.commonCancel, style: const TextStyle(color: Color(0xFF9CA3AF))),
         ),
         FilledButton(
           onPressed: () {
             Navigator.pop(ctx);
             widget.ws.sendCommand('respond_ask', {'requestId': req.id, 'answer': ctrl.text});
           },
-          child: const Text('确定'),
+          child: Text(_l.commonOk),
         ),
       ],
     ));
@@ -768,7 +784,7 @@ class _ChatViewState extends State<ChatView> {
         backgroundColor: Colors.transparent,
         actions: [
           if (_busy && !widget.isSupervisor)
-            IconButton(onPressed: _stop, icon: const Icon(Icons.stop_circle_outlined), tooltip: '停止任务'),
+            IconButton(onPressed: _stop, icon: const Icon(Icons.stop_circle_outlined), tooltip: _l.chatStopTask),
         ],
       ),
       body: Column(
@@ -878,7 +894,7 @@ class _ChatViewState extends State<ChatView> {
         child: TextButton.icon(
           onPressed: _loadEarlier,
           icon: Icon(Icons.expand_less, size: 16, color: c.textMuted),
-          label: Text('加载更早历史', style: TextStyle(fontSize: 12, color: c.textMuted)),
+          label: Text(_l.chatLoadEarlier, style: TextStyle(fontSize: 12, color: c.textMuted)),
         ),
       ),
     );
@@ -897,13 +913,13 @@ class _ChatViewState extends State<ChatView> {
             const SizedBox(width: 8),
             Expanded(
               child: Text(
-                '任务已中断，可继续执行',
+                _l.chatInterruptedBar,
                 style: TextStyle(fontSize: 13, color: c.textPrimary),
               ),
             ),
             FilledButton.tonal(
               onPressed: _resume,
-              child: const Text('继续执行'),
+              child: Text(_l.chatResume),
             ),
           ],
         ),
@@ -936,7 +952,9 @@ class _ChatViewState extends State<ChatView> {
                 textInputAction: TextInputAction.newline,
                 onSubmitted: (_) => _send(_inputCtrl.text),
                 decoration: InputDecoration(
-                  hintText: widget.isSupervisor ? '对管家说…' : '发送消息…',
+                  hintText: widget.isSupervisor
+                      ? _l.chatHintSupervisor
+                      : _l.chatHintSend,
                   hintStyle: TextStyle(fontSize: 14, color: c.textMuted),
                   filled: true,
                   fillColor: c.cardBg,
@@ -949,7 +967,7 @@ class _ChatViewState extends State<ChatView> {
             IconButton.filled(
               onPressed: () => _send(_inputCtrl.text),
               icon: const Icon(Icons.arrow_upward),
-              tooltip: '发送',
+              tooltip: _l.commonSend,
             ),
           ],
         ),
@@ -997,7 +1015,7 @@ class _ReasoningDisclosureState extends State<_ReasoningDisclosure> {
                 children: [
                   Icon(_open ? Icons.expand_more : Icons.chevron_right, size: 16, color: const Color(0xFF808080)),
                   const SizedBox(width: 2),
-                  const Text('AI 为什么问你（点开看背景）', style: TextStyle(fontSize: 12, color: Color(0xFF808080))),
+                  Text(_l.chatWhyAsking, style: const TextStyle(fontSize: 12, color: Color(0xFF808080))),
                 ],
               ),
             ),
@@ -1071,7 +1089,10 @@ class _OptionsAskDialogState extends State<_OptionsAskDialog> {
 
   void _submit() {
     if (!_canSubmit) return;
-    final answer = _customMode ? _textCtrl.text.trim() : _selected.toList().join('、');
+    // 顿号做成词条：英文列举用逗号+空格（与桌面端 common.sepEnumeration 同处理）
+    final answer = _customMode
+        ? _textCtrl.text.trim()
+        : _selected.toList().join(_l.commonSepEnum);
     widget.onSubmit(answer);
   }
 
@@ -1090,12 +1111,12 @@ class _OptionsAskDialogState extends State<_OptionsAskDialog> {
       titlePadding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
       contentPadding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
       actionsPadding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-      title: const Row(
+      title: Row(
         children: [
           Icon(Icons.help_outline, size: 18, color: Color(0xFF22D3EE)),
           SizedBox(width: 8),
           Expanded(
-            child: Text('AI 需要你的确认', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Color(0xFFF2F2F7))),
+            child: Text(_l.chatAskTitle, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Color(0xFFF2F2F7))),
           ),
         ],
       ),
@@ -1129,15 +1150,15 @@ class _OptionsAskDialogState extends State<_OptionsAskDialog> {
                 _textCtrl.clear();
               });
             },
-            child: const Text('返回选项', style: TextStyle(color: Color(0xFF9CA3AF))),
+            child: Text(_l.chatBackToOptions, style: const TextStyle(color: Color(0xFF9CA3AF))),
           ),
         TextButton(
           onPressed: widget.onCancel,
-          child: const Text('取消', style: TextStyle(color: Color(0xFF9CA3AF))),
+          child: Text(_l.commonCancel, style: const TextStyle(color: Color(0xFF9CA3AF))),
         ),
         FilledButton(
           onPressed: _canSubmit ? _submit : null,
-          child: Text(_multiple ? '确定' : '提交'),
+          child: Text(_multiple ? _l.commonOk : _l.chatSubmit),
         ),
       ],
     );
@@ -1152,7 +1173,9 @@ class _OptionsAskDialogState extends State<_OptionsAskDialog> {
         if (_multiple)
           Padding(
             padding: const EdgeInsets.only(top: 4),
-            child: Text('可多选，已选 ${_selected.length} 项', style: const TextStyle(fontSize: 11, color: Color(0xFF808080))),
+            // 计数走 plural（原实现把「项」拼在数字后，英文没有量词）
+            child: Text(_l.chatMultiHint(_selected.length),
+                style: const TextStyle(fontSize: 11, color: Color(0xFF808080))),
           ),
         // 选项都不符合时：切换到自定义填写（对齐桌面端 AskCard）
         Padding(
@@ -1168,11 +1191,11 @@ class _OptionsAskDialogState extends State<_OptionsAskDialog> {
                 borderRadius: BorderRadius.circular(8),
                 border: Border.all(color: const Color(0xFF3A3A3C)),
               ),
-              child: const Row(
+              child: Row(
                 children: [
-                  Icon(Icons.add, size: 16, color: Color(0xFF808080)),
+                  const Icon(Icons.add, size: 16, color: Color(0xFF808080)),
                   SizedBox(width: 8),
-                  Text('其他（自定义填写）', style: TextStyle(fontSize: 13, color: Color(0xFFB0B0B0))),
+                  Text(_l.chatOtherCustom, style: const TextStyle(fontSize: 13, color: Color(0xFFB0B0B0))),
                 ],
               ),
             ),
@@ -1243,7 +1266,7 @@ class _OptionsAskDialogState extends State<_OptionsAskDialog> {
       maxLines: 4,
       style: const TextStyle(fontSize: 14, color: Color(0xFFE0E0E0)),
       decoration: InputDecoration(
-        hintText: req.placeholder ?? '请输入你的回答',
+        hintText: req.placeholder ?? _l.chatAnswerHint,  // 模型给的 placeholder 优先原样呈现
         hintStyle: const TextStyle(fontSize: 14, color: Color(0xFF5A5A5A)),
         filled: true,
         fillColor: const Color(0xFF262633),

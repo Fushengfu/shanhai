@@ -1,4 +1,6 @@
 import type { ChatMessage, Model, ModelResponse, ToolCall, ContentPart, Usage } from '@shanhai/llm'
+// 网关超时/不可用的稳定标记由 packages/llm 定义（那里负责把 Go 原文归一成中文），这里只认标记 + 兜底原文
+import { GATEWAY_ERROR_MARKER } from '@shanhai/llm'
 import { toolReasoningContext, type ToolContract } from '@shanhai/tools'
 import type { Session } from '@shanhai/session'
 import type { ApprovalService } from '@shanhai/approval'
@@ -678,20 +680,39 @@ export class AgentLoop {
     let lastErr: unknown
     for (let attempt = 0; attempt < MAX_AUTO_RETRY; attempt++) {
       try {
+        // 每次都是**全新一次请求**：decide() 重新构造 body、重新取 apiKey、重新 fetch（新 AbortController），
+        // 不复用上一次失败的响应对象；undici 在连接出错后会把该连接踢出池子，下一次重试是新连接。
         return await this.decide(messages, onDelta, onReasoning)
       } catch (err) {
         if (err instanceof Error && err.message === '__stopped__') throw err
         if (isContextLengthError(err)) throw err
         if (!isRetryableError(err)) throw err
         lastErr = err
-        if (attempt < MAX_AUTO_RETRY - 1) {
-          const base = isRateLimitError(err) ? RATE_LIMIT_BACKOFF_MS : AUTO_RETRY_BACKOFF_MS
-          await sleep(computeBackoffMs(attempt, base))
-        }
+        const gateway = isGatewayTimeoutError(err)
+        // 用户口径「最多重试 3 次」= **含首次共 4 次尝试**，必须与私信 HTTP 链路（member-channel.httpJson：
+        // attempt 0..GATEWAY_RETRY_MAX 共 4 次、播报 3 条）逐项同口径 —— 同一个用户要求不允许两条链路给出两种次数。
+        // cap 统一表示「总尝试次数」；其它类别保持既有 5 次尝试（不把已有的抗抖动能力改小）。
+        const cap = gateway ? GATEWAY_MAX_RETRY + 1 : MAX_AUTO_RETRY
+        if (attempt + 1 >= cap) break
+        // 【重试必须可见】静默重试在用户眼里就是卡死。这里在退避之前播报一次「正在重试 N/上限」。
+        // 播报口径是「第几次重试 / 最多重试几次」（不是第几次尝试）：网关类上限 3 → 依次 1/3、2/3、3/3；
+        // 其它类别沿用既有 max=5 的措辞，一个字符都不改。
+        retryNotifier?.({
+          sessionId: this.sessionId,
+          attempt: attempt + 1,
+          max: gateway ? GATEWAY_MAX_RETRY : MAX_AUTO_RETRY,
+          reason: retryReasonOf(err),
+        })
+        const base = gateway ? GATEWAY_ERROR_BACKOFF_MS : isRateLimitError(err) ? RATE_LIMIT_BACKOFF_MS : AUTO_RETRY_BACKOFF_MS
+        await sleep(computeBackoffMs(attempt, base))
       }
     }
     const msg = lastErr instanceof Error ? lastErr.message : String(lastErr)
-    throw new Error(`__retry_exhausted__::${msg}`)
+    // 耗尽文案：网关类错误给准确中文说明（含「网关侧上限 10 分钟」这一事实）与下一步建议，**不透传英文原文**
+    const reason = isGatewayTimeoutError(lastErr)
+      ? `网关持续超时：已重试 ${GATEWAY_MAX_RETRY} 次仍未拿到结果（网关侧单次请求上限 10 分钟）。常见原因是本次请求体过大（例如把图片 base64 塞进了消息）或上游模型排队；可精简内容后点「重试」再发一次`
+      : msg
+    throw new Error(`__retry_exhausted__::${reason}`)
   }
 
   private async decide(
@@ -856,6 +877,18 @@ const MAX_AUTO_RETRY = 5
 const AUTO_RETRY_BACKOFF_MS = 500
 /** 限流类错误（429/Throttling）初始退避时间（毫秒），指数增长（1s → 2s → 4s → 8s），比普通可重试错误更保守，给限流器足够冷却时间 */
 const RATE_LIMIT_BACKOFF_MS = 1000
+/**
+ * 网关超时/不可用的退避基数（毫秒），指数增长（3s → 6s → 12s）。
+ * 比普通网络抖动（500ms）保守得多：网关报 deadline exceeded 说明上游**已经跑了很久**才失败，
+ * 立刻重打只会再撞一次同样的慢路径，白等更久还占着上游额度。
+ */
+const GATEWAY_ERROR_BACKOFF_MS = 3000
+/**
+ * 网关超时/不可用的**重试**上限（用户拍板：最多 3 次）。注意语义是「重试次数」，不含首次请求：
+ * 含首次共 4 次尝试，与私信 HTTP 链路（member-channel 的 GATEWAY_RETRY_MAX）逐字同口径。
+ * 其它类别仍沿用 MAX_AUTO_RETRY（那是「总尝试次数」），不回退既有韧性。
+ */
+const GATEWAY_MAX_RETRY = 3
 
 /** 用户发起新任务时（新发消息 / 编辑重发 / 点击重发）回放历史保留的最近对话回合数（20 轮：用户原始消息 + 最终 assistant 回复正文） */
 const MAX_HISTORY_TURNS = 20
@@ -890,8 +923,58 @@ function isContextLengthError(err: unknown): boolean {
 /** 判断错误是否为「可自动重试」（临时性故障：网络抖动/超时/网关 5xx/限流 429/余额或配额不足）。
  * 命中后由 decideWithRetry 自动重试 MAX_AUTO_RETRY 次，全失败再抛 __retry_exhausted__ 弹窗。
  * 注意：__stopped__（用户停止）与上下文超限已在 decideWithRetry 里提前拦截，不会走到这里。 */
+/**
+ * 【识别网关超时/不可用】三个来源都要覆盖（本项目反复踩过「只匹配一处」）：
+ *  ① HTTP 响应 body 的 message 字段 —— 网关把 Go 原文 `context deadline exceeded` 放在 error.message 里透出；
+ *     这条已在 packages/llm 归一成带 GATEWAY_ERROR_MARKER 的中文错误（真机 traces 命中 354/232/105 次）；
+ *  ② HTTP 502/503/504 —— 同样在 packages/llm 归一（nginx proxy_read_timeout 600s 到点会给我们 504）；
+ *  ③ 未经 packages/llm 归一的调用链（自定义 provider / 插件桥）仍可能直接带 Go 原文 → 这里保留原文兜底匹配。
+ * 关键：`deadline exceeded` 里既没有「超时」也没有 `timed out`，所以它此前**绕过**了 isRetryableError，
+ * 直接以英文原文冒泡到界面 —— 这就是用户看到的「context deadline exceeded」。
+ */
+function isGatewayTimeoutError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  if (msg.includes(GATEWAY_ERROR_MARKER)) return true
+  return /context\s+deadline\s+exceeded|deadline\s+exceeded\s+while\s+reading\s+body|Client\.Timeout\s+exceeded|net\/http:\s+request\s+canceled/i.test(msg)
+}
+
+/** 重试播报（给用户的可见反馈）：静默重试在用户眼里就是卡死，比直接报错更糟 */
+export interface AgentRetryNotice {
+  /** 所属会话（AgentLoop 的 sessionId 本身是可选的，拿不到时宿主只广播到「无路由」并跳过） */
+  sessionId?: string
+  /** 第几次重试（1-based） */
+  attempt: number
+  /** 本次错误类别最多允许重试几次 */
+  max: number
+  /** 中文原因（不含网关英文原文） */
+  reason: string
+}
+
+let retryNotifier: ((n: AgentRetryNotice) => void) | undefined
+
+/**
+ * 宿主（apps/runtime）注入重试播报通道。用模块级 setter 而不是构造参数：
+ * AgentLoop 有 6 处构造点，逐个加参数会把改动面摊到整个 runtime；这是一个「进程级输出通道」，
+ * 与 deltaCallbacks 同性质，setter 一次接线即可。
+ */
+export function setAgentRetryNotifier(cb: ((n: AgentRetryNotice) => void) | undefined): void {
+  retryNotifier = cb
+}
+
+/** 重试原因的中文措辞：不透传网关英文原文，也不把不同原因混成一句「网络异常」 */
+function retryReasonOf(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err)
+  if (isGatewayTimeoutError(err)) return '网关处理超时'
+  if (isRateLimitError(err)) return '触发限流'
+  if (/超时|timed?\s*out|ETIMEDOUT/i.test(msg)) return '请求超时'
+  if (/5\d\d/.test(msg)) return '网关服务异常'
+  return '网络异常'
+}
+
 function isRetryableError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err)
+  // 网关超时/不可用（Go 原文 context deadline exceeded / 502 / 503 / 504）：单独判定，见上面注释
+  if (isGatewayTimeoutError(err)) return true
   // 超时
   if (/超时|timed?\s*out|ETIMEDOUT/i.test(msg)) return true
   // 网络层错误（fetch 底层抛出的系统错误 + undici 连接中断类错误）

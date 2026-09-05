@@ -1,5 +1,7 @@
 import * as React from 'react'
 import { useEffect, useState } from 'react'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /** 气泡样式（助手/用户消息的通用底样） */
 export function bubble(bg: string, color: string): React.CSSProperties {
@@ -57,17 +59,19 @@ export function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
 
-/** 毫秒 → 人类可读耗时（如 850ms / 3.2s / 1分05秒） */
+/** 毫秒 → 人类可读耗时（如 850ms / 3.2s / 1分05秒；英文 1m 05s）。取词在调用时进行，跟随当前语言 */
 export function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
   const m = Math.floor(ms / 60_000)
   const s = Math.round((ms % 60_000) / 1000)
-  return `${m}分${s}秒`
+  return t('chat.time.minuteSecond', { m, s })
 }
 
 /** 实时计时器：基于 startTs 每秒刷新已消耗时间（任务/工具步骤执行中跳动显示） */
 export function LiveDuration({ startTs }: { startTs: number }): React.JSX.Element {
+  // 谁取词谁订阅：formatDuration 现在按当前语言取词，本组件不订阅就会在切语言后停在旧语言
+  useLocaleSync()
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 500)
@@ -80,19 +84,21 @@ export function LiveDuration({ startTs }: { startTs: number }): React.JSX.Elemen
 export function formatRelativeTime(ts: number): string {
   if (!ts || !Number.isFinite(ts)) return ''
   const diff = Date.now() - ts
-  if (diff < 0) return '刚刚'
+  if (diff < 0) return t('chat.time.justNow')
   const sec = Math.floor(diff / 1000)
-  if (sec < 60) return '刚刚'
+  if (sec < 60) return t('chat.time.justNow')
   const min = Math.floor(sec / 60)
-  if (min < 60) return `${min} 分钟前`
+  if (min < 60) return t('chat.time.minutesAgo', { n: min })
   const hour = Math.floor(min / 60)
-  if (hour < 24) return `${hour} 小时前`
+  if (hour < 24) return t('chat.time.hoursAgo', { n: hour })
   const day = Math.floor(hour / 24)
-  if (day === 1) return '昨天'
-  if (day < 7) return `${day} 天前`
+  if (day === 1) return t('common.yesterday')
+  if (day < 7) return t('chat.time.daysAgo', { n: day })
   const d = new Date(ts)
-  const md = `${d.getMonth() + 1}月${d.getDate()}日`
-  return d.getFullYear() === new Date().getFullYear() ? md : `${d.getFullYear()}年${md}`
+  const md = t('chat.time.monthDay', { m: d.getMonth() + 1, d: d.getDate() })
+  return d.getFullYear() === new Date().getFullYear()
+    ? md
+    : t('chat.time.yearMonthDay', { y: d.getFullYear(), m: d.getMonth() + 1, d: d.getDate() })
 }
 
 /** 把 token 数格式化成可读文本（k/M） */
@@ -104,8 +110,8 @@ export function fmtTokens(n: number): string {
 
 /** 把任意值转成可读字符串：对象/数组 JSON 序列化，避免 [object Object] */
 export function prettyValue(v: unknown): string {
-  if (v === null || v === undefined) return '（空）'
-  if (typeof v === 'string') return v.length > 300 ? `${v.slice(0, 300)}…（共 ${v.length} 字）` : v
+  if (v === null || v === undefined) return t('common.emptyValue')
+  if (typeof v === 'string') return v.length > 300 ? `${v.slice(0, 300)}${t('common.truncatedChars', { n: v.length })}` : v
   if (typeof v === 'number' || typeof v === 'boolean') return String(v)
   try {
     const s = JSON.stringify(v)
@@ -117,13 +123,13 @@ export function prettyValue(v: unknown): string {
 
 /** 把工具参数渲染成友好键值对（长字符串截断，避免直接甩 JSON） */
 export function formatArgs(args: Record<string, unknown> | undefined): React.ReactNode {
-  if (!args || Object.keys(args).length === 0) return <span style={{ color: 'var(--text-muted)' }}>（无参数）</span>
+  if (!args || Object.keys(args).length === 0) return <span style={{ color: 'var(--text-muted)' }}>{t('chat.approval.noArgs')}</span>
   const entries = Object.entries(args)
   return (
     <div>
       {entries.map(([k, v]) => (
         <div key={k} style={{ marginBottom: 2 }}>
-          <span style={{ color: 'var(--text-muted)' }}>{k}：</span>
+          <span style={{ color: 'var(--text-muted)' }}>{t('common.labelLine', { label: k })}</span>
           <span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>{prettyValue(v)}</span>
         </div>
       ))}
@@ -141,7 +147,7 @@ export function redactSecret(text: string): string {
 /** 字符串截断（超出 max 显示「…（共 N 字）」） */
 export function truncate(text: string, max: number): string {
   if (text.length <= max) return text
-  return `${text.slice(0, max)}…（共 ${text.length} 字）`
+  return `${text.slice(0, max)}${t('common.truncatedChars', { n: text.length })}`
 }
 
 /** 把工具结果转成可读字符串：字符串原样返回，对象/数组用 JSON 序列化 */

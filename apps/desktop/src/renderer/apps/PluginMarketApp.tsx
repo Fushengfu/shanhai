@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { WindowTitleBar } from '../components/WindowTitleBar'
 import { IconStore, IconSearch, IconRefresh } from '../components/icons'
 import { smallIconBtn } from '../components/ui'
+import { t as tKey } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 import { useThemeSync } from '../theme'
 
 /** 市场插件条目（与 preload listMarketPlugins 返回项对齐） */
@@ -42,7 +44,40 @@ interface MyItem {
 /** 行业分类枚举（与 plugin_share_pack / 网关 hasUI/categories 对齐） */
 const CATEGORIES = ['效率办公', '内容创作', '视频生成', '设计', '数据分析', '生活工具', '行业专属', '其他'] as const
 
-/** 网关接口未就绪时的 mock 数据（仅用于把 UI 跑通；联调点：网关公开接口上线后自动切换真实数据） */
+/**
+ * 行业分类「线值 → 展示词条 key」。表里存 key 不存中文（历轮第 5 次同一个坑：
+ * STATUS_LABEL / TOOL_META / SUPERVISOR_ARG_LABELS / SECTIONS / ROLE_META 都是模块加载期就固化中文，
+ * 切语言不会变）。
+ *
+ * 【为什么 CATEGORIES 本身还是中文】它是**协议值**：既作为 category 查询参数发给网关，
+ * 又要和网关回来的 p.categories 做 includes 匹配。翻了就会同时坏掉筛选与标签匹配。
+ * 未知分类值由 categoryLabel() 原样回显（不猜、不吞）。
+ */
+const CATEGORY_KEYS: Record<string, string> = {
+  '效率办公': 'market.cat.efficiency',
+  '内容创作': 'market.cat.content',
+  '视频生成': 'market.cat.video',
+  '设计': 'market.cat.design',
+  '数据分析': 'market.cat.data',
+  '生活工具': 'market.cat.life',
+  '行业专属': 'market.cat.industry',
+  '其他': 'market.cat.other',
+}
+
+/** 分类展示名：已知枚举走语言包，未知值原样回显（渲染期取词，故必须在使用它的组件里订阅语言变化） */
+function categoryLabel(c: string): string {
+  const k = CATEGORY_KEYS[c]
+  return k ? tKey(k) : c
+}
+
+/**
+ * 网关接口未就绪时的 mock 数据（仅用于把 UI 跑通；联调点：网关公开接口上线后自动切换真实数据）。
+ *
+ * 【本期口径】这里的 name / purpose / author 是**模拟网关返回的内容**，按「网关返回原文不做客户端
+ * 全量映射」的既定口径原样呈现，不进语言包 —— 真接口上线后拿到的本来就是运营写的中文，
+ * 把 mock 翻成英文反而会造出「mock 是英文、真数据是中文」的第二套真相。
+ * categories 是线值枚举，展示时由 categoryLabel() 本地化。
+ */
 const MOCK_PLUGINS: MarketItem[] = [
   { id: 'shortdrama', name: 'AI视频工坊', purpose: '多集网剧短剧工作台：分镜剧本、AI 视频生成（万相 wan3.0-video 经内核桥 videoGen）', version: '1.1.2', author: '山海官方', hasUI: true, categories: ['视频生成', '内容创作'] },
   { id: 'todo-list', name: '待办清单', purpose: '轻量待办事项管理插件：增删改查、到期提醒，支持拖拽排序', version: '2.0.0', author: '山海官方', hasUI: true, categories: ['效率办公'] },
@@ -85,6 +120,10 @@ function shareAction(p: MyItem): 'share' | 'upgrade' | null {
 
 export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX.Element {
   useThemeSync()
+  // 谁取词谁订阅：本组件渲染期调 tKey()（tab 名、分类胶囊、计数句等）。
+  // PluginMarketApp 是独立窗口应用，挂在 AppWindow 下；AppWindow 只挂了窗口级 onLocaleChange
+  // （更新取词镜像），本身不订阅，所以这里必须自订阅，否则切语言时本窗口不重渲染。
+  useLocaleSync()
 
   const [tab, setTab] = useState<'browse' | 'mine' | 'submit'>('browse')
   const [keyword, setKeyword] = useState('')
@@ -153,7 +192,7 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
         setMineError(res.mineError ?? '')
       } else {
         setMyPlugins([])
-        setMineError(res?.mineError ?? '读取已安装插件失败')
+        setMineError(res?.mineError ?? tKey('market.mineReadFailed'))
       }
     } catch (e) {
       setMyPlugins([])
@@ -180,7 +219,7 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
     setNotice('')
     try {
       const res = await window.shanhai?.installMarketPlugin(id)
-      setNotice(res?.ok ? (res.message ?? '已安装') : (res?.message ?? '安装失败'))
+      setNotice(res?.ok ? (res.message ?? tKey('market.installed')) : (res?.message ?? tKey('market.installFailed')))
       if (res?.ok) {
         // 安装成功后刷新列表（标记「已安装」）+ 刷新「我已安装」区块
         void load(keyword, category, hasUI)
@@ -198,7 +237,7 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
     try {
       const res = await window.shanhai?.submitPluginToMarket(id)
       setShareOk(!!res?.ok)
-      setShareMsg(res?.ok ? (res.message ?? '已提交') : (res?.message ?? '提交失败'))
+      setShareMsg(res?.ok ? (res.message ?? tKey('market.submitted')) : (res?.message ?? tKey('market.submitFailed')))
       // 提交后刷新「我已安装」区块（更新 submitted / gatewayVersion 状态）
       void loadMine()
     } catch (err) {
@@ -217,7 +256,7 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
     try {
       const res = await window.shanhai?.uninstallMarketPlugin(id)
       setUninstallOk(!!res?.ok)
-      setUninstallMsg(res?.ok ? (res.message ?? '已卸载') : (res?.message ?? '卸载失败'))
+      setUninstallMsg(res?.ok ? (res.message ?? tKey('market.uninstalled')) : (res?.message ?? tKey('market.uninstallFailed')))
       if (res?.ok) {
         // 卸载成功后刷新「我已安装」区块 + 刷新「发现」列表（更新 installed 标记）
         void loadMine()
@@ -237,14 +276,14 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden', background: 'var(--bg-app)', color: 'var(--text)', fontFamily: 'system-ui, sans-serif' }}>
-      <WindowTitleBar icon={<IconStore />} title="创意空间" subtitle="浏览、安装与提交插件" onClose={onClose} />
+      <WindowTitleBar icon={<IconStore />} title={tKey('market.title')} subtitle={tKey('market.subtitle')} onClose={onClose} />
 
       {/* Tab 切换 */}
       <div style={{ display: 'flex', gap: 4, padding: '0 20px', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
         {[
-          { k: 'browse', label: '发现' },
-          { k: 'mine', label: '我已安装' },
-          { k: 'submit', label: '我的提交' },
+          { k: 'browse', label: tKey('market.tab.browse') },
+          { k: 'mine', label: tKey('market.tab.mine') },
+          { k: 'submit', label: tKey('market.tab.submit') },
         ].map((t) => (
           <button
             key={t.k}
@@ -279,12 +318,12 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
                       setKeyword(e.target.value)
                       void load(e.target.value, category, hasUI)
                     }}
-                    placeholder="搜索插件名称 / 用途"
+                    placeholder={tKey('market.searchPlaceholder')}
                     style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', color: 'var(--text)', fontSize: 13 }}
                   />
                 </div>
                 <button
-                  title="刷新"
+                  title={tKey('common.refresh')}
                   onClick={() => void load(keyword, category, hasUI)}
                   style={{ ...smallIconBtn, color: 'var(--text-muted)', width: 34, height: 34 }}
                 >
@@ -294,13 +333,13 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
 
               {/* hasUI + 分类筛选 */}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
-                <FilterChip label="全部" active={hasUI === ''} onClick={() => { setHasUI(''); void load(keyword, category, '') }} />
-                <FilterChip label="有界面" active={hasUI === true} onClick={() => { setHasUI(true); void load(keyword, category, true) }} />
-                <FilterChip label="纯工具" active={hasUI === false} onClick={() => { setHasUI(false); void load(keyword, category, false) }} />
+                <FilterChip label={tKey('market.filterAll')} active={hasUI === ''} onClick={() => { setHasUI(''); void load(keyword, category, '') }} />
+                <FilterChip label={tKey('market.filterHasUI')} active={hasUI === true} onClick={() => { setHasUI(true); void load(keyword, category, true) }} />
+                <FilterChip label={tKey('market.filterToolOnly')} active={hasUI === false} onClick={() => { setHasUI(false); void load(keyword, category, false) }} />
                 <span style={{ width: 1, height: 18, background: 'var(--border)', margin: '0 6px' }} />
-                <FilterChip label="全部分类" active={category === ''} onClick={() => { setCategory(''); void load(keyword, '', hasUI) }} />
+                <FilterChip label={tKey('market.filterAllCats')} active={category === ''} onClick={() => { setCategory(''); void load(keyword, '', hasUI) }} />
                 {CATEGORIES.map((c) => (
-                  <FilterChip key={c} label={c} active={category === c} onClick={() => { setCategory(c); void load(keyword, c, hasUI) }} />
+                  <FilterChip key={c} label={categoryLabel(c)} active={category === c} onClick={() => { setCategory(c); void load(keyword, c, hasUI) }} />
                 ))}
               </div>
             </div>
@@ -308,7 +347,7 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
             {/* 状态提示 */}
             {mockMode && (
               <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--tint-yellow-soft, rgba(255,193,7,0.12))', color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.6 }}>
-                网关创意空间接口尚未就绪（{error || '网络错误'}），当前展示 mock 数据。网关接口上线后将自动切换为真实插件列表。
+                {tKey('market.mockBanner', { err: error || tKey('market.netError') })}
               </div>
             )}
             {notice && (
@@ -316,7 +355,7 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
             )}
 
             {/* 结果统计 */}
-            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{loading ? '加载中…' : `共 ${total} 个应用`}</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{loading ? tKey('common.loading') : tKey('market.count.apps', { n: total })}</div>
 
             {/* 列表：骨架屏 / 空态 / 应用卡片网格 */}
             {loading ? (
@@ -328,8 +367,8 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
             ) : filteredPlugins.length === 0 ? (
               <div style={{ padding: '56px 0', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13, display: 'flex', flexDirection: 'column', gap: 10, alignItems: 'center' }}>
                 <div style={{ opacity: 0.45, display: 'inline-flex' }}><span style={{ transform: 'scale(1.6)', display: 'inline-flex' }}><IconStore /></span></div>
-                <div>没有找到匹配的应用</div>
-                <div style={{ fontSize: 12, color: 'var(--text-faint)' }}>换个关键词或分类再试试</div>
+                <div>{tKey('market.empty.title')}</div>
+                <div style={{ fontSize: 12, color: 'var(--text-faint)' }}>{tKey('market.empty.hint')}</div>
               </div>
             ) : (
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(230px, 1fr))', gap: 14 }}>
@@ -344,12 +383,12 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             {!auth.loggedIn && (
               <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--tint-yellow-soft, rgba(255,193,7,0.12))', color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.6 }}>
-                未登录。登录后才能提交「分享 / 提交升级版本共享」到创意空间。请先登录。
+                {tKey('market.needLogin')}
               </div>
             )}
             {mineError && (
               <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--tint-yellow-soft, rgba(255,193,7,0.12))', color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.6 }}>
-                网关「我的插件」接口（mine）未就绪（{mineError}），提交状态按「未提交」降级处理，自研插件将显示「分享」按钮。
+                {tKey('market.mineBanner', { err: mineError })}
               </div>
             )}
             {shareMsg && (
@@ -359,10 +398,10 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
               <div style={{ padding: '10px 12px', borderRadius: 8, background: uninstallOk ? 'var(--tint-green-soft, rgba(76,175,80,0.14))' : 'rgba(239,68,68,0.14)', color: uninstallOk ? 'var(--text)' : 'var(--text-danger, #ef4444)', fontSize: 13, lineHeight: 1.6, wordBreak: 'break-all' }}>{uninstallMsg}</div>
             )}
 
-            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{mineLoading ? '加载中…' : `共 ${myPlugins.length} 个已安装插件`}</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{mineLoading ? tKey('common.loading') : tKey('market.count.installed', { n: myPlugins.length })}</div>
             {!mineLoading && myPlugins.length === 0 && (
               <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
-                还没有安装任何插件。去「发现」tab 下载安装，或提交自己的插件。
+                {tKey('market.mineEmpty')}
               </div>
             )}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(230px, 1fr))', gap: 14 }}>
@@ -384,11 +423,11 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             {/* 我的提交记录列表 */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>我的提交记录</div>
-              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{mineLoading ? '加载中…' : `共 ${submittedPlugins.length} 条提交记录`}</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{tKey('market.recordsTitle')}</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{mineLoading ? tKey('common.loading') : tKey('market.count.records', { n: submittedPlugins.length })}</div>
               {submittedPlugins.length === 0 ? (
                 <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
-                  还没有提交记录。提交自研插件后，这里会显示审核状态。
+                  {tKey('market.recordsEmpty')}
                 </div>
               ) : (
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(230px, 1fr))', gap: 14 }}>
@@ -493,6 +532,7 @@ function AppIcon({ name, iconUrl, size = 52, radius = 13 }: { name: string; icon
 
 /** 应用卡片：图标 + 名称 + 一句话简介 + 元信息标签 + 操作按钮，hover 悬浮阴影/上移 */
 function MarketCard({ p, installing, onInstall }: { p: MarketItem; installing: boolean; onInstall: (id: string) => void }): React.JSX.Element {
+  useLocaleSync()
   const [hover, setHover] = useState(false)
   const sizeLabel = formatSize(p.fileSize)
   return (
@@ -518,20 +558,20 @@ function MarketCard({ p, installing, onInstall }: { p: MarketItem; installing: b
         <AppIcon name={p.name} iconUrl={p.iconUrl} size={52} radius={13} />
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 15, color: 'var(--text)', lineHeight: 1.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</div>
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{p.purpose || '暂无简介'}</div>
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{p.purpose || tKey('market.noDesc')}</div>
         </div>
       </div>
 
       {/* 中间：元信息标签 */}
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-        {p.hasUI ? <Tag label="界面" /> : <Tag label="工具" tone="gray" />}
+        {p.hasUI ? <Tag label={tKey('market.tag.ui')} /> : <Tag label={tKey('market.tag.tool')} tone="gray" />}
         {(p.categories ?? []).slice(0, 3).map((c) => (
-          <Tag key={c} label={c} tone="blue" />
+          <Tag key={c} label={categoryLabel(c)} tone="blue" />
         ))}
-        {p.installed && <Tag label="已安装" tone="green" />}
+        {p.installed && <Tag label={tKey('market.installed')} tone="green" />}
       </div>
       <div style={{ fontSize: 11, color: 'var(--text-faint)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
-        {p.author && <span>来自 {p.author}</span>}
+        {p.author && <span>{tKey('market.fromAuthor', { author: p.author })}</span>}
         {p.version && <span>v{p.version}</span>}
         {sizeLabel && <span>{sizeLabel}</span>}
       </div>
@@ -554,7 +594,7 @@ function MarketCard({ p, installing, onInstall }: { p: MarketItem; installing: b
           opacity: installing ? 0.6 : 1,
         }}
       >
-        {installing ? '安装中…' : p.installed ? '已安装' : '下载安装'}
+        {installing ? tKey('market.installing') : p.installed ? tKey('market.installed') : tKey('market.install')}
       </button>
     </div>
   )
@@ -563,6 +603,7 @@ function MarketCard({ p, installing, onInstall }: { p: MarketItem; installing: b
 /** 「我已安装」插件卡片：复用「发现」面板卡片视觉（图标 + 名称 + 简介 + 标签 + 元信息 + 整宽操作按钮），
  *  同时承载「已安装」专属信息（自研标记 / 本地版本 / 网关版本 / 分享 / 提交升级版本共享）。 */
 function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { p: MyItem; sharing: boolean; loggedIn: boolean; onShare: (id: string) => void; uninstalling: boolean; onUninstall: (id: string) => void }): React.JSX.Element {
+  useLocaleSync()
   const [hover, setHover] = useState(false)
   const [confirming, setConfirming] = useState(false)
   const action = shareAction(p)
@@ -588,21 +629,21 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
         <AppIcon name={p.name} size={52} radius={13} />
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 15, color: 'var(--text)', lineHeight: 1.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</div>
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{p.purpose || '暂无简介'}</div>
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{p.purpose || tKey('market.noDesc')}</div>
         </div>
       </div>
 
       {/* 中间：标签 */}
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-        <Tag label="已安装" tone="green" />
-        {p.selfMade && <Tag label="自研" tone="orange" />}
-        {p.submitted && p.hasApproved && <Tag label="已上架" tone="blue" />}
+        <Tag label={tKey('market.installed')} tone="green" />
+        {p.selfMade && <Tag label={tKey('market.tag.selfMade')} tone="orange" />}
+        {p.submitted && p.hasApproved && <Tag label={tKey('market.tag.listed')} tone="blue" />}
       </div>
 
       {/* 元信息：本地版本 + 网关版本 */}
       <div style={{ fontSize: 11, color: 'var(--text-faint)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
         {p.version && <span>v{p.version}</span>}
-        {p.submitted && p.gatewayVersion && <span>网关 v{p.gatewayVersion}</span>}
+        {p.submitted && p.gatewayVersion && <span>{tKey('market.gatewayVersion', { v: p.gatewayVersion })}</span>}
       </div>
 
       {/* 底部：操作按钮（分享 / 提交升级版本共享 / 已安装 + 卸载）同一行 */}
@@ -625,7 +666,7 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
             transition: 'opacity 0.15s ease',
           }}
         >
-          {sharing ? '分享中…' : '分享'}
+          {sharing ? tKey('market.sharing') : tKey('market.share')}
         </button>
       )}
       {action === 'upgrade' && (
@@ -646,7 +687,7 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
             transition: 'opacity 0.15s ease',
           }}
         >
-          {sharing ? '提交中…' : '提交升级版本共享'}
+          {sharing ? tKey('market.upgrading') : tKey('market.upgrade')}
         </button>
       )}
       {action === null && (
@@ -664,7 +705,7 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
             cursor: 'default',
           }}
         >
-          已安装
+          {tKey('market.installed')}
         </button>
       )}
 
@@ -687,11 +728,11 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
             transition: 'opacity 0.15s ease',
           }}
         >
-          {uninstalling ? '卸载中…' : '卸载'}
+          {uninstalling ? tKey('market.uninstalling') : tKey('market.uninstall')}
         </button>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '10px 12px', borderRadius: 10, background: 'rgba(239,68,68,0.08)', border: '1px solid var(--text-danger, #ef4444)' }}>
-          <div style={{ fontSize: 12, color: 'var(--text-danger, #ef4444)', lineHeight: 1.5 }}>确认卸载「{p.name}」？将从本机移除该插件，卸载不可恢复。</div>
+          <div style={{ fontSize: 12, color: 'var(--text-danger, #ef4444)', lineHeight: 1.5 }}>{tKey('market.uninstallConfirm', { name: p.name })}</div>
           <div style={{ display: 'flex', gap: 8 }}>
             <button
               onClick={() => { setConfirming(false); onUninstall(p.id) }}
@@ -709,7 +750,7 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
                 opacity: uninstalling ? 0.55 : 1,
               }}
             >
-              {uninstalling ? '卸载中…' : '确认卸载'}
+              {uninstalling ? tKey('market.uninstalling') : tKey('market.uninstallConfirmBtn')}
             </button>
             <button
               onClick={() => setConfirming(false)}
@@ -726,7 +767,7 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
                 cursor: uninstalling ? 'not-allowed' : 'pointer',
               }}
             >
-              取消
+              {tKey('common.cancel')}
             </button>
           </div>
         </div>
@@ -757,18 +798,23 @@ function SkeletonCard(): React.JSX.Element {
   )
 }
 
-/** 网关审核状态 → 展示文案 + 色调（gatewayStatus: approved/pending/rejected） */
-function reviewStatus(p: MyItem): { label: string; tone: 'green' | 'orange' | 'red' | 'gray' } {
+/**
+ * 网关审核状态 → 展示词条 key + 色调（gatewayStatus: approved/pending/rejected）。
+ * 返回 k 而不是 label：本函数在渲染期被调用，返回中文会把语言固化进 state/props；
+ * 判定分支（含 hasApproved 回落与未知状态默认「审核中」）一字未改。
+ */
+function reviewStatus(p: MyItem): { k: string; tone: 'green' | 'orange' | 'red' | 'gray' } {
   const s = (p.gatewayStatus ?? '').toLowerCase()
-  if (s === 'approved') return { label: '已通过', tone: 'green' }
-  if (s === 'rejected') return { label: '未通过', tone: 'red' }
-  if (s === 'pending' || s === 'reviewing' || s === 'under_review' || s === 'submitted') return { label: '审核中', tone: 'orange' }
-  if (p.hasApproved) return { label: '已通过', tone: 'green' }
-  return { label: '审核中', tone: 'gray' }
+  if (s === 'approved') return { k: 'market.review.approved', tone: 'green' }
+  if (s === 'rejected') return { k: 'market.review.rejected', tone: 'red' }
+  if (s === 'pending' || s === 'reviewing' || s === 'under_review' || s === 'submitted') return { k: 'market.review.pending', tone: 'orange' }
+  if (p.hasApproved) return { k: 'market.review.approved', tone: 'green' }
+  return { k: 'market.review.pending', tone: 'gray' }
 }
 
 /** 「我的提交」记录卡片：复用卡片视觉，突出展示审核状态（审核中 / 已通过 / 未通过） */
 function SubmitRecordCard({ p }: { p: MyItem }): React.JSX.Element {
+  useLocaleSync()
   const [hover, setHover] = useState(false)
   const st = reviewStatus(p)
   return (
@@ -793,19 +839,19 @@ function SubmitRecordCard({ p }: { p: MyItem }): React.JSX.Element {
         <AppIcon name={p.name} size={52} radius={13} />
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 15, color: 'var(--text)', lineHeight: 1.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</div>
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{p.purpose || '暂无简介'}</div>
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{p.purpose || tKey('market.noDesc')}</div>
         </div>
       </div>
 
       {/* 审核状态 */}
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-        <Tag label={st.label} tone={st.tone} />
+        <Tag label={tKey(st.k)} tone={st.tone} />
       </div>
 
       {/* 元信息：本地版本 + 网关版本 */}
       <div style={{ fontSize: 11, color: 'var(--text-faint)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
         {p.version && <span>v{p.version}</span>}
-        {p.gatewayVersion && <span>网关 v{p.gatewayVersion}</span>}
+        {p.gatewayVersion && <span>{tKey('market.gatewayVersion', { v: p.gatewayVersion })}</span>}
       </div>
     </div>
   )

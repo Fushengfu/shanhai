@@ -1,5 +1,6 @@
 import type { ComponentType } from 'react'
 import { IconChat, IconMonitor, IconTerminal, IconActivity, IconClock, IconSettings, IconWrench, IconImage, IconStore } from '../components/icons'
+import { t } from '../../shared/i18n'
 
 /**
  * 插件应用清单（多窗口桌面系统的「应用」注册表）。
@@ -7,9 +8,17 @@ import { IconChat, IconMonitor, IconTerminal, IconActivity, IconClock, IconSetti
  * 每个应用承载一个独立 BrowserWindow（app 类型），Step 4 起逐个迁入真实面板。
  */
 export interface AppManifest {
+  /** 路由键：openApp(appId) / 窗口归属都靠它，**绝不进语言包、绝不翻译** */
   id: string
-  name: string
-  description: string
+  /**
+   * 【i18n 期4C】展示名一律存词条 key，渲染期再 t() 取。
+   * 为什么不在这里就拼好中文：模块级常量在**加载期**求值，切语言不会重算 ——
+   * 这个坑历轮已实证六次（STATUS_LABEL / TOOL_META / SUPERVISOR_ARG_LABELS /
+   * PROTOCOL_OPTIONS / SECTIONS / ROLE_META），本期是第七次。
+   * 展示请走 appNameOf() / appDescOf()，别直接读字段。
+   */
+  nameKey: string
+  descKey: string
   Icon: ComponentType
   /**
    * 是否作为 Dock 上「直接可见」的应用图标显示。
@@ -20,18 +29,18 @@ export interface AppManifest {
 }
 
 export const APP_REGISTRY: AppManifest[] = [
-  { id: 'marketplace', name: '创意空间', description: '浏览与安装插件', Icon: IconStore },
+  { id: 'marketplace', nameKey: 'app.marketplace.name', descKey: 'app.marketplace.desc', Icon: IconStore },
   // 私信（会员实时通讯底线的内置 UI）：占 Dock 图标位，便于发现与看到未读红点
-  { id: 'messages', name: '私信', description: '会员之间的好友与私信', Icon: IconChat },
-  { id: 'chat', name: '聊天', description: '聊天窗口', Icon: IconChat },
-  { id: 'supervisor', name: '管家', description: '会话管家', Icon: IconMonitor },
-  { id: 'terminal', name: '终端', description: '命令终端', Icon: IconTerminal },
+  { id: 'messages', nameKey: 'app.messages.name', descKey: 'app.messages.desc', Icon: IconChat },
+  { id: 'chat', nameKey: 'app.chat.name', descKey: 'app.chat.desc', Icon: IconChat },
+  { id: 'supervisor', nameKey: 'app.supervisor.name', descKey: 'app.supervisor.desc', Icon: IconMonitor },
+  { id: 'terminal', nameKey: 'app.terminal.name', descKey: 'app.terminal.desc', Icon: IconTerminal },
   // 轨迹 / 记忆：不直接占 Dock 图标位，入口收敛到聊天窗口顶栏（HeaderPlugin 的「记忆」「轨迹」按钮）
-  { id: 'trace', name: '轨迹', description: '执行轨迹', Icon: IconActivity, showInDock: false },
-  { id: 'memory', name: '记忆', description: '长期记忆', Icon: IconClock, showInDock: false },
-  { id: 'settings', name: '设置', description: '系统设置', Icon: IconSettings },
-  { id: 'models', name: '模型', description: '模型管理', Icon: IconWrench },
-  { id: 'wallpaper', name: '壁纸', description: '桌面背景', Icon: IconImage },
+  { id: 'trace', nameKey: 'app.trace.name', descKey: 'app.trace.desc', Icon: IconActivity, showInDock: false },
+  { id: 'memory', nameKey: 'app.memory.name', descKey: 'app.memory.desc', Icon: IconClock, showInDock: false },
+  { id: 'settings', nameKey: 'app.settings.name', descKey: 'app.settings.desc', Icon: IconSettings },
+  { id: 'models', nameKey: 'app.models.name', descKey: 'app.models.desc', Icon: IconWrench },
+  { id: 'wallpaper', nameKey: 'app.wallpaper.name', descKey: 'app.wallpaper.desc', Icon: IconImage },
 ]
 
 /** Dock 直接显示的应用（过滤掉 showInDock === false 的二级入口应用） */
@@ -39,4 +48,14 @@ export const DOCK_APPS: AppManifest[] = APP_REGISTRY.filter((a) => a.showInDock 
 
 export function getAppManifest(appId: string): AppManifest | undefined {
   return APP_REGISTRY.find((a) => a.id === appId)
+}
+
+/** 应用展示名（**渲染期**调用；key 缺失时 t() 会兜底，界面不会露出 app.xxx） */
+export function appNameOf(app: Pick<AppManifest, 'nameKey'>): string {
+  return t(app.nameKey)
+}
+
+/** 应用描述（同上） */
+export function appDescOf(app: Pick<AppManifest, 'descKey'>): string {
+  return t(app.descKey)
 }

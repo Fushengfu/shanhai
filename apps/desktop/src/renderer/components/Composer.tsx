@@ -1,9 +1,11 @@
 import * as React from 'react'
-import { IconCheck, IconChevronDown, IconClock, IconFile, IconFolder, IconMic, IconMonitor, IconPaperclip, IconPlus, IconRefresh, IconSend, IconShield, IconStop } from './icons'
+import { IconCheck, IconChevronDown, IconClock, IconFile, IconFolder, IconMic, IconMonitor, IconPaperclip, IconPlus, IconRefresh, IconSend, IconShield, IconStop, IconWarn } from './icons'
 import { iconBtn } from './ui'
 import { AppendSlotView } from '../slots'
 import type { AttachmentItem, DmQuotePayload, GatewayModel } from '../types'
 import { DmQuoteBanner } from './DmQuoteBanner'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /**
  * 统一的输入框组件（props 驱动）：聊天窗口（ComposerSlot）与「会话管家」窗口共用，
@@ -19,6 +21,14 @@ export interface ComposerProps {
   handleFileSelect: (e: React.ChangeEvent<HTMLInputElement>) => Promise<void>
   queueCount: number
   voiceNotice: string
+  /**
+   * 【P3】发送被拦下时的可见原因（图片没传完 / 附件超限 / 类型不允许…）。
+   * 之所以要有这一条：App.tsx 与 SupervisorApp.tsx 的 send 里原本直接 `return`，
+   * 用户点发送「什么都没发生」—— 本项目反复出现的静默失败，必须给可见且可区分的原因。
+   */
+  sendNotice?: string
+  /** 附件文件选择框的白名单（accept 属性）：由 shared 的附件规矩统一生成，避免三处各写一套 */
+  accept?: string
   input: string
   setInput: (v: string) => void
   isComposingRef: React.MutableRefObject<boolean>
@@ -55,6 +65,7 @@ export interface ComposerProps {
 }
 
 export const Composer = React.memo(function Composer(p: ComposerProps): React.JSX.Element {
+  useLocaleSync()
   const systemModels = p.models.filter((m) => !m.custom)
   const customModels = p.models.filter((m) => m.custom)
 
@@ -89,7 +100,7 @@ export const Composer = React.memo(function Composer(p: ComposerProps): React.JS
                     )}
                     {a.uploadStatus === 'error' && (
                       <div
-                        title="上传失败，点击重试"
+                        title={t('common.uploadFailedRetry')}
                         onClick={() => p.retryImageUpload(a.id)}
                         style={{ position: 'absolute', right: -4, bottom: -4, width: 16, height: 16, borderRadius: '50%', background: 'var(--danger)', color: '#fff', fontSize: 11, lineHeight: '16px', textAlign: 'center', cursor: 'pointer' }}
                       >
@@ -117,11 +128,11 @@ export const Composer = React.memo(function Composer(p: ComposerProps): React.JS
             ))}
           </div>
         )}
-        <input ref={p.fileRef} type="file" multiple style={{ display: 'none' }} onChange={(e) => void p.handleFileSelect(e)} />
+        <input ref={p.fileRef} type="file" multiple accept={p.accept} style={{ display: 'none' }} onChange={(e) => void p.handleFileSelect(e)} />
         {p.queueCount > 0 && (
           <div style={{ marginBottom: 6, fontSize: 12, color: 'var(--warning)', display: 'flex', alignItems: 'center', gap: 4 }}>
             <IconClock />
-            排队中 {p.queueCount} 条消息，将在当前任务完成后自动执行
+            {t('chat.composer.queued', { n: p.queueCount })}
           </div>
         )}
         {p.quote && <DmQuoteBanner quote={p.quote} onDismiss={() => p.onClearQuote?.()} />}
@@ -129,6 +140,15 @@ export const Composer = React.memo(function Composer(p: ComposerProps): React.JS
           <div style={{ marginBottom: 6, fontSize: 12, color: 'var(--warning)', display: 'flex', alignItems: 'center', gap: 4 }}>
             <IconMic />
             {p.voiceNotice}
+          </div>
+        )}
+        {/* 发送被拦下的原因（红色，与语音那种「提示」区分开）：不静默、不吞异常 */}
+        {p.sendNotice && (
+          <div style={{ marginBottom: 6, fontSize: 12, color: 'var(--danger-text, var(--danger))', display: 'flex', alignItems: 'flex-start', gap: 4, lineHeight: 1.5 }}>
+            <span style={{ display: 'inline-flex', flexShrink: 0, marginTop: 1 }}>
+              <IconWarn />
+            </span>
+            <span style={{ minWidth: 0 }}>{p.sendNotice}</span>
           </div>
         )}
         <textarea
@@ -156,14 +176,14 @@ export const Composer = React.memo(function Composer(p: ComposerProps): React.JS
           onPaste={(e) => void p.handlePaste(e)}
           autoFocus
           rows={3}
-          placeholder="输入任务，Enter 发送，Shift+Enter 换行"
+          placeholder={t('chat.composer.placeholder')}
           style={{ width: '100%', border: 'none', outline: 'none', resize: 'none', fontSize: 14, lineHeight: 1.6, background: 'transparent', minHeight: 60, maxHeight: 200, fontFamily: 'inherit', display: 'block', boxSizing: 'border-box' }}
         />
         {/* 追加型扩展点：输入框下方（agent 往这里挂按钮/小组件，不替换核心输入框） */}
         <AppendSlotView slot="composer.below" />
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4, gap: 8 }}>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', flex: 1, minWidth: 0 }}>
-            <button title="附件" onClick={() => p.fileRef.current?.click()} style={iconBtn}>
+            <button title={t('chat.composer.attachTitle')} onClick={() => p.fileRef.current?.click()} style={iconBtn}>
               <IconPaperclip />
             </button>
             {/* 追加型扩展点：输入框工具栏（agent 往这里追加操作按钮） */}
@@ -174,28 +194,28 @@ export const Composer = React.memo(function Composer(p: ComposerProps): React.JS
                 style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid var(--border-strong)', fontSize: 12, color: 'var(--text-secondary)', background: 'var(--bg-panel)', outline: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: 180, minWidth: 0 }}
               >
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 140 }}>
-                  {p.models.find((m) => m.id === p.selectedModel)?.name ?? (p.loggedIn ? '选择模型' : '未登录')}
+                  {p.models.find((m) => m.id === p.selectedModel)?.name ?? (p.loggedIn ? t('chat.model.pick') : t('chat.model.notLoggedIn'))}
                 </span>
                 <IconChevronDown />
               </button>
               {p.modelMenuOpen && (
                 <div style={{ position: 'absolute', bottom: '110%', left: 0, minWidth: 260, maxHeight: 360, overflowY: 'auto', background: 'var(--bg-panel)', border: '1px solid var(--border-soft)', borderRadius: 10, boxShadow: '0 4px 16px rgba(0,0,0,0.12)', zIndex: 20, padding: 4 }}>
                   <div style={{ padding: '6px 10px', fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <span>系统内置</span>
+                    <span>{t('chat.model.systemBuiltIn')}</span>
                     <button
                       onClick={(e) => {
                         e.stopPropagation()
                         void window.shanhai?.refreshModels()
                       }}
-                      title="从网关重新拉取最新模型列表"
+                      title={t('chat.model.refreshTitle')}
                       style={{ display: 'inline-flex', alignItems: 'center', gap: 4, border: 'none', background: 'transparent', color: 'var(--accent)', fontSize: 11, cursor: 'pointer', padding: '2px 4px', borderRadius: 4 }}
                     >
                       <IconRefresh />
-                      刷新
+                      {t('common.refresh')}
                     </button>
                   </div>
                   {systemModels.length === 0 ? (
-                    <div style={{ padding: '8px 10px', color: 'var(--text-faint)', fontSize: 12 }}>请先登录以加载模型</div>
+                    <div style={{ padding: '8px 10px', color: 'var(--text-faint)', fontSize: 12 }}>{t('chat.model.loginToLoad')}</div>
                   ) : (
                     systemModels.map((m) => (
                       <div
@@ -212,7 +232,7 @@ export const Composer = React.memo(function Composer(p: ComposerProps): React.JS
                     ))
                   )}
                   {customModels.length > 0 && (
-                    <div style={{ padding: '6px 10px', fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, marginTop: 4, borderTop: '1px solid var(--border)' }}>我的模型</div>
+                    <div style={{ padding: '6px 10px', fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, marginTop: 4, borderTop: '1px solid var(--border)' }}>{t('chat.model.myModels')}</div>
                   )}
                   {customModels.map((m) => (
                     <div
@@ -235,7 +255,7 @@ export const Composer = React.memo(function Composer(p: ComposerProps): React.JS
                       }}
                       style={{ width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px dashed var(--border-strong)', background: 'var(--bg-panel)', cursor: 'pointer', fontSize: 12, color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}
                     >
-                      <IconPlus /> 管理自定义模型
+                      <IconPlus /> {t('chat.model.manageCustom')}
                     </button>
                   </div>
                 </div>
@@ -244,49 +264,49 @@ export const Composer = React.memo(function Composer(p: ComposerProps): React.JS
             {p.showWorkdir !== false && (
               <button
                 onClick={() => void p.pickWorkdir?.()}
-                title={`工作目录：${p.workDir || '未设置'}（点击选择目录）`}
+                title={t('chat.workdir.title', { dir: p.workDir || t('chat.workdir.notSet') })}
                 style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid var(--border-strong)', fontSize: 12, color: 'var(--text-secondary)', background: 'var(--bg-panel)', outline: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: 150 }}
               >
                 <IconFolder />
-                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.workDirName ?? '选择目录'}</span>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.workDirName ?? t('common.chooseDir')}</span>
               </button>
             )}
             <div ref={p.approvalMenuRef} style={{ position: 'relative' }}>
               <button
                 onClick={() => p.setApprovalMenuOpen((v) => !v)}
-                title="安全模式（审批策略）"
+                title={t('chat.policy.title')}
                 style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid var(--border-strong)', fontSize: 12, color: p.approvalPolicy === 'never' ? 'var(--warning)' : p.approvalPolicy === 'workdir' ? 'var(--accent)' : 'var(--text-secondary)', background: 'var(--bg-panel)', outline: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4 }}
               >
                 <IconShield />
-                {p.approvalPolicy === 'ask' ? '每次询问' : p.approvalPolicy === 'workdir' ? '目录内免审批' : '自动执行'}
+                {p.approvalPolicy === 'ask' ? t('chat.policy.ask') : p.approvalPolicy === 'workdir' ? t('chat.policy.workdir') : t('chat.policy.auto')}
                 <IconChevronDown />
               </button>
               {p.approvalMenuOpen && (
                 <div style={{ position: 'absolute', bottom: '110%', left: 0, minWidth: 180, background: 'var(--bg-panel)', border: '1px solid var(--border-soft)', borderRadius: 10, boxShadow: '0 4px 16px rgba(0,0,0,0.12)', zIndex: 20, padding: 4 }}>
-                  <div style={{ padding: '6px 10px', fontSize: 11, color: 'var(--text-muted)', fontWeight: 600 }}>安全模式</div>
+                  <div style={{ padding: '6px 10px', fontSize: 11, color: 'var(--text-muted)', fontWeight: 600 }}>{t('chat.policy.section')}</div>
                   <div
                     onClick={() => p.switchApprovalPolicy('ask')}
                     style={{ padding: '8px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, color: p.approvalPolicy === 'ask' ? 'var(--accent)' : 'var(--text)', background: p.approvalPolicy === 'ask' ? 'var(--tint-blue-soft)' : 'transparent', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
                   >
-                    <span>每次询问</span>
+                    <span>{t('chat.policy.ask')}</span>
                     {p.approvalPolicy === 'ask' && <IconCheck />}
                   </div>
                   <div
                     onClick={() => p.switchApprovalPolicy('workdir')}
                     style={{ padding: '8px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, color: p.approvalPolicy === 'workdir' ? 'var(--accent)' : 'var(--text)', background: p.approvalPolicy === 'workdir' ? 'var(--tint-blue-soft)' : 'transparent', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
                   >
-                    <span>工作目录内免审批</span>
+                    <span>{t('chat.policy.workdirFull')}</span>
                     {p.approvalPolicy === 'workdir' && <IconCheck />}
                   </div>
                   <div
                     onClick={() => p.switchApprovalPolicy('never')}
                     style={{ padding: '8px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, color: p.approvalPolicy === 'never' ? 'var(--warning)' : 'var(--text)', background: p.approvalPolicy === 'never' ? 'var(--tint-orange)' : 'transparent', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
                   >
-                    <span>自动执行（不询问）</span>
+                    <span>{t('chat.policy.autoFull')}</span>
                     {p.approvalPolicy === 'never' && <IconCheck />}
                   </div>
                   <div style={{ padding: '4px 10px 6px', fontSize: 10, color: 'var(--text-faint)', lineHeight: 1.5 }}>
-                    每次询问：工作目录内也确认；工作目录内免审批：目录内自动执行、访问目录外才确认；自动执行：所有操作都不确认
+                    {t('chat.policy.help')}
                   </div>
                 </div>
               )}
@@ -294,7 +314,7 @@ export const Composer = React.memo(function Composer(p: ComposerProps): React.JS
           </div>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 }}>
             <button
-              title={p.recording ? '停止录音' : '语音输入（录音识别）'}
+              title={p.recording ? t('chat.composer.stopRecordTitle') : t('chat.composer.voiceInputTitle')}
               onClick={() => void p.toggleRecording()}
               style={{ ...iconBtn, color: p.recording ? 'var(--danger)' : undefined, borderColor: p.recording ? 'var(--tint-red-strong)' : undefined, background: p.recording ? 'var(--tint-red)' : undefined, animation: p.recording ? 'micPulse 1.4s ease-in-out infinite' : undefined }}
             >
@@ -303,7 +323,7 @@ export const Composer = React.memo(function Composer(p: ComposerProps): React.JS
             <button
               onClick={() => (p.busy ? p.stopSend() : void p.send())}
               disabled={!p.busy && !p.input.trim()}
-              title={p.busy ? '停止' : '发送'}
+              title={p.busy ? t('chat.composer.stopTitle') : t('chat.composer.sendTitle')}
               style={{
                 width: 36,
                 height: 36,

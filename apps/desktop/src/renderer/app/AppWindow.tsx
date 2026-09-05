@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { useEffect, useState } from 'react'
 import { getUiStoreSnapshot, patchUiStore, useUiStore } from '../store-client'
-import { getAppManifest } from '../apps/registry'
+import { getAppManifest, appNameOf } from '../apps/registry'
 import { MemoryPanel } from '../components/MemoryPanel'
 import { SettingsPanel } from '../components/SettingsPanel'
 import { TracePanel } from '../components/TracePanel'
@@ -11,6 +11,8 @@ import { WallpaperPanel } from '../components/WallpaperPanel'
 import { PluginMarketApp } from '../apps/PluginMarketApp'
 import { MemberPanel } from '../components/MemberPanel'
 import { useThemeSync } from '../theme'
+import { applyLocale, useLocaleSync } from '../locale'
+import { t } from '../../shared/i18n'
 
 /**
  * 插件应用窗口（多窗口桌面系统的独立应用）。
@@ -23,8 +25,20 @@ export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
     void window.shanhai?.closeApp(appId)
   }
 
+  // 【期4C 重扫补修】本窗口自己会渲染应用展示名（下方 default 分支的 appNameOf），
+  // 而窗口级 onLocaleChange 回调只 applyLocale、不 setState —— 光靠它本组件不会重渲染。
+  // 补上取词订阅，切语言时标题才会跟着变（这也是「AppWindow 到底靠什么重渲染」的答案）。
+  useLocaleSync()
+
   // 主题：订阅主进程广播，跟随聊天窗口切换（亮/暗实时同步）
   useThemeSync()
+
+  // 语言：同上，订阅 ui:locale 广播。私信面板（MemberPanel）就渲染在本窗口里，
+  // 不订阅的话会出现「聊天窗口切了英文、私信窗口还是中文」。
+  useEffect(() => {
+    const off = window.shanhai?.onLocaleChange((l) => applyLocale(l))
+    return off
+  }, [])
 
   // trace 应用：订阅广播的流式事件，实时显示当前会话执行过程（busy 恒 false，思考态由 streamingReasoning 承载）
   const [streaming, setStreaming] = useState('')
@@ -134,10 +148,10 @@ export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
               } as React.CSSProperties
             }
           >
-            {manifest?.name ?? appId}
+            {manifest ? appNameOf(manifest) : appId}
           </header>
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
-            未知应用：{appId}
+            {t('app.unknownApp', { id: appId })}
           </div>
         </div>
       )

@@ -65,8 +65,20 @@ const DEFAULT_GATEWAY_BASE = 'https://agent.bjctykj.com'
  *
  * 返回 { ok, url?, status, body?, attemptedHosts }；失败不抛异常，错误原因在 body / status 中。
  */
+/**
+ * 直传超时（毫秒）按体积给：改前是 15 秒写死 —— 而这条通道实测传过 8.47MB / 4.74MB / 5.23MB 的截图，
+ * 15 秒只在上游网络好时才够，弱网或稍大一点的文件必然被山海自己掐断（表现为「上传失败」红点）。
+ * 口径：15s 起步 + 每 1MB 追加 8s，封顶 180s（再长就该给用户看进度而不是干等）。
+ */
+function uploadTimeoutForBytes(bytes: number): number {
+  const mb = Math.max(0, bytes) / (1024 * 1024)
+  return Math.min(180_000, Math.max(15_000, Math.round(15_000 + mb * 8_000)))
+}
+
 export async function uploadToQiniu(params: QiniuUploadParams): Promise<QiniuUploadResult> {
-  const { uploadUrl, token, key, file, filename, publicBaseUrl = '', timeoutMs = 15000 } = params
+  // 未显式给 timeoutMs 时按 Blob 体积自适应（调用方给了就以调用方为准，不改既有语义）
+  const { uploadUrl, token, key, file, filename, publicBaseUrl = '', timeoutMs } = params
+  const effTimeoutMs = timeoutMs ?? uploadTimeoutForBytes(file.size)
   const attemptedHosts: string[] = []
 
   const sendOnce = async (url: string): Promise<{ ok: boolean; status: number; body: string }> => {
@@ -77,9 +89,12 @@ export async function uploadToQiniu(params: QiniuUploadParams): Promise<QiniuUpl
     form.append('file', file, filename)
     let resp: Response
     try {
-      resp = await fetchWithTimeout(url, { method: 'POST', body: form }, timeoutMs)
+      resp = await fetchWithTimeout(url, { method: 'POST', body: form }, effTimeoutMs)
     } catch (err) {
-      return { ok: false, status: 0, body: err instanceof Error ? err.message : String(err) }
+      const raw = err instanceof Error ? err.message : String(err)
+      // abort 时 fetch 抛的是 "This operation was aborted"，看不出是超时；这里换成中文并带上真实时限
+      const body = /abort/i.test(raw) ? `上传超时（${Math.round(effTimeoutMs / 1000)} 秒内未完成）` : raw
+      return { ok: false, status: 0, body }
     }
     const body = await resp.text().catch(() => '')
     return { ok: resp.ok, status: resp.status, body }
@@ -126,15 +141,31 @@ async function doCloudUpload(file: {
     // 计算 SHA-256 hash（网关侧去重：相同文件只存一份）
     const hash = createHash('sha256').update(file.bytes).digest('hex')
     // 1. 调网关拿上传凭证（登录账号上传体系；与插件市场提交的凭证来源不同，保持独立）
-    const tokenResp = await fetchWithTimeout(
-      `${file.gatewayBase.replace(/\/+$/, '')}/api/member/storage/upload-token`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${file.token}` },
-        body: JSON.stringify({ file_name: file.fileName, mime_type: file.mimeType, hash }),
-      },
-    )
-    if (!tokenResp.ok) return null
+    // 换凭证是**幂等**请求（body 带同一份 SHA-256，网关按 hash 去重、命中直接 reused 返回），
+    // 所以网关超时/5xx 可以安全重发：最多 3 次，指数退避 800ms → 1.6s → 3.2s，每次都是全新 fetch。
+    const tokenUrl = `${file.gatewayBase.replace(/\/+$/, '')}/api/member/storage/upload-token`
+    const tokenBody = JSON.stringify({ file_name: file.fileName, mime_type: file.mimeType, hash })
+    let tokenResp: Response | null = null
+    for (let attempt = 0; attempt <= UPLOAD_TOKEN_RETRY_MAX; attempt += 1) {
+      try {
+        tokenResp = await fetchWithTimeout(
+          tokenUrl,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${file.token}` },
+            body: tokenBody,
+          },
+        )
+      } catch {
+        tokenResp = null // 网络错误 / abort：请求没到达网关，重试安全
+      }
+      if (tokenResp && tokenResp.ok) break
+      // 4xx 是请求本身的问题（参数/鉴权），重发也不会变好 → 不重试
+      if (tokenResp && tokenResp.status < 500 && tokenResp.status !== 429) break
+      if (attempt === UPLOAD_TOKEN_RETRY_MAX) break
+      await new Promise((r) => setTimeout(r, UPLOAD_TOKEN_RETRY_BASE_MS * 2 ** attempt))
+    }
+    if (!tokenResp || !tokenResp.ok) return null
     const tokenJson = (await tokenResp.json().catch(() => ({}))) as {
       code?: number
       message?: string
@@ -219,6 +250,10 @@ export async function uploadFileToCloud(params: UploadFileParams): Promise<strin
     return null
   }
 }
+
+/** 换上传凭证的重试上限与退避基数（幂等请求，网关按 hash 去重） */
+const UPLOAD_TOKEN_RETRY_MAX = 3
+const UPLOAD_TOKEN_RETRY_BASE_MS = 800
 
 /** 带超时的 fetch：防止网络挂起导致截图上传永久卡住 */
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 15000): Promise<Response> {

@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 import type { GatewayModel } from '../types'
 import { IconPlus, IconWrench, IconCheck, IconWarn, IconTrash, IconChevronDown } from './icons'
 import { WindowTitleBar } from './WindowTitleBar'
+import { t as tKey, getLocale } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /** 模型协议 */
 type ModelProtocol = 'openai' | 'anthropic'
@@ -24,14 +26,32 @@ const MODEL_PROVIDERS: Array<{ id: string; name: string; badge: string; protocol
 /** 自定义端点（不属于任何预置服务商）的默认 providerId */
 const CUSTOM_PROVIDER_ID = 'custom'
 
-/** 协议下拉选项 */
-const PROTOCOL_OPTIONS: SelectOption[] = [
-  { value: 'openai', label: 'OpenAI 兼容', hint: 'DeepSeek / Qwen / GLM 等', badge: 'AI' },
-  { value: 'anthropic', label: 'Anthropic', hint: 'Claude 原生协议', badge: 'AN' },
-]
+/**
+ * 协议下拉选项。
+ *
+ * 【为什么是函数而不是模块级常量】历轮五次实证同一个坑（STATUS_LABEL / TOOL_META /
+ * SUPERVISOR_ARG_LABELS / SECTIONS / ROLE_META）：模块级常量里的中文在模块加载那一刻就固化，
+ * 切语言不会重算 → 下拉里永远显示旧语言。改成渲染期调用的函数，语言一变、组件重渲染就跟着变。
+ */
+function protocolOptions(): SelectOption[] {
+  return [
+    { value: 'openai', label: tKey('panels.model.protocolOpenai'), hint: tKey('panels.model.protocolOpenaiHint'), badge: 'AI' },
+    { value: 'anthropic', label: 'Anthropic', hint: tKey('panels.model.protocolAnthropicHint'), badge: 'AN' },
+  ]
+}
 
 /** 上下文长度上限（token 数，防止误填超大值导致上下文预算计算异常） */
 const MAX_CONTEXT_LENGTH = 2_000_000
+
+/**
+ * 上限数字的千分位展示跟随当前界面语言。
+ * 摸底第 7 节点名的 9 处 toLocale* 之一，也是渲染层最后一处还写死语言的；
+ * 改法与期 4A 在 TracePanel 的处理同源，但这里显式给 locale tag（不用 undefined），
+ * 免得结果随宿主系统语言漂 —— 中文态输出与改前 toLocaleString() 在中文环境下逐字一致。
+ */
+function maxCtxLabel(): string {
+  return MAX_CONTEXT_LENGTH.toLocaleString(getLocale() === 'en-US' ? 'en-US' : 'zh-CN')
+}
 
 /** 根据 baseUrl 反查服务商（编辑已配置模型时回填下拉）；匹配不到返回 undefined */
 function inferProvider(baseUrl: string): (typeof MODEL_PROVIDERS)[number] | undefined {
@@ -189,7 +209,7 @@ function CustomSelect(props: { value: string; options: SelectOption[]; onChange:
       <button ref={btnRef} type="button" className="cm-select" onClick={toggle}>
         <span className="cm-select-value">
           {current?.badge && <span className="cm-option-badge">{current.badge}</span>}
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{current ? current.label : (props.placeholder ?? '请选择')}</span>
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{current ? current.label : (props.placeholder ?? tKey('panels.model.choose'))}</span>
         </span>
         <span className={`cm-select-chevron${open ? ' open' : ''}`}>
           <IconChevronDown />
@@ -239,7 +259,7 @@ function Field(props: { label: string; value: string; onChange: (v: string) => v
             placeholder={props.placeholder}
             style={{ paddingRight: 44 }}
           />
-          <button type="button" className="cm-eye-btn" onClick={() => setReveal((r) => !r)} title={reveal ? '隐藏' : '显示'} aria-label={reveal ? '隐藏 API Key' : '显示 API Key'}>
+          <button type="button" className="cm-eye-btn" onClick={() => setReveal((r) => !r)} title={reveal ? tKey('panels.model.hide') : tKey('panels.model.show')} aria-label={reveal ? tKey('panels.model.hideKey') : tKey('panels.model.showKey')}>
             <IconEye closed={!reveal} />
           </button>
         </div>
@@ -274,18 +294,22 @@ export function CustomModelDrawer(props: {
   const [savedMsg, setSavedMsg] = useState('')
   const [loading, setLoading] = useState(false)
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
+  // 谁取词谁订阅：本组件渲染期取词（分组标题、字段标签、下拉选项、校验提示等）。
+  // 它挂在 AppWindow 下，而 AppWindow 只挂窗口级 onLocaleChange（更新取词镜像）本身不订阅，
+  // 所以必须自订阅，否则切语言时抽屉不重渲染、仍显示旧语言。
+  useLocaleSync()
 
   /** 当前协议下的预置服务商 */
   const providersOfProtocol = MODEL_PROVIDERS.filter((p) => p.protocol === protocol)
   /** 服务商下拉选项（预置 + 自定义端点） */
   const providerOptions: SelectOption[] = [
     ...providersOfProtocol.map((p) => ({ value: p.id, label: p.name, hint: p.baseUrl, badge: p.badge })),
-    { value: CUSTOM_PROVIDER_ID, label: '自定义端点', hint: '手动填写接口地址与模型', badge: '自' },
+    { value: CUSTOM_PROVIDER_ID, label: tKey('panels.model.customProvider'), hint: tKey('panels.model.customProviderHint'), badge: tKey('panels.model.customBadge') },
   ]
   /** 模型下拉选项（当前服务商的预置模型 + 其他自定义） */
   const modelOptions: SelectOption[] = [
     ...(MODEL_PROVIDERS.find((p) => p.id === providerId)?.models ?? []).map((m) => ({ value: m, label: m })),
-    { value: '__custom__', label: '其他（自定义）…', badge: '+' },
+    { value: '__custom__', label: tKey('panels.model.otherModel'), badge: '+' },
   ]
 
   // 打开时默认选中第一个已配置模型，右侧立即有内容
@@ -388,34 +412,34 @@ export function CustomModelDrawer(props: {
 
   async function submit(): Promise<void> {
     setSavedMsg('')
-    const finalName = name.trim() || MODEL_PROVIDERS.find((p) => p.id === providerId)?.name || '自定义模型'
+    const finalName = name.trim() || MODEL_PROVIDERS.find((p) => p.id === providerId)?.name || tKey('panels.model.fallbackName')
     const trimmedBaseUrl = baseUrl.trim()
     const trimmedApiKey = apiKey.trim()
     const trimmedModel = model.trim()
     if (!trimmedBaseUrl || !trimmedApiKey || !trimmedModel) {
-      setErr('请填写接口地址、API Key 与模型名')
+      setErr(tKey('panels.model.errRequired'))
       return
     }
     // URL 格式校验：必须以 http(s) 开头，避免保存非法地址后调用必失败
     if (!/^https?:\/\//i.test(trimmedBaseUrl)) {
-      setErr('接口地址需以 http:// 或 https:// 开头')
+      setErr(tKey('panels.model.errUrlScheme'))
       return
     }
     // 重复添加检测：相同 baseUrl + 模型名已存在则拦截（排除当前正在编辑的那条）
     const dup = props.models.find((m) => m.id !== editingId && m.baseUrl.trim() === trimmedBaseUrl && (m.model ?? m.id) === trimmedModel)
     if (dup) {
-      setErr(`已存在接口地址与模型名相同的配置「${dup.name}」，无需重复添加`)
+      setErr(tKey('panels.model.errDuplicate', { name: dup.name }))
       return
     }
     let ctxLenNum: number | undefined
     if (contextLength.trim()) {
       const n = Number(contextLength.trim())
       if (!Number.isFinite(n) || n <= 0) {
-        setErr('上下文长度需为正整数')
+        setErr(tKey('panels.model.errCtxInt'))
         return
       }
       if (n > MAX_CONTEXT_LENGTH) {
-        setErr(`上下文长度过大（上限 ${MAX_CONTEXT_LENGTH.toLocaleString()} token）`)
+        setErr(tKey('panels.model.errCtxMax', { max: maxCtxLabel() }))
         return
       }
       ctxLenNum = n
@@ -425,10 +449,10 @@ export function CustomModelDrawer(props: {
     try {
       if (editingId) {
         await props.onUpdate(editingId, { name: finalName, baseUrl: trimmedBaseUrl, apiKey: trimmedApiKey, model: trimmedModel, protocol, contextLength: ctxLenNum, supportsVision })
-        setSavedMsg('已保存修改')
+        setSavedMsg(tKey('panels.model.saved'))
       } else {
         await props.onAdd({ name: finalName, baseUrl: trimmedBaseUrl, apiKey: trimmedApiKey, model: trimmedModel, protocol, contextLength: ctxLenNum, supportsVision })
-        setSavedMsg(`已添加「${finalName}」`)
+        setSavedMsg(tKey('panels.model.added', { name: finalName }))
       }
     } catch (e) {
       setErr(String(e))
@@ -463,32 +487,32 @@ export function CustomModelDrawer(props: {
       >
         {/* 全屏弹窗：左右排版 */}
         <div onClick={(e) => e.stopPropagation()} className="cm-shell">
-          <WindowTitleBar icon={<IconWrench />} title="自定义模型" onClose={() => props.onClose?.()} />
+          <WindowTitleBar icon={<IconWrench />} title={tKey('panels.model.drawerTitle')} onClose={() => props.onClose?.()} />
 
           <div className="cm-body">
             {/* 左侧：已配置模型列表 */}
             <aside className="cm-sidebar">
-              <div className="cm-sidebar-head">已配置模型</div>
+              <div className="cm-sidebar-head">{tKey('panels.model.sidebarHead')}</div>
               <div className="cm-sidebar-list">
                 {props.models.length === 0 ? (
                   <div className="cm-empty">
-                    还没有自定义模型
+                    {tKey('panels.model.empty')}
                     <br />
-                    点击下方按钮新增
+                    {tKey('panels.model.emptyHint')}
                   </div>
                 ) : (
                   props.models.map((m) => (
                     <div key={m.id} onClick={() => openEdit(m)} className={editingId === m.id ? 'cm-list-item active' : 'cm-list-item'}>
                       <div className="cm-list-name">{m.name}</div>
                       <div className="cm-list-meta">
-                        {m.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI 兼容'}
+                        {m.protocol === 'anthropic' ? 'Anthropic' : tKey('panels.model.protocolOpenai')}
                         <span className="cm-badge">{m.model ?? m.id}</span>
                       </div>
                       <div className="cm-list-url">{m.baseUrl}</div>
                       <button
                         type="button"
                         className="cm-list-del"
-                        title={`删除「${m.name}」`}
+                        title={tKey('panels.model.deleteTip', { name: m.name })}
                         onClick={(e) => {
                           e.stopPropagation()
                           setConfirmDeleteId(m.id)
@@ -502,51 +526,51 @@ export function CustomModelDrawer(props: {
               </div>
               <div className="cm-sidebar-foot">
                 <button onClick={openAdd} className="cm-add-btn">
-                  <IconPlus /> 新增自定义模型
+                  <IconPlus /> {tKey('panels.model.addBtn')}
                 </button>
               </div>
             </aside>
 
             {/* 右侧：选中模型的配置编辑区域 */}
             <main className="cm-main">
-              <div className="cm-title">{editingId ? '编辑自定义模型' : '新增自定义模型'}</div>
-              <div className="cm-subtitle">支持 OpenAI 兼容与 Anthropic 两种协议，可接任意服务商或自建网关</div>
+              <div className="cm-title">{editingId ? tKey('panels.model.editTitle') : tKey('panels.model.addBtn')}</div>
+              <div className="cm-subtitle">{tKey('panels.model.subtitle')}</div>
 
               {/* 分组：接入方式 */}
               <div className="cm-group">
-                <div className="cm-group-title">接入方式</div>
+                <div className="cm-group-title">{tKey('panels.model.groupAccess')}</div>
                 <div className="cm-field">
-                  <div className="cm-field-label">协议</div>
-                  <CustomSelect value={protocol} options={PROTOCOL_OPTIONS} onChange={(v) => selectProtocol(v as ModelProtocol)} />
+                  <div className="cm-field-label">{tKey('panels.model.protocol')}</div>
+                  <CustomSelect value={protocol} options={protocolOptions()} onChange={(v) => selectProtocol(v as ModelProtocol)} />
                 </div>
                 <div className="cm-field">
-                  <div className="cm-field-label">服务商（快捷填充）</div>
+                  <div className="cm-field-label">{tKey('panels.model.provider')}</div>
                   <CustomSelect value={providerId} options={providerOptions} onChange={selectProvider} />
-                  <div className="cm-field-hint">选择服务商后自动填充接口地址、模型与上下文长度，也可选「自定义端点」手动填写</div>
+                  <div className="cm-field-hint">{tKey('panels.model.providerHint')}</div>
                 </div>
               </div>
 
               {/* 分组：模型信息 */}
               <div className="cm-group">
-                <div className="cm-group-title">模型信息</div>
-                <Field label="名称" value={name} onChange={setName} placeholder="例如：我的 Claude" />
+                <div className="cm-group-title">{tKey('panels.model.groupInfo')}</div>
+                <Field label={tKey('panels.model.name')} value={name} onChange={setName} placeholder={tKey('panels.model.namePlaceholder')} />
                 <div className="cm-field">
-                  <div className="cm-field-label">模型</div>
+                  <div className="cm-field-label">{tKey('panels.model.model')}</div>
                   {customModel ? (
                     <input
                       className="cm-input"
                       value={model}
                       onChange={(e) => setModel(e.target.value)}
-                      placeholder={protocol === 'anthropic' ? '输入模型名，如 claude-3-5-sonnet-20241022' : '输入模型名，如 gpt-4o'}
+                      placeholder={protocol === 'anthropic' ? tKey('panels.model.modelPhAnthropic') : tKey('panels.model.modelPhOpenai')}
                     />
                   ) : (
-                    <CustomSelect value={model} options={modelOptions} onChange={handleModelSelect} placeholder="选择模型" />
+                    <CustomSelect value={model} options={modelOptions} onChange={handleModelSelect} placeholder={tKey('panels.model.selectModel')} />
                   )}
                   {customModel && (
                     <div className="cm-field-hint" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                      <span>自定义模型名（可随时切回预置）</span>
+                      <span>{tKey('panels.model.customNameHint')}</span>
                       <button type="button" className="cm-link" onClick={() => setCustomModel(false)}>
-                        从预置选择
+                        {tKey('panels.model.pickPreset')}
                       </button>
                     </div>
                   )}
@@ -555,30 +579,30 @@ export function CustomModelDrawer(props: {
 
               {/* 分组：连接配置 */}
               <div className="cm-group">
-                <div className="cm-group-title">连接配置</div>
-                <Field label="接口地址 (Base URL)" value={baseUrl} onChange={setBaseUrl} placeholder={protocol === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.example.com/v1'} hint="需以 http:// 或 https:// 开头" />
+                <div className="cm-group-title">{tKey('panels.model.groupConn')}</div>
+                <Field label={tKey('panels.model.baseUrl')} value={baseUrl} onChange={setBaseUrl} placeholder={protocol === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.example.com/v1'} hint={tKey('panels.model.baseUrlHint')} />
                 <Field label="API Key" value={apiKey} onChange={setApiKey} placeholder={protocol === 'anthropic' ? 'sk-ant-...' : 'sk-...'} password />
               </div>
 
               {/* 分组：高级选项 */}
               <div className="cm-group">
-                <div className="cm-group-title">高级选项</div>
+                <div className="cm-group-title">{tKey('panels.model.groupAdvanced')}</div>
                 <div className="cm-field">
                   <label className="cm-checkbox-row">
                     <input type="checkbox" className="cm-checkbox" checked={supportsVision} onChange={(e) => setSupportsVision(e.target.checked)} />
-                    支持多模态（视觉输入）
+                    {tKey('panels.model.vision')}
                   </label>
                 </div>
                 <div className="cm-field">
-                  <div className="cm-field-label">上下文长度（token，选填）</div>
+                  <div className="cm-field-label">{tKey('panels.model.ctxLen')}</div>
                   <input
                     className="cm-input"
                     value={contextLength}
                     onChange={(e) => setContextLength(e.target.value.replace(/[^0-9]/g, ''))}
-                    placeholder="例如 131072、200000，留空则使用默认"
+                    placeholder={tKey('panels.model.ctxPlaceholder')}
                     inputMode="numeric"
                   />
-                  <div className="cm-field-hint">选择服务商时会自动填充默认值，可手动修改（上限 {MAX_CONTEXT_LENGTH.toLocaleString()}）</div>
+                  <div className="cm-field-hint">{tKey('panels.model.ctxHint', { max: maxCtxLabel() })}</div>
                 </div>
               </div>
 
@@ -597,20 +621,20 @@ export function CustomModelDrawer(props: {
 
               <div className="cm-actions">
                 <button onClick={() => void submit()} disabled={loading} className="cm-btn cm-btn-primary">
-                  {loading ? '保存中…' : '保存'}
+                  {loading ? tKey('common.saving') : tKey('common.save')}
                 </button>
                 {editingId && (
                   <>
                     <button onClick={useModel} className="cm-btn cm-btn-outline">
-                      使用此模型
+                      {tKey('panels.model.useThis')}
                     </button>
                     <button onClick={() => setConfirmDeleteId(editingId)} className="cm-btn cm-btn-danger">
-                      <IconTrash /> 删除
+                      <IconTrash /> {tKey('common.delete')}
                     </button>
                   </>
                 )}
                 <button onClick={() => props.onClose?.()} className="cm-btn cm-btn-ghost" style={{ marginLeft: 'auto' }}>
-                  关闭
+                  {tKey('common.winClose')}
                 </button>
               </div>
             </main>
@@ -622,14 +646,14 @@ export function CustomModelDrawer(props: {
       {confirmDeleteId && (
         <div className="cm-modal-overlay" onClick={() => setConfirmDeleteId(null)}>
           <div className="cm-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="cm-modal-title">删除自定义模型</div>
-            <div className="cm-modal-body">确认删除「{confirmDeleteModel?.name ?? ''}」？此操作不可撤销。</div>
+            <div className="cm-modal-title">{tKey('panels.model.deleteConfirmTitle')}</div>
+            <div className="cm-modal-body">{tKey('panels.model.deleteConfirmBody', { name: confirmDeleteModel?.name ?? '' })}</div>
             <div className="cm-modal-actions">
               <button onClick={() => setConfirmDeleteId(null)} className="cm-btn cm-btn-ghost">
-                取消
+                {tKey('common.cancel')}
               </button>
               <button onClick={() => void doConfirmDelete()} className="cm-btn cm-btn-danger">
-                <IconTrash /> 删除
+                <IconTrash /> {tKey('common.delete')}
               </button>
             </div>
           </div>

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { DOCK_APPS } from '../apps/registry'
+import { DOCK_APPS, appNameOf, appDescOf } from '../apps/registry'
 import { useThemeSync } from '../theme'
+import { applyLocale, useLocaleSync } from '../locale'
+import { t } from '../../shared/i18n'
 import { useUiStore, patchUiStore } from '../store-client'
 import { IconAvatar, IconMonitor, IconGrid } from '../components/icons'
 import { PluginAppIcon } from '../components/PluginAppIcon'
@@ -53,6 +55,15 @@ export function DockApp(): React.JSX.Element {
 
   // 主题：订阅主进程广播，跟随聊天窗口切换（亮/暗实时同步）
   useThemeSync()
+  // 语言：同上（期3 移交欠账）。Dock 是独立窗口，不订阅就永远停在挂载时那份语言
+  useLocaleSync()
+  // 语言（i18n 期4A）：本窗口是独立 BrowserWindow，只在挂载时 initLocale() 读一次是不够的 ——
+  // 别的窗口切语言时必须靠这条广播把本窗口的取词镜像同步过来（期3 移交的欠账，照抄 App.tsx 的写法）。
+  useEffect(() => {
+    const off = window.shanhai?.onLocaleChange((l) => applyLocale(l))
+    return off
+  }, [])
+
 
   // 登录状态项点击：未登录 → 打开聊天窗口并弹出登录框；已登录 → 弹出退出登录菜单。
   const handleAuthClick = (): void => {
@@ -142,7 +153,7 @@ export function DockApp(): React.JSX.Element {
         <button
           data-dock-icon
           onClick={() => patchUiStore({ appMenuOpen: !ui.appMenuOpen })}
-          title="应用菜单（已安装的应用列表）"
+          title={t('panels.dockAppMenuTip')}
           style={{
             display: 'flex',
             flexDirection: 'column',
@@ -167,7 +178,7 @@ export function DockApp(): React.JSX.Element {
           <span style={{ transform: 'scale(1.6)', display: 'inline-flex' }}>
             <IconGrid />
           </span>
-          <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>应用</span>
+          <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{t('panels.dockApps')}</span>
         </button>
 
         {DOCK_APPS.map((app) => (
@@ -175,7 +186,7 @@ export function DockApp(): React.JSX.Element {
             key={app.id}
             data-dock-icon
             onClick={() => void window.shanhai?.openApp(app.id)}
-            title={`${app.name}（${app.description}）`}
+            title={t('panels.dockAppTip', { name: appNameOf(app), desc: appDescOf(app) })}
             style={{
               display: 'flex',
               flexDirection: 'column',
@@ -223,7 +234,7 @@ export function DockApp(): React.JSX.Element {
                 </span>
               )}
             </span>
-            <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{app.name}</span>
+            <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{appNameOf(app)}</span>
           </button>
         ))}
 
@@ -233,7 +244,7 @@ export function DockApp(): React.JSX.Element {
             key={`plugin-${app.appId}`}
             data-dock-icon
             onClick={() => void window.shanhai?.openApp(app.appId)}
-            title={`${app.name}（动态插件应用）`}
+            title={t('panels.dockPluginTip', { name: app.name })}
             style={{
               display: 'flex',
               flexDirection: 'column',
@@ -283,8 +294,8 @@ export function DockApp(): React.JSX.Element {
               background: 'rgba(0,0,0,0.06)',
             }}
           >
-            <span style={{ fontSize: 20, lineHeight: 1 }}>＋</span>
-            <span>松开放置</span>
+            <span style={{ fontSize: 20, lineHeight: 1 }}>{t('common.plus')}</span>
+            <span>{t('panels.dockDropHere')}</span>
           </div>
         )}
 
@@ -294,7 +305,7 @@ export function DockApp(): React.JSX.Element {
           <button
             data-dock-icon
             onClick={() => void handleAuthClick()}
-            title={loggedIn ? `已登录：${username ?? ''}（点击管理登录状态）` : '点击登录'}
+            title={loggedIn ? t('panels.dockLoggedInTip', { u: username ?? '' }) : t('panels.dockClickLogin')}
             style={{
               display: 'flex',
               flexDirection: 'column',
@@ -342,7 +353,7 @@ export function DockApp(): React.JSX.Element {
                 whiteSpace: 'nowrap',
               }}
             >
-              {loggedIn ? (username ?? '已登录') : '登录'}
+              {loggedIn ? (username ?? t('panels.dockLoggedIn')) : t('panels.dockLogin')}
             </span>
           </button>
 
@@ -383,7 +394,7 @@ export function DockApp(): React.JSX.Element {
                     whiteSpace: 'nowrap',
                   }}
                 >
-                  {username ?? '已登录'}
+                  {username ?? t('panels.dockLoggedIn')}
                 </div>
                 <button
                   onClick={() => void handleLogout()}
@@ -398,7 +409,7 @@ export function DockApp(): React.JSX.Element {
                     fontWeight: 600,
                   }}
                 >
-                  退出登录
+                  {t('panels.dockLogout')}
                 </button>
               </div>
             </>
@@ -410,7 +421,7 @@ export function DockApp(): React.JSX.Element {
         <button
           data-dock-icon
           onClick={handleExitToDesktop}
-          title="退出到桌面（隐藏山海所有窗口，回到系统界面，后台运行）"
+          title={t('panels.dockExitTip')}
           style={{
             display: 'flex',
             flexDirection: 'column',
@@ -436,7 +447,7 @@ export function DockApp(): React.JSX.Element {
             <IconMonitor />
           </span>
           <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', maxWidth: 64, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            回桌面
+            {t('panels.dockExit')}
           </span>
         </button>
       </div>

@@ -3,7 +3,10 @@ import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef, 
 import { Composer } from '../components/Composer'
 import type { AttachmentItem, DmQuotePayload, GatewayModel } from '../types'
 import { readFileAsDataUrl } from '../components/ui'
+import { acceptAttrFor, classifyAttachmentFile } from '../../shared/dm-attachment'
 import { useDismissOnClickOutside } from '../components/useDismissOnClickOutside'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /** 通过 ref 暴露给父组件（SupervisorApp）的输入区读取接口：send 时从 ref 取当前输入，使键入不再冒泡到顶层 */
 export interface SupervisorComposerHandle {
@@ -30,6 +33,8 @@ export interface SupervisorComposerProps {
   /** 【红线】私信引用来源提示条（由 SupervisorApp 在用户显式点击后设置；不自动发送） */
   quote?: DmQuotePayload | null
   onClearQuote?: () => void
+  /** 上层发送被拦下时的可见原因（如「图片还没传完」） */
+  sendNotice?: string
 }
 
 /** PCM(Float32 16kHz) → 16-bit 单声道 PCM 的 base64（与聊天窗口一致） */
@@ -61,10 +66,15 @@ function audioRms(frame: Float32Array): number {
  */
 const SupervisorComposerInner = forwardRef<SupervisorComposerHandle, SupervisorComposerProps>(
   function SupervisorComposerInner(p, ref) {
+    // 语言（i18n 期3）：本组件在事件回调里取词（附件拒因 / 语音提示），取到的字符串会渲染进 Composer。
+    // memo 组件必须自订阅 —— 父组件的订阅不会替它重渲染（期2 的反向对照已证）。
+    useLocaleSync()
     const [input, setInput] = useState('')
     const [attachments, setAttachments] = useState<AttachmentItem[]>([])
     const [recording, setRecording] = useState(false)
     const [voiceNotice, setVoiceNotice] = useState('')
+    /** 附件被规矩拒掉时的可见原因（超限 / 类型不允许）；与聊天窗口同一套 shared 规矩 */
+    const [attachNotice, setAttachNotice] = useState('')
     /**
      * 模型下拉 / 安全模式下拉的开合状态。
      *
@@ -165,13 +175,14 @@ const SupervisorComposerInner = forwardRef<SupervisorComposerHandle, SupervisorC
       const files = e.target.files
       if (!files) return
       for (const file of Array.from(files)) {
-        const type = file.type.startsWith('image/')
-          ? 'image'
-          : file.type.startsWith('audio/')
-            ? 'audio'
-            : file.type.startsWith('video/')
-              ? 'video'
-              : 'file'
+        // 【P3 同步到管家窗口】附件规矩（图片 ≤10MB / 文档 ≤20MB / 禁可执行与脚本）由 shared 统一判定；
+        // 音视频放行 —— 管家本来就把它们编成 input_audio / input_video 发给模型，一刀切会砍掉既有功能。
+        const cls = classifyAttachmentFile({ name: file.name, mime: file.type, size: file.size }, { allowAudioVideo: true })
+        if (!cls.ok) {
+          setAttachNotice(t('chat.composer.notAdded', { name: file.name, reason: cls.reason }))
+          continue
+        }
+        const type = cls.kind
         const dataUrl = await readFileAsDataUrl(file)
         if (type === 'image') {
           const id = genId()
@@ -191,6 +202,11 @@ const SupervisorComposerInner = forwardRef<SupervisorComposerHandle, SupervisorC
         if (item.type.startsWith('image/')) {
           const file = item.getAsFile()
           if (file) {
+            const cls = classifyAttachmentFile({ name: file.name || 'pasted.png', mime: file.type, size: file.size }, { allowAudioVideo: true })
+            if (!cls.ok) {
+              setAttachNotice(t('chat.composer.notPasted', { reason: cls.reason }))
+              continue
+            }
             const dataUrl = await readFileAsDataUrl(file)
             const id = genId()
             setAttachments((prev) => [...prev, { id, type: 'image', name: `pasted-${Date.now()}.png`, dataUrl, mime: file.type || 'image/png', size: file.size, uploadStatus: 'uploading' }])
@@ -239,16 +255,16 @@ const SupervisorComposerInner = forwardRef<SupervisorComposerHandle, SupervisorC
             }
             try {
               if (lastVoiceFrame < 0) {
-                setVoiceNotice('未检测到有效语音，请重试')
+                setVoiceNotice(t('chat.voice.noSpeech'))
                 return
               }
               let keepFrames = totalFrames
               if (trigger === 'auto') {
                 keepFrames = lastVoiceFrame + 1
-                setVoiceNotice(`检测到约 ${(consecutiveSilenceFrames * FRAME_SECONDS).toFixed(1)} 秒静音，已自动结束并提交有效语音`)
+                setVoiceNotice(t('chat.voice.silenceAutoEnd', { s: (consecutiveSilenceFrames * FRAME_SECONDS).toFixed(1) }))
               } else if (totalFrames - 1 - lastVoiceFrame >= TRAILING_SILENCE_FRAMES) {
                 keepFrames = lastVoiceFrame + 1
-                setVoiceNotice(`已自动截断结尾 ${((totalFrames - keepFrames) * FRAME_SECONDS).toFixed(1)} 秒静音`)
+                setVoiceNotice(t('chat.voice.silenceTruncated', { s: ((totalFrames - keepFrames) * FRAME_SECONDS).toFixed(1) }))
               }
               let total = 0
               for (let i = 0; i < keepFrames; i++) total += chunks[i]?.length ?? 0
@@ -353,6 +369,8 @@ const SupervisorComposerInner = forwardRef<SupervisorComposerHandle, SupervisorC
         stopSend={p.onStop}
         quote={p.quote}
         onClearQuote={p.onClearQuote}
+        sendNotice={p.sendNotice || attachNotice}
+        accept={acceptAttrFor({ allowAudioVideo: true })}
       />
     )
   },

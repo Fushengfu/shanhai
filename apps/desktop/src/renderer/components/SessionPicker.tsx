@@ -3,6 +3,8 @@ import { useState } from 'react'
 import type { AskRequest } from '../types'
 import { IconMonitor } from './icons'
 import { btn } from './ui'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 interface SessionPickerProps {
   req: AskRequest
@@ -21,6 +23,7 @@ function ratioPct(ratio: number): string {
  * 单选，选中后把会话 id 回传给 agent；取消走 onCancel。
  */
 export function SessionPicker({ req, onSubmit, onCancel }: SessionPickerProps) {
+  useLocaleSync()
   const [selected, setSelected] = useState<string | null>(null)
   const options = req.sessionOptions ?? []
   const canSubmit = selected != null
@@ -43,7 +46,7 @@ export function SessionPicker({ req, onSubmit, onCancel }: SessionPickerProps) {
     >
       <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text)', display: 'flex', alignItems: 'center' }}>
         <IconMonitor />
-        请选择会话
+        {t('chat.picker.title')}
       </div>
       <div style={{ color: 'var(--text)', marginBottom: 10, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
         {req.question}
@@ -84,32 +87,32 @@ export function SessionPicker({ req, onSubmit, onCancel }: SessionPickerProps) {
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                   <span style={{ fontWeight: 600, overflowWrap: 'break-word', wordBreak: 'break-word' }}>{opt.title}</span>
                   {opt.active && (
-                    <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 999, background: 'var(--accent)', color: '#fff', flexShrink: 0 }}>当前</span>
+                    <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 999, background: 'var(--accent)', color: '#fff', flexShrink: 0 }}>{t('dm.quote.badgeCurrent')}</span>
                   )}
                   {opt.busy && (
-                    <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 999, background: 'var(--tint-red)', color: 'var(--tint-red-strong)', flexShrink: 0 }}>执行中</span>
+                    <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 999, background: 'var(--tint-red)', color: 'var(--tint-red-strong)', flexShrink: 0 }}>{t('dm.quote.badgeBusy')}</span>
                   )}
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                  {opt.modelName && <span>模型：{opt.modelName}</span>}
-                  <span>上下文占用：{ratioPct(opt.contextUsageRatio)}</span>
+                  {opt.modelName && <span>{t('chat.picker.modelLine', { model: opt.modelName })}</span>}
+                  <span>{t('chat.picker.contextLine', { pct: ratioPct(opt.contextUsageRatio) })}</span>
                   {opt.currentRequest && (
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220 }}>需求：{opt.currentRequest}</span>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220 }}>{t('chat.picker.requestLine', { req: opt.currentRequest })}</span>
                   )}
                 </div>
               </div>
             </div>
           )
         })}
-        {options.length === 0 && <div style={{ color: 'var(--text-muted)', padding: 8 }}>暂无可选择的会话</div>}
+        {options.length === 0 && <div style={{ color: 'var(--text-muted)', padding: 8 }}>{t('chat.picker.empty')}</div>}
       </div>
 
       <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
         <button onClick={() => selected && onSubmit(selected)} disabled={!canSubmit} style={{ ...btn('var(--accent)', '#fff'), opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}>
-          选择
+          {t('chat.picker.choose')}
         </button>
         <button onClick={onCancel} style={btn('var(--bg-panel)', 'var(--text)', '1px solid var(--border-strong)')}>
-          取消
+          {t('common.cancel')}
         </button>
       </div>
     </div>

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { toPng } from 'html-to-image'
 import { copyText } from './ui'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 function extractCodeText(children: React.ReactNode): string {
   if (typeof children === 'string') return children
@@ -10,6 +12,7 @@ function extractCodeText(children: React.ReactNode): string {
 
 /** 代码块：深色高亮 + 右上角「复制代码」按钮（点击后对勾反馈） */
 export function CodeBlock({ children }: { children?: React.ReactNode }) {
+  useLocaleSync()
   const [copied, setCopied] = useState(false)
   const text = extractCodeText(children)
   return (
@@ -22,7 +25,7 @@ export function CodeBlock({ children }: { children?: React.ReactNode }) {
         }}
         style={{ position: 'absolute', top: 8, right: 8, padding: '2px 8px', borderRadius: 6, border: '1px solid rgba(255,255,255,0.18)', background: 'rgba(255,255,255,0.08)', color: '#abb2bf', fontSize: 11, cursor: 'pointer', zIndex: 2 }}
       >
-        {copied ? '✓ 已复制' : '复制'}
+        {copied ? t('chat.md.copied') : t('chat.md.copy')}
       </button>
       <pre style={{ background: '#282c34', color: '#abb2bf', padding: '12px 12px 12px 12px', borderRadius: 8, overflowX: 'auto', maxWidth: '100%', boxSizing: 'border-box', whiteSpace: 'pre', fontSize: 13, lineHeight: 1.55, margin: 0 }}>
         <code style={{ fontFamily: 'ui-monospace, monospace' }}>{children}</code>
@@ -41,6 +44,8 @@ function isDarkTheme(): boolean {
  * 渲染成功显示 SVG；渲染中显示占位；渲染失败回退为普通代码块，不阻塞正文。
  */
 export function MermaidBlock({ code }: { code: string }) {
+  // 【期4C 谁取词谁订阅】渲染期取词（占位/按钮/对勾），与 CodeBlock 同理各自挂订阅
+  useLocaleSync()
   const [svg, setSvg] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
@@ -89,7 +94,7 @@ export function MermaidBlock({ code }: { code: string }) {
   if (!svg) {
     return (
       <div style={{ margin: '8px 0', padding: '16px', borderRadius: 8, background: 'var(--bg-hover)', color: 'var(--text-muted)', fontSize: 12, textAlign: 'center' }}>
-        正在渲染图表…
+        {t('chat.md.rendering')}
       </div>
     )
   }
@@ -97,10 +102,10 @@ export function MermaidBlock({ code }: { code: string }) {
     <div style={{ position: 'relative' }}>
       <button
         onClick={() => void copyAsImage()}
-        title="复制图表为图片"
+        title={t('chat.md.copyImageTitle')}
         style={{ position: 'absolute', top: 14, right: 14, padding: '2px 8px', borderRadius: 6, border: '1px solid var(--border-strong)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 11, cursor: 'pointer', zIndex: 2 }}
       >
-        {copied ? '✓ 已复制' : '复制图表'}
+        {copied ? t('chat.md.copied') : t('chat.md.copyChart')}
       </button>
       <div
         ref={containerRef}

@@ -3,6 +3,9 @@ import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import { Composer } from './Composer'
 import type { AttachmentItem, DmQuotePayload, GatewayModel } from '../types'
 import { readFileAsDataUrl } from './ui'
+import { acceptAttrFor, classifyAttachmentFile } from '../../shared/dm-attachment'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /**
  * 聊天窗口输入区（自包含）：内部持有 input / attachments / recording / voiceNotice / 菜单开关等高频输入态，
@@ -49,6 +52,8 @@ export interface ChatComposerProps {
   /** 【红线】私信引用来源提示条（由 App 在用户显式点击「引用到会话」后设置；不自动发送） */
   quote?: DmQuotePayload | null
   onClearQuote?: () => void
+  /** 上层（App）发送被拦下时的可见原因（如「图片还没传完」） */
+  sendNotice?: string
 }
 
 /** PCM(Float32 16kHz) → 16-bit 单声道 PCM 的 base64 */
@@ -75,12 +80,15 @@ function audioRms(frame: Float32Array): number {
 }
 
 const ChatComposerInner = memo(function ChatComposerInner(p: ChatComposerProps): React.JSX.Element {
+  useLocaleSync()
   const [input, setInput] = useState('')
   const [attachments, setAttachments] = useState<AttachmentItem[]>([])
   const [recording, setRecording] = useState(false)
   const [voiceNotice, setVoiceNotice] = useState('')
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
   const [approvalMenuOpen, setApprovalMenuOpen] = useState(false)
+  /** 附件被规矩拒掉时的可见原因（超限 / 类型不允许）。与语音提示共用一条自动清除的节奏，不静默 */
+  const [attachNotice, setAttachNotice] = useState('')
 
   const fileRef = useRef<HTMLInputElement>(null)
   const modelMenuRef = useRef<HTMLDivElement>(null)
@@ -99,6 +107,13 @@ const ChatComposerInner = memo(function ChatComposerInner(p: ChatComposerProps):
     const t = setTimeout(() => setVoiceNotice(''), 3200)
     return () => clearTimeout(t)
   }, [voiceNotice])
+
+  // 附件拒因提示自动清除（拒因本身在 Composer 里是红色一行，不靠 toast）
+  useEffect(() => {
+    if (!attachNotice) return
+    const t = setTimeout(() => setAttachNotice(''), 6000)
+    return () => clearTimeout(t)
+  }, [attachNotice])
 
   // 外部重置信号（草稿恢复 / 新建清空 / 发送清空）：seq 递增时用 seed 内容重同步自身输入态
   useEffect(() => {
@@ -161,13 +176,14 @@ const ChatComposerInner = memo(function ChatComposerInner(p: ChatComposerProps):
       const files = e.target.files
       if (!files) return
       for (const file of Array.from(files)) {
-        const type = file.type.startsWith('image/')
-          ? 'image'
-          : file.type.startsWith('audio/')
-            ? 'audio'
-            : file.type.startsWith('video/')
-              ? 'video'
-              : 'file'
+        // 【P3 同步到会话窗口】附件规矩（图片 ≤10MB / 文档 ≤20MB / 禁可执行与脚本）由 shared 统一判定；
+        // 音视频这里放行 —— 会话窗口本来就把它们编成 input_audio / input_video 发给模型，一刀切会砍掉既有功能。
+        const cls = classifyAttachmentFile({ name: file.name, mime: file.type, size: file.size }, { allowAudioVideo: true })
+        if (!cls.ok) {
+          setAttachNotice(t('chat.composer.notAdded', { name: file.name, reason: cls.reason }))
+          continue
+        }
+        const type = cls.kind
         const dataUrl = await readFileAsDataUrl(file)
         if (type === 'image') {
           const id = genId()
@@ -190,6 +206,12 @@ const ChatComposerInner = memo(function ChatComposerInner(p: ChatComposerProps):
         if (item.type.startsWith('image/')) {
           const file = item.getAsFile()
           if (file) {
+            // 粘贴的截图同样要过规矩（>10MB 的整屏截图是真实场景），拒因必须可见
+            const cls = classifyAttachmentFile({ name: file.name || 'pasted.png', mime: file.type, size: file.size }, { allowAudioVideo: true })
+            if (!cls.ok) {
+              setAttachNotice(t('chat.composer.notPasted', { reason: cls.reason }))
+              continue
+            }
             const dataUrl = await readFileAsDataUrl(file)
             const id = genId()
             setAttachments((prev) => [...prev, { id, type: 'image', name: `pasted-${Date.now()}.png`, dataUrl, mime: file.type || 'image/png', size: file.size, uploadStatus: 'uploading' }])
@@ -240,16 +262,16 @@ const ChatComposerInner = memo(function ChatComposerInner(p: ChatComposerProps):
           }
           try {
             if (lastVoiceFrame < 0) {
-              setVoiceNotice('未检测到有效语音，请重试')
+              setVoiceNotice(t('chat.voice.noSpeech'))
               return
             }
             let keepFrames = totalFrames
             if (trigger === 'auto') {
               keepFrames = lastVoiceFrame + 1
-              setVoiceNotice(`检测到约 ${(consecutiveSilenceFrames * FRAME_SECONDS).toFixed(1)} 秒静音，已自动结束并提交有效语音`)
+              setVoiceNotice(t('chat.voice.silenceAutoEnd', { s: (consecutiveSilenceFrames * FRAME_SECONDS).toFixed(1) }))
             } else if (totalFrames - 1 - lastVoiceFrame >= TRAILING_SILENCE_FRAMES) {
               keepFrames = lastVoiceFrame + 1
-              setVoiceNotice(`已自动截断结尾 ${((totalFrames - keepFrames) * FRAME_SECONDS).toFixed(1)} 秒静音`)
+              setVoiceNotice(t('chat.voice.silenceTruncated', { s: ((totalFrames - keepFrames) * FRAME_SECONDS).toFixed(1) }))
             }
             let total = 0
             for (let i = 0; i < keepFrames; i++) total += chunks[i]?.length ?? 0
@@ -343,6 +365,8 @@ const ChatComposerInner = memo(function ChatComposerInner(p: ChatComposerProps):
       stopSend={p.stopSend}
       quote={p.quote}
       onClearQuote={p.onClearQuote}
+      sendNotice={p.sendNotice || attachNotice}
+      accept={acceptAttrFor({ allowAudioVideo: true })}
     />
   )
 })

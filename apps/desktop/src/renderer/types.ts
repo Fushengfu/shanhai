@@ -127,6 +127,12 @@ export interface DmFriend {
   username: string
   nickname?: string
   online?: boolean
+  /**
+   * 【真头像】网关下发的头像 URL。实测该字段常为**空字符串**，主进程 pickStr 会把空串归成 null，
+   * 因此这里空串一律表现为 undefined = 「无头像」，界面回落首字占位（不猜图、不显示破图）。
+   * ⚠️ 只做显示：不参与任何请求参数、不进消息体、不进日志。
+   */
+  avatar?: string
 }
 
 /** 待处理的好友申请 */
@@ -135,6 +141,8 @@ export interface DmFriendRequest {
   fromMemberId: string
   fromUsername: string
   fromNickname?: string
+  /** 【真头像】申请方头像 URL（网关空串 → undefined），仅用于申请列表显示 */
+  fromAvatar?: string
   /** 对方申请时写的附言（定稿载荷 requestMsg） */
   message?: string
   ts: number
@@ -169,6 +177,11 @@ export interface DmThread {
   channelId: string
   peerId: string
   peerName: string
+  /**
+   * 【真头像】对端头像 URL（会话列表 peer 对象下发，拿不到时主进程用本地好友表兜底）。
+   * 命名与本接口 peerId / peerName 前缀口径一致 —— 线程上只有一个「对方」，用 peer 前缀避免「这是谁的头像」歧义。
+   */
+  peerAvatar?: string
   messages: DmMessage[]
   unread: number
   lastTs: number
@@ -195,7 +208,7 @@ export interface MemberErrorPayload {
 
 /** 会员通道业务通知 */
 export interface MemberNotice {
-  kind: 'friend_request_result' | 'friend_removed' | 'subscribed'
+  kind: 'friend_request_result' | 'friend_removed' | 'subscribed' | 'gateway_retry'
   ok?: boolean
   peer: string
   message: string
@@ -404,6 +417,11 @@ export interface AppSettings {
     /** 统一压缩模型 id：上下文超限触发 LLM 摘要时用的模型。空串 = 未配置，回退当前会话模型。 */
     modelId: string
   }
+  /**
+   * 界面语言（i18n 期1）。空串 = 从未设置（主进程启动时按系统语言解析成具体值后写回）。
+   * 与 runtime / preload 的同名字段一一对应，三处都要有，否则 tsc 报缺字段。
+   */
+  locale: string
 }
 
 /** 设置补丁：允许只传某个分组的某个字段（嵌套 Partial） */
@@ -415,6 +433,7 @@ export type AppSettingsPatch = {
   supervisorApproval?: Partial<AppSettings['supervisorApproval']>
   supervisorAsk?: Partial<AppSettings['supervisorAsk']>
   compaction?: Partial<AppSettings['compaction']>
+  locale?: string
 }
 
 /** 一条 HTTP 原始请求/响应记录（排查问题用：请求一条、响应一条，含接口地址与完整 body） */
@@ -498,6 +517,8 @@ declare global {
       setTheme(theme: 'light' | 'dark'): void
       /** 订阅主题变更（主进程广播 ui:theme），返回取消订阅函数 */
       onThemeChange(cb: (theme: 'light' | 'dark') => void): () => void
+      /** 订阅语言变更（主进程广播 ui:locale），返回取消订阅函数 */
+      onLocaleChange(cb: (locale: string) => void): () => void
       /** 读取桌面壁纸（CSS backgroundImage 值，null = 默认渐变） */
       getWallpaper(): Promise<string | null>
       /** 设置并持久化桌面壁纸（CSS backgroundImage 值，null = 恢复默认渐变） */
@@ -634,6 +655,8 @@ declare global {
       setSessionWorkdir(id: string, workdir: string): Promise<void>
       saveUploadedFile(fileName: string, dataBase64: string): Promise<string>
       uploadImage(imageBase64: string, mimeType?: string): Promise<string | null>
+      /** 通用文件上传到云存储（私信附件用）：主进程复用既有 runtime.uploadFile，返回公网直链；失败返回 null（调用方必须给可见提示） */
+      uploadFile(dataBase64: string, mimeType?: string, fileName?: string): Promise<string | null>
       listBrowserWindows(sessionId?: string): Promise<Array<{ appId: string; url: string; title: string; label?: string }>>
       showBrowserWindow(appId: string): Promise<void>
       closeBrowserWindow(appId: string): Promise<void>

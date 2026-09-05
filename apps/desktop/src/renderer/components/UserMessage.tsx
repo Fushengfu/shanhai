@@ -2,6 +2,8 @@ import { memo, useState } from 'react'
 import { IconClock, IconCopy, IconEdit, IconRefresh } from './icons'
 import { MessageActions } from './MessageActions'
 import { copyText } from './ui'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /** 用户消息气泡：右对齐，气泡下方常显「编辑 / 复制 / 重新发送」；编辑为内联编辑（Enter 确认 / Esc 取消，参考 taco） */
 export const UserMessage = memo(function UserMessage({ content, images, userIndex, busy, pending, onResend, onEditResend, onPreviewImage }: {
@@ -15,6 +17,8 @@ export const UserMessage = memo(function UserMessage({ content, images, userInde
   onEditResend: (userIndex: number, newContent: string) => void
   onPreviewImage: (url: string) => void
 }) {
+  // 【期4C 重扫补修】本组件是 memo，父重渲染不会带着它 → 语言变化必须自己订阅
+  useLocaleSync()
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(content)
 
@@ -30,7 +34,7 @@ export const UserMessage = memo(function UserMessage({ content, images, userInde
         <img
           key={j}
           src={img}
-          alt="附件"
+          alt={t('chat.user.attachmentAlt')}
           onClick={() => onPreviewImage(img)}
           style={{ maxWidth: 200, maxHeight: 200, borderRadius: 8, display: 'block', marginBottom: 4, objectFit: 'cover', cursor: 'zoom-in' }}
         />
@@ -54,9 +58,9 @@ export const UserMessage = memo(function UserMessage({ content, images, userInde
             style={{ width: '100%', padding: '8px 14px', borderRadius: 12, border: '1px solid var(--accent)', fontSize: 14, lineHeight: 1.6, resize: 'none', outline: 'none', boxSizing: 'border-box', fontFamily: 'inherit', background: 'var(--bg-panel)', color: 'var(--text)', display: 'block' }}
           />
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: 'var(--text-muted)' }}>
-            <span>Enter 确认 · Esc 取消</span>
-            <button onClick={confirmEdit} style={{ padding: '4px 12px', borderRadius: 6, border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 12, cursor: 'pointer' }}>确认</button>
-            <button onClick={() => { setEditing(false); setDraft(content) }} style={{ padding: '4px 12px', borderRadius: 6, border: '1px solid var(--border-strong)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer' }}>取消</button>
+            <span>{t('chat.user.editHint')}</span>
+            <button onClick={confirmEdit} style={{ padding: '4px 12px', borderRadius: 6, border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 12, cursor: 'pointer' }}>{t('chat.user.confirm')}</button>
+            <button onClick={() => { setEditing(false); setDraft(content) }} style={{ padding: '4px 12px', borderRadius: 6, border: '1px solid var(--border-strong)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer' }}>{t('common.cancel')}</button>
           </div>
         </div>
       ) : content ? (
@@ -66,14 +70,14 @@ export const UserMessage = memo(function UserMessage({ content, images, userInde
           </div>
           {pending ? (
             <div style={{ fontSize: 11, color: 'var(--warning)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
-              <IconClock /> 排队中
+              <IconClock /> {t('chat.user.queued')}
             </div>
           ) : !busy ? (
             <MessageActions
               actions={[
-                { key: 'edit', icon: <IconEdit />, label: '编辑', run: () => { setEditing(true); setDraft(content) } },
-                { key: 'copy', icon: <IconCopy />, label: '复制', run: () => copyText(content) },
-                { key: 'resend', icon: <IconRefresh />, label: '重新发送', run: () => onResend(userIndex) },
+                { key: 'edit', icon: <IconEdit />, label: t('chat.user.edit'), run: () => { setEditing(true); setDraft(content) } },
+                { key: 'copy', icon: <IconCopy />, label: t('common.copy'), run: () => copyText(content) },
+                { key: 'resend', icon: <IconRefresh />, label: t('chat.user.resend'), run: () => onResend(userIndex) },
               ]}
             />
           ) : null}

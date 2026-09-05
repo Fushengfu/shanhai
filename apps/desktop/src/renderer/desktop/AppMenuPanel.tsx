@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { PluginAppIcon } from '../components/PluginAppIcon'
 import { patchUiStore } from '../store-client'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /** 与 preload listPluginApps 返回项对齐的插件应用信息 */
 export interface PluginAppInfo {
@@ -19,6 +21,8 @@ export interface PluginAppInfo {
  * 打开/关闭状态由全局共享状态 ui.appMenuOpen 驱动（Dock 入口写、桌面壳读），跨窗口同步。
  */
 export function AppMenuPanel(): React.JSX.Element | null {
+  // 谁取词谁订阅
+  useLocaleSync()
   const [apps, setApps] = useState<PluginAppInfo[]>([])
   // Dock 窗口顶部距桌面壳底部的距离（用于把面板定位在 Dock 上方，紧贴 Dock 弹出）
   const [dockTop, setDockTop] = useState(132)
@@ -78,11 +82,11 @@ export function AppMenuPanel(): React.JSX.Element | null {
         }}
       >
         <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '0 4px 4px', borderBottom: '1px solid var(--border-soft)' }}>
-          应用列表
+          {t('panels.appMenu.title')}
         </div>
         {apps.length === 0 ? (
           <div style={{ padding: '16px 8px', fontSize: 13, color: 'var(--text-muted)', textAlign: 'center' }}>
-            暂无已安装的应用
+            {t('panels.appMenu.empty')}
           </div>
         ) : (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, justifyContent: 'center' }}>
@@ -90,7 +94,7 @@ export function AppMenuPanel(): React.JSX.Element | null {
               <button
                 key={app.appId}
                 onClick={() => handleLaunch(app.appId)}
-                title={`${app.name}（插件应用）`}
+                title={t('panels.appMenu.appTip', { name: app.name })}
                 style={{
                   display: 'flex',
                   flexDirection: 'column',

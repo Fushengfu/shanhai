@@ -3,6 +3,8 @@ import { useState } from 'react'
 import * as React from 'react'
 import { IconClose, IconMaximize, IconMinimize, IconRestore } from './icons'
 import { smallIconBtn } from './ui'
+import { t } from '../../shared/i18n'
+import { useLocaleSync } from '../locale'
 
 /** 标题栏窗口控制按钮（最小化/最大化/关闭），对齐文件管理器插件标准：36×36、圆角 8、关闭键 hover 红色 */
 export function WindowControlButton(props: { title: string; onClick: () => void; children: ReactNode; danger?: boolean }): React.JSX.Element {
@@ -57,6 +59,10 @@ export const WindowTitleBar = React.memo(function WindowTitleBar(props: {
   actions?: ReactNode
   onClose?: () => void
 }): React.JSX.Element {
+  // 本组件是共享件且渲染期直接取词（窗口控制按钮的 tooltip）→ 必须自订阅，
+  // 否则切语言时它停在挂载时那份语言（期2/期3 的「谁取词谁订阅」规矩）。
+  useLocaleSync()
+
   const toneBg = props.tone === 'purple' ? 'var(--tint-purple)' : 'var(--tint-blue-soft)'
   const toneColor = props.tone === 'purple' ? 'var(--purple)' : 'var(--accent)'
   const [maximized, setMaximized] = useState(false)
@@ -116,14 +122,14 @@ export const WindowTitleBar = React.memo(function WindowTitleBar(props: {
         </div>
       )}
       <div style={{ display: 'flex', alignItems: 'center', gap: 4, ...({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) }}>
-        <WindowControlButton title="最小化" onClick={handleMinimize}>
+        <WindowControlButton title={t('common.winMinimize')} onClick={handleMinimize}>
           <IconMinimize />
         </WindowControlButton>
-        <WindowControlButton title={maximized ? '还原' : '最大化'} onClick={() => void handleToggleMaximize()}>
+        <WindowControlButton title={maximized ? t('common.winRestore') : t('common.winMaximize')} onClick={() => void handleToggleMaximize()}>
           {maximized ? <IconRestore /> : <IconMaximize />}
         </WindowControlButton>
         {props.onClose && (
-          <WindowControlButton title="关闭" onClick={props.onClose} danger>
+          <WindowControlButton title={t('common.winClose')} onClick={props.onClose} danger>
             <IconClose />
           </WindowControlButton>
         )}

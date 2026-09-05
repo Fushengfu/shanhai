@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import '../l10n/generated/app_localizations.dart';
+import '../locale.dart';
 import '../theme.dart';
 import '../services/ws_client.dart';
 import 'home_page.dart';
@@ -17,8 +19,18 @@ class _ConnectPageState extends State<ConnectPage> {
   final _hostCtrl = TextEditingController();
   final _portCtrl = TextEditingController(text: '47800');
   final _codeCtrl = TextEditingController();
-  String _status = '';
+  L10nText _status = (l) => '';
   bool _busy = false;
+
+  /// 【判定与文案解耦】原实现靠 `_status.contains('失败'/'请输入'/'错误')` 决定红色，
+  /// 也就是把「是不是错误」这件事寄托在中文文案的字面上 —— 文案一旦本地化成英文，
+  /// 这个判定就整体失效（错误不再标红）。改成显式布尔，由每个赋值点自己声明。
+  /// 服务端原文（口径④不翻）那一路仍沿用原判定，行为与改前逐字一致。
+  bool _statusIsError = false;
+
+  static bool _looksLikeErrorZh(String s) =>
+      s.contains('失败') || s.contains('请输入') || s.contains('错误');
+
   StreamSubscription<ConnState>? _stateSub;
   StreamSubscription<ServerEvent>? _eventSub;
 
@@ -34,8 +46,11 @@ class _ConnectPageState extends State<ConnectPage> {
     });
     _eventSub = _ws.events.listen((e) {
       if (e.event == 'error' && mounted) {
+        final raw = e.payload['message']?.toString();
         setState(() {
-          _status = e.payload['message']?.toString() ?? '出错';
+          // 服务端带回的原文原样呈现（口径④）；没带回才用我们自己的兜底词条
+          _status = raw == null ? (l) => l.commonErrorFallback : rawText(raw);
+          _statusIsError = raw == null || _looksLikeErrorZh(raw);
           _busy = false;
         });
       }
@@ -46,22 +61,32 @@ class _ConnectPageState extends State<ConnectPage> {
     final host = _hostCtrl.text.trim();
     final port = int.tryParse(_portCtrl.text.trim()) ?? 47800;
     if (host.isEmpty) {
-      setState(() => _status = '请输入桌面端显示的 IP 地址');
+      setState(() {
+        _status = (l) => l.connectNeedHost;
+        _statusIsError = true;
+      });
       return;
     }
     setState(() {
       _busy = true;
-      _status = '连接中…';
+      _status = (l) => l.commonConnecting;
+      _statusIsError = false;
     });
     try {
       await _ws.connect(host, port);
       _ws.pair(_codeCtrl.text.trim());
-      if (mounted) setState(() => _status = '已连接，正在配对…');
+      if (mounted) {
+        setState(() {
+          _status = (l) => l.connectPairedPending;
+          _statusIsError = false;
+        });
+      }
     } catch (e) {
       if (mounted) {
         setState(() {
           _busy = false;
-          _status = '连接失败：$e';
+          _status = (l) => l.connectFailed('$e');
+          _statusIsError = true;
         });
       }
     }
@@ -79,6 +104,7 @@ class _ConnectPageState extends State<ConnectPage> {
 
   @override
   Widget build(BuildContext context) {
+    final l = AppLocalizations.of(context);
     final accent = Theme.of(context).colorScheme.primary;
     return Scaffold(
       body: SafeArea(
@@ -91,35 +117,35 @@ class _ConnectPageState extends State<ConnectPage> {
                 const SizedBox(height: 16),
                 Icon(Icons.hub_outlined, size: 64, color: accent),
                 const SizedBox(height: 16),
-                const Text(
-                  '山海',
+                Text(
+                  l.brandShanhai,
                   textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 28, fontWeight: FontWeight.w700, letterSpacing: 4),
+                  style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w700, letterSpacing: 4),
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  '连接桌面端，远程查看与控制会话',
+                  l.connectSubtitle,
                   textAlign: TextAlign.center,
                   style: TextStyle(fontSize: 14, color: Colors.grey.shade400),
                 ),
                 const SizedBox(height: 32),
                 _field(
-                  label: '桌面端 IP 地址',
-                  hint: '如 192.168.1.105（见桌面端「设置 → 远程连接」）',
+                  label: l.connectHostLabel,
+                  hint: l.connectHostHint,
                   controller: _hostCtrl,
                   keyboard: TextInputType.url,
                 ),
                 const SizedBox(height: 16),
                 _field(
-                  label: '端口',
+                  label: l.connectPortLabel,
                   hint: '47800',
                   controller: _portCtrl,
                   keyboard: TextInputType.number,
                 ),
                 const SizedBox(height: 16),
                 _field(
-                  label: '配对码',
-                  hint: '6 位数字',
+                  label: l.connectCodeLabel,
+                  hint: l.connectCodeHint,
                   controller: _codeCtrl,
                   keyboard: TextInputType.number,
                   obscure: true,
@@ -132,13 +158,15 @@ class _ConnectPageState extends State<ConnectPage> {
                     backgroundColor: accent,
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                   ),
-                  child: Text(_busy ? '连接中…' : '连接', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                  child: Text(_busy ? l.commonConnecting : l.connectAction,
+                      style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
                 ),
                 const SizedBox(height: 16),
                 Text(
-                  _status,
+                  // 状态文案在渲染期才求值 → 用户中途切语言，这一行立刻跟着变
+                  _status(l),
                   textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 13, color: _status.contains('失败') || _status.contains('请输入') || _status.contains('错误') ? Colors.redAccent : Colors.grey.shade400),
+                  style: TextStyle(fontSize: 13, color: _statusIsError ? Colors.redAccent : Colors.grey.shade400),
                 ),
               ],
             ),
