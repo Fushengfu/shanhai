@@ -13,6 +13,22 @@ import { modelSupportsVision, fetchGatewayModels } from './models'
 import { SUPERVISOR_ID } from './supervisor'
 import { DEFAULT_WORK_DIR, type RuntimeContext, type RuntimeEnvironment } from './context'
 
+/**
+ * 系统提示词里「语言：…」该填哪个语言。
+ *
+ * 取值优先级：宿主注入的【生效语言】effectiveLocale（解析后的，不落盘）> 落盘的【用户选择】原文。
+ * 为什么必须有第一档：settings.locale 允许是「跟随系统」（空串 / 'auto'），
+ * 直接拿原文判 'en-US' 会把 auto 一律当成中文 → 英文系统 + 跟随系统的用户，
+ * 界面是英文、AI 却被要求中文回复（正是用户当初否决的那种割裂，绝不能由落盘修复引入）。
+ * 第二档是兜底：宿主没注入（独立跑 runtime）时行为与历轮一致。
+ * 指令正文一个字都不翻（用户批准的范围只有这一处语言参数）。
+ */
+export function resolvePromptLang(rawSetting: unknown, effectiveLocale: unknown): string {
+  const eff = typeof effectiveLocale === 'string' ? effectiveLocale.trim() : ''
+  if (eff === 'en-US' || eff === 'zh-CN') return eff
+  return typeof rawSetting === 'string' && rawSetting.trim() === 'en-US' ? 'en-US' : 'zh-CN'
+}
+
 export interface PromptsModule {
   /** 图片识别：用视觉模型分析图片（当前模型不支持多模态时降级用），同一张图按 url 去重 */
   analyzeImageWithVision(imageUrl: string): Promise<string>
@@ -90,9 +106,11 @@ export function createPromptsModule(
       shell: process.env.SHELL ?? process.env.ComSpec ?? 'unknown',
       home: homedir(),
       cwd,
-      // 【i18n 期1 · 用户批准的唯一提示词改动】语言不再写死：读全局唯一真相源 settings.locale。
-      // 空串（从未设置）由主进程启动时解析成具体值写回，所以这里只需兜一层，不做系统语言判定。
-      lang: ctx.currentSettings.locale === 'en-US' ? 'en-US' : 'zh-CN',
+      // 【i18n 期1 · 用户批准的唯一提示词改动】语言不再写死。
+      // 但读的必须是「解析后的生效语言」（宿主注入的 ctx.effectiveLocale），
+      // 不能读 settings.locale 原文 —— 那是用户的【选择】，可能是「跟随系统」，
+      // 直接判 'en-US' 会把 auto 当成中文（见 resolvePromptLang 注释）。
+      lang: resolvePromptLang(ctx.currentSettings.locale, ctx.effectiveLocale),
     }
   }
 

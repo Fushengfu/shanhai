@@ -2,8 +2,9 @@
  * 渲染层的语言绑定 —— 照抄同目录 theme.ts 的范式，不发明第二套。
  *
  *   主题：localStorage['shanhai-theme'] → data-theme → setTheme 广播 ui:theme → useThemeSync
- *   语言：settings.locale（真相源，主进程启动时已解析成具体值）→ data-locale
- *         → settings:set 里广播 ui:locale → useLocaleSync
+ *   语言：settings.locale（真相源，存的是用户的【选择】，可能是「跟随系统」）
+ *         → 生效语言由主进程解析并广播 ui:locale（含每个窗口加载完成时补推一次）→ useLocaleSync
+ *         → data-locale
  *
  * 【localStorage 只是首屏缓存，不是真相源】
  * 真相源要走一次异步 IPC（settings:get）。若等它回来再首帧渲染，英文用户会先看到一屏中文再跳英文
@@ -16,9 +17,10 @@
  */
 import { Fragment, useCallback, useSyncExternalStore } from 'react'
 import type { ReactNode } from 'react'
+import type { AppSettings } from './types'
 import type { LParams, LPart, Locale } from '../shared/i18n'
 import { getLocale, onLocaleChange, setLocale as setI18nLocale, t, tf } from '../shared/i18n'
-import { FALLBACK_LOCALE, normalizeLocale } from '../shared/i18n'
+import { FALLBACK_LOCALE, LOCALE_AUTO, normalizeLocale } from '../shared/i18n'
 
 /** 首屏缓存键（与主题的 shanhai-theme 同一层级、同一性质：只是缓存） */
 export const LOCALE_STORAGE_KEY = 'shanhai-locale'
@@ -63,26 +65,56 @@ export function applyLocale(locale: unknown): Locale {
  * 用户主动切换语言：写进真相源（settings.locale），主进程落盘后广播给所有窗口。
  * 本窗口先乐观应用一次，不等广播回来 —— 否则点了没反应，就是本项目反复踩的静默失败。
  * 写失败必须可见（抛给调用方去提示），不静默吞。
+ *
+ * 【为什么必须把 setSettings 的返回值交回调用方（真机缺陷修复）】
+ * 返回值是主进程落盘后的**全量快照**，其中 settings.locale 就是「用户的选择」这个真相源。
+ * 历轮这里 `await` 完就丢弃返回值 → 设置面板那份用于渲染选中高亮的 state 永远停在 mount 时读到的旧值，
+ * 于是出现用户报的现象：**界面语言真的切了（走的是 i18n 镜像），但高亮一直钉在「跟随系统」**。
+ * 「生效语言」与「用户的选择」是两件事，面板判高亮只看后者，所以后者必须被同步回来。
+ * 交回快照而不是让调用方自己猜一个值写进 state —— 后者会在主进程改写（如归一化）时出现两份真相。
  */
-export async function setAppLocale(locale: Locale): Promise<void> {
+export async function setAppLocale(locale: Locale): Promise<AppSettings | null> {
   applyLocale(locale)
   const api = window.shanhai
   if (!api?.setSettings) throw new Error('本窗口拿不到设置通道（window.shanhai.setSettings 不可用），请重启山海')
-  await api.setSettings({ locale })
+  return (await api.setSettings({ locale })) ?? null
+}
+
+/**
+ * 「用户的选择」→ 设置面板单选组应该点亮哪一项。
+ *
+ * 判定源**只能**是 settings.locale（真相源），绝不能用 getLocale()（当前生效语言）：
+ * 系统语言是中文时，「跟随系统」与「显式选简体中文」的生效语言都是 zh-CN，
+ * 用生效语言判高亮就把两种选择压成一种，用户点了也看不出区别。
+ * 抽成纯函数是为了能被真跑断言覆盖（面板本体要 React + IPC 才渲得出来）。
+ *
+ * 空串 / 'auto' → 'auto'（跟随系统；空串是老 config 的「从未设置」，与 auto 同义，见 locale.ts 取值域注释）。
+ * 其余值一律 normalizeLocale —— 手改 config 写进来的 'zh' / 'en_GB' / 未知标签也能落到一个真实选项上，
+ * 比历轮的「不匹配就谁都不亮」更贴近实际（那种情况下生效语言正是 normalizeLocale 的结果）。
+ */
+export function localeOptionOf(rawSetting: unknown): Locale | 'auto' {
+  if (typeof rawSetting !== 'string') return 'auto'
+  const s = rawSetting.trim()
+  if (!s || s === LOCALE_AUTO) return 'auto'
+  return normalizeLocale(s)
 }
 
 /**
  * 窗口启动时的语言初始化（在 main.tsx 里对所有窗口类型统一调用一次）：
  * 1) 先用 localStorage 缓存同步定语言 → 首屏不闪；
- * 2) 再向主进程要真相（settings.locale 已被解析成具体值），不一致就校正；
- * 3) 订阅后续广播（在 useLocaleSync 里）。
+ * 2) 再向主进程要真相，但**只有落盘值是具体语言时**才拿它校正；
+ * 3) 订阅后续广播（在 useLocaleSync 里）——「跟随系统」时的生效语言由主进程在
+ *    窗口加载完成时补推（main/locale-store.ts 的 attachInitialLocalePush）。
  */
 export function initLocale(): void {
   applyLocale(readLocaleCache() ?? FALLBACK_LOCALE)
   void (async () => {
     try {
       const s = await window.shanhai?.getSettings?.()
-      if (s && typeof s.locale === 'string' && s.locale) applyLocale(s.locale)
+      // ⚠️ 落盘值是【用户的选择】，可能是「跟随系统」（空串 / 'auto'）。
+      // 那种情况下它不是生效语言，拿去 applyLocale 会被 normalize 成兜底中文，
+      // 把首屏正确的语言（localStorage 缓存 / 主进程补推）冲掉 —— 所以必须跳过。
+      if (s && typeof s.locale === 'string' && localeOptionOf(s.locale) !== 'auto') applyLocale(s.locale)
     } catch {
       /* 拿不到主进程：保持缓存值（或兜底），不阻断渲染 */
     }
@@ -130,8 +162,8 @@ export function useI18n(): {
   tr: (key: string, params?: LParams) => string
   /** 按当前语言取富文本片段（词条里的 {b} 槽交给调用方渲染成节点） */
   tfParts: (key: string) => LPart[]
-  /** 切换语言（写真相源 + 广播） */
-  switchLocale: (locale: Locale) => Promise<void>
+  /** 切换语言（写真相源 + 广播），返回主进程落盘后的全量快照，调用方据此同步自己那份 settings */
+  switchLocale: (locale: Locale) => Promise<AppSettings | null>
 } {
   const locale = useSyncExternalStore(subscribeLocale, getLocale, () => FALLBACK_LOCALE)
   const tr = useCallback((key: string, params?: LParams) => t(key, params), [locale])

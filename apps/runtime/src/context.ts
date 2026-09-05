@@ -148,6 +148,14 @@ export interface RuntimeContext {
   memory: MemoryStore
   /** 通用设置（跨会话、重启保留） */
   currentSettings: AppSettings
+  /**
+   * 生效语言（解析后的具体语言，如 'zh-CN' | 'en-US'）。**内存派生值，绝不落盘** ——
+   * 落盘的 settings.locale 存的是用户的【选择】（可能是「跟随系统」= 空串 / 'auto'），
+   * 与【生效语言】不是一回事，直接拿原文判 'en-US' 会把 auto 一律当成中文。
+   * 由宿主（桌面端主进程 main/locale-store.ts，全仓唯一语言真相源）在启动与每次语言变化时注入；
+   * 空串 = 宿主未注入（独立跑 runtime 的场景），此时系统提示词退回按 settings.locale 原文判定。
+   */
+  effectiveLocale: string
 
   // —— 提问服务 + 记忆持久化 ——
   askService: AskService

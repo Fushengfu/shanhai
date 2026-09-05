@@ -7,7 +7,7 @@ import { WindowTitleBar } from './WindowTitleBar'
 // 进度「状态行」文案与全局浮层同源（期5C A 方案：主进程只发 phase，句子在渲染层取词）
 import { updateStatusLine } from './UpdateProgressOverlay'
 import { LOCALE_DISPLAY_NAME } from '../../shared/i18n'
-import { useI18n, useLocaleSync } from '../locale'
+import { localeOptionOf, useI18n, useLocaleSync } from '../locale'
 // tKey：httpTraces.map((t, i) => …) 的循环变量叫 t，会在该回调里遮蔽取词函数 →
 // 那几处一律用别名 tKey（同一个函数，只是不被遮蔽）。
 import { t, t as tKey } from '../../shared/i18n'
@@ -381,8 +381,11 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
     setLocaleError('')
     try {
       // 'auto' 走 update() 写回空串（跟随系统）；具体语言走 switchLocale（乐观应用 + 失败抛错）
+      // 两条分支都必须把落盘回来的 locale 同步进面板 state —— 单选组的高亮判的就是 settings.locale。
+      // 历轮 switchLocale 的返回值被丢弃 → 界面语言切了、高亮却还停在 mount 时读到的旧值（用户报的 bug）。
       if (v === 'auto') { await update({ locale: '' }); return }
-      await switchLocale(v as 'zh-CN' | 'en-US')
+      const next = await switchLocale(v as 'zh-CN' | 'en-US')
+      if (next && typeof next.locale === 'string') setSettings((prev) => ({ ...prev, locale: next.locale }))
     } catch (e) {
       setLocaleError(t('settings.lang.saveFailed', { err: e instanceof Error ? e.message : String(e) }))
     }
@@ -474,7 +477,7 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                   <RadioGroup
                     label={t('settings.lang.label')}
                     description={t('settings.lang.desc')}
-                    value={settings.locale || 'auto'}
+                    value={localeOptionOf(settings.locale)}
                     onChange={(v) => void onLocaleChange(v)}
                     options={[
                       { value: 'auto', label: t('settings.lang.auto'), desc: t('settings.lang.autoDesc') },

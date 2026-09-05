@@ -169,6 +169,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     // 加 locale 时必须手动补 —— 否则 readSettings 之前 ctx.currentSettings.locale 是 undefined。
     locale: DEFAULT_SETTINGS.locale,
   } as AppSettings
+  // 生效语言（内存派生值，不落盘）：先置空 = 宿主还没注入，提示词退回按 settings.locale 原文判定。
+  // ctx 是 `{} as RuntimeContext`（绕过完整性检查），漏这一行不会编译报错，只能靠注释与断言钉住。
+  ctx.effectiveLocale = ''
   ctx.askService = new AskService()
   ctx.memoryFile = join(homedir(), '.shanhai', 'memory.json')
   ctx.imageDescCache = new Map<string, string>()
@@ -1893,6 +1896,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
 
     getTraceDir() {
       return ctx.tracesDir
+    },
+
+    setEffectiveLocale(locale) {
+      // 只写内存，不落盘：落盘的 settings.locale 是「用户的选择」，这里存的是「解析后的生效语言」，
+      // 两者语义不同、合起来也只有一份磁盘真相。宿主（桌面端主进程）在启动与每次语言变化时注入。
+      ctx.effectiveLocale = typeof locale === 'string' ? locale.trim() : ''
     },
 
     async setSettings(patch) {

@@ -13,11 +13,15 @@
  *    writeSettings / bootstrap.setSettings 的合并与返回 / getSettings 的返回 / SettingsPanel 的初始 state）。
  *    看着像风险，其实每一处都是对象字面量赋给 AppSettings 类型 —— **漏一个字段 tsc 直接报错**，
  *    比 env 变量、独立 json 文件这类「编译器看不见的第二份真相」安全得多。
- * 3. 主进程读当前语言 = runtime.getSettings().locale，不需要新文件、不需要新真相源。
+ * 3. 主进程读当前语言 = locale-store.getMainLocale()（就是下面那份 shared 镜像），
+ *    不需要新文件、不需要新真相源。
  *
- * 【取值】持久化值是**具体语言**（'zh-CN' | 'en-US'）；空串 = 从未设置。
- * 首次跟随系统语言由主进程在启动时解析一次并落盘（见 main/locale-store.ts），
- * 之后 settings.locale 永远是具体值，prompts.ts 侧不再需要知道「auto」这个概念。
+ * 【取值】持久化的是用户的【选择】：'zh-CN' | 'en-US' | 空串 | 'auto'，
+ * 其中**空串与 'auto' 同义，都表示「跟随系统」**（合并成一个语义是刻意的：老 config 的 ''
+ * 与用户显式选的「跟随系统」行为完全一致，分成两个值就需要迁移历史数据）。
+ * ⚠️ 主进程**不会**把解析结果写回这里（i18n 落盘修复轮）：解析出来的是【生效语言】，只进内存
+ * （shared 镜像 + runtime 的 ctx.effectiveLocale），一次都不落盘 —— 否则「跟随系统」会在
+ * 第一次重启后被冲成具体语言、语义永久丢失。见 main/locale-store.ts 的 ensureLocaleResolved。
  */
 
 /** 支持的语言集合。本期只中英（用户拍板）；新增语言要同时补 dict 与这里。 */

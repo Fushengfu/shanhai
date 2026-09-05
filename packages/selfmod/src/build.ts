@@ -14,8 +14,11 @@ import { auditHostDangerousModules, HARD_BLOCK_DANGEROUS_NODE_MODULES } from './
  *
  * 构建器定位（关键）：esbuild / vite / react 是「山海桌面端进程内已有的依赖」，本文件不静态 import 它们，
  * 而是运行时用 createRequire / 动态 import 定位，避免被 tsup 打进 selfmod 产物（导致二进制/巨大 bundle）。
- * 打包分发后若这些构建器不在 app 依赖里（它们在 devDependencies），load* 会返回 null，
- * buildPlugin 会优雅降级并给出明确 warning——这是「现场编译」在终端环境的已知边界，由后续打包配置补齐。
+ * 构建器是否随包分发（本期实测更正：原注释写「它们在 devDependencies」与事实相反）——
+ * esbuild / vite / @vitejs/plugin-react 实测都在 apps/desktop 的 dependencies 里，故会进产物；
+ * electron-builder.yml 的 asarUnpack 也已含 node_modules/esbuild 与 node_modules/@esbuild。
+ * 若哪天它们被挪出 dependencies，load* 会返回 null，buildPlugin 会优雅降级并给出明确 warning
+ * ——这是「现场编译」在终端环境的已知边界。
  */
 
 // 主进程 require 上下文（与 selfmod.ts 的 nodeRequire 同源；selfmod 被 desktop 以 noExternal bundle 成 ESM）
@@ -53,11 +56,36 @@ function patchEsbuildBinaryPath(subdir: string): void {
   // 非打包环境（dev 直接跑 node / electron . 跑源码）：resourcesPath 下无 app.asar，esbuild 二进制
   // 在真实 node_modules，require.resolve 正确，无需修复。
   if (!existsSync(join(rp, 'app.asar'))) return
+  const isWin = process.platform === 'win32'
   const platform = `${process.platform}-${process.arch}`
-  const binName = process.platform === 'win32' ? 'esbuild.exe' : 'esbuild'
+  const binName = isWin ? 'esbuild.exe' : 'esbuild'
   const base = join(rp, 'app.asar.unpacked', 'node_modules')
-  const bin = join(base, subdir, '@esbuild', platform, 'bin', binName)
-  if (existsSync(bin)) process.env.ESBUILD_BINARY_PATH = bin
+  const pkgDir = join(base, subdir, '@esbuild', platform)
+  // 平台包内部布局【不同】，必须按平台分支：
+  //   win32（x64 与 arm64 都一样）是扁平布局 —— esbuild.exe 直接躺在包根，没有 bin/ 目录；
+  //   类 Unix（darwin / linux / freebsd…）才是 bin/esbuild。
+  // 依据 esbuild 自己的定义 lib/main.js#pkgAndSubpathForCurrentPlatform：
+  //   win32 → subpath = "esbuild.exe"；unix → subpath = "bin/esbuild"（0.21.5 与 0.27.7 同）。
+  // 改前对所有平台一律拼 'bin' → win32 恒 existsSync=false → ESBUILD_BINARY_PATH 从未被设置
+  // → esbuild 退回自己 require.resolve 算出的 app.asar 内路径 → spawn 无法穿越 asar（app.asar 是
+  // 文件不是目录）→ 用户侧报 `spawn ...\@esbuild\win32-x64\esbuild.exe ENOENT`。
+  // 判据只用 process.platform === 'win32'，不写死 win32-x64（ARM 机器同为扁平布局，写死会漏）。
+  const bin = isWin ? join(pkgDir, binName) : join(pkgDir, 'bin', binName)
+  const found = existsSync(bin)
+  if (found) {
+    process.env.ESBUILD_BINARY_PATH = bin
+  } else {
+    // 诊断（口径①：日志不翻，保持中文）。行为与改前完全一致：不设 env、不抛错、不吞错 ——
+    // esbuild 后续仍走它自己的 require.resolve 那条路，报错形态与改前相同。这里只是把「整条
+    // 链路唯一的知情点却完全静默」补上记录：区分「打包产物压根没这个平台包目录」（需查打包机
+    // pnpm install 是否在 supportedArchitectures 生效后重跑）与「目录在但二进制名/层级不符」。
+    console.warn(
+      `[selfmod] asarUnpack 里未找到 esbuild 二进制，将交由 esbuild 自行定位（打包环境可能报 spawn ENOENT/ENOTDIR）。` +
+        ` 期望路径=${bin} 存在=${found} 命中 asarUnpack 平台包目录=${existsSync(pkgDir)}` +
+        ` 平台=${process.platform} 架构=${process.arch} 构建器子目录=${subdir || '.'}` +
+        ` resourcesPath=${rp} app.asar.unpacked 存在=${existsSync(join(rp, 'app.asar.unpacked'))}`,
+    )
+  }
 }
 
 type EsbuildModule = { build: (opts: Record<string, unknown>) => Promise<unknown>; buildSync: (opts: Record<string, unknown>) => unknown }

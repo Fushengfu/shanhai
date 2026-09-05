@@ -13,7 +13,7 @@ import { subscribeMemberUnread } from './member-channel'
 import { scheduleStartupUpdateCheck } from './app-updater'
 import { reportDeviceStartup } from './device-report'
 import { refreshDockMenu } from './dock-menu'
-import { ensureLocaleResolved, getMainLocale, onMainLocaleChange } from './locale-store'
+import { attachInitialLocalePush, ensureLocaleResolved, getMainLocale, onMainLocaleChange } from './locale-store'
 import { tIn } from '../shared/i18n'
 
 /** 全局唤起/隐藏主窗口的快捷键（macOS 上 CommandOrControl 即 ⌘，避开 Spotlight 的 ⌘+Space） */
@@ -108,9 +108,12 @@ if (!gotSingleInstanceLock) {
     initUiStore(getRuntime())
     registerIpc()
 
-    // 语言（i18n 期1）：必须在任何窗口创建之前把 settings.locale 的「未设置」按系统语言解析成具体值并落盘，
-    // 这样首屏就是用户系统的语言，且 runtime 侧（prompts.ts 决定回复语言）读到的是同一个具体值。
+    // 语言（i18n 期1）：必须在任何窗口创建之前把「跟随系统」按系统语言解析成生效语言，
+    // 这样首屏就是用户系统的语言，且 runtime 侧（prompts.ts 决定回复语言）读到的是同一个值。
+    // ⚠️ 解析结果只进内存、不回写磁盘（落盘修复轮）：否则「跟随系统」会在第一次重启后被冲成
+    // 具体语言、语义永久丢失。渲染层因此改由下面这条「窗口加载完成补推」拿到生效语言。
     await ensureLocaleResolved()
+    attachInitialLocalePush()
 
     // 启动上报：匿名 POST 设备信息 + 版本到山海后台（AI 网关）。fire-and-forget，
     // 失败静默、不阻塞启动，这里不 await（否则拖慢窗口创建）。

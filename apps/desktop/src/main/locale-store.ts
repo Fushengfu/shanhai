@@ -1,9 +1,12 @@
 /**
  * 主进程的语言通道（i18n 期1 · 用户已批准的「新增语言能力」）。
  *
- * 【本期职责】只做两件事，且刻意不新增任何 IPC 通道：
- *   ① 启动时把「未设置」按系统语言解析一次并落盘（首次跟随系统语言）；
- *   ② 语言一变就广播 ui:locale 给所有窗口（照抄 theme:set → ui:theme 那条通道的形态）。
+ * 【本期职责】只做三件事，且刻意不新增任何 IPC 通道：
+ *   ① 启动时把「跟随系统」按系统语言解析成【生效语言】，只写进内存（镜像 + runtime），
+ *      **不回写磁盘** —— 磁盘上的 settings.locale 永远是用户的【选择】（i18n 落盘修复轮改的）；
+ *   ② 语言一变就广播 ui:locale 给所有窗口（照抄 theme:set → ui:theme 那条通道的形态）；
+ *   ③ 每个窗口加载完成时补推一次生效语言（渲染层拿到「跟随系统」这个原文时自己解不出来，
+ *      也不许自己解 —— 见 attachInitialLocalePush）。
  *
  * 【为什么不新开 locale:get / locale:set 通道】
  * 读写设置已有现成通道（ipc-handlers.ts 的 settings:get / settings:set → runtime.getSettings/setSettings），
@@ -32,7 +35,7 @@ import { app, BrowserWindow } from 'electron'
 import { getRuntime } from './runtime'
 import { safeSend } from './safe-send'
 import type { Locale } from '../shared/i18n'
-import { FALLBACK_LOCALE, getLocale, resolveLocaleSetting, setLocale } from '../shared/i18n'
+import { FALLBACK_LOCALE, LOCALE_AUTO, SUPPORTED_LOCALES, getLocale, normalizeLocale, resolveLocaleSetting, setLocale } from '../shared/i18n'
 
 /**
  * 主进程侧要重建的原生 UI 回调（Dock 菜单 / 托盘菜单 + 托盘 tooltip）。
@@ -95,12 +98,48 @@ function broadcastLocale(locale: Locale): void {
 }
 
 /**
+ * 把「生效语言」注入 runtime（**内存派生值，不落盘**）—— 系统提示词据此决定 AI 回复语言。
+ *
+ * 为什么必须由这里注入、而不是让 prompts 自己解析：解析只允许发生一次、只允许有一个真相源；
+ * runtime 读不到 Electron 的 app.getLocale()，它自己按 Node ICU 去解就会解出另一套
+ * （界面按 A 显示、提示词按 B 要求回复 —— 正是本项目反复防的第二份真相）。
+ * 失败只告警不抛：注入失败时提示词退回按落盘值判定（与历轮行为一致），不该拖垮启动或设置保存。
+ */
+function pushEffectiveLocale(locale: Locale): void {
+  try {
+    getRuntime().setEffectiveLocale(locale)
+  } catch (err) {
+    console.warn('[山海] 生效语言未能注入 runtime（提示词将退回按落盘值判定）：', err)
+  }
+}
+
+/**
+ * 「这个落盘值是不是非法、需要被归一后写回」——返回要写回的值，null 表示**不许写盘**。
+ *
+ * 这是本期修复的关键判据：
+ *   空串 / 'auto'  → null。**它们就是「跟随系统」的落盘表达**，历轮在这里把解析结果写回去，
+ *                    于是用户显式选的「跟随系统」在第一次重启后被冲成具体语言、语义永久丢失。
+ *   已是合法标签    → null。用户的选择，一个字都不该动。
+ *   其它非空字符串  → 归一成合法标签后写回（'zh' / 'en_GB' / 'fr' 这类手改或历史值）。
+ *   字段缺失/类型错 → 写兜底语言。
+ */
+function illegalLocaleTag(raw: unknown): string | null {
+  if (typeof raw !== 'string') return FALLBACK_LOCALE
+  const s = raw.trim()
+  if (!s || s === LOCALE_AUTO) return null
+  for (const l of SUPPORTED_LOCALES) if (l === s) return null
+  return normalizeLocale(s)
+}
+
+/**
  * 应用一份新的 locale 设置值：更新本进程镜像 + 广播。
  * @param raw settings.locale 的原始值（可能是 ''=未设置 / 任意历史字符串）
  * @returns 解析后的生效语言
  */
 export function syncLocaleFromSettings(raw: unknown): Locale {
   const next = resolveLocaleSetting(raw, systemLocaleTag())
+  // 无论是否变化都要注入：赋值本身幂等，且能补上「启动时注入失败」的窗口
+  pushEffectiveLocale(next)
   // setLocale 内部对「同值」直接 bail out 并返回 false —— 同值时既不广播也不重建菜单，
   // 否则每次写设置（保存任何一项都会带全量 patch）都要重扫一遍窗口、重建一次原生菜单。
   const changed = setLocale(next)
@@ -112,21 +151,47 @@ export function syncLocaleFromSettings(raw: unknown): Locale {
 }
 
 /**
- * 启动时调用一次：把「未设置」按系统语言解析并落盘，之后 settings.locale 一直是具体值。
- * 这样 prompts.ts（runtime 侧）只需比较 'en-US' 就能决定回复语言指令，不必知道「auto」这个概念。
- * 落盘失败不阻断启动：内存里仍按解析结果工作，下次启动再落。
+ * 启动时调用一次：把「跟随系统」按系统语言**解析成生效语言**，写进本进程镜像与 runtime。
+ *
+ * ⚠️ 本期改掉的关键语义：**不再把解析结果写回磁盘**。
+ *   历轮 `saved !== resolved` 就落盘 → 空串（跟随系统）被冲成 'zh-CN'/'en-US'，
+ *   于是「跟随系统」这个选择在第一次重启后永久丢失（面板高亮也跟着变成显式语言）。
+ *   落盘值存的是【用户的选择】，解析值是【生效语言】，两者必须分开：后者只进内存
+ *   （shared/i18n 镜像 + ctx.effectiveLocale），一次都不许落盘。
+ *   现在只有「字段缺失 / 非法值」才写回归一结果（见 illegalLocaleTag）。
+ * 落盘失败不阻断启动：内存值已生效，下次启动再纠正。
  */
 export async function ensureLocaleResolved(): Promise<Locale> {
   const saved = getRuntime().getSettings().locale
   const resolved = resolveLocaleSetting(saved, systemLocaleTag())
   // 启动时也要写镜像（此时还没有窗口、也没有注册回调，setLocale 的返回值在这里不用于广播）
   setLocale(resolved)
-  if (saved !== resolved) {
+  pushEffectiveLocale(resolved)
+  const fix = illegalLocaleTag(saved)
+  if (fix !== null) {
     try {
-      await getRuntime().setSettings({ locale: resolved })
+      await getRuntime().setSettings({ locale: fix })
     } catch {
-      /* 落盘失败：内存值已生效，界面与主进程仍一致（只是重启后要重新解析一次） */
+      /* 落盘失败：内存值已生效，界面与主进程仍一致（只是下次启动要再纠正一次） */
     }
   }
   return resolved
+}
+
+/**
+ * 每个窗口内容加载完成后，主动推一次当前生效语言（ui:locale）。
+ *
+ * 为什么必须有：落盘值允许是「跟随系统」（空串 / 'auto'），而渲染层**不许**自己解生效语言
+ * （解析只发生在主进程一次，否则就是两个进程各解一套）。历轮靠「启动时把解析结果写回磁盘」
+ * 让渲染层读到具体值 —— 那正是本期要消灭的缺陷，所以换成主进程主动推。
+ * 时序安全：preload 的 ipcRenderer.on 与 React 的 useLocaleSync 订阅都在首屏脚本里完成，
+ * 而 did-finish-load 必然晚于首屏脚本执行 → 推送不会早于订阅。
+ * 同值时 applyLocale 内部 bail out、不通知订阅者 → 不会因此多渲染一次（任务59 消掉的重复渲染不回来）。
+ */
+export function attachInitialLocalePush(): void {
+  app.on('browser-window-created', (_event, win) => {
+    win.webContents.on('did-finish-load', () => {
+      safeSend(win, 'ui:locale', getMainLocale())
+    })
+  })
 }

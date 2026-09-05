@@ -138,8 +138,10 @@ export interface AppSettings {
   }
   /**
    * 界面语言（i18n 期1）。**全局唯一真相源**：渲染层与主进程都从这里取，不另立 env / 独立 json 第二份。
-   * 空串 = 从未设置；主进程启动时按系统语言解析一次并写回具体值（desktop main/locale-store.ts
-   * 的 ensureLocaleResolved），所以运行期读到的通常是 'zh-CN' | 'en-US'。
+   * ⚠️ 这里存的是用户的【选择】，不是【生效语言】：空串与 'auto' 同义，都表示「跟随系统」，
+   * 主进程**不会**把它改写成解析结果（历轮会，导致「跟随系统」在第一次重启后永久丢失，已修）。
+   * 需要「当前到底显示哪种语言」时，主进程读 locale-store.getMainLocale()，
+   * runtime 侧读 ctx.effectiveLocale（由宿主注入的内存派生值，不落盘）。
    * 类型故意是 string 而非联合类型：磁盘上可能出现任意历史值，归一化统一交给
    * shared/i18n 的 normalizeLocale / resolveLocaleSetting，避免两处各判一套。
    */
@@ -460,6 +462,12 @@ export interface Runtime {
   getSettings(): AppSettings
   /** 更新通用设置（局部 patch，仅改传入字段），持久化并实时同步到相关能力（如浏览器窗口显示） */
   setSettings(patch: AppSettingsPatch): Promise<AppSettings>
+  /**
+   * 注入「生效语言」（解析后的具体语言，**不落盘**）：系统提示词据此决定 AI 回复语言，
+   * 与界面实际语言同源。持久化的 settings.locale 存的是用户选择（可能是「跟随系统」），
+   * 不能直接当生效语言用；本方法只是把主进程解析好的结果传进来，不产生第二份真相。
+   */
+  setEffectiveLocale(locale: string): void
   /** 读取指定会话（缺省当前会话）的 HTTP 原始请求/响应记录（请求一条、响应一条，含接口地址与完整原始 body），无记录返回空数组 */
   getHttpTrace(id?: string): Promise<Array<{ ts: number; sessionId: string; phase: 'request' | 'response'; url: string; method: string; body?: unknown; responseStatus?: number; error?: string }>>
   /** 清空指定会话（缺省当前会话）的 HTTP trace 记录 */
