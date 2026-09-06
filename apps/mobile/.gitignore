@@ -43,3 +43,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# i18n 期7A：gen_l10n 从 lib/l10n/*.arb 生成的派生物，不入库（入库=第二份文案真相）
+/lib/l10n/generated/
