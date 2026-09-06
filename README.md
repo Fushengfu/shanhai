@@ -6,8 +6,10 @@
 
 ## 下载
 
-- [🪟 Windows 版下载](https://store.bjctykj.com/app-versions/Windows/1788425655_Shanhai-0.6.2-x64.exe)（x64，v0.6.2）
-- [🍎 macOS 版下载](https://store.bjctykj.com/app-versions/macOS/1788425981_Shanhai-0.6.2-arm64.dmg)（Apple Silicon / arm64，v0.6.2）
+- [🪟 Windows 版下载](https://store.bjctykj.com/app-versions/Windows/1788659753_Shanhai-0.6.3-x64.exe)（x64，v0.6.3）
+- [🍎 macOS 版下载](https://store.bjctykj.com/app-versions/macOS/1788614896_Shanhai-0.6.3-arm64.dmg)（Apple Silicon / arm64，v0.6.3）
+
+> 最新版本也可通过网关公开接口查询：`https://aigateway.bjctykj.com/api/v1/app/version/check?type=macOS&arch=arm64`（`type` 取 `macOS` / `Windows`，macOS 另需 `arch=arm64`）。
 
 ## 功能
 
