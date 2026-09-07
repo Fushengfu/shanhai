@@ -141,6 +141,22 @@ export interface InstalledPackageMeta {
   dependencies?: Record<string, string>
   /** 落盘形态：bundled=工程化（含 dist 编译产物） */
   kind?: 'bundled'
+  /* ── 市场来源记账（任务122 P1）──────────────────────────────────────────
+     由主进程 marketplace.writeMarketAccounting 在「下载并安装/升级」成功后写进 manifest.json。
+     这里必须同步进本接口：PluginStore.load 的返回值就是本类型，字段不声明就会出现
+     「磁盘上有、类型不认」的第二套真相（读不到 / 被后续 store.install 原样写回时丢掉）。
+     ★取值口径：一律来自「本次下载响应 + 实际落盘 manifest」，不信市场列表的 version
+       （网关选版是 ORDER BY id DESC 而非 semver 最大，列表 version 只用于展示与触发）。 */
+  /** 本次从市场安装/升级后**实际落盘**的 manifest.version（记账真值，不是列表显示值） */
+  marketInstalledVersion?: string
+  /** 下载包 SHA-256（与网关 X-SHA256 响应头同一算法、同一来源，用于校验/复用） */
+  marketFileSha256?: string
+  /** 下载响应头 Content-Disposition 里标注的版本（与 marketInstalledVersion 做对齐校验，不一致要如实播报） */
+  marketHeaderVersion?: string
+  /** 本次市场安装/升级完成时刻（ms） */
+  marketInstalledAt?: number
+  /** 升级前的本地版本（首装为空）；供「恢复上一版本」提示与排查 */
+  marketPreviousVersion?: string
 }
 
 /**

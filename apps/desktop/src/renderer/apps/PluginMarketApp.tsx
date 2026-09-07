@@ -3,6 +3,8 @@ import { WindowTitleBar } from '../components/WindowTitleBar'
 import { IconStore, IconSearch, IconRefresh } from '../components/icons'
 import { smallIconBtn } from '../components/ui'
 import { t as tKey } from '../../shared/i18n'
+// 任务122：版本比较统一从 shared 取（主进程算 hasUpdate / 防降级也用同一份，禁止两处各留一份）
+import { compareVersions } from '../../shared/market-semver'
 import { useLocaleSync } from '../locale'
 import { useThemeSync } from '../theme'
 
@@ -19,6 +21,18 @@ interface MarketItem {
   fileSha256?: string
   fileSize?: number
   installed?: boolean
+  /** 网关数字行 id（任务122④，主进程下载时用来锁行；渲染层只透传不展示） */
+  rowId?: number
+  /** 本地已安装版本（主进程读 manifest 得到） */
+  localVersion?: string
+  /** 有更新：市场版本明确高于本地 ⇒ 卡片出「更新」按钮（任务122） */
+  hasUpdate?: boolean
+  /** 防降级（任务122②）：市场版本明确低于本地 ⇒ 按钮灰态不可点 + 如实标注 */
+  downgrade?: boolean
+  /** 本机有可恢复的旧版本备份（任务122⑤） */
+  hasBackup?: boolean
+  /** 备份对应版本 */
+  backupVersion?: string
 }
 
 /** 「我已安装」插件条目（与 preload listMyPlugins 返回项对齐） */
@@ -39,6 +53,14 @@ interface MyItem {
   gatewayStatus?: string
   /** 网关是否有已审批版本 */
   hasApproved?: boolean
+  /** 已安装 manifest 版本（自研卡片的 version 优先取工程 package.json，这里是落盘真值） */
+  localVersion?: string
+  /** 本机有可恢复的旧版本备份（只有用山海升级过、且备份未被消耗时才有） */
+  hasBackup?: boolean
+  /** 备份对应版本 */
+  backupVersion?: string
+  /** 上次市场安装/升级记账的版本 */
+  marketInstalledVersion?: string
 }
 
 /** 行业分类枚举（与 plugin_share_pack / 网关 hasUI/categories 对齐） */
@@ -85,25 +107,7 @@ const MOCK_PLUGINS: MarketItem[] = [
   { id: 'image-compress', name: '图片压缩', purpose: '批量图片压缩工具（纯工具插件，无界面窗口）', version: '0.9.1', author: '社区', hasUI: false, categories: ['设计', '生活工具'] },
 ]
 
-/** 解析版本号为数字段（semver 逐段比较，1.10.0 > 1.9.0 正确，禁止字符串字典序） */
-function parseVersion(v?: string): number[] {
-  if (!v) return []
-  const m = String(v).trim().match(/\d+/g)
-  return m ? m.map((n) => parseInt(n, 10)) : []
-}
-
-/** semver 比较：a > b 返回 1，a < b 返回 -1，相等返回 0 */
-function compareVersions(a?: string, b?: string): number {
-  const pa = parseVersion(a)
-  const pb = parseVersion(b)
-  const len = Math.max(pa.length, pb.length)
-  for (let i = 0; i < len; i++) {
-    const x = pa[i] ?? 0
-    const y = pb[i] ?? 0
-    if (x !== y) return x > y ? 1 : -1
-  }
-  return 0
-}
+/** 版本比较已提到 shared/market-semver.ts（任务122 单一真相源），本文件不再自带一份 */
 
 /** 分享按钮状态机（仅自研插件）：
  *  - 网关无该 plugin_id 提交记录 → 'share'（分享）
@@ -137,6 +141,12 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
   const [mockMode, setMockMode] = useState(false)
   const [installing, setInstalling] = useState<string | null>(null)
   const [notice, setNotice] = useState('')
+  // 通知条成败底色（任务122：升级/取消/防降级等失败分支不能再用绿色冒充成功）
+  const [noticeOk, setNoticeOk] = useState(true)
+  // 「恢复上一版本」（任务122⑤：只能靠本机升级时留下的备份，网关无版本历史接口）
+  const [restoring, setRestoring] = useState<string | null>(null)
+  const [restoreMsg, setRestoreMsg] = useState('')
+  const [restoreOk, setRestoreOk] = useState(true)
 
   // 「我已安装」tab 状态
   const [myPlugins, setMyPlugins] = useState<MyItem[]>([])
@@ -219,6 +229,7 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
     setNotice('')
     try {
       const res = await window.shanhai?.installMarketPlugin(id)
+      setNoticeOk(!!res?.ok)
       setNotice(res?.ok ? (res.message ?? tKey('market.installed')) : (res?.message ?? tKey('market.installFailed')))
       if (res?.ok) {
         // 安装成功后刷新列表（标记「已安装」）+ 刷新「我已安装」区块
@@ -227,6 +238,32 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
       }
     } finally {
       setInstalling(null)
+    }
+  }
+
+  /**
+   * 恢复上一版本（任务122⑤）。
+   * ★复用同一个 market:install 入口，不新增 IPC 通道/preload 方法：主进程按「本机有备份 +
+   *   市场版本不高于本地」自动走恢复分支，并在原生对话框里二次确认（取消/失败都回可见原因）。
+   */
+  const handleRestore = async (id: string): Promise<void> => {
+    if (restoring || installing) return
+    setRestoring(id)
+    setRestoreMsg('')
+    try {
+      const res = await window.shanhai?.installMarketPlugin(id)
+      setRestoreOk(!!res?.ok)
+      setRestoreMsg(res?.message ?? tKey('market.restoreFailed'))
+      if (res?.ok) {
+        // 备份已被消耗 ⇒ 刷新两处，卡片上的「恢复上一版本」按钮随 hasBackup 消失
+        void loadMine()
+        void load(keyword, category, hasUI)
+      }
+    } catch (err) {
+      setRestoreOk(false)
+      setRestoreMsg(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRestoring(null)
     }
   }
 
@@ -351,7 +388,7 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
               </div>
             )}
             {notice && (
-              <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--tint-green-soft, rgba(76,175,80,0.14))', color: 'var(--text)', fontSize: 13, lineHeight: 1.6 }}>{notice}</div>
+              <div style={{ padding: '10px 12px', borderRadius: 8, background: noticeOk ? 'var(--tint-green-soft, rgba(76,175,80,0.14))' : 'rgba(239,68,68,0.14)', color: noticeOk ? 'var(--text)' : 'var(--text-danger, #ef4444)', fontSize: 13, lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{notice}</div>
             )}
 
             {/* 结果统计 */}
@@ -397,6 +434,9 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
             {uninstallMsg && (
               <div style={{ padding: '10px 12px', borderRadius: 8, background: uninstallOk ? 'var(--tint-green-soft, rgba(76,175,80,0.14))' : 'rgba(239,68,68,0.14)', color: uninstallOk ? 'var(--text)' : 'var(--text-danger, #ef4444)', fontSize: 13, lineHeight: 1.6, wordBreak: 'break-all' }}>{uninstallMsg}</div>
             )}
+            {restoreMsg && (
+              <div style={{ padding: '10px 12px', borderRadius: 8, background: restoreOk ? 'var(--tint-green-soft, rgba(76,175,80,0.14))' : 'rgba(239,68,68,0.14)', color: restoreOk ? 'var(--text)' : 'var(--text-danger, #ef4444)', fontSize: 13, lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{restoreMsg}</div>
+            )}
 
             <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{mineLoading ? tKey('common.loading') : tKey('market.count.installed', { n: myPlugins.length })}</div>
             {!mineLoading && myPlugins.length === 0 && (
@@ -414,6 +454,8 @@ export function PluginMarketApp({ onClose }: { onClose: () => void }): React.JSX
                   onShare={handleShare}
                   uninstalling={uninstalling === p.id}
                   onUninstall={handleUninstall}
+                  restoring={restoring === p.id}
+                  onRestore={handleRestore}
                 />
               ))}
             </div>
@@ -535,6 +577,10 @@ function MarketCard({ p, installing, onInstall }: { p: MarketItem; installing: b
   useLocaleSync()
   const [hover, setHover] = useState(false)
   const sizeLabel = formatSize(p.fileSize)
+  // 任务122：已安装 + 明确有更新 ⇒ 出「更新」按钮（复用同一 market:install 入口，不新造第二个安装出口）；
+  // 已安装但无更新（含防降级）⇒ 维持原灰态。★防降级时按钮必须不可点（市场版本低于本地，装了就是覆盖回旧版）。
+  const canUpdate = !!p.installed && p.hasUpdate === true
+  const greyButton = !!p.installed && !canUpdate
   return (
     <div
       onMouseEnter={() => setHover(true)}
@@ -568,33 +614,46 @@ function MarketCard({ p, installing, onInstall }: { p: MarketItem; installing: b
         {(p.categories ?? []).slice(0, 3).map((c) => (
           <Tag key={c} label={categoryLabel(c)} tone="blue" />
         ))}
-        {p.installed && <Tag label={tKey('market.installed')} tone="green" />}
+        {p.installed && !p.hasUpdate && <Tag label={tKey('market.installed')} tone="green" />}
+        {canUpdate && <Tag label={tKey('market.tag.hasUpdate')} tone="orange" />}
       </div>
       <div style={{ fontSize: 11, color: 'var(--text-faint)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
         {p.author && <span>{tKey('market.fromAuthor', { author: p.author })}</span>}
         {p.version && <span>v{p.version}</span>}
         {sizeLabel && <span>{sizeLabel}</span>}
+        {/* 任务122②：服务端版本比本地还旧时如实标注（网关按 id DESC 选版，不猜、不静默） */}
+        {p.downgrade && (
+          <span style={{ color: 'var(--warning-text, #b26a00)' }}>
+            {tKey('market.tag.downgrade', { local: p.localVersion ?? '?', market: p.version ?? '?' })}
+          </span>
+        )}
       </div>
 
       {/* 底部：操作按钮（紧凑尺寸，不占满整卡；已安装 → 置灰描边，未安装 → 主色实心） */}
       <button
         onClick={() => onInstall(p.id)}
-        disabled={installing || p.installed}
+        disabled={installing || greyButton}
         style={{
           alignSelf: 'flex-start',
           padding: '7px 16px',
           borderRadius: 8,
-          border: p.installed ? '1px solid var(--border)' : 'none',
-          cursor: p.installed ? 'default' : 'pointer',
-          background: p.installed ? 'transparent' : 'var(--accent)',
-          color: p.installed ? 'var(--text-muted)' : '#fff',
+          border: greyButton ? '1px solid var(--border)' : 'none',
+          cursor: greyButton ? 'default' : 'pointer',
+          background: greyButton ? 'transparent' : 'var(--accent)',
+          color: greyButton ? 'var(--text-muted)' : '#fff',
           fontSize: 13,
           fontWeight: 600,
           transition: 'background 0.15s ease',
           opacity: installing ? 0.6 : 1,
         }}
       >
-        {installing ? tKey('market.installing') : p.installed ? tKey('market.installed') : tKey('market.install')}
+        {installing
+          ? tKey('market.installing')
+          : canUpdate
+            ? tKey('market.update')
+            : p.installed
+              ? tKey('market.installed')
+              : tKey('market.install')}
       </button>
     </div>
   )
@@ -602,7 +661,7 @@ function MarketCard({ p, installing, onInstall }: { p: MarketItem; installing: b
 
 /** 「我已安装」插件卡片：复用「发现」面板卡片视觉（图标 + 名称 + 简介 + 标签 + 元信息 + 整宽操作按钮），
  *  同时承载「已安装」专属信息（自研标记 / 本地版本 / 网关版本 / 分享 / 提交升级版本共享）。 */
-function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { p: MyItem; sharing: boolean; loggedIn: boolean; onShare: (id: string) => void; uninstalling: boolean; onUninstall: (id: string) => void }): React.JSX.Element {
+function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall, restoring, onRestore }: { p: MyItem; sharing: boolean; loggedIn: boolean; onShare: (id: string) => void; uninstalling: boolean; onUninstall: (id: string) => void; restoring: boolean; onRestore: (id: string) => void }): React.JSX.Element {
   useLocaleSync()
   const [hover, setHover] = useState(false)
   const [confirming, setConfirming] = useState(false)
@@ -644,9 +703,11 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
       <div style={{ fontSize: 11, color: 'var(--text-faint)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
         {p.version && <span>v{p.version}</span>}
         {p.submitted && p.gatewayVersion && <span>{tKey('market.gatewayVersion', { v: p.gatewayVersion })}</span>}
+        {/* 任务122⑤：只有本机曾升级过才有备份；恢复一次即消耗，不能退回任意历史版本 */}
+        {p.hasBackup && p.backupVersion && <span>{tKey('market.backupOf', { v: p.backupVersion })}</span>}
       </div>
 
-      {/* 底部：操作按钮（分享 / 提交升级版本共享 / 已安装 + 卸载）同一行 */}
+      {/* 底部：操作按钮（分享 / 提交升级版本共享 / 已安装 + 恢复上一版本 + 卸载）同一行 */}
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
       {action === 'share' && (
         <button
@@ -706,6 +767,30 @@ function MyCard({ p, sharing, loggedIn, onShare, uninstalling, onUninstall }: { 
           }}
         >
           {tKey('market.installed')}
+        </button>
+      )}
+
+      {/* 恢复上一版本（任务122⑤）：仅本机有备份时出现。点击复用 market:install 入口，
+          主进程识别到「有备份 + 市场版本不高于本地」后进原生对话框二次确认，取消/失败都回可见原因。 */}
+      {p.hasBackup && p.backupVersion && (
+        <button
+          onClick={() => onRestore(p.id)}
+          disabled={restoring || uninstalling}
+          style={{
+            alignSelf: 'flex-start',
+            padding: '7px 16px',
+            borderRadius: 8,
+            border: '1px solid var(--border)',
+            background: 'var(--bg-panel)',
+            color: 'var(--text-secondary)',
+            fontSize: 12,
+            fontWeight: 600,
+            cursor: restoring || uninstalling ? 'not-allowed' : 'pointer',
+            opacity: restoring || uninstalling ? 0.55 : 1,
+            transition: 'opacity 0.15s ease',
+          }}
+        >
+          {restoring ? tKey('market.restoring') : tKey('market.restore')}
         </button>
       )}
 
