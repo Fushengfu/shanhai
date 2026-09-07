@@ -118,6 +118,9 @@ function createMockDmUseService(): DmUseService {
     async sendFromAgent() {
       return { ok: false, reason: 'not_enabled', message: '私信发消息桥未装配（非桌面端宿主）' }
     },
+    async listFriends() {
+      return { ok: false, message: '好友列表桥未装配（非桌面端宿主）' }
+    },
   }
 }
 
@@ -152,6 +155,33 @@ function createDmSendTool(dmUse: DmUseService): ToolContract {
         replyTo: args.replyTo ? String(args.replyTo) : undefined,
       })
       return r
+    },
+  }
+}
+
+/** 私信「管家接管」·只读列好友工具：列出好友（昵称/用户名/memberId + 在线 + 未读数 + 最后一条时间），
+ *  用于把用户口中的「张三」解析成 dm_send 需要的 peerMemberId。数据来自宿主既有内存缓存
+ *  （member-channel 的 friends/threads 单一真相源），只读、不读私信正文、不产生网络请求。 */
+const DM_FRIENDS_TOOL_NAME = 'dm_friends'
+function createDmFriendListTool(dmUse: DmUseService): ToolContract {
+  return {
+    name: DM_FRIENDS_TOOL_NAME,
+    description:
+      '只读列出当前会员的私信好友（昵称/用户名/memberId + 在线状态 + 未读数 + 最后一条消息时间），用于把用户口中的「张三」解析成 dm_send 需要的 peerMemberId。可选 keyword 按昵称或用户名过滤（大小写不敏感）。本工具不读取任何私信正文。⚠️ 返回的 memberId 仅用于调用 dm_send，不得出现在给用户看的回复里（界面显示口径：昵称→用户名→「未知会员」）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        keyword: { type: 'string', description: '按昵称或用户名过滤（可选，大小写不敏感）' },
+      },
+      required: [],
+      additionalProperties: false,
+    } as Record<string, unknown>,
+    riskLevel: 'readonly',
+    timeoutMs: 10_000,
+    execute: async (args) => {
+      if (!dmUse.listFriends) return { ok: false, message: '好友列表桥未装配（当前宿主不支持列好友）' }
+      const keyword = String(args.keyword ?? '').trim()
+      return dmUse.listFriends(keyword || undefined)
     },
   }
 }
@@ -818,6 +848,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     ...mcpTools,
     pluginTool,
     createDmSendTool(ctx.dmUse),
+    createDmFriendListTool(ctx.dmUse),
   ]
   ctx.tools.push(...baseTools.map(wrapTool))
 

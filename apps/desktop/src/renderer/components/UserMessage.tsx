@@ -1,11 +1,12 @@
 import { memo, useState } from 'react'
-import { IconClock, IconCopy, IconEdit, IconRefresh } from './icons'
+import { IconClock, IconCopy, IconEdit, IconRefresh, IconShare } from './icons'
 import { MessageActions } from './MessageActions'
+import { DmSharePicker } from './DmSharePicker'
 import { copyText } from './ui'
 import { t } from '../../shared/i18n'
 import { useLocaleSync } from '../locale'
 
-/** 用户消息气泡：右对齐，气泡下方常显「编辑 / 复制 / 重新发送」；编辑为内联编辑（Enter 确认 / Esc 取消，参考 taco） */
+/** 用户消息气泡：右对齐，气泡下方常显「编辑 / 复制 / 重新发送 / 分享到好友」；编辑为内联编辑（Enter 确认 / Esc 取消，参考 taco） */
 export const UserMessage = memo(function UserMessage({ content, images, userIndex, busy, pending, onResend, onEditResend, onPreviewImage }: {
   content: string
   images?: string[]
@@ -21,6 +22,8 @@ export const UserMessage = memo(function UserMessage({ content, images, userInde
   useLocaleSync()
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(content)
+  // 【任务109】分享弹层开关：与其它 hook 同批无条件调用（条件性 Hook 调用 = SessionRow 白屏那种崩法）
+  const [shareOpen, setShareOpen] = useState(false)
 
   const confirmEdit = (): void => {
     const text = draft.trim()
@@ -78,11 +81,15 @@ export const UserMessage = memo(function UserMessage({ content, images, userInde
                 { key: 'edit', icon: <IconEdit />, label: t('chat.user.edit'), run: () => { setEditing(true); setDraft(content) } },
                 { key: 'copy', icon: <IconCopy />, label: t('common.copy'), run: () => copyText(content) },
                 { key: 'resend', icon: <IconRefresh />, label: t('chat.user.resend'), run: () => onResend(userIndex) },
+                // 【任务109】分享到好友：与上面三个按钮同批受 pending/busy 闸门管辖（不新造第三态）
+                { key: 'share', icon: <IconShare />, label: t('chat.share.button'), run: () => setShareOpen(true) },
               ]}
             />
           ) : null}
         </>
       ) : null}
+      {/* 分享弹层：position:fixed 居中，不占消息流空间；只有打开时才挂载（关闭即整棵子树卸载） */}
+      {shareOpen && <DmSharePicker body={content} source="user" images={images} onClose={() => setShareOpen(false)} />}
     </div>
   )
 })

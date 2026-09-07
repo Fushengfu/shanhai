@@ -33,7 +33,7 @@ import { useLocaleSync } from '../locale'
  *  2. 发送按钮不做「busy → 红色 IconStop + breathe」：私信没有「停止发送」这种可中断动作，
  *     照搬会做出一个「看着能点、点了什么都没停」的假按钮（本项目反复踩的静默失败）。
  *     发送中沿用同一尺寸与圆角，配色保持 accent、禁用并改 title 说明「正在发送」，图标用 IconStop 表示「再点无效」。
- *  3. 多了一行「编码后字节 / 上限」计数：私信 content 上限 4000 字节，且附件引用也计入。
+ *  3. 多了一行「编码后字节 / 上限」计数：私信 content 有字节上限（上限值见 shared 的 DM_MAX_CONTENT_BYTES），且附件引用也计入。
  *
  * 【硬约束】附件一律「先上传拿公网 URL → 消息里只放引用」，**绝不把 base64 塞进私信消息**；
  * 本地 dataUrl 只用于发送前的预览（用户拍板：粘贴后先本地预览再发、可取消）。
@@ -75,7 +75,7 @@ export interface DmComposerProps {
   loggedIn: boolean
   /** 对方显示名（调用方必须已用 displayNameOf 归一；本组件不参与任何显示兜底） */
   peerName: string
-  /** 单条私信 content 字节上限（4000，与主进程 MAX_MSG_BYTES 同口径） */
+  /** 单条私信 content 字节上限（调用方传 shared 的 DM_MAX_CONTENT_BYTES，与主进程同口径） */
   maxContentBytes: number
   /**
    * 真正发送：返回 true = 已交给主进程（本组件清空输入与附件）；
@@ -273,7 +273,8 @@ export function DmComposer(p: DmComposerProps): React.JSX.Element {
     const content = encodeDmContent(trimmed, donePayloads)
     const bytes = utf8Bytes(content)
     if (bytes > p.maxContentBytes) {
-      p.onBlocked(tKey('dm.composer.blockedTooLong', { bytes, max: p.maxContentBytes }))
+      // 【任务113】超限文案收敛成共享词条 dm.contentTooLong（与主进程 / 私信面板同一份文案、同一组参数名）
+      p.onBlocked(tKey('dm.contentTooLong', { bytes, max: p.maxContentBytes }))
       return
     }
     setSending(true)
@@ -396,7 +397,7 @@ export function DmComposer(p: DmComposerProps): React.JSX.Element {
             >
               <IconPaperclip />
             </button>
-            {/* 字节计数：私信独有的硬约束（编码后 content ≤ 4000 字节），放工具行左侧不压住文字 */}
+            {/* 字节计数：私信独有的硬约束（编码后 content ≤ 上限字节），放工具行左侧不压住文字 */}
             <span title={tKey('dm.composer.byteTitle', { max: p.maxContentBytes })} style={{ fontSize: 11, color: overLimit ? 'var(--danger-text, #b91c1c)' : 'var(--text-muted)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 }}>
               {tKey('dm.composer.byteLine', { bytes: totalBytes, max: p.maxContentBytes })}{overLimit ? tKey('dm.composer.byteOver') : ''}
             </span>

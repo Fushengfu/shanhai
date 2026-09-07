@@ -517,6 +517,27 @@ export interface DmUseService {
     /** 命中的敏感规则（content_filtered 时给出，便于管家换措辞重试） */
     filterRule?: string
   }>
+  /** 只读列出私信好友（dm_friends 工具后端）：把用户口中的「张三」解析成 dm_send 所需的 peerMemberId。
+   *  keyword 按昵称/用户名过滤（大小写不敏感），过滤发生在宿主（主进程）内存，不产生网络请求。
+   *  ⚠️ 只返回元数据（在线/未读数/最后一条消息时间），绝不返回私信正文；memberId 仅供工具调用，
+   *  不得出现在给用户看的回复里（界面口径：昵称→用户名→「未知会员」）。非桌面宿主可不提供 → 工具侧返回可读失败。 */
+  listFriends?(keyword?: string): Promise<{
+    ok: boolean
+    message?: string
+    count?: number
+    friends?: Array<{
+      memberId: string
+      username: string
+      nickname?: string
+      online?: boolean
+      /** 会话级元数据：该好友会话未读数（无会话记录则省略） */
+      unread?: number
+      /** 会话级元数据：最后一条消息时间戳 ms（无会话记录则省略） */
+      lastTs?: number
+    }>
+    /** 给模型的使用限制说明：memberId 仅用于调用 dm_send，不得出现在给用户看的回复里 */
+    notice?: string
+  }>
 }
 
 /** 私信「管家接管」·待回发映射：记录「因某好友私信而派活的会话」的目标好友。

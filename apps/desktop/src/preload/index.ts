@@ -379,8 +379,12 @@ export interface ShanhaiBridge {
   memberUnsubscribe(channelId: string): Promise<void>
   /** 分页拉取历史（HTTP 权威，before=时间戳游标；失败退回本地缓存并带 error） */
   memberHistory(input: { channelId: string; page?: number; pageSize?: number }): Promise<{ messages: DmMessage[]; hasMore: boolean; total: number; page: number; error: string | null }>
-  /** 发送私信（好友前提 / 4000 字节上限 / 按会员限流 由主进程预检并如实返回原因） */
-  memberSend(input: { peerMemberId?: string; channelId?: string; text: string; peerName?: string }): Promise<MemberResult & { msgId?: string; channelId?: string }>
+  /**
+   * 发送私信（好友前提 / DM_MAX_CONTENT_BYTES 字节上限 / 按会员限流 由主进程预检并如实返回原因）。
+   * 【任务109】fromUserShare：消息卡片「分享到好友」的用户主动动作标记 —— 主进程据此改走
+   * sendDmFromAgent（出站敏感过滤照过、但不受「管家接管」开关约束）。★不是新增方法，只是可选入参。
+   */
+  memberSend(input: { peerMemberId?: string; channelId?: string; text: string; peerName?: string; fromUserShare?: boolean }): Promise<MemberResult & { msgId?: string; channelId?: string; reason?: string; filterKind?: 'secret' | 'path' | 'addr' | 'error' }>
   /** 标记某通道已读（HTTP 上报，多设备按会员维度共享：任一设备读过即已读） */
   memberMarkRead(channelId: string): Promise<MemberResult>
   /**

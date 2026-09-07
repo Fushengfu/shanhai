@@ -280,6 +280,8 @@ export function createExecutionModule(
     'plugin',
     // 管家接管私信：管家代表用户对好友发消息（安全门在宿主 sendDmFromAgent：接管开关 + 出站敏感信息硬拦截）
     'dm_send',
+    // 只读列好友（dm_friends）：把「张三」解析成 dm_send 的 peerMemberId；数据来自主进程既有缓存，不读私信正文
+    'dm_friends',
   ])
 
   const buildSupervisorLoopTools = (): ToolContract[] => [

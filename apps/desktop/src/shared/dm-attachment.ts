@@ -7,7 +7,8 @@
  *  2. 私信的 `[图片]` 内容在主进程也要用（系统通知正文、「引用到会话」的落地文本），
  *     渲染层再实现一遍解码就是第三个真相源。
  *
- * 【硬约束】私信正文上限 4000 字节（网关 im_service），**绝不允许把 base64 塞进消息**
+ * 【硬约束】私信正文上限 = 本文件导出的 DM_MAX_CONTENT_BYTES（单一真相源，主进程与渲染层都从这一处取），
+ * **绝不允许把 base64 塞进消息**
  * （本项目已因截图 base64 撑爆请求踩过 context deadline exceeded）。所以附件一律
  * 「先上传拿公网 URL → 消息里只放引用」。
  */
@@ -31,6 +32,30 @@ import { t } from './i18n'
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024
 /** 文档 / 音视频上限 20MB（用户拍板） */
 export const MAX_FILE_BYTES = 20 * 1024 * 1024
+
+/**
+ * 【任务113 · 单一真相源】单条私信 content 的字节上限。
+ *
+ * 为什么必须有这一份：改前主进程 member-channel.ts:110 `MAX_MSG_BYTES = 4000` 与渲染层
+ * MemberPanel.tsx:49 `MAX_CONTENT_BYTES = 4000` 各写一个字面量，连 i18n key 与参数名都不同
+ * （dm.sendTooLong{now,max} vs dm.send.tooLong{bytes,max}），改一处必然漂开另一处。
+ * 现在两侧都 import 本常量，全仓只有这一个数值。
+ *
+ * 【口径统一】判定对象 = **编码后的 content**（encodeDmContent 的产物）的 UTF-8 字节数。
+ *  主进程 sendDm 检的是入参 text，而渲染层传进来的入参本身就已经是编码后的 content
+ *  （MemberPanel onSend 先 encodeDmContent 再 memberSend），所以两边其实是同一口径；
+ *  渲染层 DmComposer / MemberPanel 也按编码后计数（附件引用同样占字节，只数正文字符会算少）。
+ *
+ * 【40000 这个数怎么来的（任务115，用户 2026-09-07 授权放宽）】
+ *  - 网关 im_service 的 send handler 原先硬校验 4000（与旧客户端契约 v1 同值），已同步放宽到 40000；
+ *  - 存储层 direct_messages.content 是 TEXT 列，容量 65535 字节 ⇒ 40000 约占 61%，不触列上限；
+ *  - ws 帧 / 请求体上限 10MB（≈10485760 字节），远大于本值；
+ *  - 相对存储列 65535 留 (65535-40000)/65535 ≈ 39% 余量，给附件引用 JSON 与编码膨胀留空间；
+ *  - 手机端无私信 UI（apps/mobile 实测零私信渲染面），不构成约束。
+ * 【上线顺序】网关那行未部署前，客户端单方面放到 40000 会出现「本地能输、发出去被网关以 4000 拒」；
+ *  实际生效 = 网关已部署 + 山海重启。若网关侧回滚，本行改回 4000 即可，无需动任何其它文件。
+ */
+export const DM_MAX_CONTENT_BYTES = 40000
 
 /** 允许的图片扩展名（用户拍板的清单，逐字照抄） */
 export const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic'] as const
@@ -131,8 +156,8 @@ export function acceptAttrFor(opts: ClassifyOptions): string {
 
 /**
  * UTF-8 字节数（与主进程 Buffer.byteLength 同口径）。
- * 放这里是因为**编码后的 content** 才受 4000 字节上限约束：附件引用会占几十字节，
- * 只数正文字符数会算少，于是「本地以为没超、网关回 content_too_long」。渲染层两处（私信面板 / 输入区）共用一份。
+ * 放这里是因为**编码后的 content** 才受本文件 DM_MAX_CONTENT_BYTES 的上限约束：附件引用会占几十字节，
+ * 只数正文字符数会算少，于是「本地以为没超、网关回 message_too_large」。渲染层两处（私信面板 / 输入区）共用一份。
  */
 export function utf8Bytes(text: string): number {
   let n = 0
@@ -148,7 +173,7 @@ export function utf8Bytes(text: string): number {
 
 /**
  * 单条附件引用（放进私信 content 里的紧凑 JSON）。
- * 字段名刻意压到一个字母：私信正文上限 4000 字节，一条带名字的长 URL 也要占地方。
+ * 字段名刻意压到一个字母：私信正文受 DM_MAX_CONTENT_BYTES 的字节上限约束，一条带名字的长 URL 也要占地方。
  * 理想方案是网关给 direct_messages 加 msg_type + attachment 列（依赖清单 G1）；
  * 网关没加之前，本期就走这个「content 放 JSON 字符串」的兼容写法。
  */

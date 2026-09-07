@@ -70,6 +70,13 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
         background: 'var(--tint-blue-soft)',
         fontSize: 13,
         boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+        // 任务114：卡片整体不得超出视口安全区。外层原本只有 bottom:158 下锚点、无高度上限，
+        // 内容（长问题 / 长审批参数）一多就向上撑高，绘制到顶部标题栏之上，盖住最小化/最大化/关闭按钮。
+        // 227 = 158（既有下锚点，见上方 bottom）+ 69（标题栏安全区：管家窗口 WindowTitleBar
+        // padding 16+16 + 最高子元素 WindowControlButton 36 + borderBottom 1 = 69；会话窗口 HeaderPlugin 同算法=61，取大者）。
+        // 用 maxHeight 不用 height：内容少时按内容高，不留白（任务107 那类坑）。
+        maxHeight: 'calc(100% - 227px)',
+        overflowY: 'auto',
         zIndex: 10,
       }}
     >
@@ -102,7 +109,9 @@ export function AskCard({ req, onSubmit, onCancel }: AskCardProps) {
 
       {!collapsed && (
         <>
-          <div style={{ color: 'var(--text)', marginBottom: 6, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+          {/* 任务114：长问题正文限高 + 内部滚动。maxHeight 200 + overflowY:'auto' 照抄本组件既有
+              reasoning 区（:113）与选项列表（:120）的同款写法，不另立样式。内容少时不占多余空间。 */}
+          <div style={{ color: 'var(--text)', marginBottom: 6, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word', maxHeight: 200, overflowY: 'auto' }}>
             {req.question?.trim() ? req.question : t('chat.ask.noQuestion')}
           </div>
           {req.reasoning && (

@@ -75,7 +75,9 @@ export const zhCN = {
 
   // 发送私信
   'dm.send.noBridge': '本窗口拿不到发送通道（window.shanhai.memberSend 不可用），请重启山海',
-  'dm.send.tooLong': '内容过长：编码后 {bytes} 字节，单条上限 {max} 字节（附件引用也占字节），请减少附件或分段发送',
+  // 【任务113】超限文案收敛成**一个共享词条**：主进程 sendDm、私信面板、输入区三处都取这一条，
+  // 参数名统一 {bytes}/{max}（改前主进程 dm.sendTooLong{now,max} 与这里 dm.send.tooLong{bytes,max} 并存，必漂）。
+  'dm.contentTooLong': '内容过长：编码后 {bytes} 字节，单条上限 {max} 字节（附件引用也占字节），请精简内容或减少附件后重发',
   'dm.sentWithAttachment': '已发送（附件已存云存储，消息里只带引用）',
   'dm.sent': '已发送',
 
@@ -223,7 +225,6 @@ export const zhCN = {
   'dm.composer.blockedNoLogin': '未登录会员账号：私信需要登录后才能收发（点左下方「去登录」）',
   'dm.composer.blockedNotReady': '会员通道还没就绪，暂时发不出去（可点左下方「重试」；持续失败请重启山海）',
   'dm.composer.blockedEmpty': '还没有内容：写点文字或添加一个附件再发送',
-  'dm.composer.blockedTooLong': '内容过长：编码后 {bytes} 字节，单条上限 {max} 字节（附件引用也占字节），请减少附件或分段发送',
   'dm.composer.blockedUploading': {
     one: '还有 {n} 个附件没传完，请稍候（附件只传云存储引用，传完才能发）',
     other: '还有 {n} 个附件没传完，请稍候（附件只传云存储引用，传完才能发）',
@@ -447,6 +448,32 @@ export const zhCN = {
   'common.emptyValue': '（空）',
   'common.truncatedChars': { one: '…（共 {n} 字）', other: '…（共 {n} 字）' },
   'chat.msg.copyImage': '复制为图片',
+  // ———— 【任务109】消息卡片「分享到好友」：按钮 tooltip / 弹层 / 分段 / 各失败分支可见原因 ————
+  // 全部走词典（渲染层 t() 取词，谁取词谁订阅），★组件里不许写死中文
+  'chat.share.button': '分享到好友',
+  'chat.share.ariaLabel': '选择要分享到的好友',
+  'chat.share.title': '分享到好友',
+  'chat.share.footer': '只会发给下面选中的好友，不会自动发给其他人；整条一次发出，过长则不发送。',
+  'chat.share.emptyFriends': '还没有可分享的好友：请先在私信面板添加好友。',
+  'chat.share.pickHere': '分享给他',
+  'chat.share.online': '在线',
+  'chat.share.offline': '离线',
+  'chat.share.sending': '正在分享…',
+  'chat.share.idle': '选择好友后即发送，不会自动带会话标题。',
+  'chat.share.done': '已分享给 {name}',
+  'chat.share.notReady': '私信通道未就绪（未登录或连接已断开），暂时无法分享。',
+  'chat.share.tooLong': '内容过长，请手动精简后再分享。',
+  'chat.share.emptyBody': '这条消息没有可分享的文字内容。',
+  'chat.share.filtered': '内容含不宜外发的信息，已停止分享。',
+  'chat.share.filtered.secret': '内容里疑似包含密钥、令牌或编码后的凭证，已停止分享。请把相关内容删掉后再试一次。',
+  'chat.share.filtered.path': '内容里疑似包含本机文件路径（如 /Users/… 或 ~/.shanhai/…），已停止分享。请把路径删掉后再试一次。',
+  'chat.share.filtered.addr': '内容里疑似包含内网或服务器地址，已停止分享。请把 IP、端口或站点域名删掉后再试一次。',
+  'chat.share.filtered.error': '内容里疑似包含程序报错堆栈，已停止分享。请把报错正文精简后再试一次。',
+  'chat.share.failed': '分享失败：{err}',
+  'chat.share.failedUnknown': '分享失败，未返回具体原因。',
+  'chat.share.imageSkipped': '图片暂不可分享，仅分享文字。',
+  'chat.share.sourceAssistant': '分享自 山海 · AI 回复',
+  'chat.share.sourceUser': '分享自 山海 · 我的消息',
   'chat.sessionRow.processing': '处理中',
   'chat.sessionRow.runningTitle': '任务执行中',
   'chat.sessionRow.renameTitle': '重命名',
@@ -1010,7 +1037,7 @@ export const zhCN = {
   'dm.err.rateLimited': '发送过于频繁，已被限流，请稍后再试',
   'dm.err.memberNotFound': '没有找到这个会员（用户名必须完全一致，注意大小写与空格）',
   'dm.err.messageTooLarge': '消息超出长度限制（单条上限 {n} 字节）',
-  'dm.err.contentTooLong': '内容过长：单条上限 {n} 字节，请分段发送',
+  'dm.err.contentTooLong': '内容过长：单条上限 {n} 字节，请精简内容后重发',
   'dm.err.protocolUnsupported': '网关不支持当前协议版本（v1），请升级山海或联系开发者',
   'dm.err.channelNotFound': '你不是该会话的成员（可能已被对方删除好友），无法收发这个会话',
   'dm.err.tokenExpired': '登录凭证已过期（超出续签宽限期），请重新登录',
@@ -1058,7 +1085,6 @@ export const zhCN = {
   'dm.sendNoPeer': '缺少接收方，无法发送私信',
   'dm.sendToSelf': '不能给自己发私信',
   'dm.sendNotFriends': '你们还不是好友，无法发送私信（请先添加好友并等待对方同意）',
-  'dm.sendTooLong': '内容过长：当前 {now} 字节，单条上限 {max} 字节，请分段发送',
   'dm.sendRateLimited': { one: '发送过于频繁（限流 {n} 条 / {sec} 秒），请稍后再试', other: '发送过于频繁（限流 {n} 条 / {sec} 秒），请稍后再试' },
   'dm.sendFailedDisconnected': '发送失败：会员通道已断开（消息未送达，请重试）',
   'dm.sendSubmitted': '已提交网关，等待送达回显',

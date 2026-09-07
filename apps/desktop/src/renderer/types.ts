@@ -589,8 +589,8 @@ declare global {
       memberUnsubscribe(channelId: string): Promise<void>
       /** 分页拉取历史（HTTP 权威，失败退回本地缓存并带 error） */
       memberHistory(input: { channelId: string; page?: number; pageSize?: number }): Promise<{ messages: DmMessage[]; hasMore: boolean; total: number; page: number; error: string | null }>
-      /** 发送私信 */
-      memberSend(input: { peerMemberId?: string; channelId?: string; text: string; peerName?: string }): Promise<MemberResult & { msgId?: string; channelId?: string }>
+      /** 发送私信。【任务109】fromUserShare=消息卡片分享标记（主进程据此走 sendDmFromAgent 安全门） */
+      memberSend(input: { peerMemberId?: string; channelId?: string; text: string; peerName?: string; fromUserShare?: boolean }): Promise<MemberResult & { msgId?: string; channelId?: string; reason?: string; filterKind?: 'secret' | 'path' | 'addr' | 'error' }>
       /** 标记某通道已读（HTTP 上报；任一设备读过即已读） */
       memberMarkRead(channelId: string): Promise<MemberResult>
       /** 【红线】把某条私信引用到指定会话的输入框（只写输入框，不自动发送） */

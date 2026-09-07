@@ -8,7 +8,7 @@ import { getWindowType } from './window-manager'
 import { notifyDmMessage, notifyFriendRequest } from './notifications'
 // 附件引用消息的解码（与渲染层共用一份，避免两套标准）：私信 content 里可能是 {"t":"image",…} 这种引用，
 // 系统通知正文与「引用到会话」的落地文本都不能把这段 JSON 原样甩给用户。
-import { dmContentPreview, dmContentToPlainText } from '../shared/dm-attachment'
+import { DM_MAX_CONTENT_BYTES, decodeDmContent, dmContentPreview, dmContentToPlainText } from '../shared/dm-attachment'
 // 【i18n 期5B】本模块的用户可见文案全部走词条，语言只认 main/locale-store.ts 的 getMainLocale()
 // （全仓唯一真相源；本模块绝不读 settings.locale 原文、不读 config.json、不把语言决策渗回渲染层）。
 // ⚠️ 取词时机见下面 ErrSpec 的注释：**存结构、出口求值**，不在模块加载期求值（历轮 9 次同一个坑）。
@@ -106,8 +106,17 @@ const RECONNECT_MAX_DELAY_MS = 60000
 const PING_INTERVAL_MS = 30000
 /** 应用层心跳（契约 heartbeat） */
 const HEARTBEAT_INTERVAL_MS = 25000
-/** 单条内容字节上限（契约 v1 定稿：纯文本 4000 字节；超限网关回 content_too_long / message_too_large） */
-const MAX_MSG_BYTES = 4000
+/**
+ * 单条内容字节上限。【任务113】不再在本文件写字面量：数值与口径的唯一真相源是
+ * src/shared/dm-attachment.ts 的 DM_MAX_CONTENT_BYTES（渲染层 MemberPanel / DmComposer 也 import 同一份），
+ * 改前这里 4000、渲染层再写一个 4000，两份必然漂开（连词条与参数名都不一样）。
+ * 保留 MAX_MSG_BYTES 这个别名只为少改动点，**不含任何数字**；放宽只改 shared 那一行
+ * （任务115 已按用户授权把该值从 4000 放宽到 40000）。
+ * 【纠正一条不实记载（任务115）】网关超限实际只回 **message_too_large** 一个码；
+ *  旧注释写的 content_too_long 经网关侧全仓实证**零命中、该码从不存在**，不要再照它排查。
+ *  （下方 ERROR_COPY 里那条映射作为防御性冗余保留，见其行内注释。）
+ */
+const MAX_MSG_BYTES = DM_MAX_CONTENT_BYTES
 /** 每个会话线程本地持久化的消息上限（超出丢弃最早的历史；更早的历史走 HTTP 分页拉） */
 const MAX_PERSIST_MESSAGES = 500
 /** 发送限流（契约 v1 定稿：按 memberID 30 条 / 10 秒）。本地同口径预检，避免把注定被拒的请求发出去。 */
@@ -1310,6 +1319,7 @@ const ERROR_COPY: Record<string, string> = {
   rate_limited: 'dm.err.rateLimited',
   member_not_found: 'dm.err.memberNotFound',
   message_too_large: 'dm.err.messageTooLarge',
+  // 网关当前不返回此码（任务115 实证：网关全仓 content_too_long 零命中）；保留映射以防将来新增
   content_too_long: 'dm.err.contentTooLong',
   protocol_unsupported: 'dm.err.protocolUnsupported',
   channel_not_found: 'dm.err.channelNotFound',
@@ -2036,42 +2046,167 @@ async function pullGlobalUnread(): Promise<void> {
 /**
  * 发送私信（内置侧身份 caller='builtin'）。
  * 定稿载荷：{v,type,seq,to,channelId,payload:{content},ts}；messageId 由网关生成，本地先占乐观气泡。
- * 本地预检：好友前提 / 4000 字节上限 / 按 memberID 30 条每 10 秒限流，失败一律如实回报不静默。
+ * 本地预检：好友前提 / DM_MAX_CONTENT_BYTES 字节上限 / 按 memberID 30 条每 10 秒限流，失败一律如实回报不静默。
  */
 // ── 管家接管私信：出站敏感信息过滤器（硬拦截，宁可误拦不漏放）─────────────────
 // 只拦「管家/Agent 代用户外发」这一条路径（sendDmFromAgent）。用户手动发的 sendDm
 // 不经过这里（用户有权发出含路径/凭据的内容，这是自己的私信）。
 // 用正则 + 规则做，**不用 LLM** 语义判断：可 review、可测试、不被 prompt injection 绕过。
+/** 【任务116】占位/示例值判定：`KEY=xxx`、`PASSWORD=***`、`<你的密钥>`、`your_key_here`、`test123`
+ *  这类教学示例不该被当成真凭据（用户分享「.env 该怎么写」的对话是高频正常场景）。
+ *  ★只放宽「右侧值是占位形态」这一件事：右侧一旦是真实长度 + 真实字符集，照旧拦。
+ *  判定保守（宁可认不出占位 → 走拦截），放宽面严格限定在示例形态。 */
+function looksLikePlaceholderValue(v: string): boolean {
+  const s = String(v ?? '')
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, '')
+  if (!s) return true
+  if (s.length <= 3) return true // KEY=abc
+  if (/^[x*#.\-、\s]+$/i.test(s)) return true // xxxx / **** / ---- / …
+  if (/^<[^>]*>$/.test(s)) return true // <your-key>
+  if (/^\$\{[^}]*\}$/.test(s)) return true // ${API_KEY}
+  if (/^(?:your|my|the|some)[_-][a-z0-9_-]*$/i.test(s)) return true // your_key_here / my-key
+  if (/^(?:placeholder|sample|example|changeme|replace[_-]?me|dummy|fake|redacted|todo|tbd|n\/a|null|undefined|empty|示例|占位)$/i.test(s)) return true
+  if (/^(?:test|demo|foo|bar|sample)[_-]?(?:\d{1,6}|key|token|secret|abc|123)?$/i.test(s)) return true // test / test123 / demo_key
+  if (/^(.)\1{3,}$/.test(s)) return true // aaaaa / 11111（单一字符重复的示意串）
+  if (/^(?:sk|ghp|gho|ghs|api|key|token)[_-](?:x{3,}|\*{3,}|[yoursample]{4,})$/i.test(s)) return true // sk-xxxx
+  return false
+}
+
+/** 【任务116】规则表：命中即拒发。带 guard 的规则还要看捕获组（用于「值是不是占位」这类判定）。 */
+interface FilterRule {
+  name: string
+  re: RegExp
+  guard?: (m: RegExpExecArray) => boolean
+}
+
+/**
+ * 【任务120 · 停用开关】用户裁决原话（2026-09-07）：
+ *   「可以不限制这个，账号密码、密钥这些可以拦截，其他的可以不拦截」
+ *  ⇒ 地址类（internal_addr）/ 路径类（internal_path）/ 报错堆栈类（internal_error）**不再拦截**；
+ *    凭证类（jwt / api_key_prefix / env_secret）与 base64 类（inline_base64 / long_base64）照旧拦，一道不减。
+ * ★停用 ≠ 删除：DISABLED_FILTER_RULES 保留正则原文与类名，重新启用只需把本开关置 true（回退成本＝一行）。
+ * ★为什么地址/路径算低危：路径只是字符串，好友拿到 `/Users/xxx` 也读不到用户机器；IP / 域名同理。
+ *   而凭证（密钥 / 令牌 / 真实口令）拿到即可用，故这条底线不因「用户嫌麻烦」让路。
+ * ★base64 两条保留**不是**因为怕泄露，而是因为技术危害：本项目实测过 base64 图片原文被塞进请求
+ *   撑爆体积导致 context deadline exceeded；一条 data:image 动辄数百 KB，放开等于把已知事故重新打开。
+ *   分享路径另有 shareableImageUrl 分流（data: 图不带图 + 出可见提示），故拦它不会造成「点了没反应」。
+ */
+const ADDRESS_PATH_ERROR_FILTER_ENABLED = false
+
+/** 【任务120 停用表】以下 9 条**当前不参与拦截**；原文照抄自任务116 生效表（含任务116 补的
+ *  RFC1918 四段与栈帧结构两条），一字未改，便于把开关置 true 即零成本回退。 */
+const DISABLED_FILTER_RULES: FilterRule[] = [
+  // 【任务120 停用】路径类三条（macOS / Windows / 山海配置目录）——原文照抄，未做任何修改
+  { name: 'internal_path', re: /\/(Users|Applications|Volumes|System)\/[^\s,'"):]+/ },
+  { name: 'internal_path', re: /[A-Z]:\\[^\s,'"):]+/ },
+  { name: 'internal_path', re: /~\/\.shanhai\/[^\s,'"):]+/ },
+  // 【任务120 停用】地址类前三条（生产 IP / 端口 / 内部域名）——原文照抄，未做任何修改
+  { name: 'internal_addr', re: /39\.106\.82\.55\b/ },
+  { name: 'internal_addr', re: /:\s*6033\b/ },
+  { name: 'internal_addr', re: /(?:git\.)?huiyuanjia\.net\b/ },
+  // 【任务116 补一处漏放】改前 /\b(?:192\.168\.|10\.)\d+\.\d+\.\d+\b/ 实际要求 **5 段**
+  // （`192.168.` 之后还要再接 \d+.\d+.\d+），所以 192.168.1.20 / 172.16.x.x 一条都不命中 —— 内网地址根本没拦住。
+  // 现在改成标准 RFC1918 四段，并补 127.0.0.1 / localhost:端口（本机服务地址同样不该外发）。
+  { name: 'internal_addr', re: /\b(?:192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|127\.\d{1,3}\.\d{1,3}\.\d{1,3})\b|\blocalhost:\d{2,5}\b/i },
+  // 内部报错：★只拦「栈帧结构」（两行以上连续的 at 函数 (文件:行:列)）与山海自身服务短语；
+  //  改前 /\bENOENT\b/、/\bECONNREFUSED\b/ 把「这个 ENOENT 是路径拼错了」这种正常技术讨论判成敏感内容。
+  { name: 'internal_error', re: /The service was stopped/ },
+  { name: 'internal_error', re: /(?:^|\n)[ \t]*at\s+[^\n(]*\([^\n)]*:\d+:\d+\)[ \t]*(?:\n[ \t]*at\s+[^\n(]*\([^\n)]*:\d+:\d+\)[ \t]*)+/ },
+]
+
 export function outboundContentFilter(text: string): string | null {
   const t = String(text ?? '')
-  const rules: Array<[string, RegExp]> = [
-    // JWT 三段式
-    ['jwt', /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/],
-    // sk- 前缀（OpenAI 风格密钥）
-    ['api_key_prefix', /\bsk-[A-Za-z0-9]{16,}/],
-    // 长 base64（泛指可能被截断的凭证/token；>= 30 字符降低误报）
-    ['long_base64', /[A-Za-z0-9+/]{30,}={0,2}/],
-    // 内部绝对路径（macOS / Windows / 配置目录）
-    ['internal_path', /\/(Users|Applications|Volumes|System)\/[^\s,'"):]+/],
-    ['internal_path', /[A-Z]:\\[^\s,'"):]+/],
-    ['internal_path', /~\/\.shanhai\/[^\s,'"):]+/],
-    // 生产/内网地址与端口
-    ['internal_addr', /39\.106\.82\.55\b/],
-    ['internal_addr', /:\s*6033\b/],
-    ['internal_addr', /(?:git\.)?huiyuanjia\.net\b/],
-    ['internal_addr', /\b(?:192\.168\.|10\.)\d+\.\d+\.\d+\b/],
-    // 内部报错原文（English ENOENT 这类裸报错）
-    ['internal_error', /\bENOENT\b/],
-    ['internal_error', /\bECONNREFUSED\b/],
-    ['internal_error', /The service was stopped/],
-    ['internal_error', /at [A-Za-z0-9_$]+\s*\([^)]*\)/],
-    // 内嵌 base64（截图/资源直传）
-    ['inline_base64', /data:image\/[a-z0-9]+;base64,/],
-    // 配置/环境变量/口令赋值
-    ['env_secret', /(?:API_KEY|SECRET|DB_PASS|DB_PASSWORD|ACCESS_KEY|SECRET_KEY|PASSWORD)\s*[:=]/i],
+  const rules: FilterRule[] = [
+    // JWT 三段式（★保留照拦：带签名的完整令牌本就不该外发）
+    { name: 'jwt', re: /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/ },
+    // 密钥前缀：★要求「前缀 + 完整长度 + 真实字符集」，单纯提到 sk- / ghp_ 这个词不拦；
+    //  形态够但值是占位（sk-xxxxxxxx）也不拦。前缀集比改前更宽（补 ghp_/gho_/ghs_/glpat/xox*/AKIA），
+    //  这是**收紧**不是放松：改前只认 sk- 一种，GitHub/Slack/AWS 的真 token 反而漏放。
+    {
+      name: 'api_key_prefix',
+      re: /\b(?:sk|ghp|gho|ghs|glpat|xox[baprs])[._-][A-Za-z0-9]{16,}\b|\bAKIA[0-9A-Z]{12,}\b/,
+      guard: (m) => !looksLikePlaceholderValue(m[0] ?? ''),
+    },
+    // 内嵌 base64（截图/资源直传）——★保留照拦（放在 long_base64 之前，归因更具体）
+    { name: 'inline_base64', re: /data:image\/[a-z0-9]+;base64,/ },
+    // 长 base64：★本轮主因。改前 /[A-Za-z0-9+/]{30,}={0,2}/ 的字符类**含 `/`**，
+    //  于是任何长 URL 的 path 段（如 docs/Web/JavaScript/Reference/Global_Objects）都算「base64」，
+    //  用户分享一段带文档链接的 AI 回复必然被误拦。现在只在两种明确特征下才算：
+    //  ① 紧跟 base64 语境标记（data:...;base64, / base64, / base64:）；② ≥200 连续且带 padding。
+    { name: 'long_base64', re: /(?:data:[a-z]+\/[a-z0-9.+-]+;base64|base64[,:])\s*["'`]?[A-Za-z0-9+/]{24,}/i },
+    { name: 'long_base64', re: /(^|[^A-Za-z0-9+/])[A-Za-z0-9+/]{200,}={1,2}(?![A-Za-z0-9+/])/ },
+    // 【任务120】地址类 / 路径类 / 报错堆栈类共 9 条已按用户裁决**停用**（不再拦），
+    //   正则原文与类名**原样**搬进下方 DISABLED_FILTER_RULES —— 停用 ≠ 删除。
+    //   重新启用只需把 ADDRESS_PATH_ERROR_FILTER_ENABLED 置 true，不需要重写任何正则。
+    // 配置/环境变量/口令赋值：★只在「右侧是真实值」时才算（改前只看左键名，分享 .env 写法示例必被误拦）。
+    //  键名集比改前更宽（补 API_SECRET/APP_SECRET/CLIENT_SECRET/PRIVATE_KEY/TOKEN），同样是收紧不是放松。
+    {
+      name: 'env_secret',
+      re: /(?:API_KEY|API_SECRET|APP_SECRET|CLIENT_SECRET|SECRET|DB_PASS|DB_PASSWORD|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|PASSWORD|TOKEN)\s*[:=]\s*([^\s,;"'`)]{1,200})/i,
+      guard: (m) => !looksLikePlaceholderValue(m[1] ?? ''),
+    },
+    // 【任务120】停用表按开关并入：默认 false ⇒ 地址/路径/堆栈放行；置 true ⇒ 一行回到任务116 口径
+    ...(ADDRESS_PATH_ERROR_FILTER_ENABLED ? DISABLED_FILTER_RULES : []),
   ]
-  for (const [name, re] of rules) {
-    if (re.test(t)) return name
+  for (const rule of rules) {
+    const m = rule.re.exec(t)
+    if (!m) continue
+    if (rule.guard && !rule.guard(m)) continue
+    return rule.name
+  }
+  return null
+}
+
+/** 命中规则 → 面向用户的**分类**（渲染层据此取词典文案）。
+ *  ★这是给界面的唯一额外信息：不含命中片段、不含内部规则名标识符。
+ *  【任务120】addr / path / error 三类**当前不会触发**（规则已停用，见 ADDRESS_PATH_ERROR_FILTER_ENABLED），
+ *   但映射条目与词典四条分类提示词条**全部保留不删**：① 回退成本最低（开关一拨即生效）；
+ *   ② 本表仍被代码引用 ⇒ 那四条词条不构成死键。 */
+export const FILTER_RULE_KIND: Record<string, 'secret' | 'path' | 'addr' | 'error'> = {
+  jwt: 'secret',
+  api_key_prefix: 'secret',
+  long_base64: 'secret',
+  inline_base64: 'secret',
+  env_secret: 'secret',
+  internal_path: 'path',
+  internal_addr: 'addr',
+  // 【任务120】地址类停用后，attachment_url 只剩「query 带签名参数」一条会触发（签名 URL＝临时钥匙，
+  //  属凭证类），故分类由 addr 改归 secret —— 措辞纠偏，不是放松：拦与不拦的判定一行未改。
+  attachment_url: 'secret',
+  internal_error: 'error',
+}
+
+/** 【任务116】附件引用 URL 的独立判定：不再走 base64 规则（七牛随机 key 动辄 32 位字母数字，
+ *  改前「只要带图就必被拦」是确定性 bug）。
+ *  【任务120 分档】附件 URL 现在只拦**两档，都是凭证/base64 类**：
+ *    ① data: 内联 base64（技术危害类，见上方开关注释）；② query 带签名参数（token/sign/AK 等＝临时钥匙）。
+ *  ★原任务116 的另三档（非 http(s) 协议 / 主机名解析不出 / 回环与内网主机）属**地址类**，
+ *   已按用户裁决一并停用，原文包在 ADDRESS_PATH_ERROR_FILTER_ENABLED 分支里保留，置 true 即回退。
+ *  ★未做「已知可信图床域名」静态白名单：图床域名由网关上传凭证接口运行时下发（public_base_url，
+ *  见 packages/storage/src/storage.ts:188），山海侧没有可依赖的常量，硬编一份就成了会漂的第二真相源
+ *  —— 已登记为待用户裁决项。 */
+function outboundAttachmentRule(atts: Array<{ u?: string }>): string | null {
+  for (const a of atts) {
+    const u = String(a?.u ?? '').trim()
+    // 【任务120 停用】下面三条属**地址类**（非 http(s) 协议 / 主机解析不出 / 回环与内网主机），
+    //  按用户裁决「其他的可以不拦截」一并放行；原文保留在此，开关置 true 即一行回退。
+    if (ADDRESS_PATH_ERROR_FILTER_ENABLED) {
+      if (!/^https?:\/\//i.test(u)) return 'attachment_url'
+      let host = ''
+      try {
+        host = new URL(u).hostname.toLowerCase()
+      } catch {
+        return 'attachment_url'
+      }
+      if (/^(?:localhost|127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|\[?::1)/.test(host)) return 'attachment_url'
+    }
+    // 【任务120 保留】data: 内联 base64 **不属地址类**，属上面明确保留的 base64 类（撑爆请求前科）⇒ 照旧拦。
+    if (/^data:[^,;]*;base64,/i.test(u)) return 'inline_base64'
+    // 【任务116 补一处放松风险】把正文从附件 JSON 里摘出来检之后，「凭证藏在附件 URL 的 query 里」
+    //  会变成新的外带通道（签名URL 常带 token/signature/AK）。山海自己的图链是 public_base_url + '/' + key，
+    //  **不带 query**（packages/storage/src/storage.ts:126 buildPublicUrl），所以这条几乎不误伤正常图链。
+    if (/[?&](?:token|sign|signature|q-sign[a-z_-]*|access[_-]?key|accesskey|api[_-]?key|credential|auth|pwd|password|x-amz-credential)=/i.test(u)) return 'attachment_url'
   }
   return null
 }
@@ -2079,16 +2214,33 @@ export function outboundContentFilter(text: string): string | null {
 /** 管家接管：以当前会员身份给好友发消息（走出站安全门）。
  *  只在 dmAutoReply == true 时才放行；命中出站敏感词则拒绝并返回 filterRule 供管家换措辞重试。
  *  与 IPC handler `member:send-from-agent` 共用同一份实现（宿主 dmUse 桥也调这里），避免两条路行为漂移。 */
-export function sendDmFromAgent(input: { channelId?: string; peerMemberId?: string; text: string; replyTo?: string }): MemberResult & { msgId?: string; channelId?: string; reason?: string; filterRule?: string } {
+export function sendDmFromAgent(input: { channelId?: string; peerMemberId?: string; text: string; replyTo?: string; fromUserShare?: boolean }): MemberResult & { msgId?: string; channelId?: string; reason?: string; filterRule?: string; filterKind?: 'secret' | 'path' | 'addr' | 'error' } {
   const settings = getRuntime().getSettings()
-  if (!settings.dmAutoReply) {
+  // 【任务109】fromUserShare=true：用户在消息卡片上当面点「分享」，不是管家代发 —— 那扇
+  // 「管家接管」开关是给 Agent 自动回复用的，用户主动动作不该被它拦，故此分支**不查开关**；
+  // 但下面的出站敏感信息过滤**一道不减**（分享内容同样可能夹带密钥/内部路径/内网地址）。
+  if (!input.fromUserShare && !settings.dmAutoReply) {
     console.warn('[dm-agent] 管家发消息被拒：dmAutoReply 未开启')
     return { ok: false, message: tIn(getMainLocale(), 'dm.agentNotEnabled'), reason: 'not_enabled' }
   }
-  const rule = outboundContentFilter((input.text ?? '').trim())
+  // 【任务116 根因修复】改前把 input.text **整串**喂给过滤器，而分享路径传进来的是 encodeDmContent
+  // 之后的 content（带图时是 {"t":"atts","x":正文,"a":[{"u":"https://…随机key…"}]}）——
+  // 附件 JSON 里的直链天然命中 long_base64，等于「只要带图就必被拦」的确定性 bug。
+  // 现在：过滤器只看**人类可读正文**（atts 的 x 字段；无附件时 decodeDmContent 原样返回，行为不变），
+  //      附件引用 URL 走 outboundAttachmentRule 的独立判定（【任务120】只看是否 data: 内联 base64
+  //      与 query 里的签名参数，地址类判定已随停用开关一并关掉）。
+  const parsed = decodeDmContent(input.text ?? '')
+  const rule = outboundContentFilter(parsed.text) ?? outboundAttachmentRule(parsed.atts)
   if (rule) {
     console.warn(`[dm-agent] 出站内容被敏感信息过滤器拦截 rule=${rule}`)
-    return { ok: false, message: tIn(getMainLocale(), 'dm.agentFiltered'), reason: 'content_filtered', filterRule: rule }
+    return {
+      ok: false,
+      message: tIn(getMainLocale(), 'dm.agentFiltered'),
+      reason: 'content_filtered',
+      filterRule: rule,
+      // 给界面的分类（★不回显规则名与命中原文），渲染层按它取词典词条
+      filterKind: FILTER_RULE_KIND[rule] ?? 'secret',
+    }
   }
   const r = sendDm({ channelId: input.channelId, peerMemberId: input.peerMemberId, text: input.text })
   if (r.ok) return { ...r }
@@ -2111,7 +2263,7 @@ export function sendDm(input: { peerMemberId?: string; channelId?: string; text:
   }
   const bytes = byteLen(text)
   if (bytes > MAX_MSG_BYTES) {
-    return { ok: false, message: tIn(getMainLocale(), 'dm.sendTooLong', { now: bytes, max: MAX_MSG_BYTES }) }
+    return { ok: false, message: tIn(getMainLocale(), 'dm.contentTooLong', { bytes, max: MAX_MSG_BYTES }) }
   }
   const channelId = input.channelId?.trim() || computeDmChannelId(self, peer)
   if (!takeSendToken('builtin')) {

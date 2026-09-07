@@ -8,7 +8,7 @@ import { DmComposer } from './DmComposer'
 import { DmQuotePicker, type DmQuoteTarget } from './DmQuotePicker'
 import { DmToast, useDmToast } from './dm-toast'
 import { dmContentPreview } from '../../shared/dm-attachment'
-import { encodeDmContent, utf8Bytes } from '../../shared/dm-attachment'
+import { DM_MAX_CONTENT_BYTES, encodeDmContent, utf8Bytes } from '../../shared/dm-attachment'
 import type { DmAttachmentPayload } from '../../shared/dm-attachment'
 import { patchUiStore, useUiStoreSelector } from '../store-client'
 import { DmAvatar, DmMessageRow, DmTimeDivider, DmUnreadDivider, LEFT_WIDTH_NARROW_PX, LEFT_WIDTH_PX, NARROW_WIDTH_PX, buildChatRows, fmtListTime, statusLabelOf, threadPreview } from './DmIm'
@@ -45,8 +45,12 @@ import type { CredentialSnapshot, DmDraftStore, DmFriend, DmFriendRequest, DmMes
 
 type Tab = 'dm' | 'friends'
 
-/** 单条私信内容字节上限（与主进程 member-channel.ts 的 MAX_MSG_BYTES 保持一致：契约 v1 定稿 4000 字节） */
-const MAX_CONTENT_BYTES = 4000
+/**
+ * 【任务113】单条私信 content 字节上限不再在本文件写字面量：与主进程同取 src/shared/dm-attachment.ts
+ * 的 DM_MAX_CONTENT_BYTES（改前这里 4000、主进程再写 4000，两份会漂，连词条与参数名都不同）。
+ * 判定口径 = **编码后的 content**（encodeDmContent 产物）的 UTF-8 字节数，与主进程 sendDm 入参同口径
+ * （渲染层传给主进程的 text 本身就是编码后的 content）。
+ */
 
 /** utf8Bytes 改用 src/shared/dm-attachment.ts 里那一份：输入区（DmComposer）与面板都要按**编码后的
  *  content** 计数，两处各写一份必然漂开（主进程 Buffer.byteLength 是同口径）。 */
@@ -564,7 +568,7 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
 
   /**
    * 【P3】发送一条私信：正文 + 附件引用一起交给主进程。
-   * 附件**只带云存储公网 URL**（content 里是紧凑 JSON 引用），绝不带 base64 —— 单条上限 4000 字节，
+   * 附件**只带云存储公网 URL**（content 里是紧凑 JSON 引用），绝不带 base64 —— 单条上限见 DM_MAX_CONTENT_BYTES，
    * 且本项目已因 base64 撑爆请求踩过 context deadline exceeded。
    * 返回 true = 已发出（输入区据此清空）；false = 没发出去（用户已写的正文与已选的附件一律保留）。
    */
@@ -579,9 +583,10 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
       }
       const content = encodeDmContent(text, atts)
       const bytes = utf8Bytes(content)
-      if (bytes > MAX_CONTENT_BYTES) {
+      if (bytes > DM_MAX_CONTENT_BYTES) {
         // 本地就拦住，不等网关回 content_too_long（省一次往返，也避免用户以为发出去了）
-        setErrorText(tKey('dm.send.tooLong', { bytes, max: MAX_CONTENT_BYTES }))
+        // 【任务113】超限文案收敛成共享词条 dm.contentTooLong（与主进程同一份文案、同一组参数名）
+        setErrorText(tKey('dm.contentTooLong', { bytes, max: DM_MAX_CONTENT_BYTES }))
         setNotice(null)
         return false
       }
@@ -921,35 +926,36 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
 
       {/*
         提示 / 错误条（成功与失败都显示，不静默）。
-        【保留任务59 的成果】这里仍是「容器恒定占一行 + 只切透明度」，不是条件渲染：
-        会员通道偶发抖动时，条件渲染会把下方整块列表顶下去再弹回来，就是用户看到的「一闪一闪」。
-        （浮层 toast 属 P6，本轮按任务书要求先不换。）
+        【任务107】由「容器恒定占一行 + 只切透明度」改为条件渲染：提示消失后它占的 30px
+        一并回收、下方聊天区回填，不再残留空白条。任务59 的防闪烁现在完全由数据层收敛承担
+        （sameJson / 广播指纹去重 / threadsRef，均原样在位）—— notice 是低频事件且 4s 自动
+        消失，挂载/卸载只发生一次布局变化，正是用户要的「消失即回收」。
+        原 opacity/transition 两行与按钮内层条件在新结构下恒真/恒 1，属死代码，一并移除（行为等价）。
+        （浮层 toast 属 P6，position:fixed 不占文档流，无同类留白，保持不动。）
       */}
-      <div style={{ height: 30, flexShrink: 0, overflow: 'hidden' }}>
-        <div
-          style={{
-            padding: '6px 20px',
-            fontSize: 12,
-            background: errorText ? 'rgba(239,68,68,0.10)' : 'rgba(34,197,94,0.10)',
-            color: errorText ? 'var(--danger-text, #b91c1c)' : 'var(--success-text, #15803d)',
-            borderBottom: '1px solid var(--border-soft)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            boxSizing: 'border-box',
-            height: '100%',
-            opacity: notice || errorText ? 1 : 0,
-            transition: 'opacity 180ms ease',
-          }}
-        >
-          <span style={{ flex: 1, whiteSpace: 'pre-wrap' }}>{errorText ?? notice ?? ''}</span>
-          {!!(notice || errorText) && (
+      {(notice || errorText) && (
+        <div style={{ height: 30, flexShrink: 0, overflow: 'hidden' }}>
+          <div
+            style={{
+              padding: '6px 20px',
+              fontSize: 12,
+              background: errorText ? 'rgba(239,68,68,0.10)' : 'rgba(34,197,94,0.10)',
+              color: errorText ? 'var(--danger-text, #b91c1c)' : 'var(--success-text, #15803d)',
+              borderBottom: '1px solid var(--border-soft)',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              boxSizing: 'border-box',
+              height: '100%',
+            }}
+          >
+            <span style={{ flex: 1, whiteSpace: 'pre-wrap' }}>{errorText ?? notice ?? ''}</span>
             <button onClick={() => { setErrorText(null); setNotice(null) }} style={{ ...smallIconBtn, width: 20, height: 20 }}>
               <IconClose />
             </button>
-          )}
+          </div>
         </div>
-      </div>
+      )}
 
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
         {/* ——————————————————————— 左列（常驻）——————————————————————— */}
@@ -1450,7 +1456,7 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
                 ready={channelReady}
                 loggedIn={ui.loggedIn}
                 peerName={peerName}
-                maxContentBytes={MAX_CONTENT_BYTES}
+                maxContentBytes={DM_MAX_CONTENT_BYTES}
                 initialText={drafts[active.channelId] ?? ''}
                 onTextChange={(text) => setDrafts((prev) => ({ ...prev, [active.channelId]: text }))}
                 onSent={() => setDrafts((prev) => { const n = { ...prev }; delete n[active.channelId]; return n })}

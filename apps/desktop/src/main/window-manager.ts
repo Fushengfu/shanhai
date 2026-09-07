@@ -82,6 +82,16 @@ let seq = 0
 
 /** 应用退出标志：置 true 后放行所有窗口的 close（否则 chat/desktop 的 close 会 preventDefault 只隐藏、卡住退出） */
 let isQuitting = false
+/**
+ * 「回到桌面」收起抑制标志（任务104 收口，2026-09）：
+ * hideToSystemDesktop() 进入收起时置 true，收起期间任何 ensureDesktopLayer()
+ * （含 hideToSystemDesktop 末尾 syncSupervisorBubble→showWindow(悬浮图标) 的同步调用，
+ * 以及 macOS 焦点转移异步派发的 browser-window-focus→ensureDesktopLayer）一律短路——
+ * 否则它会把刚 hide 的桌面壳/Dock 又 show() 回来，表现为「第一次点击留桌面壳、必须点第二次」。
+ * 清除时机：下一次【非悬浮图标】窗口被主动 showWindow（托盘/快捷键/悬浮图标唤回管家）= 用户
+ * 已离开收起态，层级纠正恢复。悬浮图标自身 show 不清除：它是收起态唯一常驻窗口。
+ */
+let collapsingToSystemDesktop = false
 app.on('before-quit', () => {
   isQuitting = true
 })
@@ -321,6 +331,8 @@ function findWindow(type: WindowType, appId?: string): { win: BrowserWindow; met
 /** 显示并聚焦指定窗口（若已销毁则重建 chat 窗口） */
 function showWindow(win: BrowserWindow | undefined): void {
   if (!win || win.isDestroyed()) return
+  // 任何【非悬浮图标】窗口被主动唤回 = 用户离开了「回到桌面」收起态，恢复层级纠正（任务104）。
+  if (getWindowType(win) !== 'supervisor-bubble') collapsingToSystemDesktop = false
   if (win.isMinimized()) win.restore()
   win.show()
   win.focus()
@@ -483,6 +495,8 @@ export function unregisterExternalWindow(win: BrowserWindow): void {
  * 重新聚焦山海窗口后必须显式 moveTop 桌面壳，否则会出现「聊天/管家窗口浮在外部窗口之上，但桌面背景缺失」。
  */
 export function ensureDesktopLayer(): void {
+  // 「回到桌面」收起期间不做任何层级纠正/重新 show：见 collapsingToSystemDesktop 注释（任务104）。
+  if (collapsingToSystemDesktop) return
   const desktop = findWindow('desktop')
   if (desktop && !desktop.win.isDestroyed()) {
     if (!desktop.win.isVisible()) desktop.win.show()
@@ -509,6 +523,8 @@ export function ensureDesktopLayer(): void {
  * 把气泡放出来，保证回到桌面后一定有入口，而不是「窗口和气泡同时消失」。
  */
 export function hideToSystemDesktop(): void {
+  // 进入「收起」态：抑制 ensureDesktopLayer 把桌面壳/Dock 复活，直到下一次非悬浮图标窗口被主动唤回。
+  collapsingToSystemDesktop = true
   let supervisorHidden = false
   for (const meta of windows.values()) {
     if (meta.win.isDestroyed() || !meta.win.isVisible()) continue
@@ -701,6 +717,28 @@ const lastSnapMoveTs = new Map<number, number>()
 const detachStreak = new Map<number, number>()
 
 /**
+ * 窗口几何是否处于「由系统或自身托管」的边界态：最大化 / Windows 贴靠（Snap，Electron 的
+ * isMaximized() 走 IsZoomed()，贴靠中的窗口恒为 true）/ 最小化 / 全屏，
+ * 以及山海在 Windows 上用 setBounds 模拟的最大化（见 toggleMaximizeWindow 的 preMaximizeBounds，
+ * 那条路上 isMaximized() 恒为 false，必须单独认）。
+ *
+ * 【为什么磁吸必须认这个态（任务116）】这类窗口的尺寸是系统按贴靠/最大化区域算出来的，
+ * 外部只要对它调一次 setPosition（SetWindowPos + SWP_NOSIZE），Windows 就会重算它的落位尺寸：
+ * 要么退出贴靠还原成贴靠前的尺寸，要么按整块工作区重新铺满 —— 两种都表现为「窗口自己变大」。
+ * 磁吸联动本来就只搬位置不改尺寸，所以遇到边界态直接放手最安全，也不影响用户正常用 Windows 分屏。
+ */
+function isGeometryLocked(win: BrowserWindow): boolean {
+  if (win.isDestroyed()) return true
+  if (preMaximizeBounds.has(win.id)) return true
+  try {
+    return win.isMaximized() || win.isMinimized() || win.isFullScreen()
+  } catch {
+    // 状态取不到（窗口正在被系统重排等）时按「锁定」处理：宁可不联动，也不要贸然搬动它
+    return true
+  }
+}
+
+/**
  * 程序性移动：移动前记录目标坐标，setPosition 触发的自身 move 事件经「坐标命中」判定后跳过（防递归）。
  * 相比布尔集合 + 短 setTimeout 兜底，坐标匹配不会因 move 事件派发延迟而把后续手拖误判为程序移动，
  * 从根上消除联动时的抖动；setTimeout 兜底仅用于「setPosition 到相同位置不触发 move」时的标记清理。
@@ -777,6 +815,20 @@ function handleSnapMove(win: BrowserWindow, type: WindowType): void {
   const pb = partner.getBounds()
   if (!sameDisplay(wb, pb)) return
 
+  // 【任务116 修复】partner 处于贴靠/最大化/最小化/全屏（含 Windows 模拟最大化）时，绝不搬它：
+  // 拖动方（管家窗口）本身会被 Windows 从贴靠组里摘出来，此时若再对 partner 调 setPosition，
+  // 系统会重算它的尺寸 → 用户看到「只是拖了一下管家窗口，子会话窗口自己变大」。
+  // 这里顺手解绑：partner 的尺寸已经和绑定时的 dx/dy 不再自洽，留着绑定等它退出贴靠后再拉一次更糟。
+  if (isGeometryLocked(partner)) {
+    const stale = snapBindings.get(win.id)
+    if (stale) {
+      unbindSnap(win.id, stale.partnerId)
+      detachStreak.delete(win.id)
+      detachStreak.delete(stale.partnerId)
+    }
+    return
+  }
+
   const binding = snapBindings.get(win.id)
   if (binding) {
     // 已绑定：边距超过阈值 → 进入解绑缓冲（连续 N 次才真解绑），否则联动 partner 保持相对位置。
@@ -821,8 +873,9 @@ function attachSnapToWindow(win: BrowserWindow, type: WindowType): void {
       }
     }
     if (win.isDestroyed()) return
-    // 边界态：全屏/最大化/最小化不参与磁吸联动
-    if (win.isMaximized() || win.isMinimized() || win.isFullScreen()) return
+    // 边界态：全屏/最大化/最小化（含 Windows 贴靠与山海模拟最大化）不参与磁吸联动。
+    // 任务116：判定收敛到 isGeometryLocked()，与 handleSnapMove 里对 partner 的守卫同一口径，避免两套。
+    if (isGeometryLocked(win)) return
     const now = Date.now()
     const last = lastSnapMoveTs.get(win.id) ?? 0
     if (now - last < SNAP_THROTTLE_MS) return

@@ -300,6 +300,13 @@ function ChatSlot(): React.JSX.Element {
             background: 'var(--tint-red)',
             fontSize: 13,
             boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+            // 任务114：卡片整体不得超出视口安全区。外层原本只有 bottom:158 下锚点、无高度上限，
+            // 内容（长问题 / 长审批参数）一多就向上撑高，绘制到顶部标题栏之上，盖住最小化/最大化/关闭按钮。
+            // 227 = 158（既有下锚点，见上方 bottom）+ 69（标题栏安全区：管家窗口 WindowTitleBar
+            // padding 16+16 + 最高子元素 WindowControlButton 36 + borderBottom 1 = 69；会话窗口 HeaderPlugin 同算法=61，取大者）。
+            // 用 maxHeight 不用 height：内容少时按内容高，不留白（任务107 那类坑）。
+            maxHeight: 'calc(100% - 227px)',
+            overflowY: 'auto',
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: approvalCollapsed ? 0 : 6 }}>
@@ -331,7 +338,8 @@ function ChatSlot(): React.JSX.Element {
           {!approvalCollapsed && (
             <>
               <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>{t('chat.approval.toolLine', { tool: toolDisplayName(ctx.curApproval.toolName, ctx.curApproval.args), risk: riskLevelLabel(ctx.curApproval.riskLevel) })}</div>
-              <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+              {/* 任务114：审批详情（工具入参可达数 KB，如整文件写入）限高滚动，与 AskCard 同口径 */}
+              <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word', maxHeight: 200, overflowY: 'auto' }}>
                 {renderApprovalDetail(ctx.curApproval.toolName, ctx.curApproval.args)}
               </div>
               <div style={{ display: 'flex', gap: 8 }}>
@@ -380,6 +388,13 @@ function ChatSlot(): React.JSX.Element {
             background: 'var(--tint-blue-soft)',
             fontSize: 13,
             boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+            // 任务114：卡片整体不得超出视口安全区。外层原本只有 bottom:158 下锚点、无高度上限，
+            // 内容（长问题 / 长审批参数）一多就向上撑高，绘制到顶部标题栏之上，盖住最小化/最大化/关闭按钮。
+            // 227 = 158（既有下锚点，见上方 bottom）+ 69（标题栏安全区：管家窗口 WindowTitleBar
+            // padding 16+16 + 最高子元素 WindowControlButton 36 + borderBottom 1 = 69；会话窗口 HeaderPlugin 同算法=61，取大者）。
+            // 用 maxHeight 不用 height：内容少时按内容高，不留白（任务107 那类坑）。
+            maxHeight: 'calc(100% - 227px)',
+            overflowY: 'auto',
           }}
         >
           <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text)' }}>
@@ -389,7 +404,8 @@ function ChatSlot(): React.JSX.Element {
           <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>
             {renderRich(tf('chat.clientRun.pkg'), { b1: <b>{ctx.curClientRunRequest.name}</b>, pkgId: <>{ctx.curClientRunRequest.pkgId}</> })}
           </div>
-          <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word' }}>
+          {/* 任务114：purpose 由插件作者自定、长度不可控 → 限高滚动 */}
+          <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word', maxHeight: 200, overflowY: 'auto' }}>
             {t('chat.clientRun.purpose', { purpose: ctx.curClientRunRequest.purpose })}
           </div>
           <div style={{ display: 'flex', gap: 8 }}>

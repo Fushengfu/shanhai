@@ -91,7 +91,24 @@ export function DmQuotePicker(props: DmQuotePickerProps): React.JSX.Element {
       </div>
 
       {/* 被引用的内容：来源名与预览都由调用方归一，这里绝不出现会员ID，也不出现附件 JSON 串码 */}
-      <div style={{ padding: '8px 12px', borderBottom: '1px solid var(--border-soft)', fontSize: 12, lineHeight: 1.6, background: 'var(--bg-subtle)', flexShrink: 0 }}>
+      {/*
+        【任务112】顶部「被引用消息」区限高 + 内部滚动（修「长私信把底部会话列表挤出可视区」）。
+        成因（读码实证，非猜）：
+         - preview 走 dmContentPreview，而它**对纯文本消息原样返回全文、不截断**
+           （shared/dm-attachment.ts 的 dmContentPreview：`if (atts.length === 0) return raw ?? ''`），
+           一条私信上限 = DM_MAX_CONTENT_BYTES 字节（任务113 时 4000≈1300 汉字；任务115 放宽到 40000≈1.3 万汉字）
+           → 这块能撑到几千乃至几万 px 高，所以限高滚动是必须的；
+         - 本块改前是 `flexShrink: 0` 且**没有 maxHeight / overflow** —— 既不封顶也不肯收缩；
+         - 弹层是 flex column + `maxHeight: 72vh` + `overflow: 'hidden'`（:64/:73），
+           底部会话列表是 `flex: 1, minHeight: 0`（:116）：flex-basis 为 0，只能靠**剩余空间**长高；
+           顶部这块把 72vh 吃干后没有剩余空间 → 列表高度归 0，再被 overflow:hidden 整块裁掉
+           → 用户看到「消息一多，底部会话列表被挤出显示区域」。
+        修法：限高用 maxHeight（**不写死 height**，内容少时不占多余空间，避开任务107 那类留白坑）
+        + overflowY 内部滚动，滚动样式照抄项目既有实现（ReasoningBlock.tsx:22 / SessionPicker.tsx:55
+        同为 `maxHeight: <px>, overflowY: 'auto'`，不另立滚动条外观）；同时把 flexShrink 放开为 1 + minHeight:0，
+        使极矮窗口下**由消息区继续让位**，而不是把底部列表/页脚裁掉（优先级：会话列表 > 引用预览）。
+      */}
+      <div style={{ padding: '8px 12px', borderBottom: '1px solid var(--border-soft)', fontSize: 12, lineHeight: 1.6, background: 'var(--bg-subtle)', flexShrink: 1, minHeight: 0, maxHeight: 'min(200px, 28vh)', overflowY: 'auto' }}>
         <span style={{ color: 'var(--text-muted)' }}>{tKey('dm.quote.fromLabel')}</span>
         {/* 【任务58 口径】兜底显示「未知会员」，绝不回落成会员ID */}
         <b style={{ color: 'var(--text)' }}>{props.fromLabel || tKey('common.unknownMember')}</b>

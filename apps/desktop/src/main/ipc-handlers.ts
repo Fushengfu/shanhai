@@ -363,7 +363,14 @@ export function registerIpc(): void {
   ipcMain.handle('member:unsubscribe', async (e, channelId: string) => unsubscribeChannel(String(channelId ?? ''), e.sender.id))
   // 定稿 v1.1：历史是 page/pageSize 偏移分页（page=1 最新一页，加载更早=page 递增），不是时间戳游标
   ipcMain.handle('member:history', async (_e, input: { channelId: string; page?: number; pageSize?: number }) => getHistory(input))
-  ipcMain.handle('member:send', async (_e, input: { peerMemberId?: string; channelId?: string; text: string; peerName?: string }) => sendDm(input ?? { text: '' }))
+  // 【任务109】消息卡片「分享到好友」带 fromUserShare 标志 → 转调 sendDmFromAgent：
+  // 与管家 dm_send **同一份实现、同一道出站敏感过滤**，不走裸 sendDm（那样等于绕过安全门）。
+  // ★本轮不新增 ipcMain.handle / IPC 通道 / preload 方法，只在既有 member:send 的入参上扩一个可选字段。
+  // 该标志只有内置渲染层能构造：插件窗口挂的是 preload/plugin.cjs（只暴露 window.shanhaiPlugin 白名单桥），
+  // 拿不到 window.shanhai.memberSend，故外部/插件路径无法伪造。
+  ipcMain.handle('member:send', async (_e, input: { peerMemberId?: string; channelId?: string; text: string; peerName?: string; fromUserShare?: boolean }) =>
+    input?.fromUserShare ? sendDmFromAgent(input) : sendDm(input ?? { text: '' }),
+  )
   // 【管家接管私信】管家/Agent 以当前会员身份发私信：进 sendDmFromAgent 的安全门（dmAutoReply 开关 + 出站敏感信息硬拦截）。
   // 允许新增这一条 handler（ipcMain.handle 125→126）；不进插件窗口白名单（危险接口，永不放行给插件）。
   ipcMain.handle('member:send-from-agent', async (_e, input: { channelId?: string; peerMemberId?: string; text: string; replyTo?: string }) =>
