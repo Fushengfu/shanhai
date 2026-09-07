@@ -1,8 +1,9 @@
 import { SUPERVISOR_ID, type Runtime, type ToolTrace, type TokenSnapshot, type AskRequest } from '@shanhai/runtime'
-import { app } from 'electron'
+import { app, BrowserWindow } from 'electron'
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { WindowType } from './window-manager'
+import { getWindowType } from './window-manager'
 import { notifySessionTaskComplete } from './notifications'
 
 /**
@@ -332,6 +333,76 @@ function mutate(fn: (s: UiStoreState) => UiStoreState): void {
   listeners.forEach((l) => l())
 }
 
+/**
+ * 【busy 对账·纯函数】用 runningLoops 真值（runningSet）纠正 state 里 sessions[].busy 与 sessionMap[].busy。
+ * 导出仅为可被复刻测试直接调用；生产路径由 reconcileBusy 调用。
+ *
+ * 为什么需要它：busy 完全靠 onSessionActivity('start'/'end') 增量事件驱动，一旦某个 start 漏发/被 16ms 合并吞掉/
+ * 广播时窗口尚未订阅，该会话显示就永久停在错误态（直到别的事件偶然触发全量 listSessions 重取才自愈）——
+ * 这正是用户反复报的「列表不显示处理中但实际在跑」。用真值定时/聚焦对账兜底。
+ *
+ * 关键安全约束（防把任务59 刚修的「高频 setState 闪烁」重新引回来）：
+ * - 只改 busy 字段，绝不重建 items/streaming（不动重字段，不触发消息流重渲染）。
+ * - changed=false 时 sessions / sessionMap 返回【入参同一引用】→ 调用方据此跳过 mutate → 零 rev++、零广播、零重渲染。
+ * - false→true 立即纠正（修「漏 start 的 stuck-false」，这是用户主诉；runningSet 说有就跑，加个正确的「处理中」不会闪）。
+ * - true→false 需【连续两轮】都不在 runningSet 才置（offPending 去抖）：规避「渲染层乐观 busy=true 已 patch 到主进程、
+ *   但 runInSession 尚未 runningLoops.set」这一小段竞态被误判成空闲而闪烁（该竞态 < 一个 tick，第二轮必然已在 runningSet）。
+ * - 顺带收敛「sessions[] 与 sessionMap[] 两份 busy」：对每个 id 只解析一次目标 busy，两处都写成同一个值，
+ *   使渲染层 `sessionMap[id]?.busy ?? sessions[].busy` 的 ?? 回落不再有「条目在但值过期」的偏差。
+ */
+export function computeBusyReconcile(
+  s: UiStoreState,
+  runningSet: Set<string>,
+  offPending: Set<string>,
+): { changed: boolean; sessions: SessionListItem[]; sessionMap: Record<string, SessionUIState> } {
+  // 汇总每个会话 id 当前显示的 busy（sessions 与 sessionMap 取 OR：任一显示在跑即视为在跑，作为去抖基线）
+  const curBusy = new Map<string, boolean>()
+  for (const it of s.sessions) curBusy.set(it.id, it.busy)
+  for (const [id, st] of Object.entries(s.sessionMap)) curBusy.set(id, (curBusy.get(id) ?? false) || st.busy)
+
+  // 每个 id 只解析一次目标 busy（null = 不变）
+  const nextBusy = new Map<string, boolean>()
+  for (const [id, cb] of curBusy) {
+    if (runningSet.has(id)) {
+      offPending.delete(id)
+      // runningSet 说在跑 → 目标 busy=true 一律下发；apply 阶段按源各自跳过「已是 true」的，
+      // 故 sessions[] 与 sessionMap[] 若有一侧过期也能各自纠正（不因另一侧的 OR 真值而被跳过）。
+      nextBusy.set(id, true)
+      continue
+    }
+    if (!cb) continue // 本就 false 且不在跑：不变
+    // cb=true 且不在 runningSet：需连续两轮确认才 true→false（去抖防乐观竞态闪烁）
+    if (offPending.has(id)) {
+      offPending.delete(id)
+      nextBusy.set(id, false)
+    } else {
+      offPending.add(id)
+    }
+  }
+  if (nextBusy.size === 0) return { changed: false, sessions: s.sessions, sessionMap: s.sessionMap }
+
+  let sessionsChanged = false
+  const nextSessions = s.sessions.map((it) => {
+    const nb = nextBusy.get(it.id)
+    if (nb === undefined || nb === it.busy) return it
+    sessionsChanged = true
+    return { ...it, busy: nb }
+  })
+  let nextMap = s.sessionMap
+  let mapChanged = false
+  for (const [id, nb] of nextBusy) {
+    const cur = s.sessionMap[id]
+    if (!cur || cur.busy === nb) continue
+    if (!mapChanged) {
+      nextMap = { ...s.sessionMap }
+      mapChanged = true
+    }
+    nextMap = { ...nextMap, [id]: { ...cur, busy: nb } }
+  }
+  return { changed: sessionsChanged || mapChanged, sessions: sessionsChanged ? nextSessions : s.sessions, sessionMap: nextMap }
+}
+
+
 /** 从 runtime 装配初始状态 + 监听 runtime 事件维护事件驱动状态（streaming/工具步骤/审批/提问/token/轨迹/浏览器窗口） */
 export function initUiStore(runtime: Runtime): void {
   state = {
@@ -533,6 +604,40 @@ export function initUiStore(runtime: Runtime): void {
   runtime.onAuthExpired(() => {
     mutate((s) => ({ ...s, loggedIn: false, username: null, models: [] }))
   })
+
+  // —— busy 对账兜底（本轮核心）：busy 事件驱动一旦漏事件/被裁剪/广播时窗口未订阅，会永久漂移。用 runningLoops 真值纠正。——
+  // offPending：true→false 去抖集合（连续两轮都不在 runningSet 才置 false，防乐观 busy 竞态闪烁）。模块级 state 生命周期，随 initUiStore 一次装配。
+  const offPending = new Set<string>()
+  const doReconcile = (): void => {
+    let runningSet: Set<string>
+    try {
+      runningSet = new Set(runtime.getRunningSessionIds())
+    } catch {
+      return // runtime 尚未就绪/异常：跳过本轮，绝不误清 busy
+    }
+    const r = computeBusyReconcile(state, runningSet, offPending)
+    if (!r.changed) return // 状态未变化：零 mutate、零 rev++、零广播、零重渲染（不把高频 setState 引回来）
+    mutate((s) => ({ ...s, sessions: r.sessions, sessionMap: r.sessionMap }))
+  }
+  // 低频定时器 3s：仅在「至少有一个可见且消费共享状态的窗口」时跑（全隐藏则暂停，省电省 IPC）。
+  const RECONCILE_INTERVAL_MS = 3000
+  const reconcileTimer = setInterval(() => {
+    let anyVisible = false
+    for (const w of BrowserWindow.getAllWindows()) {
+      try {
+        if (!w.isDestroyed() && w.isVisible() && windowConsumesUiState(getWindowType(w))) {
+          anyVisible = true
+          break
+        }
+      } catch {
+        /* 窗口正在销毁：忽略 */
+      }
+    }
+    if (anyVisible) doReconcile()
+  }, RECONCILE_INTERVAL_MS)
+  reconcileTimer.unref?.()
+  // 窗口重新获得焦点时立即对账：用户「看一眼」的瞬间纠正，比等定时器快（且聚焦是低频动作，不会造成高频广播）。
+  app.on('browser-window-focus', doReconcile)
 }
 
 // 让 patchUiState 接受深层 Partial

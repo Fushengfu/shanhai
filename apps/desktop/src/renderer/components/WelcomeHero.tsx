@@ -10,6 +10,9 @@ export function WelcomeHero({ onSuggestion }: { onSuggestion: (text: string) => 
     t('chat.suggest.project'),
     t('chat.suggest.intro'),
     t('chat.suggest.file'),
+    t('chat.suggest.plugin.dev'),
+    t('chat.suggest.plugin.list'),
+    t('chat.suggest.plugin.open'),
   ]
   return (
     <div style={{ textAlign: 'center', maxWidth: 640, width: '100%', paddingBottom: 8 }}>

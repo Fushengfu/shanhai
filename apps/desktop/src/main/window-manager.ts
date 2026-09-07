@@ -209,9 +209,9 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
       ? { transparent: true, backgroundColor: '#00000000', hasShadow: false }
       : {}),
     ...(type === 'supervisor-bubble' ? { alwaysOnTop: true, resizable: false, minimizable: false, maximizable: false, skipTaskbar: true } : {}),
-    // 会话管家窗口：永远置顶，始终浮在所有山海其它窗口之上（不被 chat/desktop/app 盖住），便于长期可见。
-    // alwaysOnTop 不影响最小化/关闭/拖动；悬浮图标(supervisor-bubble)已置顶，此处对齐管家主窗口。
-    ...(type === 'supervisor' ? { alwaysOnTop: true } : {}),
+    // 会话管家窗口：不再置顶（与普通窗口一样可被其它窗口遮挡）。仅浮动悬浮图标(supervisor-bubble)保持置顶。
+    // 用户要求（2026-09）：管家主窗口不需置顶所有窗口，只有悬浮按钮置顶所有窗口。
+    // 注意：不删上面的 supervisor-bubble 分支的 alwaysOnTop —— 那是浮动图标，要始终置顶。
     ...(type === 'app' ? { alwaysOnTop: true } : {}),
     // t7/P7 私信面板最小宽度 760：比默认 1080 窄，但防气泡/输入区被压到崩坏。高度由内容自适应，不设下限。
     ...(type === 'app' && appId === DM_PANEL_APP_ID ? { minWidth: 760 } : {}),
@@ -497,15 +497,28 @@ export function ensureDesktopLayer(): void {
 }
 
 /**
- * 退出到桌面：隐藏所有山海窗口（桌面壳 / Dock / 聊天 / 管家 / 悬浮图标 / 应用窗口），回到系统原始界面。
+ * 退出到桌面：隐藏所有山海窗口（桌面壳 / Dock / 聊天 / 管家 / 应用窗口），回到系统原始界面。
  * 应用不退出（托盘常驻），通过托盘「显示主窗口」或全局快捷键恢复；恢复时 ensureDesktopLayer 会把桌面壳 + Dock 一并带回。
+ *
+ * 【例外】悬浮图标（supervisor-bubble）不隐藏：它创建时即 alwaysOnTop:true + skipTaskbar:true，
+ * 是「回到桌面后仍然可见、仍然浮在所有窗口最上层」的唯一常驻入口（用户要求，2026-09）。
+ * 因此这里必须跳过它，否则「回到桌面」= 把用户唯一的快捷入口一起收掉。
+ *
+ * 同时维持任务49 的互斥不变式「管家主窗口不可见 ⇔ 悬浮图标给出」：
+ * 若本次收起的是【管家主窗口】（互斥态下气泡本来是隐藏的），收完按既有 syncSupervisorBubble(false)
+ * 把气泡放出来，保证回到桌面后一定有入口，而不是「窗口和气泡同时消失」。
  */
 export function hideToSystemDesktop(): void {
+  let supervisorHidden = false
   for (const meta of windows.values()) {
-    if (!meta.win.isDestroyed() && meta.win.isVisible()) {
-      meta.win.hide()
-    }
+    if (meta.win.isDestroyed() || !meta.win.isVisible()) continue
+    // 悬浮图标：保持显示 + 保持置顶，不参与「回到桌面」的隐藏
+    if (meta.type === 'supervisor-bubble') continue
+    if (meta.type === 'supervisor') supervisorHidden = true
+    meta.win.hide()
   }
+  // 收起的是管家主窗口 → 按互斥语义补出悬浮图标（syncSupervisorBubble 是唯一互斥同步点，不另写一半）
+  if (supervisorHidden) syncSupervisorBubble(false)
 }
 
 /**

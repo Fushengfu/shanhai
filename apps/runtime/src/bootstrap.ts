@@ -1111,6 +1111,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
           busy: ctx.runningLoops.has(s.id),
         }))
     },
+    getRunningSessionIds() {
+      // busy 对账真值：直接取 runningLoops 的 key 集合（含管家 SUPERVISOR_ID —— 与 listSessions 不同，
+      // listSessions 刻意过滤掉管家，但管家窗口的「处理中/发送按钮」同样依赖 runningLoops 真值，故对账必须能看到管家）。
+      // 这是「谁在跑」的唯一权威来源；ui-store 的 busy 事件驱动一旦漏事件，用这份真值定时/聚焦时纠正。
+      return [...ctx.runningLoops.keys()]
+    },
     switchSession(id) {
       sessionsModule.switchSessionInternal(id)
     },
@@ -1536,6 +1542,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       if (!meta) throw new Error(`会话不存在: ${sid}`)
       const loop = ctx.runningLoops.get(sid)
       if (loop) {
+        // ⚠️ 重试同样是一次「会话执行」：补发 start 让 ui-store 同步 sessionMap/sessions 的 busy=true，
+        // 否则「失败挂起(retryExhausted) → 点重试」时 runningLoops 已 set 但 UI 不知晓，
+        // 列表/发送按钮仍显示空闲，与「实际在跑」不一致（复刻已实证）。完成 delete 后补发 end 恢复空闲态。
+        ctx.sessionActivityCallbacks.forEach((cb) => cb(sid, 'start'))
         try {
           // 用失败节点相同的 messages 快照重新提交请求（保持上下文），继续 ReAct 循环
           const result = await sessionContext.run(sid, () => loop.retry())
@@ -1546,7 +1556,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
           return result
         } finally {
           // retry 成功后不再挂起 → 移除 loop；retry 又失败耗尽 → 仍挂起 → 保留 loop 供再次重试
-          if (!loop.isSuspended()) ctx.runningLoops.delete(sid)
+          if (!loop.isSuspended()) {
+            ctx.runningLoops.delete(sid)
+            ctx.sessionActivityCallbacks.forEach((cb) => cb(sid, 'end'))
+          }
         }
       }
       // 无运行中 loop：优先从持久化快照恢复精确重试（重启后仍用失败节点相同的 body 重发），无快照才降级 resume
@@ -1560,6 +1573,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         const restoredLoop = new AgentLoop(effModel, isSupervisorRun ? ctx.supervisorLoopTools : ctx.tools, meta.session, ctx.approval, sid, tokenStatsModule.currentContextBudget(effModelId), visionCapable, tokenStatsModule.currentApiKey(effModelId), modelProviderModule.resolveCompactModel())
         restoredLoop.restoreSuspended(snapshot)
         ctx.runningLoops.set(sid, restoredLoop)
+        // ⚠️ 同重试：补发 start 让 ui-store 同步 busy，删除后补发 end（防「实际在跑但 UI 不显示处理中」）
+        ctx.sessionActivityCallbacks.forEach((cb) => cb(sid, 'start'))
         try {
           const result = await sessionContext.run(sid, () =>
             restoredLoop.retry(
@@ -1576,7 +1591,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
           tokenStatsModule.emitTokenStats()
           return result
         } finally {
-          if (!restoredLoop.isSuspended()) ctx.runningLoops.delete(sid)
+          if (!restoredLoop.isSuspended()) {
+            ctx.runningLoops.delete(sid)
+            ctx.sessionActivityCallbacks.forEach((cb) => cb(sid, 'end'))
+          }
         }
       }
       // 无快照：降级 resume（从最后一条用户消息续跑）

@@ -77,8 +77,8 @@ export interface UIContextValue {
   composerRef: React.MutableRefObject<ChatComposerState>
   /** 外部重置信号（草稿恢复 / 新建清空 / 发送清空），seq 递增触发 ChatComposer 重同步自身输入态 */
   composerSeed: ChatComposerSeed
-  /** 欢迎页建议点击：把建议文本填入输入框（保留现有附件） */
-  setComposerInput: (text: string) => void
+  /** 欢迎页建议点击：把建议文本填入输入框（保留现有附件）。默认追加；传 replace=true 为整体替换。 */
+  setComposerInput: (text: string, replace?: boolean) => void
   /**
    * 【安全红线】最近一次「私信引用到本会话」的来源信息（null = 没有）。
    * 只在本地用户于私信面板显式点击「引用到会话」后由 App 设置，用于在输入区上方显示来源提示条；

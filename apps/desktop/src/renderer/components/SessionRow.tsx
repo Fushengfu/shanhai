@@ -19,6 +19,11 @@ export function SessionRow(props: {
   onSelect: () => void
 }) {
   const { session: s } = props
+  // ⚠️ 不许把 useLocaleSync() 移到 if(props.editing) 的提前 return 之后 —— 它内部是 React Hook
+  // (useSyncExternalStore)，必须无条件、按固定顺序调用。若只在非编辑分支调用，进入编辑态时
+  // hook 数量从 2 变 1，React 抛「Rendered fewer hooks than expected」→ 无 ErrorBoundary → 整树白屏。
+  // 这正是「添加会话 → 编辑名称 → 白屏」的根因。
+  useLocaleSync()
   const [hovered, setHovered] = useState(false)
 
   if (props.editing) {
@@ -57,7 +62,6 @@ export function SessionRow(props: {
   }
 
   // 副标题：执行中显示「处理中」（活跃时间即当前时间，无需显示时间）；空闲后显示最后活跃时间；不再显示工作目录
-  useLocaleSync()
   const relTime = s.lastActiveAt ? formatRelativeTime(s.lastActiveAt) : ''
   const subtitle = props.busy ? t('chat.sessionRow.processing') : relTime
 

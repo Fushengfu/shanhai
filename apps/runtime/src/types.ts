@@ -254,6 +254,9 @@ export interface Runtime {
 
   /** 会话列表（内存多会话，含每会话工作目录、活跃时间、是否进行中；排序规则「进行中置顶 → 最近活跃时间倒序」由前端负责） */
   listSessions(): Array<{ id: string; title: string; workDir: string; lastActiveAt: number; busy: boolean }>
+  /** 当前正在执行的会话 id 集合（runningLoops 真值，含管家 SUPERVISOR_ID）。
+   *  供主进程 ui-store 做 busy 对账兜底：busy 事件驱动一旦漏事件会永久漂移，用这份真值定时/聚焦时纠正。 */
+  getRunningSessionIds(): string[]
   switchSession(id: string): void
   /** 描述指定会话的完整状态（管家工具用）：模型/审批策略/当前需求/已执行步数/上下文占用等 */
   describeSession(sessionId: string): SessionStateSummary | null

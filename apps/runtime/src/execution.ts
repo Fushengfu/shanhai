@@ -92,7 +92,6 @@ export function createExecutionModule(
     ctx.stoppedSessions.delete(sid)
     if (!isSupervisorRun) ctx.sessionOrigin.set(sid, origin)
     sessions.touchSession(sid)
-    ctx.sessionActivityCallbacks.forEach((cb) => cb(sid, 'start'))
     const statAcc = tokenStats.sessionStats(sid)
     statAcc.turnPrompt = 0
     statAcc.turnCompletion = 0
@@ -113,6 +112,12 @@ export function createExecutionModule(
     }
     const loop = new AgentLoop(effModel, isSupervisorRun ? ctx.supervisorLoopTools : ctx.tools, targetSession, ctx.approval, sid, tokenStats.currentContextBudget(effModelId), visionCapable, tokenStats.currentApiKey(effModelId), modelProvider.resolveCompactModel())
     ctx.runningLoops.set(sid, loop)
+    // ⚠️ 会话活动 start 事件必须放在 runningLoops.set 之后：start 事件会触发主进程 ui-store
+    // 同步更新 sessionMap/sessions 的 busy；若先发 start 再 set runningLoops（中间还隔着头像/图片分析等
+    // await），并发下另一会话 end 的 listSessions 全量重取会读到「本会话尚未 set」→ 把本会话 busy 误清为
+    // false，造成「实际在跑但会话列表/发送按钮不显示处理中」的不一致（复刻已实证）。set 后再发 end
+    // 路径（先 delete 再发 end）时序对称。
+    ctx.sessionActivityCallbacks.forEach((cb) => cb(sid, 'start'))
     // 发新任务前，物理清理上一个「未完成轮次」的半截事件（普通会话与管家会话一致清理）。
     // 网络中断会把「只有 user、无最终 assistant 正文、无 turn/end 收尾」的半截事件留在事件日志，
     // 污染后续回放/续跑。发新任务(run)即代表放弃对上一个中断任务的断点续跑，故可安全物理删除；

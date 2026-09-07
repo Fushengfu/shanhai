@@ -165,8 +165,14 @@ export function App() {
    * 故对齐语音听写那条的写法 setInput(prev => prev ? prev + text : text)：
    * 已有草稿时换行接在后面，没有草稿时直接作为输入内容。仍只写输入框，不自动发送。
    */
-  const setComposerInput = useCallback((text: string) => {
+  const setComposerInput = useCallback((text: string, replace = false) => {
     if (!text) return
+    // 【快捷提问·替换语义】欢迎页建议点哪条，输入框就只显示哪条：整段替换，不保留用户已输入内容。
+    // 默认（replace=false）仍是追加语义，供私信「引用到会话」使用（那是要保留用户已打草稿的场景，不破坏）。
+    if (replace) {
+      resetComposer(text, composerRef.current.attachments)
+      return
+    }
     const prev = composerRef.current.input
     const next = prev.trim() ? `${prev.replace(/\s+$/, '')}\n\n${text}` : text
     resetComposer(next, composerRef.current.attachments)
