@@ -6,11 +6,12 @@ import { btn, smallIconBtn } from '../components/ui'
 import { ImagePreview } from '../components/ImagePreview'
 import { DmComposer } from './DmComposer'
 import { DmQuotePicker, type DmQuoteTarget } from './DmQuotePicker'
+import { DmToast, useDmToast } from './dm-toast'
 import { dmContentPreview } from '../../shared/dm-attachment'
 import { encodeDmContent, utf8Bytes } from '../../shared/dm-attachment'
 import type { DmAttachmentPayload } from '../../shared/dm-attachment'
 import { patchUiStore, useUiStoreSelector } from '../store-client'
-import { DmAvatar, DmMessageRow, DmTimeDivider, LEFT_WIDTH_NARROW_PX, LEFT_WIDTH_PX, NARROW_WIDTH_PX, buildChatRows, fmtListTime, statusLabelOf, threadPreview } from './DmIm'
+import { DmAvatar, DmMessageRow, DmTimeDivider, DmUnreadDivider, LEFT_WIDTH_NARROW_PX, LEFT_WIDTH_PX, NARROW_WIDTH_PX, buildChatRows, fmtListTime, statusLabelOf, threadPreview } from './DmIm'
 // 【i18n 期1】取词函数导入成 tKey：本文件多处把会话条目命名为 t（visibleThreads.map((t) => …) 等），
 // 直接 import { t } 会在那些回调里被遮蔽。用别名最稳，不去改既有回调的形参名。
 import { getLocale, t as tKey, tf as tfKey } from '../../shared/i18n'
@@ -21,7 +22,7 @@ import { displayNameOf as displayNameOfShared } from '../../shared/member-displa
 import { renderRich, useLocaleSync } from '../locale'
 import { useDmMessageScroll } from './useDmMessageScroll'
 import type { DmRow } from './DmIm'
-import type { CredentialSnapshot, DmFriend, DmFriendRequest, DmMessage, DmThread, DmUnread, MemberChannelStatus, MemberNotice, MemberResult } from '../types'
+import type { CredentialSnapshot, DmDraftStore, DmFriend, DmFriendRequest, DmMessage, DmThread, DmUnread, MemberChannelStatus, MemberNotice, MemberResult } from '../types'
 
 /**
  * 「私信」应用窗口（会员实时通讯底线的内置 UI）：两个分区 —— 私信 / 好友。
@@ -113,6 +114,29 @@ function displayNameOf(name: string | undefined | null, id?: string): string {
   return displayNameOfShared(name, id)
 }
 
+const DRAFT_KEY = 'shanhai:dm:drafts'
+
+/** 【P6】读本地草稿缓存（容错：JSON 坏 / localStorage 不可用都回退空表，不崩溃） */
+function loadDrafts(): DmDraftStore {
+  try {
+    const raw = window.localStorage.getItem(DRAFT_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as DmDraftStore
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+/** 【P6】写本地草稿缓存（try/catch 容错：隐私模式下 localStorage 可抛异常，不因此崩） */
+function saveDrafts(store: DmDraftStore): void {
+  try {
+    window.localStorage.setItem(DRAFT_KEY, JSON.stringify(store))
+  } catch {
+    // 草稿只是便利功能，写盘失败不应打断使用
+  }
+}
+
 const cardStyle: React.CSSProperties = {
   border: '1px solid var(--border-soft)',
   borderRadius: 12,
@@ -179,6 +203,17 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
    */
   const [threadLoading, setThreadLoading] = useState(false)
   const [hasMore, setHasMore] = useState(false)
+  /** 管家接管开关（私信 IM 化·管家接管）：默认 false，跟随 settings.dmAutoReply（主进程读它做发消息总开关） */
+  const [dmAutoReply, setDmAutoReply] = useState(false)
+  /** 首次开启的确认框只弹一次（会话内），不是每次开都问 */
+  const dmConfirmShownRef = useRef(false)
+  /** 【P6】跨会话草稿保留：按 channelId 存 {channelId: text}，localStorage 持久化。
+   *  为什么落盘：任务54 记录「去登录让位用 closeApp 是 destroy 非 hide → 面板重挂载 state 清空」，
+   *  只用组件 state 面板被 destroy 后草稿全丢；localStorage（同 origin 跨窗口/跨重启）才保得住。 */
+  const [drafts, setDrafts] = useState<DmDraftStore>(loadDrafts)
+  const draftsRef = useRef<DmDraftStore>(drafts)
+  useEffect(() => { draftsRef.current = drafts; saveDrafts(drafts) }, [drafts])
+  const { toast, show: showToast, dismiss: dismissToast } = useDmToast()
   /** 当前已加载到的历史页码（定稿 v1.1：page=1 是最新一页，「加载更早」= page 递增） */
   const [historyPage, setHistoryPage] = useState(1)
   /**
@@ -251,6 +286,23 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
     if (th) setThreadsIfChanged(th)
     if (un) setUnread(un)
   }, [setThreadsIfChanged, setFriendsIfChanged])
+
+  // 管家接管开关：写 settings.dmAutoReply（主进程 member-channel 在「管家发消息」出站前读它做总开关）。
+  // 开启前弹一次确认框（明白「发出去无法撤回」）；关闭直接写 false 不确认。
+  const setDmAutoReplySetting = useCallback(async (next: boolean): Promise<void> => {
+    if (!next) {
+      await window.shanhai?.setSettings?.({ dmAutoReply: false })
+      setDmAutoReply(false)
+      return
+    }
+    if (!dmConfirmShownRef.current) {
+      dmConfirmShownRef.current = true
+      const ok = window.confirm(tKey('dm.autoReplyConfirm'))
+      if (!ok) return
+    }
+    const s = await window.shanhai?.setSettings?.({ dmAutoReply: true })
+    if (s) setDmAutoReply(!!s.dmAutoReply)
+  }, [])
 
   /**
    * 【任务63】拉「引用到会话」的可选目标：`listSessions()` 的全部普通会话 + 会话管家。
@@ -326,6 +378,15 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
     void window.shanhai?.memberPullThreads()
     void refreshQuoteTargets()
   }, [reloadAll, refreshQuoteTargets])
+
+  // 管家接管开关：挂载拉一次当前值（主进程读它做发消息总开关，这里只用来渲染选中态）
+  useEffect(() => {
+    let live = true
+    void window.shanhai?.getSettings?.().then((s) => {
+      if (live && s) setDmAutoReply(!!s.dmAutoReply)
+    }).catch(() => undefined)
+    return () => { live = false }
+  }, [])
 
   // 订阅主进程广播（低频小事件，不进 ui:state 全量快照）
   useEffect(() => {
@@ -535,6 +596,7 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
         return false
       }
       setNotice(r?.message ?? (atts.length > 0 ? tKey('dm.sentWithAttachment') : tKey('dm.sent')))
+      showToast({ type: 'success', text: r?.message ?? (atts.length > 0 ? tKey('dm.sentWithAttachment') : tKey('dm.sent')) })
       reloadThreads()
       return true
     },
@@ -1199,6 +1261,27 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
               </button>
             )}
           </div>
+
+          {/* 管家接管开关（私信 IM 化·管家接管期）：只改 settings.dmAutoReply，不改任何收发/审批逻辑。
+              三态下拉：关 / 开-全自动 / 半自动（未开放·占位）；本期只实现前两态可用。
+              说明文字放 tooltip，窄列不占行；开关状态与主进程「管家发消息总开关」同源（settings）。 */}
+          <div style={{ flexShrink: 0, borderTop: '1px solid var(--border)', padding: '6px 10px', display: 'flex', alignItems: 'center', gap: 8, background: 'var(--bg-panel)' }}>
+            <span
+              title={tKey('dm.autoReplyDesc')}
+              style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: 'var(--text-secondary)' }}
+            >
+              {tKey('dm.autoReply')}
+            </span>
+            <select
+              value={dmAutoReply ? 'auto' : 'off'}
+              onChange={(e) => void setDmAutoReplySetting(e.target.value === 'auto')}
+              style={{ fontSize: 11, padding: '3px 6px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text)', maxWidth: 100, flexShrink: 0 }}
+            >
+              <option value="off">{tKey('dm.autoReplyState.off')}</option>
+              <option value="auto">{tKey('dm.autoReplyState.on')}</option>
+              <option value="half" disabled>{tKey('dm.autoReplyState.half')}</option>
+            </select>
+          </div>
         </div>
 
         {/* ——————————————————————— 右列：聊天区（常驻）——————————————————————— */}
@@ -1292,13 +1375,27 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
                       {threadLoading ? tKey('dm.reading') : tKey('dm.emptyThread')}
                     </div>
                   )}
-                  {chatRows.map((row) =>
-                    row.kind === 'divider' ? (
-                      <DmTimeDivider key={row.key} ts={row.ts} />
-                    ) : (
-                      <DmMessageRow key={row.key} msg={row.msg} peerName={peerName} mineName={myName} peerAvatar={active.peerAvatar} narrow={narrow} onQuote={(x) => openQuotePicker(x)} onPreviewImage={(src) => setPreviewImage(src)} />
-                    ),
-                  )}
+                  {(() => {
+                    const msgCount = chatRows.filter((r) => r.kind === 'msg').length
+                    const unread = active?.unread ?? 0
+                    const firstUnread = Math.max(0, msgCount - unread)
+                    let seen = 0
+                    return chatRows.map((row) => {
+                      if (row.kind === 'divider') return <DmTimeDivider key={row.key} ts={row.ts} />
+                      const showDiv = unread > 0 && seen === firstUnread
+                      seen += 1
+                      return showDiv
+                        ? (
+                            <React.Fragment key={row.key}>
+                              <DmUnreadDivider count={unread} />
+                              <DmMessageRow msg={row.msg} peerName={peerName} mineName={myName} peerAvatar={active.peerAvatar} narrow={narrow} onQuote={(x) => openQuotePicker(x)} onPreviewImage={(src) => setPreviewImage(src)} />
+                            </React.Fragment>
+                          )
+                        : (
+                            <DmMessageRow key={row.key} msg={row.msg} peerName={peerName} mineName={myName} peerAvatar={active.peerAvatar} narrow={narrow} onQuote={(x) => openQuotePicker(x)} onPreviewImage={(src) => setPreviewImage(src)} />
+                          )
+                    })
+                  })()}
                 </div>
                 {dmScroll.newCount > 0 && (
                   <button
@@ -1354,6 +1451,9 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
                 loggedIn={ui.loggedIn}
                 peerName={peerName}
                 maxContentBytes={MAX_CONTENT_BYTES}
+                initialText={drafts[active.channelId] ?? ''}
+                onTextChange={(text) => setDrafts((prev) => ({ ...prev, [active.channelId]: text }))}
+                onSent={() => setDrafts((prev) => { const n = { ...prev }; delete n[active.channelId]; return n })}
                 onSend={onSend}
                 onBlocked={(reason) => {
                   if (reason) {
@@ -1372,6 +1472,8 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
 
       {/* 图片大图预览：遮罩层与聊天窗口 / 管家窗口共用同一个组件（Esc 或点背景关闭） */}
       {previewImage && <ImagePreview src={previewImage} onClose={() => setPreviewImage(null)} />}
+
+      {toast && <DmToast toast={toast} onDismiss={dismissToast} />}
 
       {/*
         【任务63】点消息旁 ＋ 后弹出的「引用到哪个会话」选择器。

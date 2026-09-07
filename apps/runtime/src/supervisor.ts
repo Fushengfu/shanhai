@@ -1,5 +1,6 @@
 import type { ToolContract } from '@shanhai/tools'
 import type { ApprovalPolicy } from '@shanhai/session'
+import type { DmPendingReply } from './types'
 
 /** 「会话管家」超级会话的固定 id（独立常驻窗口承载，作为主 Agent 监控/转发所有用户会话） */
 export const SUPERVISOR_ID = 'supervisor'
@@ -70,7 +71,7 @@ export interface SupervisorContext {
   /** 列出可用模型（id + 显示名 + 类型），供 session(set_model) 选择 */
   listModels(): Array<{ id: string; name: string; modelType?: string }>
   /** 向指定会话发消息（等同手动切过去发），mode=insert 追加 / queue 排队 */
-  sendMessage(sessionId: string, message: string, mode: 'insert' | 'queue'): Promise<{ ok: boolean; message: string; result?: string }>
+  sendMessage(sessionId: string, message: string, mode: 'insert' | 'queue', dmReplyTarget?: DmPendingReply): Promise<{ ok: boolean; message: string; result?: string }>
   /** 切换激活会话（等同用户在侧边栏点击切换，同步更新聊天窗口当前显示的会话） */
   switchSession(sessionId: string): { ok: boolean; message: string }
   /** 切换指定会话使用的模型（写会话事件日志，不影响正在运行的任务） */
@@ -283,6 +284,16 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
           sessionId: { type: 'string', description: '目标会话 id（来自 session(list)）' },
           content: { type: 'string', description: '要转发给该会话的需求/消息内容' },
           mode: { type: 'string', enum: ['insert', 'queue'], description: '发送模式，默认 insert' },
+          dmReplyTarget: {
+            type: 'object',
+            description: '可选。当本次派发是为处理某好友的私信任务时传入，把目标好友与本次会话绑定；会话完成后会自动用 dm_send 把结果回发给该好友。仅处理私信任务时传，普通任务不要传。',
+            properties: {
+              channelId: { type: 'string', description: '好友私信会话 id（与 peerMemberId 二选一）' },
+              peerMemberId: { type: 'string', description: '好友 memberId（与 channelId 二选一）' },
+              fromName: { type: 'string', description: '好友显示名' },
+            },
+            additionalProperties: false,
+          },
         },
         required: ['sessionId', 'content'],
       },
@@ -301,7 +312,15 @@ export function createSupervisorTools(ctx: SupervisorContext): ToolContract[] {
         const content = String(args.content ?? '')
         const mode = args.mode === 'queue' ? 'queue' : 'insert'
         if (!content.trim()) return { ok: false, message: '消息内容不能为空' }
-        return ctx.sendMessage(sid, content, mode)
+        const t = args.dmReplyTarget as { channelId?: string; peerMemberId?: string; fromName?: string } | undefined
+        const dmReplyTarget = t && t.fromName
+          ? {
+              channelId: t.channelId ? String(t.channelId) : undefined,
+              peerMemberId: t.peerMemberId ? String(t.peerMemberId) : undefined,
+              fromName: String(t.fromName),
+            }
+          : undefined
+        return ctx.sendMessage(sid, content, mode, dmReplyTarget)
       },
     },
     {

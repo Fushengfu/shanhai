@@ -60,7 +60,7 @@ interface HostFacade {
 |------|------|------|--------------|
 | `ctx.on` | `(name, listener) => void` | 订阅内核事件总线，返回无（⚠️ 当前内核**不广播任何事件**，可订阅事件清单为空，见下） | ✅ 撤销时自动 off |
 | `ctx.provide` | `(name, impl) => void` | 注册命名服务。**若 `impl` 是函数，client 半可经 `window.shanhaiPlugin.invokePluginService(name, ...args)` 调用它（client→host RPC，见 §6）** | ✅ 撤销时自动删除 |
-| `ctx.tools.register` | `(tool: ToolContract) => void` | 注册一个「插件工具」：收集进插件工具 Registry（**不再进顶层工具表**），由统一调度工具 `plugin_tool` 按 action 分派调用（见 §8） | ✅ 撤销时自动移除 |
+| `ctx.tools.register` | `(tool: ToolContract) => void` | 注册一个「插件工具」：收集进插件工具 Registry（**不再进顶层工具表**），由统一入口工具 `plugin` 的 `action: "tool"` 按 `(pluginId, tool)` 双键分派调用（见 §8） | ✅ 撤销时自动移除 |
 | `ctx.openWindow` | `(appId?: string) => void` | 打开本插件的窗口应用（`appId` 缺省 = 插件 id） | ✅ 撤销时自动关闭该窗口 |
 | `ctx.closeWindow` | `(appId?: string) => void` | 显式关闭本插件的窗口应用（`appId` 缺省 = 插件 id） | ❌ 主动关闭，不挂撤销 |
 
@@ -160,7 +160,7 @@ client 半运行在浏览器渲染进程，**唯一形态**：窗口应用（配
 - 因此 `plugin_stop` / `plugin_uninstall` / `plugin_test`（撤回）时，**已打开窗口自动关闭**。
 - `ctx.closeWindow(appId?)`：只主动关闭、不挂撤销。
 - 窗口打开是**惰性**的：`openApp` 已有则聚焦、否则创建；`closeApp` 真正 `destroy()` 窗口。
-- 窗口应用注册表：`appId → { name, entryHtml, icon, ... }`（由 `plugin_apps` 工具 / Dock 图标体现）。
+- 窗口应用注册表：`appId → { name, entryHtml, icon, ... }`（由 `plugin({ action: 'list' })` / Dock 图标体现）。
 
 > ⚠️ **坑 1**：窗口应用默认「**不自动开窗**」——脚手架模板的 host 半**不**直接调 `ctx.openWindow()`，安装/加载后由用户点 Dock 图标主动打开（`openApp → loadFile dist/client.html`）。只有插件作者**主动**在事件回调里调 `ctx.openWindow()` 才会立即开窗（会打断用户当前工作，不推荐）。
 
@@ -352,8 +352,8 @@ const url = await window.shanhaiPlugin.uploadFile({
 
 1. **窗口应用默认「不自动开窗」**，安装/加载后由用户点 Dock 图标主动打开（非自动弹出）。
 2. **host 半无 `effect()`**，cleanup 只走 4 条自动撤销路径。
-3. **`tools.register` 注册的是「插件工具」**：收集进插件工具 Registry，**不再作为顶层 function 暴露给模型**，由统一调度工具 `plugin_tool` 按 action 分派调用（先用 `plugin_apps` 或 `plugin_inspect` 的 `pluginTools` 字段查可用工具名，见 §8）。插件工具不再直接污染模型顶层工具表。
-4. **`provide` 的函数 impl 可被 client 半 `invokePluginService` 调用**（client→host RPC，见 §6）；非函数 impl 仅 `plugin_inspect` 报告用。
+3. **`tools.register` 注册的是「插件工具」**：收集进插件工具 Registry，**不再作为顶层 function 暴露给模型**，由统一入口工具 `plugin` 的 `action: "tool"` 按 `(pluginId, tool)` 双键分派调用（先用 `plugin({ action: 'list' })` 或 `plugin({ action: 'inspect' })` 的 `pluginTools` 字段查可用工具名，见 §8）。插件工具不再直接污染模型顶层工具表。
+4. **`provide` 的函数 impl 可被 client 半 `invokePluginService` 调用**（client→host RPC，见 §6）；非函数 impl 仅 `plugin({ action: 'inspect' })` 报告用。
 5. **host 半编译产物必须自包含**，不得 external `electron` / `@shanhai/*`（越权审计拒绝加载）。
 6. **窗口应用注册表**：由内核维护窗口应用注册表（`appId → name / entryHtml / icon`），Dock 图标经 `plugin-apps:changed` 广播刷新。
 7. **`plugin_build` 产物在 workspace**，`plugin_install` 自动部署到 `plugins/<id>/dist/`（无需手动 cp）；**icon 也随 install 自动部署**：workspace 根级的 `icon.svg` / `icon.png` 会自动复制到 `plugins/<id>/`，且 `plugin_define` 未显式声明 icon 时 install 自动探测声明（优先 `icon.svg`），Dock 图标据此渲染。
@@ -364,16 +364,20 @@ const url = await window.shanhaiPlugin.uploadFile({
 
 ## 8. 插件工具统一调度与插件应用列表
 
-插件 host 半用 `ctx.tools.register(tool)` 注册的工具，**不再作为顶层 function 暴露给模型**，而是统一收集进「插件工具 Registry」（按工具名索引，条目含 `name / tool / pkgId / pkgName`，即来源插件 + 风险标记）。模型通过两个专用工具访问：
+插件 host 半用 `ctx.tools.register(tool)` 注册的工具，**不再作为顶层 function 暴露给模型**，而是统一收集进「插件工具 Registry」（**双键索引：插件 id → 工具名**，条目含 `name / tool / pkgId / pkgName`，即来源插件 + 风险标记）。模型通过**统一入口工具 `plugin` 的两个 action** 访问：
 
-| 工具 | 用途 |
+| action | 用途 |
 |------|------|
-| `plugin_tool` | **统一调度入口**：`plugin_tool action=<插件工具名> args={...}`。查 Registry 找到对应插件工具并执行，返回其结果；找不到给明确报错（含当前已注册的插件工具清单）。**动态风险**：`resolveRisk` 按具体插件工具的 `riskLevel` / `approvalRequired` 转发，审批粒度与直接调用该工具一致。 |
-| `plugin_apps` | **列出所有已安装插件应用**：返回 `id / name / purpose / version / hasWindow / kind / services / tools`。`kind` 区分「有窗口的应用插件（`app`，`hasWindow=true`）」与「纯工具插件（`tool`，`hasWindow=false`）」。拿到列表后：用 `plugin_tool` 调插件的工具，或对「有窗口的应用插件」用 computer_use / browser_use 做 UI 自动化操作。 |
+| `plugin({ action: 'tool', pluginId, tool, args })` | **统一调度入口（调用插件工具）**：按 `(pluginId, tool)` 双键查 Registry 找到对应插件工具并执行，返回其结果；找不到给明确报错（含当前已注册的插件工具清单）。`args` 是传给该插件工具自己的参数对象。**动态风险**：`resolveRisk` 按具体插件工具的 `riskLevel` / `approvalRequired` 转发，审批粒度与直接调用该工具一致（入口本身不放宽权限）。 |
+| `plugin({ action: 'list' })` | **列出所有已安装插件应用**：返回 `id / name / purpose / version / hasWindow / kind / services / tools`。`kind` 区分「有窗口的应用插件（`app`，`hasWindow=true`）」与「纯工具插件（`tool`，`hasWindow=false`）」。拿到列表后：用 `plugin({ action: 'tool' })` 调插件的工具，或对「有窗口的应用插件」用 computer_use / browser_use 做 UI 自动化操作。 |
+
+> ⚠️ **命名口径（历次踩坑，务必看清）**：模型顶层工具表里**只有一个叫 `plugin` 的工具**，**不存在** `plugin_tool` / `plugin_apps` / `plugin_inspect` 这些独立工具名（历史上曾是独立顶层工具，现已全部收敛为 `plugin` 的 action）。**判断「本会话有没有插件工具入口」的正确方法**是看 `plugin({ action: 'inspect' })` 返回的 `tools` 清单里有没有 `plugin`，而不是去找 `plugin_tool`。
 
 **关键语义（避免 AI 搞错）：**
 
-1. **Registry 生命周期**：插件 `run` 时 `ctx.tools.register` 收集进 Registry，`plugin_stop` / `plugin_uninstall` / `plugin_undefine` / `plugin_test`（撤回阶段）时自动移除对应工具——卸载后 `plugin_tool` 再调它会报「插件工具不存在」。
-2. **不进顶层工具表**：插件工具不再 `push` 进全局 `ctx.tools`，模型顶层 function 里看不到 `kanban_export_markdown` 这类插件工具名，只能看到 `plugin_tool` / `plugin_apps`。已装插件越多，顶层工具表**不膨胀**（这是本机制的目的：把「每装一个插件顶层 +N 个工具」收敛为「固定 +2 个调度工具」）。
-3. **管家 vs 普通会话**：`plugin_tool` / `plugin_apps` 是普通会话工具（进 `ctx.tools`）；管家会话用 `supervisorLoopTools` 白名单，默认**不**含插件工具（如需管家也能调，需另确认）。
-4. **查询入口**：插件工具名经 `plugin_inspect` 的 `pluginTools` 字段、或 `plugin_apps` 的 `tools` 字段暴露，AI 调用前先查清单。
+1. **Registry 生命周期**：插件 `run` 时 `ctx.tools.register` 收集进 Registry，插件 stop / uninstall / undefine / test-load（撤回阶段）时自动移除对应工具——卸载后 `plugin({ action: 'tool' })` 再调它会报「插件工具不存在」。
+2. **不进顶层工具表**：插件工具不再 `push` 进全局 `ctx.tools`，模型顶层 function 里看不到 `kanban_export_markdown` 这类插件工具名，只能看到 `plugin` 这一个入口。已装插件越多，顶层工具表**不膨胀**（这是本机制的目的：把「每装一个插件顶层 +N 个工具」收敛为「固定 +1 个调度入口」）。
+3. **管家与普通会话都有入口**（与实现一致，`apps/runtime/src/execution.ts` 的 `SUPERVISOR_ALLOWED_BASE_TOOL_NAMES` 显式含 `plugin`）：`plugin` 既在普通会话工具集 `ctx.tools` 里，也在管家白名单里 —— **任何会话（含管家下发的后台子会话）的 agent 都能调已安装插件注册的工具**，例如用已安装的语音播报类插件向用户念一句结论。管家仍不暴露 `skill_*`（技能调度），但插件工具入口不例外。
+4. **查询入口**：插件工具名经 `plugin({ action: 'inspect' })` 的 `pluginTools` 字段、或 `plugin({ action: 'list' })` 的 `tools` 字段暴露，AI 调用前先查清单拿到确切的 `(pluginId, tool)` 组合，禁止凭印象猜工具名。
+5. **与内置发声能力的关系**：山海内置的 `runtime.voice`（`voice:speak` IPC 与插件白名单能力 `speak`）**不是 agent 工具** —— 模型侧要发声，只能调已安装的语音播报类插件注册的工具（`plugin({ action: 'tool', pluginId, tool, args })`，具体 id/工具名以 `plugin({ action: 'list' })` 返回为准）。
+6. **禁止把某个插件的 `id` / 工具名写进内核或提示词**：插件 id 与工具名由插件作者自定，**随时可被改名、卸载、重装**（实测案例：某语音插件从 `voice`/`voice_speak` 改名为 `talk-to-user`/`talk_to_user` 后，任何写死旧名的示例立即失效）。内核侧只固化**机制**（`list` → `tool` 双键分派），具体名字一律运行时以 `plugin({ action: 'list' })` / `plugin({ action: 'inspect' })` 的 `pluginTools` 字段为准。

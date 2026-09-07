@@ -84,6 +84,12 @@ export interface DmComposerProps {
   onSend: (text: string, atts: DmAttachmentPayload[]) => Promise<boolean>
   /** 被本组件拦下时（未登录 / 没就绪 / 上传未完成 / 超限）交出一条可见原因；传空串表示清除上一条原因 */
   onBlocked: (reason: string) => void
+  /** 【P6】初始正文：切回该会话时用它重建输入框内容（父组件按 channelId 存草稿） */
+  initialText?: string
+  /** 【P6】每次输入变化实时上报（父组件据此存草稿） */
+  onTextChange?: (text: string) => void
+  /** 【P6】发送成功后通知父组件清除该会话草稿 */
+  onSent?: () => void
   /** 点缩略图看大图（复用既有 ImagePreview 遮罩） */
   onPreviewImage: (src: string) => void
 }
@@ -116,7 +122,7 @@ function stripDataUrl(dataUrl: string): string {
 export function DmComposer(p: DmComposerProps): React.JSX.Element {
   // 同 MemberPanel：本组件在 render 期直接取词，必须自订阅语言变化
   useLocaleSync()
-  const [text, setText] = useState('')
+  const [text, setText] = useState(p.initialText ?? '')
   const [atts, setAtts] = useState<DmPendingAttachment[]>([])
   const [sending, setSending] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -276,6 +282,7 @@ export function DmComposer(p: DmComposerProps): React.JSX.Element {
       if (ok) {
         setText('')
         setAtts([])
+        p.onSent?.()
       }
     } finally {
       setSending(false)
@@ -354,7 +361,7 @@ export function DmComposer(p: DmComposerProps): React.JSX.Element {
         <input ref={fileRef} type="file" multiple accept={accept} style={{ display: 'none' }} onChange={(e) => void handleFileSelect(e)} />
         <textarea
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => { setText(e.target.value); p.onTextChange?.(e.target.value) }}
           onCompositionStart={() => {
             isComposingRef.current = true
           }}

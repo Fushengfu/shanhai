@@ -1171,7 +1171,7 @@ export class SelfModifyRuntime {
         'scaffold（从模板生成可编译插件项目）、build（进程内编译出 dist 产物）、test-load（临时目录干跑加载验证）、' +
         'verify（产物等价校验）、install（安装进内核，入参 id = 项目 id，自动读工作区 package.json，落盘 ~/.shanhai/plugins/ 跨会话跨重启留存）、' +
         'publish（打包共享包 zip 供提交创意空间）、uninstall（卸载已安装插件）、' +
-        'tool（双键分派调用插件注册的功能工具：入参 pluginId + tool + args，先用 list 查到可用的 (pluginId, tool) 组合）。' +
+        'tool（调用【已安装插件】注册的功能工具，日常使用入口而不只是开发流程的一环：入参 pluginId + tool + args，必须先用 list 查到可用的 (pluginId, tool) 组合再调；插件可被改名/卸载，任何具体 id 与工具名都不是固定常量，禁止凭印象猜）。' +
         '开发插件前先 skill_read plugin-protocol 读完整规范。' +
         '开发闭环：scaffold → build → test-load → verify → install → uninstall；发布：publish。',
       inputSchema: {

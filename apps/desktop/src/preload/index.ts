@@ -400,6 +400,8 @@ export interface ShanhaiBridge {
   onMemberOpenThread(cb: (payload: { channelId: string; ts: number }) => void): () => void
   /** 订阅「切换面板分区」指令（点好友申请通知直达好友分区） */
   onMemberOpenTab(cb: (payload: { tab: 'dm' | 'friends'; ts: number }) => void): () => void
+  /** 订阅「好友消息进管家」自动接管事件（member:dm:auto-route，仅管家窗口订阅处理） */
+  onDmAutoRoute(cb: (payload: { from: string; fromName: string; content: string; channelId: string; ts: number }) => void): () => void
   /** 订阅未读汇总变化（member:unread 广播） */
   onMemberUnread(cb: (unread: DmUnread) => void): () => void
   /** 订阅会员通道错误提示（member:error，按真实原因分类，不统一成「连不上服务器」） */
@@ -592,6 +594,8 @@ export interface AppSettings {
    * 新增字段必须三处同步：runtime/types.ts、preload/index.ts、renderer/types.ts。
    */
   locale: string
+  /** 私信管家接管对外口吻：assistant=AI 助手（默认）/ user=代用户（占位，第一版不实现）。 */
+  dmReplyMode: 'assistant' | 'user'
 }
 
 /** 设置补丁：允许只传某个分组的某个字段（嵌套 Partial） */
@@ -601,6 +605,7 @@ export type AppSettingsPatch = {
   debug?: Partial<AppSettings['debug']>
   voice?: Partial<AppSettings['voice']>
   locale?: string
+  dmReplyMode?: string
 }
 
 /** 一条 HTTP 原始请求/响应记录（排查问题用：请求一条、响应一条，含接口地址与完整 body） */
@@ -877,6 +882,11 @@ const bridge: ShanhaiBridge = {
     const listener = (_e: unknown, unread: DmUnread) => cb(unread)
     ipcRenderer.on('member:unread', listener)
     return () => ipcRenderer.removeListener('member:unread', listener)
+  },
+  onDmAutoRoute: (cb) => {
+    const listener = (_e: unknown, payload: { from: string; fromName: string; content: string; channelId: string; ts: number }) => cb(payload)
+    ipcRenderer.on('member:dm:auto-route', listener)
+    return () => ipcRenderer.removeListener('member:dm:auto-route', listener)
   },
   onMemberError: (cb) => {
     const listener = (_e: unknown, err: MemberErrorPayload) => cb(err)

@@ -57,6 +57,17 @@ export const zhCN = {
   'dm.status.warn': '未就绪',
   'dm.status.bad': '不可用',
 
+  // 管家接管开关（私信 IM 化·管家接管期）：只改设置，不改收发逻辑
+  'dm.autoReply': '管家接管',
+  'dm.autoReplyDesc': '开启后，好友发来的私信自动进入管家处理：管家理解后必要时安排其他会话执行，并把结果自动回复给好友；管家也可主动给好友发消息。发出去的消息无法撤回。',
+  'dm.autoReplyState.off': '关闭',
+  'dm.autoReplyState.on': '开启（全自动）',
+  'dm.autoReplyState.half': '半自动（未开放）',
+  'dm.autoReplyConfirm': '开启后管家将自动处理好友消息并代你回复，发出去的消息无法撤回。是否开启？',
+  // 管家发消息的返回提示（主进程 member-channel 出站安全门）
+  'dm.agentNotEnabled': '管家接管开关未开启（请先在私信面板打开「管家接管」）',
+  'dm.agentFiltered': '消息内容含敏感信息，已拦截（请避开密钥、路径、服务器地址等敏感内容后重试）',
+
   // 「去登录」链路（禁止静默失败）
   'dm.login.noBridge': '本窗口拿不到登录通道（window.shanhai.openApp 不可用）：请在聊天窗口侧边栏或 Dock 的「登录」项完成登录后重开私信',
   'dm.login.chatNotOpened': '未能打开聊天窗口，登录框无法显示：请点 Dock 的「登录」项，或用托盘「显示主窗口」后重试',
@@ -95,6 +106,10 @@ export const zhCN = {
   'dm.quote.footer': '选定后只会把私信原文**追加**到该会话的输入框，山海不会自动发送，请你确认后自己按发送。',
   'dm.quote.hint': '点消息旁 ＋ 会弹出会话选择器；只会把原文追加到所选会话的输入框，山海不会自动发送',
   'dm.quote.btnTitle': '引用这条私信：先弹出会话选择器，选定后只把原文追加到该会话的输入框（不会自动发送）',
+  'dm.ctx.copy': '复制文本',
+  'dm.ctx.quote': '引用到会话',
+  'dm.newMessage': { one: '以下为 1 条新消息', other: '以下为 {n} 条新消息' },
+  'dm.toast.sentOk': '已发送',
 
   // 查找 / 添加好友
   'dm.search.emptyName': '请输入要查找的用户名（必须与对方账号完全一致）',

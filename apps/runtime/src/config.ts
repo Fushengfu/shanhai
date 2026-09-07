@@ -210,6 +210,8 @@ export async function readSettings(): Promise<AppSettings> {
       compaction: { modelId: s?.compaction?.modelId ?? DEFAULT_SETTINGS.compaction.modelId },
       // 老 config 没有这个字段 → 空串（未设置），由主进程按系统语言解析一次后写回
       locale: typeof s?.locale === 'string' ? s.locale : DEFAULT_SETTINGS.locale,
+      dmAutoReply: typeof s?.dmAutoReply === 'boolean' ? s.dmAutoReply : DEFAULT_SETTINGS.dmAutoReply,
+      dmReplyMode: s?.dmReplyMode === 'user' ? 'user' : DEFAULT_SETTINGS.dmReplyMode,
     }
   } catch {
     return {
@@ -243,6 +245,8 @@ export async function writeSettings(patch: Partial<AppSettings>): Promise<void> 
         compaction: { ...DEFAULT_SETTINGS.compaction, ...(cur.compaction ?? {}), ...(patch.compaction ?? {}) },
         // locale 是标量：只有显式传了才覆盖，undefined 时保留原值（避免半份 patch 把语言抹回未设置）
         locale: typeof patch.locale === 'string' ? patch.locale : (cur.locale ?? DEFAULT_SETTINGS.locale),
+        dmAutoReply: typeof patch.dmAutoReply === 'boolean' ? patch.dmAutoReply : (cur.dmAutoReply ?? DEFAULT_SETTINGS.dmAutoReply),
+        dmReplyMode: patch.dmReplyMode === 'user' ? 'user' : (cur.dmReplyMode === 'user' ? 'user' : DEFAULT_SETTINGS.dmReplyMode),
       }
       cfg.settings = merged
     })

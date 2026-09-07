@@ -193,6 +193,11 @@ export interface DmUnread {
   byChannel: Record<string, number>
 }
 
+/** 【P6】会话级草稿缓存：channelId → 未发送正文（localStorage 持久化，跨窗口/跨重启） */
+export interface DmDraftStore {
+  [channelId: string]: string
+}
+
 /** 会员通道统一返回体 */
 export interface MemberResult {
   ok: boolean
@@ -422,6 +427,10 @@ export interface AppSettings {
    * 与 runtime / preload 的同名字段一一对应，三处都要有，否则 tsc 报缺字段。
    */
   locale: string
+  /** 私信「管家接管」开关：true 时管家可代表用户对好友发消息（含自动回复）。默认 false。 */
+  dmAutoReply: boolean
+  /** 私信管家接管对外口吻：assistant=AI 助手（默认）/ user=代用户（占位，第一版不实现）。 */
+  dmReplyMode: 'assistant' | 'user'
 }
 
 /** 设置补丁：允许只传某个分组的某个字段（嵌套 Partial） */
@@ -434,6 +443,8 @@ export type AppSettingsPatch = {
   supervisorAsk?: Partial<AppSettings['supervisorAsk']>
   compaction?: Partial<AppSettings['compaction']>
   locale?: string
+  dmAutoReply?: boolean
+  dmReplyMode?: string
 }
 
 /** 一条 HTTP 原始请求/响应记录（排查问题用：请求一条、响应一条，含接口地址与完整 body） */
@@ -596,6 +607,8 @@ declare global {
       onMemberOpenThread(cb: (payload: { channelId: string; ts: number }) => void): () => void
       /** 订阅「切换面板分区」指令（点好友申请通知直达好友分区） */
       onMemberOpenTab(cb: (payload: { tab: 'dm' | 'friends'; ts: number }) => void): () => void
+      /** 订阅「好友消息进管家」自动接管事件（member:dm:auto-route，仅管家窗口订阅处理） */
+      onDmAutoRoute(cb: (payload: { from: string; fromName: string; content: string; channelId: string; ts: number }) => void): () => void
       /** 订阅未读汇总变化（member:unread） */
       onMemberUnread(cb: (unread: DmUnread) => void): () => void
       /** 订阅会员通道错误（member:error，按真实原因分类） */

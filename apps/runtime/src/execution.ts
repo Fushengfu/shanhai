@@ -20,6 +20,7 @@ import { createSupervisorTools, SUPERVISOR_ID, SUPERVISOR_MAX_HISTORY_TURNS, typ
 import { createSupervisorLedgerTools } from './supervisor-workspace'
 import { modelSupportsVision } from './models'
 import { sessionContext, type RuntimeContext, type SessionMeta } from './context'
+import type { DmPendingReply } from './types'
 import type { TokenStatsModule } from './token-stats'
 import type { PromptsModule } from './prompts'
 import type { ModelProviderModule } from './model-provider'
@@ -27,8 +28,8 @@ import type { SessionsModule } from './sessions'
 
 export interface ExecutionModule {
   runInSession(sid: string, message: string, opts?: { maxSteps?: number; attachments?: ContentPart[] }, modelIdOverride?: string, origin?: 'user' | 'supervisor'): Promise<string>
-  dispatchToSession(sid: string, message: string, mode: 'insert' | 'queue', onDone: (sid: string, title: string, result?: string, error?: string) => void, origin?: 'user' | 'supervisor'): Promise<{ ok: boolean; message: string; result?: string }>
-  sendMessageToSession(sid: string, message: string, mode: 'insert' | 'queue'): Promise<{ ok: boolean; message: string; result?: string }>
+  dispatchToSession(sid: string, message: string, mode: 'insert' | 'queue', onDone: (sid: string, title: string, result?: string, error?: string) => void, origin?: 'user' | 'supervisor', dmReplyTarget?: DmPendingReply): Promise<{ ok: boolean; message: string; result?: string }>
+  sendMessageToSession(sid: string, message: string, mode: 'insert' | 'queue', dmReplyTarget?: DmPendingReply): Promise<{ ok: boolean; message: string; result?: string }>
   runSession(sid: string, message: string, mode?: 'insert' | 'queue'): Promise<{ ok: boolean; message: string; result?: string }>
   notifySupervisorResult(sid: string, title: string, result?: string, error?: string): void
   drainSupervisorQueue(sid: string): void
@@ -193,6 +194,7 @@ export function createExecutionModule(
     mode: 'insert' | 'queue',
     onDone: (sid: string, title: string, result?: string, error?: string) => void,
     origin: 'user' | 'supervisor' = 'user',
+    dmReplyTarget?: DmPendingReply,
   ): Promise<{ ok: boolean; message: string; result?: string }> {
     const meta = ctx.sessions.get(sid)
     if (!meta || meta.isSupervisor) return { ok: false, message: `会话不存在: ${sid}` }
@@ -215,6 +217,12 @@ export function createExecutionModule(
       return Promise.resolve({ ok: true, message: `会话「${meta.title}」(${sid}) 正在执行，需求已排队（当前任务结束后自动执行）` })
     }
 
+    // 私信管家接管·回发映射：仅「管家因某好友私信而派活」时记录（origin=supervisor 且显式带 dmReplyTarget）。
+    // 普通派活（不含 dmReplyTarget）绝不记录 → 会话完成绝不触发回发（防误触发）；队列/插入模式（busy 提前返回）不覆盖映射。
+    if (origin === 'supervisor' && dmReplyTarget && dmReplyTarget.fromName) {
+      ctx.dmPendingReplies.set(sid, dmReplyTarget)
+    }
+
     const title = meta.title
     const targetModelId = meta.modelId ?? ctx.defaultModelId
     const turnSeq = countNonInjectedUserMessages(meta.session) + 1
@@ -230,8 +238,8 @@ export function createExecutionModule(
     return Promise.resolve({ ok: true, message: `已向会话「${title}」(${sid}) 下发任务，将异步执行` })
   }
 
-  function sendMessageToSession(sid: string, message: string, mode: 'insert' | 'queue'): Promise<{ ok: boolean; message: string; result?: string }> {
-    return dispatchToSession(sid, message, mode, (sid, title, result, error) => notifySupervisorResult(sid, title, result, error), 'supervisor')
+  function sendMessageToSession(sid: string, message: string, mode: 'insert' | 'queue', dmReplyTarget?: DmPendingReply): Promise<{ ok: boolean; message: string; result?: string }> {
+    return dispatchToSession(sid, message, mode, (sid, title, result, error) => notifySupervisorResult(sid, title, result, error), 'supervisor', dmReplyTarget)
   }
 
   function runSession(sid: string, message: string, mode: 'insert' | 'queue' = 'insert'): Promise<{ ok: boolean; message: string; result?: string }> {
@@ -265,6 +273,8 @@ export function createExecutionModule(
     'remember',
     'recall_memory',
     'plugin',
+    // 管家接管私信：管家代表用户对好友发消息（安全门在宿主 sendDmFromAgent：接管开关 + 出站敏感信息硬拦截）
+    'dm_send',
   ])
 
   const buildSupervisorLoopTools = (): ToolContract[] => [
@@ -277,7 +287,7 @@ export function createExecutionModule(
           .filter((s): s is SessionStateSummary => s !== null),
       inspectSession: (sid) => sessions.describeSession(sid),
       listModels: () => allModels().map((m) => ({ id: m.id, name: m.displayName ?? m.name ?? m.id, modelType: m.modelType })),
-      sendMessage: (sid, message, mode) => sendMessageToSession(sid, message, mode),
+      sendMessage: (sid, message, mode, dmReplyTarget) => sendMessageToSession(sid, message, mode, dmReplyTarget),
       switchSession: (sid) => sessions.switchSessionInternal(sid),
       setSessionModel: (sid, modelId) => sessions.setSessionModelInternal(sid, modelId),
       setSessionApproval: (sid, policy) => sessions.setSessionApprovalInternal(sid, policy),
@@ -442,13 +452,37 @@ export function createExecutionModule(
 
   function wakeSupervisorForResult(sid: string, title: string, result?: string, error?: string): void {
     const body = error ? `执行失败：${error}` : (result ?? '（无正文输出）')
-    const prompt =
-      `【任务回传】会话「${title}」(${sid}) 的任务执行${error ? '失败' : '完成'}。\n` +
-      `结果：${body}\n\n` +
-      `请按【任务编排】流程接力处理：\n` +
-      `1. 若该会话在台账里有任务清单（state.json 的 tasks），ledger({ action: "read" }) 读取后，把刚完成的任务 status 改为 done（失败改 blocked）并回填 result，同步 _index.json。\n` +
-      `2. 若清单里还有 status=todo 的后续任务，用 send_message 把下一个任务下发给该会话（继续推进流水线）。\n` +
-      `3. 若清单已全部 done、或该会话本就没有任务清单（只是简单转发），更新必要状态后结束本轮，不要重复下发、不要空转。`
+    const dmPending = ctx.dmPendingReplies.get(sid)
+    // 私信接管·回发好友：仅当该会话是「因某好友私信而派活」的（mapper 里记录过目标好友）才在其完成时
+    // 追加「用 dm_send 把结果发给好友」的指示，并立即清除映射（只回发一次，防误触发重复回发）。
+    // 普通会话（无映射）走原样【任务回传】提示词，行为与本轮之前完全一致（不回归）。
+    let prompt: string
+    if (dmPending) {
+      ctx.dmPendingReplies.delete(sid)
+      const targetDesc = dmPending.channelId
+        ? `channelId=${dmPending.channelId}`
+        : dmPending.peerMemberId
+          ? `peerMemberId=${dmPending.peerMemberId}`
+          : ''
+      prompt =
+        `【任务回传】会话「${title}」(${sid}) 的任务执行${error ? '失败' : '完成'}。\n` +
+        `结果：${body}\n\n` +
+        `请按【任务编排】流程接力处理：\n` +
+        `1. 若该会话在台账里有任务清单（state.json 的 tasks），ledger({ action: "read" }) 读取后，把刚完成的任务 status 改为 done（失败改 blocked）并回填 result，同步 _index.json。\n` +
+        `2. 若清单里还有 status=todo 的后续任务，用 send_message 把下一个任务下发给该会话（继续推进流水线）。\n` +
+        `3. 若清单已全部 done、或该会话本就没有任务清单（只是简单转发），更新必要状态后结束本轮，不要重复下发、不要空转。\n\n` +
+        `【回发好友（务必执行）】该会话「${title}」(${sid}) 是为你的用户的好友「${dmPending.fromName}」派发的私信任务。\n` +
+        `请用 dm_send 工具把本条任务结果发给该好友（params：${targetDesc}，text 填结果正文）。\n` +
+        `若返回 reason=content_filtered（含敏感信息被出站过滤器拦下），请友好地换措辞重试；若返回 not_enabled（管家接管开关已关闭），本轮结束、不要重复下发。发送成功后结束本轮。`
+    } else {
+      prompt =
+        `【任务回传】会话「${title}」(${sid}) 的任务执行${error ? '失败' : '完成'}。\n` +
+        `结果：${body}\n\n` +
+        `请按【任务编排】流程接力处理：\n` +
+        `1. 若该会话在台账里有任务清单（state.json 的 tasks），ledger({ action: "read" }) 读取后，把刚完成的任务 status 改为 done（失败改 blocked）并回填 result，同步 _index.json。\n` +
+        `2. 若清单里还有 status=todo 的后续任务，用 send_message 把下一个任务下发给该会话（继续推进流水线）。\n` +
+        `3. 若清单已全部 done、或该会话本就没有任务清单（只是简单转发），更新必要状态后结束本轮，不要重复下发、不要空转。`
+    }
     ctx.supervisorWakeQueue.push(prompt)
     const supMeta = ctx.sessions.get(SUPERVISOR_ID)
     const turnSeq = supMeta ? countNonInjectedUserMessages(supMeta.session) + 1 : 1

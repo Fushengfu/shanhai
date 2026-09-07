@@ -1,5 +1,6 @@
 import { app, BrowserWindow, Menu, screen, type MenuItemConstructorOptions } from 'electron'
 import { join, dirname } from 'node:path'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { isPluginApp, resolvePluginEntryHtml } from './plugin-apps'
 import { getMainLocale } from './locale-store'
@@ -12,6 +13,48 @@ export const ICON_PATH = join(__dirname, '../../assets/icon-256.png')
 
 /** 是否为 Windows 平台（Windows 下 roundedCorners 选项无效，frameless 窗口是直角，需透明窗口 + CSS 圆角弥补） */
 const isWin = process.platform === 'win32'
+
+/**
+ * t7/P7 私信窗口尺寸记忆。
+ * - 私信面板（appId='messages'）初始尺寸 1080×720（比其它 app 的 980×720 更宽），最小宽度 760；
+ * - 用户拖动/缩放后按 appId 持久化到 <userData>/window-bounds.json，重启后恢复。
+ * 仅 window-manager.ts 内部读写，不新增 IPC / 不写 config.json（避免与 runtime 串行写竞争），隔离于 userData。
+ */
+const DM_PANEL_APP_ID = 'messages'
+const BASE_APP_SIZE = { width: 980, height: 720 }
+const DEFAULT_APP_SIZE: Record<string, { width: number; height: number }> = {
+  [DM_PANEL_APP_ID]: { width: 1080, height: 720 },
+}
+
+function windowBoundsPath(): string {
+  return join(app.getPath('userData'), 'window-bounds.json')
+}
+
+/** 读取已持久化的窗口尺寸（key=appId）；文件缺失/损坏时返回空对象（不阻断） */
+function readWindowBounds(): Record<string, { width: number; height: number }> {
+  try {
+    const obj = JSON.parse(readFileSync(windowBoundsPath(), 'utf8'))
+    return obj && typeof obj === 'object' ? (obj as Record<string, { width: number; height: number }>) : {}
+  } catch {
+    return {}
+  }
+}
+
+/** 持久化指定 appId 的窗口尺寸到 userData/window-bounds.json（写失败忽略，属增强能力） */
+function persistWindowBounds(appId: string, width: number, height: number): void {
+  try {
+    const all = readWindowBounds()
+    all[appId] = { width, height }
+    writeFileSync(windowBoundsPath(), JSON.stringify(all, null, 2), { mode: 0o600 })
+  } catch {
+    // 忽略持久化失败：尺寸记忆丢失不影响窗口可用
+  }
+}
+
+/** 某 appId 的默认初始尺寸：私信面板用专属宽高，其余 app 回落基础尺寸 */
+function defaultAppSize(appId: string): { width: number; height: number } {
+  return DEFAULT_APP_SIZE[appId] ?? BASE_APP_SIZE
+}
 
 /**
  * 窗口类型（山海多窗口桌面系统的三类窗口）：
@@ -137,8 +180,8 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
   } else if (type === 'app') {
     // 应用/插件弹窗：贴 Dock 上方弹出（不顶到屏幕最顶部），水平居中。
     // 取 Dock 窗口实际 bounds 对齐（Dock 尺寸随内容自适应），Dock 不可见时回退到工作区底部默认值。
-    const aw = opts.width ?? 980
-    const ah = opts.height ?? 720
+    const aw = opts.width ?? defaultAppSize(appId ?? '').width
+    const ah = opts.height ?? defaultAppSize(appId ?? '').height
     const dockWin = findWindow('dock')
     let dockTop: number
     if (dockWin && !dockWin.win.isDestroyed() && dockWin.win.isVisible()) {
@@ -170,6 +213,8 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
     // alwaysOnTop 不影响最小化/关闭/拖动；悬浮图标(supervisor-bubble)已置顶，此处对齐管家主窗口。
     ...(type === 'supervisor' ? { alwaysOnTop: true } : {}),
     ...(type === 'app' ? { alwaysOnTop: true } : {}),
+    // t7/P7 私信面板最小宽度 760：比默认 1080 窄，但防气泡/输入区被压到崩坏。高度由内容自适应，不设下限。
+    ...(type === 'app' && appId === DM_PANEL_APP_ID ? { minWidth: 760 } : {}),
     fullscreen: shellBounds ? false : (opts.fullscreen ?? false),
     show: opts.show ?? true,
     icon: ICON_PATH,
@@ -569,7 +614,20 @@ export async function openApp(appId: string): Promise<boolean> {
     showWindow(existing.win)
     return true
   }
-  const win = createWindow({ type: 'app', appId, width: 980, height: 720, isPlugin: isPluginApp(appId) })
+  const savedSize = readWindowBounds()[appId] ?? defaultAppSize(appId)
+  const win = createWindow({ type: 'app', appId, width: savedSize.width, height: savedSize.height, isPlugin: isPluginApp(appId) })
+  // t7/P7 私信面板拖动/缩放后按 appId 持久化尺寸（防抖 300ms），不监听其它 app 避免写入噪声
+  if (appId === DM_PANEL_APP_ID) {
+    let saveTimer: ReturnType<typeof setTimeout> | undefined
+    win.on('resize', () => {
+      if (saveTimer) clearTimeout(saveTimer)
+      saveTimer = setTimeout(() => {
+        if (win.isDestroyed()) return
+        const b = win.getBounds()
+        if (b.width > 0 && b.height > 0) persistWindowBounds(appId, b.width, b.height)
+      }, 300)
+    })
+  }
   // 插件窗口：加载编译产物 dist/client.html（独立渲染入口，支持完整 React + JSX + 依赖 + 复杂 UI）。
   // 内置 app 窗口（terminal/trace/memory/models 等）保持统一 renderer 不变。
   const pluginEntry = isPluginApp(appId) ? resolvePluginEntryHtml(appId) : undefined

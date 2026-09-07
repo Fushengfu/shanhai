@@ -67,6 +67,8 @@ import type {
   PluginVideoGenInput,
   PluginImageGenInput,
   PluginTtsInput,
+  DmUseService,
+  DmPendingReply,
 } from './types'
 
 export type { AskRequest } from '@shanhai/ask'
@@ -105,6 +107,52 @@ function snapshotSettings(s: AppSettings): AppSettings {
     supervisorClientRun: { ...s.supervisorClientRun },
     compaction: { ...s.compaction },
     locale: s.locale,
+    dmAutoReply: s.dmAutoReply,
+    dmReplyMode: s.dmReplyMode,
+  }
+}
+
+/** CLI / 无桌面端宿主时的私信发消息 mock：任何调用都返回「未开启」或「不可用」，绝不放行。 */
+function createMockDmUseService(): DmUseService {
+  return {
+    async sendFromAgent() {
+      return { ok: false, reason: 'not_enabled', message: '私信发消息桥未装配（非桌面端宿主）' }
+    },
+  }
+}
+
+/** 管家/会话「发私信」工具：委托宿主注入的 ctx.dmUse 发消息。
+ *  执行侧只有这一层，审批与安全门都在宿主 sendDmFromAgent（dmAutoReply 开关 + 出站敏感信息硬拦截）。 */
+const DM_SEND_TOOL_NAME = 'dm_send'
+function createDmSendTool(dmUse: DmUseService): ToolContract {
+  return {
+    name: DM_SEND_TOOL_NAME,
+    description:
+      '以当前登录会员身份给好友发一条私信（需先在私信面板开启「管家接管」开关）。用于：好友发来消息后管家直接回复；任务处理结果自动转发给指定好友。入参 channelId 与 peerMemberId 二选一（channelId 优先）。返回 ok=false 时看 reason：not_enabled（接管开关未开）/ content_filtered（含敏感信息被拦，请换措辞重试）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: '会话 id（channelId）；与 peerMemberId 二选一' },
+        peerMemberId: { type: 'string', description: '目标好友 memberId；与 channelId 二选一' },
+        text: { type: 'string', description: '要发送的正文' },
+        replyTo: { type: 'string', description: '引用的对方消息（可选）' },
+      },
+      required: ['text'],
+      additionalProperties: false,
+    } as Record<string, unknown>,
+    riskLevel: 'reversible',
+    timeoutMs: 15_000,
+    execute: async (args) => {
+      const text = String(args.text ?? '').trim()
+      if (!text) return { ok: false, message: '私信内容不能为空' }
+      const r = await dmUse.sendFromAgent({
+        channelId: args.channelId ? String(args.channelId) : undefined,
+        peerMemberId: args.peerMemberId ? String(args.peerMemberId) : undefined,
+        text,
+        replyTo: args.replyTo ? String(args.replyTo) : undefined,
+      })
+      return r
+    },
   }
 }
 
@@ -152,6 +200,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   ctx.computerUse = createPlatformComputerUseService()
   ctx.browserUse = options.browserUse ?? createMockBrowserUseService()
   ctx.terminalUse = options.terminalUse ?? createMockTerminalService()
+  ctx.dmUse = options.dmUse ?? createMockDmUseService()
   ctx.userTerminalSessionMap = new Map<string, string>()
   ctx.userTerminalOutputCallbacks = new Set<(sessionId: string, terminalId: string, data: string) => void>()
   ctx.voice = createSystemVoiceService()
@@ -218,6 +267,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   ctx.supervisorQueue = new Map<string, string[]>()
   ctx.supervisorWakeQueue = [] as string[]
   ctx.supervisorWaking = false
+  ctx.dmPendingReplies = new Map<string, DmPendingReply>()
   ctx.sessionActivityCallbacks = new Set<(sessionId: string, kind: 'start' | 'end') => void>()
   ctx.currentSessionChangedCallbacks = new Set<(sessionId: string) => void>()
   ctx.supervisorResultCallbacks = new Set<(sessionId: string, title: string, result?: string, error?: string) => void>()
@@ -767,6 +817,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     ...skillTools,
     ...mcpTools,
     pluginTool,
+    createDmSendTool(ctx.dmUse),
   ]
   ctx.tools.push(...baseTools.map(wrapTool))
 
@@ -1917,6 +1968,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         supervisorClientRun: { ...ctx.currentSettings.supervisorClientRun, ...(patch.supervisorClientRun ?? {}) },
         compaction: { ...ctx.currentSettings.compaction, ...(patch.compaction ?? {}) },
         locale: typeof patch.locale === 'string' ? patch.locale : ctx.currentSettings.locale,
+        dmAutoReply: typeof patch.dmAutoReply === 'boolean' ? patch.dmAutoReply : ctx.currentSettings.dmAutoReply,
+        dmReplyMode: patch.dmReplyMode === 'user' ? 'user' : (ctx.currentSettings.dmReplyMode === 'user' ? 'user' : DEFAULT_SETTINGS.dmReplyMode),
       }
       // 实时同步到浏览器后端（影响后续新建窗口是否显示，已存在窗口不受影响）
       ctx.browserUse.setShowOnCreate?.(ctx.currentSettings.browser.showOnCreate)

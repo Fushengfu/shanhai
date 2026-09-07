@@ -35,6 +35,7 @@ import {
   pullThreads,
   getHistory,
   sendDm,
+  sendDmFromAgent,
   markChannelRead,
   getUnread,
   quoteDmToSession,
@@ -363,6 +364,11 @@ export function registerIpc(): void {
   // 定稿 v1.1：历史是 page/pageSize 偏移分页（page=1 最新一页，加载更早=page 递增），不是时间戳游标
   ipcMain.handle('member:history', async (_e, input: { channelId: string; page?: number; pageSize?: number }) => getHistory(input))
   ipcMain.handle('member:send', async (_e, input: { peerMemberId?: string; channelId?: string; text: string; peerName?: string }) => sendDm(input ?? { text: '' }))
+  // 【管家接管私信】管家/Agent 以当前会员身份发私信：进 sendDmFromAgent 的安全门（dmAutoReply 开关 + 出站敏感信息硬拦截）。
+  // 允许新增这一条 handler（ipcMain.handle 125→126）；不进插件窗口白名单（危险接口，永不放行给插件）。
+  ipcMain.handle('member:send-from-agent', async (_e, input: { channelId?: string; peerMemberId?: string; text: string; replyTo?: string }) =>
+    sendDmFromAgent(input ?? { text: '' }),
+  )
   ipcMain.handle('member:markRead', async (_e, channelId: string) => markChannelRead(String(channelId ?? '')))
   // 【红线入口】把某条私信引用到指定会话的输入框：必须由本地用户在私信面板显式点击才会走到这里，
   // 主进程只把带来源标记的文本投给聊天窗口写进输入框，不触发任何执行、不进任何 Agent 上下文。

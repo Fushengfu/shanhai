@@ -163,7 +163,7 @@ const SECTIONS: Array<{ id: SectionId; k: string; icon: ReactNode }> = [
 export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?: number; top?: number; onClose?: () => void; variant?: 'panel' | 'window' }) {
   // 当前生效语言（用于「当前生效」那一行；本面板自身的文案属第 4 期，本期不翻）
   const { locale, switchLocale } = useI18n()
-  const [settings, setSettings] = useState<AppSettings>({ browser: { showOnCreate: true, enableWebBridge: false }, messageSubmit: { mode: 'queue' }, debug: { traceLlm: false }, voice: { enabled: false }, supervisorApproval: { enabled: true }, supervisorAsk: { enabled: true }, compaction: { modelId: '' }, locale: '' })
+  const [settings, setSettings] = useState<AppSettings>({ browser: { showOnCreate: true, enableWebBridge: false }, messageSubmit: { mode: 'queue' }, debug: { traceLlm: false }, voice: { enabled: false }, supervisorApproval: { enabled: true }, supervisorAsk: { enabled: true }, compaction: { modelId: '' }, locale: '', dmAutoReply: false, dmReplyMode: 'assistant' })
   const [models, setModels] = useState<GatewayModel[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)

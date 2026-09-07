@@ -1,10 +1,11 @@
 import * as React from 'react'
 import { useState } from 'react'
-import { IconFile, IconImage, IconPlus } from './icons'
-import { formatBytes, smallIconBtn } from './ui'
-import { decodeDmContent, dmContentPreview } from '../../shared/dm-attachment'
+import { IconCopy, IconFile, IconImage, IconPlus, IconQuote } from './icons'
+import { copyText, formatBytes, smallIconBtn } from './ui'
+import { decodeDmContent, dmContentPreview, dmContentToPlainText } from '../../shared/dm-attachment'
 import { t } from '../../shared/i18n'
 import type { DmMessage } from '../types'
+import { useDismissOnClickOutside } from './useDismissOnClickOutside'
 
 /**
  * 私信面板 IM 化（P1 双栏骨架 / P2 气泡与时间）的**纯显示**共用件。
@@ -268,6 +269,51 @@ export function DmTimeDivider(props: { ts: number }): React.JSX.Element {
   )
 }
 
+/** 【P6】未读分割线（会话级近似，非逐条水位）。
+ *  ⚠️ 网关无 lastReadSeq（v1.2 未实现），拿不到「逐条已读到哪」——这里用打开会话那一刻的
+ *  unread 快照做近似：unread = 这次进入时网关给的未读数，分割线画在消息流倒数第 unread 条之前。
+ *  打开会话即 markRead，故 active.unread 在本次会话内保持打开时快照、不随 markRead 移动；
+ *  下次再进（未读已归 0）则不再显示 —— 即「看过后消失」的会话级近似。 */
+export function DmUnreadDivider(props: { count: number }): React.JSX.Element {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8, margin: '10px 0 2px' }}>
+      <span style={{ flex: '0 0 26px', height: 1, background: 'var(--border-strong, rgba(128,128,128,.4))' }} />
+      <span style={{ fontSize: 10, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+        {t('dm.newMessage', { n: props.count })}
+      </span>
+      <span style={{ flex: '0 0 26px', height: 1, background: 'var(--border-strong, rgba(128,128,128,.4))' }} />
+    </div>
+  )
+}
+
+/** 单个右键菜单项 */
+function CtxMenuItem(props: { icon: React.ReactNode; label: string; onClick: () => void }): React.JSX.Element {
+  const [hover, setHover] = useState(false)
+  return (
+    <button
+      onClick={props.onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        width: '100%',
+        padding: '6px 12px',
+        border: 'none',
+        background: hover ? 'var(--hover-bg, rgba(128,128,128,.12))' : 'transparent',
+        color: 'var(--text)',
+        cursor: 'pointer',
+        fontSize: 13,
+        textAlign: 'left',
+      }}
+    >
+      {props.icon}
+      <span>{props.label}</span>
+    </button>
+  )
+}
+
 /**
  * 【P2】一条私信气泡：左右分侧 + 头像 + 状态标记独立一行（时间已挪到消息之间，这里不再显示时间）。
  * ⚠️ 传进来的 peerName / mineName 必须已经是 displayNameOf 归一过的显示名（不许是会员ID）。
@@ -290,8 +336,19 @@ export function DmMessageRow(props: {
   // 【P3】content 可能是「附件引用 JSON」：解出正文与引用；解不出来时 decode 会原样交回文本，
   // 所以手机端 / 老版本发的普通文本（甚至用户手打的 JSON）都不会被我们吞掉。
   const parsed = decodeDmContent(m.text)
+  // ── 右键菜单状态 ──
+  const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null)
+  const ctxRef = React.useRef<HTMLDivElement>(null)
+  useDismissOnClickOutside({ open: !!ctxPos, containerRef: ctxRef, onDismiss: () => setCtxPos(null) })
+
+  const handleContextMenu = (e: React.MouseEvent): void => {
+    e.preventDefault()
+    setCtxPos({ x: e.clientX, y: e.clientY })
+  }
+  const plainText = dmContentToPlainText(m.text)
+
   return (
-    <div style={{ display: 'flex', flexDirection: mine ? 'row-reverse' : 'row', gap: 8, alignItems: 'flex-start', marginTop: 8 }}>
+    <div style={{ display: 'flex', flexDirection: mine ? 'row-reverse' : 'row', gap: 8, alignItems: 'flex-start', marginTop: 8 }} onContextMenu={handleContextMenu}>
       {/* 自己的气泡上方多了一行状态，头像往下让一格，保证头像是跟气泡对齐而不是跟状态行对齐 */}
       <span style={{ display: 'inline-flex', marginTop: mine ? 14 : 0, flexShrink: 0 }}>
         <DmAvatar name={mine ? props.mineName : props.peerName} size={30} src={mine ? undefined : props.peerAvatar} />
@@ -328,6 +385,37 @@ export function DmMessageRow(props: {
       >
         <IconPlus />
       </button>
+      {/* 【P5·右键菜单】onContextMenu 挂在外层，气泡+头像+引用按钮都响应右键 */}
+      {ctxPos && (
+        <div
+          ref={ctxRef}
+          style={{
+            position: 'fixed',
+            left: ctxPos.x,
+            top: ctxPos.y,
+            zIndex: 10000,
+            minWidth: 140,
+            background: 'var(--bg-panel)',
+            border: '1px solid var(--border)',
+            borderRadius: 8,
+            boxShadow: '0 4px 16px rgba(0,0,0,.18)',
+            padding: '4px 0',
+            fontSize: 13,
+            color: 'var(--text)',
+          }}
+        >
+          <CtxMenuItem
+            icon={<IconCopy />}
+            label={t('dm.ctx.copy')}
+            onClick={() => { copyText(plainText); setCtxPos(null) }}
+          />
+          <CtxMenuItem
+            icon={<IconQuote />}
+            label={t('dm.ctx.quote')}
+            onClick={() => { props.onQuote(m); setCtxPos(null) }}
+          />
+        </div>
+      )}
     </div>
   )
 }

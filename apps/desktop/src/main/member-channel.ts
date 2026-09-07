@@ -1591,6 +1591,19 @@ function handleDownstream(env: MemberEnvelope, rawBytes: number): void {
         notifyDmMessage(displayNameOf(peerName, peerId), dmContentPreview(content), () => {
           broadcast('member:open-thread', { channelId, ts: Date.now() })
         })
+        // 【管家接管·t6 入站路由】好友发来消息 → 若「管家接管」开关开着，广播一条 auto-route 事件给
+        // 管家窗口，由管家的 handleDmAutoRoute 订阅后触发一轮「理解 → 决定（回复/安排会话/忽略）」。
+        // 铁则①：dmAutoReply === false 时根本不诞生这条事件（好友消息绝不自动进管家上下文）。
+        // 这里只做「把对方消息原样交给管家」的搬运，不做任何判断；判断（要不要回、怎么回）全在管家的那一轮里。
+        if (getRuntime().getSettings().dmAutoReply) {
+          broadcast('member:dm:auto-route', {
+            from: idStr(from),
+            fromName: displayNameOf(peerName, peerId),
+            content,
+            channelId,
+            ts,
+          })
+        }
       } else {
         saveStore()
       }
@@ -2025,6 +2038,63 @@ async function pullGlobalUnread(): Promise<void> {
  * 定稿载荷：{v,type,seq,to,channelId,payload:{content},ts}；messageId 由网关生成，本地先占乐观气泡。
  * 本地预检：好友前提 / 4000 字节上限 / 按 memberID 30 条每 10 秒限流，失败一律如实回报不静默。
  */
+// ── 管家接管私信：出站敏感信息过滤器（硬拦截，宁可误拦不漏放）─────────────────
+// 只拦「管家/Agent 代用户外发」这一条路径（sendDmFromAgent）。用户手动发的 sendDm
+// 不经过这里（用户有权发出含路径/凭据的内容，这是自己的私信）。
+// 用正则 + 规则做，**不用 LLM** 语义判断：可 review、可测试、不被 prompt injection 绕过。
+export function outboundContentFilter(text: string): string | null {
+  const t = String(text ?? '')
+  const rules: Array<[string, RegExp]> = [
+    // JWT 三段式
+    ['jwt', /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/],
+    // sk- 前缀（OpenAI 风格密钥）
+    ['api_key_prefix', /\bsk-[A-Za-z0-9]{16,}/],
+    // 长 base64（泛指可能被截断的凭证/token；>= 30 字符降低误报）
+    ['long_base64', /[A-Za-z0-9+/]{30,}={0,2}/],
+    // 内部绝对路径（macOS / Windows / 配置目录）
+    ['internal_path', /\/(Users|Applications|Volumes|System)\/[^\s,'"):]+/],
+    ['internal_path', /[A-Z]:\\[^\s,'"):]+/],
+    ['internal_path', /~\/\.shanhai\/[^\s,'"):]+/],
+    // 生产/内网地址与端口
+    ['internal_addr', /39\.106\.82\.55\b/],
+    ['internal_addr', /:\s*6033\b/],
+    ['internal_addr', /(?:git\.)?huiyuanjia\.net\b/],
+    ['internal_addr', /\b(?:192\.168\.|10\.)\d+\.\d+\.\d+\b/],
+    // 内部报错原文（English ENOENT 这类裸报错）
+    ['internal_error', /\bENOENT\b/],
+    ['internal_error', /\bECONNREFUSED\b/],
+    ['internal_error', /The service was stopped/],
+    ['internal_error', /at [A-Za-z0-9_$]+\s*\([^)]*\)/],
+    // 内嵌 base64（截图/资源直传）
+    ['inline_base64', /data:image\/[a-z0-9]+;base64,/],
+    // 配置/环境变量/口令赋值
+    ['env_secret', /(?:API_KEY|SECRET|DB_PASS|DB_PASSWORD|ACCESS_KEY|SECRET_KEY|PASSWORD)\s*[:=]/i],
+  ]
+  for (const [name, re] of rules) {
+    if (re.test(t)) return name
+  }
+  return null
+}
+
+/** 管家接管：以当前会员身份给好友发消息（走出站安全门）。
+ *  只在 dmAutoReply == true 时才放行；命中出站敏感词则拒绝并返回 filterRule 供管家换措辞重试。
+ *  与 IPC handler `member:send-from-agent` 共用同一份实现（宿主 dmUse 桥也调这里），避免两条路行为漂移。 */
+export function sendDmFromAgent(input: { channelId?: string; peerMemberId?: string; text: string; replyTo?: string }): MemberResult & { msgId?: string; channelId?: string; reason?: string; filterRule?: string } {
+  const settings = getRuntime().getSettings()
+  if (!settings.dmAutoReply) {
+    console.warn('[dm-agent] 管家发消息被拒：dmAutoReply 未开启')
+    return { ok: false, message: tIn(getMainLocale(), 'dm.agentNotEnabled'), reason: 'not_enabled' }
+  }
+  const rule = outboundContentFilter((input.text ?? '').trim())
+  if (rule) {
+    console.warn(`[dm-agent] 出站内容被敏感信息过滤器拦截 rule=${rule}`)
+    return { ok: false, message: tIn(getMainLocale(), 'dm.agentFiltered'), reason: 'content_filtered', filterRule: rule }
+  }
+  const r = sendDm({ channelId: input.channelId, peerMemberId: input.peerMemberId, text: input.text })
+  if (r.ok) return { ...r }
+  return { ...r, reason: 'send_failed' }
+}
+
 export function sendDm(input: { peerMemberId?: string; channelId?: string; text: string; peerName?: string }): MemberResult & { msgId?: string; channelId?: string } {
   const text = (input.text ?? '').trim()
   if (!text) return { ok: false, message: tIn(getMainLocale(), 'dm.sendEmpty') }

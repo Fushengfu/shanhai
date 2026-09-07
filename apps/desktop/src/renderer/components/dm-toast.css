@@ -1,0 +1,61 @@
+/* 【P6】私信面板轻量浮层 toast：底部居中、自动消失、可点 × 关闭。
+ * 全部走 CSS 变量，明暗双主题自适应（背景/文字/边框/阴影都不写死颜色）。 */
+.dm-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 64px;
+  transform: translateX(-50%) translateY(8px);
+  z-index: 10001;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(80vw, 420px);
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.4;
+  background: var(--bg-panel, #fff);
+  color: var(--text, #222);
+  border: 1px solid var(--border, #ddd);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.16);
+  opacity: 0;
+  transition: opacity 160ms ease, transform 160ms ease;
+  pointer-events: auto;
+}
+
+.dm-toast.dm-toast-in {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.dm-toast-info {
+  border-left: 3px solid var(--accent, #2563eb);
+}
+
+.dm-toast-error {
+  border-left: 3px solid var(--danger, #ef4444);
+}
+
+.dm-toast-success {
+  border-left: 3px solid var(--success, #22c55e);
+}
+
+.dm-toast-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.dm-toast-close {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted, #888);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.dm-toast-close:hover {
+  color: var(--text, #222);
+}

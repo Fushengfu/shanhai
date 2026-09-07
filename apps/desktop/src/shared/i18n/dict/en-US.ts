@@ -59,6 +59,16 @@ const en = {
   'dm.status.warn': 'Not ready',
   'dm.status.bad': 'Unavailable',
 
+  // 管家接管开关（私信 IM 化·管家接管期）
+  'dm.autoReply': 'Supervisor takeover',
+  'dm.autoReplyDesc': 'When on, messages from friends are routed to the Supervisor: it understands them, schedules other sessions if needed, and auto-replies the result. The Supervisor may also proactively message friends. Sent messages cannot be retracted.',
+  'dm.autoReplyState.off': 'Off',
+  'dm.autoReplyState.on': 'On (full auto)',
+  'dm.autoReplyState.half': 'Semi (coming soon)',
+  'dm.autoReplyConfirm': 'Turning this on lets the Supervisor handle friends\' messages and reply on your behalf. Sent messages cannot be retracted. Turn it on?',
+  'dm.agentNotEnabled': 'The Supervisor takeover switch is off (enable "Supervisor takeover" in the Messages panel first)',
+  'dm.agentFiltered': 'The content was blocked by the sensitive-info filter (avoid secrets, paths, server addresses, etc.)',
+
   // 去登录链路
   'dm.login.noBridge': 'This window cannot reach the sign-in bridge (window.shanhai.openApp unavailable): sign in from the Chat window sidebar or the Dock "Sign in" item, then reopen Messages.',
   'dm.login.chatNotOpened': 'The Chat window could not be opened, so the sign-in dialog cannot appear: use the Dock "Sign in" item, or "Show main window" in the tray, then try again.',
@@ -96,6 +106,10 @@ const en = {
   'dm.quote.footer': 'Picking a conversation only **appends** the original text into its input box. Shanhai never sends it for you — review it and send it yourself.',
   'dm.quote.hint': 'Clicking + next to a message opens a conversation picker; it only appends the original text into the chosen conversation’s input box. Nothing is sent automatically.',
   'dm.quote.btnTitle': 'Quote this message: a conversation picker opens first, then the original text is appended to that conversation’s input box (nothing is sent automatically)',
+  'dm.ctx.copy': 'Copy text',
+  'dm.ctx.quote': 'Quote to session',
+  'dm.newMessage': { one: '1 new message below', other: '{n} new messages below' },
+  'dm.toast.sentOk': 'Sent',
 
   // 查找 / 添加好友
   'dm.search.emptyName': 'Enter the username to look up (it must match the other account exactly)',

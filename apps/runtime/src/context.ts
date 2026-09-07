@@ -30,7 +30,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { HttpTraceStore } from './http-trace'
-import type { ToolTrace, TokenSnapshot, AppSettings, ApprovalOutcome } from './types'
+import type { ToolTrace, TokenSnapshot, AppSettings, ApprovalOutcome, DmUseService, DmPendingReply } from './types'
 
 /** 并行会话的工具调用上下文：让全局工具包装层知道「当前工具属于哪个会话」 */
 export const sessionContext = new AsyncLocalStorage<string>()
@@ -141,6 +141,8 @@ export interface RuntimeContext {
   computerUse: ComputerUseService
   browserUse: BrowserUseService
   terminalUse: TerminalService
+  /** 私信发消息桥（宿主注入，见 types.DmUseService） */
+  dmUse: DmUseService
   /** 用户手动终端的会话归属映射（terminalId → sessionId） */
   userTerminalSessionMap: Map<string, string>
   userTerminalOutputCallbacks: Set<(sessionId: string, terminalId: string, data: string) => void>
@@ -220,6 +222,9 @@ export interface RuntimeContext {
   /** 待管家决策队列（审批/提问接管） */
   supervisorWakeQueue: string[]
   supervisorWaking: boolean
+  /** 私信管家接管·待回发映射：会话 id → 目标好友。仅「管家因某好友私信而派活」时记录，
+   *  会话完成后 wakeSupervisorForResult 消费并清除；普通会话完成时无此记录，绝不触发回发。内存 Map，不落盘。 */
+  dmPendingReplies: Map<string, DmPendingReply>
 
   // —— 事件回调 ——
   sessionActivityCallbacks: Set<(sessionId: string, kind: 'start' | 'end') => void>

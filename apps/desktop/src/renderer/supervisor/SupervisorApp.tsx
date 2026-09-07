@@ -275,6 +275,33 @@ export function SupervisorApp(): React.JSX.Element {
     return off
   }, [])
 
+  // 【管家接管·t6 好友消息自动路由】好友发来消息 → 若「管家接管」开（member-channel 只在 dmAutoReply 时广播），
+  // 由这里订阅并触发一轮管家「理解 → 决定（直接回复 / 安排会话处理后回复 / 忽略）」。
+  // ⚠️ 不注入到某个正在跑的会话上下文（那会改变该会话语义），而是作为独立一轮由 supervisorRun 承载。
+  // 铁则①：这条事件只在 dmAutoReply === true 时才被主进程广播；即使收到，内容也是原样交给管家判断，
+  //        绝不自动进任何其它 Agent 上下文。铁则②：管家后续要执行工具/发消息仍走 resolveRisk → 审批门，不放宽。
+  useEffect(() => {
+    const off = window.shanhai?.onDmAutoRoute(async (payload) => {
+      if (!payload?.content) return
+      if (cur.busy) return // 管家正在跑一轮：不打断、不并线，丢弃本次（下次好友消息再触发）
+      // 口吻设置（对外措辞，B=assistant 默认；user 占位第一版不实现，统一按 assistant 基线）
+      let mode: 'assistant' | 'user' = 'assistant'
+      try {
+        const st = await window.shanhai?.getSettings()
+        if (st?.dmReplyMode === 'user') mode = 'user'
+      } catch { /* ignore */ }
+      const intro =
+        mode === 'user'
+          ? `好友「${payload.fromName}」（memberId=${payload.from}，channelId=${payload.channelId}）发来一条私信：「${payload.content}」。你是替用户处理私信的山海，请用接近用户本人的口吻处理。`
+          : `好友「${payload.fromName}」（memberId=${payload.from}，channelId=${payload.channelId}）发来一条私信：「${payload.content}」。你是代表用户的 AI 助手「山海」（对方知道在跟 AI 对话）。请决定如何处理：直接回复、安排会话处理后回复、或忽略。` +
+            `若直接回复，请用 dm_send 工具（params 传 channelId=${payload.channelId} 或 peerMemberId=${payload.from}）；若需要安排会话处理：` +
+            `① 先用 dm_send 给对方发一条「收到，正在处理，稍后回复你」；② 用 send_message 给目标会话派活时，把 dmReplyTarget（{ channelId, peerMemberId, fromName }，channelId=${payload.channelId}、peerMemberId=${payload.from}、fromName=「${payload.fromName}」）一并传给该工具，这样会话完成后会自动把结果用 dm_send 回发给该好友。` +
+            `若一个好友的需求需要分多步、由同一会话持续推进，请只在最后一次下发任务时附 dmReplyTarget，避免中间步骤被回发给好友。`
+      void window.shanhai?.supervisorRun(intro)
+    })
+    return off
+  }, [cur.busy])
+
   // 启动时加载管家会话历史（跨重启保留）+ 管家工作目录
   useEffect(() => {
     const api = window.shanhai

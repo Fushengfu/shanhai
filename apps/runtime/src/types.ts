@@ -146,6 +146,13 @@ export interface AppSettings {
    * shared/i18n 的 normalizeLocale / resolveLocaleSetting，避免两处各判一套。
    */
   locale: string
+  /** 私信「管家接管」开关（私信 IM 化·管家接管期）：true 时好友发来的私信由管家理解并自动回复，
+   *  管家也能以当前会员身份主动给好友发消息（含任务结果自动转发）。默认 false（更安全）。
+   *  由配置面板切换写入；主进程 member-channel 在「管家发消息」出站前读它做总开关校验。 */
+  dmAutoReply: boolean
+  /** 私信「管家接管」对外口吻（私信 IM 化·管家接管期）：assistant=AI 助手口吻（默认，明确「我是山海」），
+   *  user=代用户口吻（第一版不实现，仅占位）。管家提示词按此值决定对外措辞基调。 */
+  dmReplyMode: 'assistant' | 'user'
 }
 
 /** 设置补丁：允许只传某个分组的某个字段（嵌套 Partial），setSettings 据此增量合并 */
@@ -159,6 +166,8 @@ export type AppSettingsPatch = {
   supervisorClientRun?: Partial<AppSettings['supervisorClientRun']>
   compaction?: Partial<AppSettings['compaction']>
   locale?: string
+  dmAutoReply?: boolean
+  dmReplyMode?: 'assistant' | 'user'
 }
 
 /** 通用设置默认值 */
@@ -173,6 +182,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   compaction: { modelId: '' },
   // 空串 = 从未设置 → 首次跟随系统语言
   locale: '',
+  dmAutoReply: false,
+  dmReplyMode: 'assistant',
 }
 
 /** 自定义模型输入（OpenAI 兼容或 Anthropic 协议；接口地址 / 密钥 / 模型名均由用户填写） */
@@ -482,9 +493,46 @@ export interface Runtime {
  * host 装配：用内核装配底座服务 + 能力插件。
  * 暴露登录 / 会话 / 模型 / 工具过程 / 审批 等产品能力。
  */
+/** 私信「管家接管」发消息桥（宿主注入）：把「以当前会员身份给好友发消息」暴露给管家/运行时。
+ *  实现放在桌面端主进程（member-channel.sendDmFromAgent），与服务端/进程内是同一份安全门
+ *  （dmAutoReply 总开关校验 + 出站敏感信息硬拦截都在里面）。CLI 模式缺省走 mock：返回 not_enabled。 */
+export interface DmUseService {
+  sendFromAgent(input: {
+    channelId?: string
+    /** 目标好友 memberId（与 channelId 二选一；传了 channelId 则由 channelId 推导） */
+    peerMemberId?: string
+    text: string
+    /** 引用的对方消息（透传给 sendDm 的 replyTo 语义），暂无实际帧支持时可为空 */
+    replyTo?: string
+  }): Promise<{
+    ok: boolean
+    message?: string
+    clientMsgId?: string
+    channelId?: string
+    /** 细分原因：not_enabled=总开关未开 / content_filtered=命中出站敏感词 / 其它=sendDm 返回 */
+    reason?: 'not_enabled' | 'content_filtered' | string
+    /** 命中的敏感规则（content_filtered 时给出，便于管家换措辞重试） */
+    filterRule?: string
+  }>
+}
+
+/** 私信「管家接管」·待回发映射：记录「因某好友私信而派活的会话」的目标好友。
+ *  由管家工具 send_message 的 dmReplyTarget 在派活时记录；会话完成后 wakeSupervisorForResult
+ *  消费并清除，只对标记过的会话回发一次，普通会话完成绝不受影响（防误触发）。存内存 Map，不落盘。 */
+export interface DmPendingReply {
+  /** 目标好友的私信会话 id（channelId；与 peerMemberId 二选一） */
+  channelId?: string
+  /** 目标好友 memberId（与 channelId 二选一） */
+  peerMemberId?: string
+  /** 好友显示名（用于提示词里称呼与回发上下文） */
+  fromName: string
+}
+
 export interface BootstrapOptions {
   /** 浏览器后端（桌面端注入 Electron 内置浏览器；CLI 模式缺省走 mock） */
   browserUse?: BrowserUseService
   /** 终端后端（桌面端注入 node-pty 持久 shell；CLI 模式缺省走 mock） */
   terminalUse?: TerminalService
+  /** 私信发消息桥（桌面端注入 member-channel；CLI 模式缺省走 mock） */
+  dmUse?: DmUseService
 }
