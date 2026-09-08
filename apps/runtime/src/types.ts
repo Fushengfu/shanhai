@@ -276,8 +276,8 @@ export interface Runtime {
   setSupervisorModel(modelId: string): { ok: boolean; message: string }
   /** 配置管家自己的安全模式（只作用于 supervisor 会话） */
   setSupervisorApprovalPolicy(policy: ApprovalPolicy): { ok: boolean; message: string }
-  /** 跑一次管家会话任务（独立 supervisor 窗口用，单步 ReAct + 管家工具集） */
-  runSupervisor(message: string, attachments?: ContentPart[]): Promise<string>
+  /** 跑一次管家会话任务（独立 supervisor 窗口用，单步 ReAct + 管家工具集）。dmContext 透传私信归属，供该轮产生的提问/审批请求携带好友归属 */
+  runSupervisor(message: string, attachments?: ContentPart[], dmContext?: DmPendingReply): Promise<string>
   /** 重命名会话标题 */
   renameSession(id: string, title: string): void
   /** 删除会话（当前会话被删则切到剩余第一个） */
@@ -337,12 +337,12 @@ export interface Runtime {
 
   /** 工具调用过程回调（UI 展示，trace 带 sessionId） */
   onToolTrace(cb: (trace: ToolTrace) => void): () => void
-  /** 审批请求回调（UI 弹卡片，req 带 sessionId） */
-  onApprovalRequest(cb: (req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }) => void): () => void
+  /** 审批请求回调（UI 弹卡片，req 带 sessionId 与私信归属） */
+  onApprovalRequest(cb: (req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string; dmChannelId?: string; dmPeerId?: string; dmFromName?: string }) => void): () => void
   /** UI 应答审批（requestId 定位具体审批请求，支持并行会话） */
   respondApproval(outcome: ApprovalOutcome, requestId: string): void
   /** 查询当前待处理的审批请求（供手机端连接后恢复弹窗，避免错过一次性事件） */
-  listPendingApprovals(): Array<{ id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }>
+  listPendingApprovals(): Array<{ id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string; dmChannelId?: string; dmPeerId?: string; dmFromName?: string }>
   /** 审批被管家决策 resolve 后回调（requestId 定位，UI 据此关闭对应弹窗） */
   onApprovalResolved(cb: (requestId: string) => void): () => void
   /** 能力级审批请求回调（插件跨插件调用 write/destructive 能力时弹能力审批卡片；sessionId 标记发起会话，用于会话级 remember 授权） */

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ToolTrace } from '../types'
 import { AskCard } from '../components/AskCard'
+import { ApprovalCard } from '../components/ApprovalCard'
 import { SessionPicker } from '../components/SessionPicker'
 import { ModelPicker } from '../components/ModelPicker'
 import { RetryPromptCard } from '../components/RetryPrompt'
@@ -9,13 +10,13 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { makeMarkdownComponents, normalizeTreeBlocks, stripWrappedRecordTag } from '../components/Markdown'
 import { ReasoningBlock } from '../components/ReasoningBlock'
-import { DiffBlock, StepStats, ToolStep, toolDisplayName, riskLevelLabel } from '../components/ToolStep'
+import { StepStats, ToolGroup } from '../components/ToolStep'
 import { t, tf } from '../../shared/i18n'
 import { renderRich, useLocaleSync } from '../locale'
 import { UserMessage } from '../components/UserMessage'
 import { VirtualList } from '../components/VirtualList'
-import { IconChevronDown, IconCode, IconRefresh, IconWarn } from '../components/icons'
-import { btn, formatArgs, LiveDuration, ThinkingDots } from '../components/ui'
+import { IconCode, IconRefresh } from '../components/icons'
+import { btn, LiveDuration, ThinkingDots } from '../components/ui'
 import { registerSlot, SlotView, AppendSlotView } from '../slots'
 import { useUIContext } from '../ui-context'
 import { useStreaming } from '../store-client'
@@ -39,36 +40,6 @@ const AI_BUBBLE_STYLE: React.CSSProperties = {
   minWidth: 0,
   userSelect: 'text',
   WebkitUserSelect: 'text',
-}
-
-/** 审批弹窗参数展示：编辑/写入文件渲染 diff 前后对比，执行命令完整显示命令，其余回退友好键值对 */
-function renderApprovalDetail(toolName: string, args: Record<string, unknown>): React.ReactNode {
-  if (!args || Object.keys(args).length === 0) return <span style={{ color: 'var(--text-muted)' }}>{t('chat.approval.noArgs')}</span>
-  if (toolName === 'edit_file') {
-    const path = typeof args.path === 'string' ? args.path : ''
-    const before = typeof args.oldText === 'string' ? args.oldText : ''
-    const after = typeof args.newText === 'string' ? args.newText : ''
-    return <DiffBlock before={before} after={after} path={path} />
-  }
-  if (toolName === 'write_file') {
-    const path = typeof args.path === 'string' ? args.path : ''
-    const content = typeof args.content === 'string' ? args.content : ''
-    return <DiffBlock before="" after={content} path={path} isNew />
-  }
-  if (toolName === 'run_command') {
-    const command = typeof args.command === 'string' ? args.command : ''
-    return (
-      <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 12 }}>
-        {command && (
-          <div style={{ padding: '8px 12px', background: '#282c34', color: '#61afef', whiteSpace: 'pre-wrap', wordBreak: 'break-all', borderRadius: 8 }}>
-            <span style={{ color: '#7f848e' }}>$ </span>
-            {command}
-          </div>
-        )}
-      </div>
-    )
-  }
-  return formatArgs(args)
 }
 
 /** shell.chat 插件：消息流主体 + 浮动交互层（审批弹窗 / 提问卡片 / browser 半投递弹窗，可被 selfmod 替换） */
@@ -108,12 +79,6 @@ function ChatSlot(): React.JSX.Element {
     return () => clearInterval(iv)
   }, [])
 
-  // 审批弹窗 / 提问卡片的折叠状态（默认展开；新请求到来时自动展开）
-  const [approvalCollapsed, setApprovalCollapsed] = useState(false)
-  useEffect(() => {
-    setApprovalCollapsed(false)
-  }, [ctx.curApproval?.id])
-
   // 用户滚动（滚轮/拖条/键盘）时更新「是否在底部」状态
   const handleScroll = (): void => {
     const el = listRef.current
@@ -148,9 +113,7 @@ function ChatSlot(): React.JSX.Element {
       toolBuffer = []
       nodes.push(
         <div key={`tools-${keyBase}`} style={{ minWidth: 0, maxWidth: '100%' }}>
-          {tools.map((t) => (
-            <ToolStep key={t.callId} trace={t} />
-          ))}
+          <ToolGroup tools={tools} />
         </div>
       )
     }
@@ -222,9 +185,7 @@ function ChatSlot(): React.JSX.Element {
                   {/* 当前轮已执行的工具步骤（实时） */}
                   {history.pendingTools.length > 0 && (
                     <div style={{ margin: '0 0 2px' }}>
-                      {history.pendingTools.map((t) => (
-                        <ToolStep key={t.callId} trace={t} />
-                      ))}
+                      <ToolGroup tools={history.pendingTools} live />
                     </div>
                   )}
                   {/* 思考过程折叠块：显示在正文之前，流式展开显示完整思考 */}
@@ -288,71 +249,7 @@ function ChatSlot(): React.JSX.Element {
 
       {/* 审批弹窗（输入框上方浮动，会话级隔离：只显示当前会话的待审批请求） */}
       {ctx.curApproval && (
-        <div
-          style={{
-            position: 'absolute',
-            bottom: 158,
-            left: 16,
-            right: 16,
-            padding: 14,
-            borderRadius: 12,
-            border: '1px solid var(--tint-red-strong)',
-            background: 'var(--tint-red)',
-            fontSize: 13,
-            boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
-            // 任务114：卡片整体不得超出视口安全区。外层原本只有 bottom:158 下锚点、无高度上限，
-            // 内容（长问题 / 长审批参数）一多就向上撑高，绘制到顶部标题栏之上，盖住最小化/最大化/关闭按钮。
-            // 227 = 158（既有下锚点，见上方 bottom）+ 69（标题栏安全区：管家窗口 WindowTitleBar
-            // padding 16+16 + 最高子元素 WindowControlButton 36 + borderBottom 1 = 69；会话窗口 HeaderPlugin 同算法=61，取大者）。
-            // 用 maxHeight 不用 height：内容少时按内容高，不留白（任务107 那类坑）。
-            maxHeight: 'calc(100% - 227px)',
-            overflowY: 'auto',
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: approvalCollapsed ? 0 : 6 }}>
-            <div style={{ fontWeight: 600, color: 'var(--text)', display: 'flex', alignItems: 'center', gap: 6 }}>
-              <IconWarn />
-              {t('chat.approval.title')}
-            </div>
-            <button
-              onClick={() => setApprovalCollapsed((c) => !c)}
-              title={approvalCollapsed ? t('common.expand') : t('common.collapse')}
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                width: 22,
-                height: 22,
-                borderRadius: 6,
-                border: 'none',
-                background: 'transparent',
-                color: 'var(--text-secondary)',
-                cursor: 'pointer',
-                transform: approvalCollapsed ? 'none' : 'rotate(180deg)',
-                transition: 'transform 0.15s ease',
-              }}
-            >
-              <IconChevronDown />
-            </button>
-          </div>
-          {!approvalCollapsed && (
-            <>
-              <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>{t('chat.approval.toolLine', { tool: toolDisplayName(ctx.curApproval.toolName, ctx.curApproval.args), risk: riskLevelLabel(ctx.curApproval.riskLevel) })}</div>
-              {/* 任务114：审批详情（工具入参可达数 KB，如整文件写入）限高滚动，与 AskCard 同口径 */}
-              <div style={{ color: 'var(--text-secondary)', marginBottom: 10, fontSize: 12, overflowWrap: 'break-word', wordBreak: 'break-word', maxHeight: 200, overflowY: 'auto' }}>
-                {renderApprovalDetail(ctx.curApproval.toolName, ctx.curApproval.args)}
-              </div>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <button onClick={() => void ctx.respondApproval('allowed-once')} style={btn('var(--accent)', '#fff')}>
-                  {t('chat.approval.allowOnce')}
-                </button>
-                <button onClick={() => void ctx.respondApproval('rejected')} style={btn('var(--bg-panel)', 'var(--text)', '1px solid var(--border-strong)')}>
-                  {t('chat.approval.reject')}
-                </button>
-              </div>
-            </>
-          )}
-        </div>
+        <ApprovalCard req={ctx.curApproval} onAllow={() => void ctx.respondApproval('allowed-once')} onReject={() => void ctx.respondApproval('rejected')} />
       )}
 
       {/* AI 向用户提问卡片 / 会话选择器 / 模型选择器（输入框上方浮动，会话级隔离，按 kind 分派） */}

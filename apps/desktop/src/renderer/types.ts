@@ -48,6 +48,12 @@ export interface ApprovalRequest {
   toolName: string
   args: Record<string, unknown>
   riskLevel: string
+  /** 本次审批归属的私信好友会话 id（channelId），用于私信面板切到对应好友 */
+  dmChannelId?: string
+  /** 本次审批归属的好友 memberId（与 dmChannelId 二选一） */
+  dmPeerId?: string
+  /** 好友显示名（绝不回显会员 id） */
+  dmFromName?: string
 }
 
 /** 能力级审批请求（插件跨插件调用 write/destructive 能力；sessionId 标记发起会话，用于会话级 remember 授权） */
@@ -313,6 +319,12 @@ export interface AskRequest {
   sessionOptions?: AskSessionOption[]
   /** 模型选择器数据（kind=model-picker 时提供） */
   modelOptions?: AskModelOption[]
+  /** 本次提问归属的私信好友会话 id（channelId），用于私信面板切到对应好友 */
+  dmChannelId?: string
+  /** 本次提问归属的好友 memberId（与 dmChannelId 二选一） */
+  dmPeerId?: string
+  /** 好友显示名（绝不回显会员 id） */
+  dmFromName?: string
 }
 
 /** 任务失败重试弹窗数据（网络/余额不足等可重试错误自动重试耗尽后弹出，用户选「重试/取消」） */
@@ -691,7 +703,7 @@ declare global {
       respondAsk(requestId: string, answer: string): Promise<void>
       cancelAsk(requestId: string): Promise<void>
       run(message: string, attachments?: ContentPart[]): Promise<string>
-      supervisorRun(message: string, attachments?: ContentPart[]): Promise<string>
+      supervisorRun(message: string, attachments?: ContentPart[], dmContext?: { channelId?: string; peerMemberId?: string; fromName?: string }): Promise<string>
       getSupervisorHistory(): Promise<HistoryItem[]>
       supervisorGetModel(): Promise<string>
       supervisorGetApproval(): Promise<'ask' | 'workdir' | 'never'>

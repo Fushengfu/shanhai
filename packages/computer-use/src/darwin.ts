@@ -104,6 +104,99 @@ while i < clicks {
 }
 `
 
+/**
+ * macOS 真实文本输入脚本：剪贴板 + Cmd+V（支持任意 Unicode：中文/emoji/全角标点）。
+ * 为什么不用 System Events `keystroke`：keystroke 只能键入键盘能直接产生的 ASCII 字符，
+ * 对中文等非 ASCII 字符会按 keycode 0（'a'）处理，实测 "雷涛" 被写成 "aa"。
+ * 剪贴板方案与 win32 的 TYPE_PS（Set-Clipboard + Ctrl+V）对齐，是唯一能稳定写中文的通用做法。
+ *
+ * 用法：type.swift <textBase64>
+ *   文本以 base64 传入，避免命令行转义/编码问题。
+ * 流程：保存原剪贴板 → 写入新文本 → 发 Cmd+V → 等待目标 App 完成粘贴 → 恢复原剪贴板。
+ * 恢复用「保存全部类型 data + 逐一 setData 写回」，尽量不丢用户原剪贴板（文字/富文本/图片）。
+ */
+const TYPE_SWIFT = `
+import AppKit
+import CoreGraphics
+import Foundation
+
+guard CommandLine.arguments.count >= 2,
+      let data = Data(base64Encoded: CommandLine.arguments[1]),
+      let text = String(data: data, encoding: .utf8) else { exit(2) }
+
+let pb = NSPasteboard.general
+// 1. 保存原剪贴板全部类型的 data（best-effort，尽量完整恢复）
+var saved: [(NSPasteboard.PasteboardType, Data)] = []
+for t in pb.types ?? [] {
+    if let d = pb.data(forType: t) { saved.append((t, d)) }
+}
+// 2. 写入新文本
+pb.clearContents()
+pb.setString(text, forType: .string)
+// 3. 发送 Cmd+V（V = kVK_ANSI_V = 0x09）
+usleep(100000)
+let src = CGEventSource(stateID: .hidSystemState)
+let down = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)
+down?.flags = .maskCommand
+down?.post(tap: .cghidEventTap)
+usleep(50000)
+let up = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
+up?.flags = .maskCommand
+up?.post(tap: .cghidEventTap)
+// 4. 等待目标 App 完成粘贴后恢复原剪贴板
+usleep(300000)
+pb.clearContents()
+for (t, d) in saved { pb.setData(d, forType: t) }
+print("ok")
+`
+
+/**
+ * macOS 前台窗口命中校验脚本：给定坐标，返回「该坐标处最上层窗口的 owner 是否 == 当前前台 App」。
+ * 用于缺陷②（坐标点击无前台命中校验会点到背景窗口）：点击前校验，若坐标处是背景窗口（另一 App），
+ * 点击会把它带到前台，属「点到别的 App」，应停下报错而非盲点。
+ *
+ * 用法：frontmostAtPoint.swift <pixelX> <pixelY>
+ *   输入是截图/OCR 的物理像素坐标，内部 ÷ backingScaleFactor 转逻辑点后再查 CGWindowList。
+ *   CGWindowList 的 bounds 与 CGEvent 的 mouseCursorPosition 同属「全局显示坐标（点，主屏左上角原点）」。
+ * 输出 JSON：{ matched: Bool, frontmost: String, ownerAtPoint: String }
+ *   matched = ownerAtPoint 非空 且 == frontmost；ownerAtPoint 空 = 该坐标处无窗口（桌面）。
+ */
+const FRONTMOST_SWIFT = `
+import CoreGraphics
+import AppKit
+import Foundation
+
+guard CommandLine.arguments.count >= 3,
+      let px = Double(CommandLine.arguments[1]),
+      let py = Double(CommandLine.arguments[2]) else { exit(1) }
+
+let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+let x = px / scale
+let y = py / scale
+
+let frontmost = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
+let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+var topOwner = ""
+var topLayer = Int.max
+for w in list {
+    guard let b = w[kCGWindowBounds as String] as? [String: Any],
+          let owner = w[kCGWindowOwnerName as String] as? String,
+          let layer = w[kCGWindowLayer as String] as? Int,
+          let bx = b["X"] as? Double, let by = b["Y"] as? Double,
+          let bw = b["Width"] as? Double, let bh = b["Height"] as? Double else { continue }
+    if x >= bx && x < bx + bw && y >= by && y < by + bh {
+        if layer < topLayer { topLayer = layer; topOwner = owner }
+    }
+}
+let matched = !topOwner.isEmpty && topOwner == frontmost
+let out: [String: Any] = ["matched": matched, "frontmost": frontmost, "ownerAtPoint": topOwner]
+if let d = try? JSONSerialization.data(withJSONObject: out), let s = String(data: d, encoding: .utf8) {
+    print(s)
+} else {
+    print("{}")
+}
+`
+
 /** 用 Swift CGEvent 发送真实鼠标点击（Electron 应用可用）；失败静默（权限不足等） */
 async function clickAtSwift(x: number, y: number, clicks: number, downUpMs = 200): Promise<void> {
   const scriptPath = `/tmp/shanhai-click-${process.pid}-${Date.now()}.swift`
@@ -158,9 +251,33 @@ export function createDarwinComputerUseService(): ComputerUseService {
       await clickAtSwift(x, y, 2, 200).catch(() => undefined)
     },
     typeText: async (text) => {
-      await execAsync(`osascript -e 'tell application "System Events" to keystroke ${JSON.stringify(text)}'`).catch(
-        () => undefined,
-      )
+      // 剪贴板 + Cmd+V（支持任意 Unicode）；失败会 throw（由上层 action 工具感知并报 failed，不再静默吞错）
+      const b64 = Buffer.from(text, 'utf8').toString('base64')
+      const scriptPath = `/tmp/shanhai-type-${process.pid}-${Date.now()}.swift`
+      try {
+        await fs.writeFile(scriptPath, TYPE_SWIFT, 'utf8')
+        await execAsync(`swift "${scriptPath}" "${b64}"`, { timeout: 15000 })
+      } finally {
+        await fs.rm(scriptPath, { force: true }).catch(() => undefined)
+      }
+    },
+    windowOwnerAtPoint: async (x, y) => {
+      // 前台窗口命中校验：返回坐标处最上层窗口 owner 是否 == 前台 App。校验脚本失败时降级放行（matched=true），不阻断坐标点击兜底路径
+      const scriptPath = `/tmp/shanhai-frontmost-${process.pid}-${Date.now()}.swift`
+      try {
+        await fs.writeFile(scriptPath, FRONTMOST_SWIFT, 'utf8')
+        const { stdout } = await execAsync(`swift "${scriptPath}" "${x}" "${y}"`, { timeout: 10000 })
+        const parsed = JSON.parse(stdout.trim() || '{}') as { matched?: boolean; frontmost?: string; ownerAtPoint?: string }
+        return {
+          matched: parsed.matched !== false,
+          frontmost: parsed.frontmost ?? '',
+          ownerAtPoint: parsed.ownerAtPoint ?? '',
+        }
+      } catch {
+        return { matched: true, frontmost: '', ownerAtPoint: '' }
+      } finally {
+        await fs.rm(scriptPath, { force: true }).catch(() => undefined)
+      }
     },
     pressKey: async (key) => {
       await execAsync(`osascript -e 'tell application "System Events" to key code ${keyCode(key)}'`).catch(

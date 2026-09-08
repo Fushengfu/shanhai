@@ -111,6 +111,9 @@ export interface ApprovalRequest {
   toolName: string
   args: Record<string, unknown>
   riskLevel: string
+  dmChannelId?: string
+  dmPeerId?: string
+  dmFromName?: string
 }
 
 /** 能力级审批请求（插件跨插件调用 write/destructive 能力时触发；sessionId 标记发起会话，用于会话级 remember 授权）。字段与 runtime 对齐。 */

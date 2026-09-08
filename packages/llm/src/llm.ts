@@ -413,6 +413,11 @@ export class DeepSeekProvider implements Model {
       throw gatewayErrorOrNull('DeepSeek', res.status, rawText) ?? new Error(`DeepSeek API ${res.status}: ${rawText}`)
     }
     // 网关响应：{ code, data: { choices: [...] } } 包装（兼容裸 OpenAI 格式）
+    // HTTP 200 但 body 为空：判为「空响应」（可重试），不落到 JSON.parse 报「非合法 JSON」
+    if (rawText.trim() === '') {
+      this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: '', responseStatus: res.status, error: '空响应体' })
+      throw new Error(`${EMPTY_RESPONSE_MARKER} 模型返回空响应体`)
+    }
     let raw: {
       code?: number
       error?: string | { message?: string }
@@ -427,7 +432,8 @@ export class DeepSeekProvider implements Model {
       raw = JSON.parse(rawText) as typeof raw
     } catch {
       this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: normalizeResponseBody(rawText), responseStatus: res.status, error: '响应非合法 JSON' })
-      throw new Error(`DeepSeek API ${res.status}: 响应非合法 JSON`)
+      // 200 但非合法 JSON：判为「空响应」（可重试），而非让英文/转义文本冒泡到界面
+      throw new Error(`${EMPTY_RESPONSE_MARKER} 响应非合法 JSON`)
     }
     this.opts.onTrace?.({ phase: 'response', url, method: 'POST', body: raw, responseStatus: res.status })
     // 网关返回错误（如模型不支持 image_url 多模态），响亮抛错，不静默吞
@@ -440,6 +446,11 @@ export class DeepSeekProvider implements Model {
       throw new Error(`gateway error code ${raw.code}`)
     }
     const payload = raw.data ?? raw
+    // choices 为空（缺失/空数组）：异常「空响应」（可重试），避免被静默当作成功空响应
+    const choices = payload.choices ?? []
+    if (choices.length === 0) {
+      throw new Error(`${EMPTY_RESPONSE_MARKER} 模型返回 choices 为空`)
+    }
     const usage = payload.usage
     if (usage && this.opts.onUsage) {
       this.opts.onUsage(toTokenUsage(usage))
@@ -848,40 +859,99 @@ export interface ProviderOptions {
 /** Anthropic 缺省最大输出 token（用户自定义模型未指定时兜底；Claude 3.5 系列上限 8192） */
 const DEFAULT_ANTHROPIC_MAX_TOKENS = 8192
 
-/** 「finish_reason=stop 但空内容」自动重试的最大尝试次数（含首次） */
+/**
+ * 「空响应」自动重试的**重试次数**上限（用户拍板：最多 3 次重试 = 含首次共 4 次尝试），
+ * 与 agent 层网关超时重试（GATEWAY_MAX_RETRY=3）同量级。语义是「重试次数」，不含首次请求。
+ */
 const EMPTY_RESPONSE_MAX_RETRY = 3
 
-/** 判定「空内容异常」：仅当 text 与 reasoningContent 均为空、且无工具调用时才视为异常空响应。
+/** 「空响应」重试的指数退避基数（毫秒）：500ms → 1s → 2s。空响应多为模型偶发异常，短退避即可，不必像网关超时那样等 3s。 */
+const EMPTY_RESPONSE_BACKOFF_MS = 500
+
+/** 「空响应」类异常的统一标记：HTTP 200 但 body 为空 / 响应非合法 JSON / choices 为空 → 抛带此标记的错误，由 withEmptyResponseRetry 捕获后重试。
+ *  与 GATEWAY_ERROR_MARKER（网关超时）区分开：网关超时是「请求没算完」，空响应是「请求算完了却什么都没给」，
+ *  两者是不同成因，不能混成同一类重试。 */
+const EMPTY_RESPONSE_MARKER = '[empty_response]'
+
+/** 判断抛出的错误是否为「空响应」类（带 EMPTY_RESPONSE_MARKER），供 withEmptyResponseRetry 识别并重试 */
+function isEmptyResponseError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes(EMPTY_RESPONSE_MARKER)
+}
+
+/** 空响应重试播报（给用户的可见反馈）：静默重试在用户眼里就是卡死，比直接报错更糟（本项目反复踩过） */
+export interface EmptyRetryNotice {
+  /** 网关缓存隔离 user_id（agent 层 = sessionId:apiKey），宿主据此路由到具体会话窗口；拿不到就跳过广播 */
+  userId?: string | number
+  /** 第几次重试（1-based） */
+  attempt: number
+  /** 最多重试几次 */
+  max: number
+  /** 中文原因（不含网关英文原文） */
+  reason: string
+}
+
+let emptyRetryNotifier: ((n: EmptyRetryNotice) => void) | undefined
+
+/** 宿主（apps/runtime）注入「空响应重试」播报通道。与 agent 的 setAgentRetryNotifier 同性质：进程级输出通道，setter 一次接线即可。 */
+export function setEmptyRetryNotifier(cb: ((n: EmptyRetryNotice) => void) | undefined): void {
+  emptyRetryNotifier = cb
+}
+
+/** 空响应重试指数退避（确定性、无抖动，便于测试与断言）：baseMs * 2^retry */
+function emptyRetryBackoffMs(retry: number): number {
+  return EMPTY_RESPONSE_BACKOFF_MS * 2 ** retry
+}
+
+/** 延时（空响应重试指数退避用） */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** 判定「空内容异常」：仅当 text 与 reasoningContent 均为空（含纯空白）、且无工具调用时才视为异常空响应。
  *  思考模型边界（关键）：reasoningContent 有值（DeepSeek v4 / Anthropic thinking 只输出思考无正文）→ 不算异常，不重试；
- *  toolCalls 存在（带 tool_calls 时 content 为 null 是 OpenAI 规范）→ 不算异常，不重试。
- *  只有 finish_reason === 'stop' 且 text/reasoningContent 全空、无 toolCalls 才判异常。 */
+ *  toolCalls 存在（带 tool_calls 时 content 为 null 是 OpenAI 规范）→ 不算异常，不重试（避免已产出的工具被二次执行）。
+ *  finish_reason 为 stop（正常结束却空）或 length（触达输出上限却空）都判异常；finish_reason 缺失则保守不重试，
+ *  避免误判（如非 thinking 端点不发 finish_reason）。 */
 function isEmptyContentResponse(res: ModelResponse): boolean {
-  const hasText = typeof res.text === 'string' && res.text !== ''
-  const hasReasoning = typeof res.reasoningContent === 'string' && res.reasoningContent !== ''
+  const hasText = typeof res.text === 'string' && res.text.trim() !== ''
+  const hasReasoning = typeof res.reasoningContent === 'string' && res.reasoningContent.trim() !== ''
   const hasTool = (res.toolCalls && res.toolCalls.length > 0) || !!res.toolCall
   if (hasText || hasReasoning || hasTool) return false
-  // content 与 reasoning_content 均为空、无工具调用：
-  // 明确 finish_reason === 'stop' 才判异常（需求触发条件）；finish_reason 缺失则保守不重试，避免误判（如非 thinking 端点不发 finish_reason）
-  return res.finishReason === 'stop'
+  return res.finishReason === 'stop' || res.finishReason === 'length'
+}
+
+/** 空响应耗尽后的准确中文文案（给用户下一步该干什么，不透传英文/网关原文） */
+function emptyExhaustedMessage(maxRetry: number): string {
+  return `模型连续返回空内容，已自动重试 ${maxRetry} 次仍未成功。可能是模型服务异常、上下文内容过多或当前模型不适用；可尝试切换模型、新开会话，或精简消息后重试。`
 }
 
 /** 包一层「空内容异常自动重试」装饰器：对 complete / stream 均生效，覆盖非流式与流式。
- *  流式采用「透传」策略：逐 chunk 实时 yield（保留流式实时性），同时累积 fullText/fullReasoning/toolCalls/finishReason，
- *  仅在流结束且「整条流完全无产出（无 text/reasoningContent/toolCall）」时判定为异常空流并重新拉流重试。
- *  关键：异常空流未产出任何内容给用户，重试对用户无感知；有内容的流实时透传、非空即结束，绝不重试（不破坏流式体验）。 */
+ *  - 重试是**全新一次请求**：每次循环重新调 inner.complete/stream（重新取凭证、重新 fetch），不复用已断的流；
+ *  - 幂等安全：只有「完全无产出（无 text/reasoningContent/toolCall）」才判异常重试，故重试不可能重复执行任何工具副作用；
+ *  - 重试可见：每次重试前经 emptyRetryNotifier 播报（静默重试在用户眼里就是卡死）；
+ *  - 流式「透传」策略：逐 chunk 实时 yield（保留流式实时性），仅在流结束且整条流完全无产出时判定异常并重新拉流重试。 */
 function withEmptyResponseRetry(inner: Model, maxRetry = EMPTY_RESPONSE_MAX_RETRY): Model {
   return {
     async complete(messages: ChatMessage[], tools?: ToolContract[], userId?: string): Promise<ModelResponse> {
-      for (let attempt = 1; attempt <= maxRetry; attempt++) {
-        const res = await inner.complete(messages, tools, userId)
-        if (!isEmptyContentResponse(res)) return res
-        // 空内容异常 → 该次请求作废，重新发起完整请求（下一次循环重新调 inner.complete）
+      for (let retry = 0; ; retry++) {
+        let res: ModelResponse
+        try {
+          res = await inner.complete(messages, tools, userId)
+        } catch (err) {
+          // 空响应类错误（HTTP 200 空 body / 非 JSON / choices 为空）→ 当作空内容进入重试；其它错误原样抛出
+          if (!isEmptyResponseError(err)) throw err
+          res = undefined as unknown as ModelResponse
+        }
+        if (res !== undefined && !isEmptyContentResponse(res)) return res
+        // 空内容异常 → 该次请求作废，重新发起完整请求
+        if (retry >= maxRetry) throw new Error(emptyExhaustedMessage(maxRetry))
+        emptyRetryNotifier?.({ userId, attempt: retry + 1, max: maxRetry, reason: '模型返回空响应' })
+        await sleep(emptyRetryBackoffMs(retry))
       }
-      throw new Error(`模型响应异常：finish_reason 为 stop 但 content 与 reasoning_content 均为空，重试 ${maxRetry} 次后仍失败`)
     },
     async *stream(messages: ChatMessage[], tools?: ToolContract[], userId?: string): AsyncIterable<StreamChunk> {
       if (typeof inner.stream !== 'function') return
-      for (let attempt = 1; attempt <= maxRetry; attempt++) {
+      for (let retry = 0; ; retry++) {
         let fullText = ''
         let fullReasoning = ''
         const allToolCalls: ToolCall[] = []
@@ -895,11 +965,16 @@ function withEmptyResponseRetry(inner: Model, maxRetry = EMPTY_RESPONSE_MAX_RETR
           yield c
         }
         // 流结束：判定异常。有 content/reasoningContent/toolCall 之一即为正常流，透传完毕即结束。
-        const isAbnormalEmpty = finishReason === 'stop' && fullText === '' && fullReasoning === '' && allToolCalls.length === 0
+        const isAbnormalEmpty =
+          (finishReason === 'stop' || finishReason === 'length' || finishReason === undefined) &&
+          fullText.trim() === '' &&
+          fullReasoning.trim() === '' &&
+          allToolCalls.length === 0
         if (!isAbnormalEmpty) return
-        // 空流异常 → 重新拉流重试（该次流无任何产出，用户无感知）
+        if (retry >= maxRetry) throw new Error(emptyExhaustedMessage(maxRetry))
+        emptyRetryNotifier?.({ userId, attempt: retry + 1, max: maxRetry, reason: '模型返回空响应' })
+        await sleep(emptyRetryBackoffMs(retry))
       }
-      throw new Error(`模型流式响应异常：finish_reason 为 stop 且 content/reasoning_content 均为空，重试 ${maxRetry} 次后仍失败`)
     },
   }
 }

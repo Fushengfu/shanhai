@@ -1,8 +1,11 @@
 import * as React from 'react'
 import { useState } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { IconCopy, IconFile, IconImage, IconPlus, IconQuote } from './icons'
 import { copyText, formatBytes, smallIconBtn } from './ui'
 import { decodeDmContent, dmContentPreview, dmContentToPlainText } from '../../shared/dm-attachment'
+import { makeMarkdownComponents, normalizeTreeBlocks } from './Markdown'
 import { t } from '../../shared/i18n'
 import type { DmMessage } from '../types'
 import { useDismissOnClickOutside } from './useDismissOnClickOutside'
@@ -367,11 +370,22 @@ export function DmMessageRow(props: {
             color: mine ? '#fff' : 'var(--text)',
             border: mine ? 'none' : '1px solid var(--border-soft)',
             fontSize: 13,
-            whiteSpace: 'pre-wrap',
             overflowWrap: 'break-word',
+            // 【任务162】气泡层补宽度上限：任务158 改成 Markdown 后，气泡作为 content column 的
+            // cross-axis 子项（alignItems 非 stretch）会 shrink-to-fit 到内容 max-content 宽度，
+            // pre/table/长 URL 会把气泡撑破右侧窗口。补 maxWidth:100% 让气泡宽度收敛到
+            // content column 的 68% 上限内（与 UserMessage 的 maxWidth:70%、AssistantMessage 的 width:85% 同口径）。
+            maxWidth: '100%',
+            boxSizing: 'border-box',
           }}
         >
-          {parsed.text}
+          {parsed.text ? (
+            <div style={{ minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents(props.onPreviewImage, mine ? 'accent' : 'panel')}>
+                {normalizeTreeBlocks(parsed.text)}
+              </ReactMarkdown>
+            </div>
+          ) : null}
           {parsed.atts.map((a, i) => (
             <DmAttachmentBlock key={`${m.msgId}-a${i}`} att={a} narrow={props.narrow} onPreviewImage={props.onPreviewImage} />
           ))}

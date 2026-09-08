@@ -24,7 +24,7 @@ import {
 import { Session, type ApprovalPolicy, type SessionEvent } from '@shanhai/session'
 import { ApprovalService } from '@shanhai/approval'
 import { AgentLoop, setAgentRetryNotifier, type SuspendedSnapshot } from '@shanhai/agent'
-import type { Model, ContentPart, TokenUsage, HttpTrace, HttpTraceCallback, ChatMessage } from '@shanhai/llm'
+import { setEmptyRetryNotifier, type Model, type ContentPart, type TokenUsage, type HttpTrace, type HttpTraceCallback, type ChatMessage } from '@shanhai/llm'
 import { createAtomicTools, createUtilityTools, toolReasoningContext, type ToolContract } from '@shanhai/tools'
 import { createAskTools, AskService, ASK_CANCELLED, type AskRequest } from '@shanhai/ask'
 import { createSkillTools, SkillService } from '@shanhai/skills'
@@ -33,7 +33,7 @@ import { MemoryStore } from '@shanhai/memory'
 import { FileCredentialStore, AuthService } from '@shanhai/auth'
 import type { GatewayModel, ModelTier } from '@shanhai/auth'
 import type { VoiceService } from '@shanhai/voice'
-import { createComputerUseSkill, createPlatformComputerUseService, type ComputerUseService } from '@shanhai/computer-use'
+import { createComputerUseSkill, createPlatformComputerUseService, type ComputerUseService, type ReadTreeResult, type PerformActionResult } from '@shanhai/computer-use'
 import { createBrowserUseSkill, createMockBrowserUseService, type BrowserUseService } from '@shanhai/browser-use'
 import { createTerminalSkill, createMockTerminalService, type TerminalService, type TerminalInfo } from '@shanhai/terminal'
 import { uploadImageToCloud, uploadFileToCloud } from '@shanhai/storage'
@@ -285,6 +285,20 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     if (!sid) return
     ctx.deltaCallbacks.forEach((cb) => cb(sid, `\n【系统】${n.reason}，正在自动重试 ${n.attempt}/${n.max}…\n`))
   })
+  /**
+   * 【空响应自动重试必须可见】与上面的网关超时重试播报同口径：静默重试在用户眼里就是卡死。
+   * 区别：空响应重试发生在 packages/llm（provider 层），那边没有 sessionId，只有网关缓存隔离的 user_id
+   * （agent 层构造为 `sessionId:apiKey`，见 agent.ts 的 this.userId），所以这里按 user_id 反解出 sessionId 再路由。
+   * 反解规则：user_id 形如 `s-xxx:apiKey`（apiKey 是 JWT/sk-，不含冒号），取第一个冒号前段即 sessionId；
+   * 取不到或等于占位 `agent`（无会话）则跳过，不广播到全部窗口。
+   */
+  setEmptyRetryNotifier((n) => {
+    const uid = typeof n.userId === 'number' ? String(n.userId) : (n.userId ?? '')
+    if (!uid) return
+    const sid = uid.split(':')[0]
+    if (!sid || sid === 'agent') return
+    ctx.deltaCallbacks.forEach((cb) => cb(sid, `\n【系统】${n.reason}，正在自动重试 ${n.attempt}/${n.max}…\n`))
+  })
   ctx.modelProviders = new Map<string, Model>()
   ctx.credentials = new FileCredentialStore()
   ctx.authService = new AuthService({ baseUrl: 'https://agent.bjctykj.com' })
@@ -298,6 +312,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   ctx.supervisorWakeQueue = [] as string[]
   ctx.supervisorWaking = false
   ctx.dmPendingReplies = new Map<string, DmPendingReply>()
+  ctx.supervisorDmContext = new Map<string, DmPendingReply>()
   ctx.sessionActivityCallbacks = new Set<(sessionId: string, kind: 'start' | 'end') => void>()
   ctx.currentSessionChangedCallbacks = new Set<(sessionId: string) => void>()
   ctx.supervisorResultCallbacks = new Set<(sessionId: string, title: string, result?: string, error?: string) => void>()
@@ -399,13 +414,14 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   // 提问被「管家代答」resolve 后的回调（UI 据此关闭对应弹窗；用户手动/手机端走各自通道，不经过这里）
 
   ctx.approval = new ApprovalService(async (req) => {
-    ctx.approvalCallbacks.forEach((cb) => cb({ id: req.id, sessionId: req.sessionId, toolName: req.toolName, args: req.args, riskLevel: req.riskLevel }))
+    const dm = req.sessionId ? ctx.supervisorDmContext.get(req.sessionId) : undefined
+    ctx.approvalCallbacks.forEach((cb) => cb({ id: req.id, sessionId: req.sessionId, toolName: req.toolName, args: req.args, riskLevel: req.riskLevel, ...(dm ? { dmChannelId: dm.channelId, dmPeerId: dm.peerMemberId, dmFromName: dm.fromName } : {}) }))
     // 发起方判定：审批请求产生的会话即发起审批的会话，查其当前任务的发起方（管家下发 or 用户侧）
     const origin = req.sessionId ? (ctx.sessionOrigin.get(req.sessionId) ?? 'user') : 'user'
     console.log('[supervisor-wake] 审批请求产生：', req.id, req.toolName, 'sessionId=', req.sessionId, 'origin=', origin, '开关=', ctx.currentSettings.supervisorApproval.enabled)
     const promise = new Promise<ApprovalOutcome>((resolve) => {
       // 记录发起审批的会话 id：删除会话时按会话拒绝其待审批请求，避免 agent 永久卡在 await
-      ctx.pendingApprovals.set(req.id, { resolve, sessionId: req.sessionId, toolName: req.toolName, args: req.args, riskLevel: req.riskLevel })
+      ctx.pendingApprovals.set(req.id, { resolve, sessionId: req.sessionId, toolName: req.toolName, args: req.args, riskLevel: req.riskLevel, dmChannelId: dm?.channelId, dmPeerId: dm?.peerMemberId, dmFromName: dm?.fromName })
     })
     // 管家接管：仅当「管家下发 + 开关开启」时唤醒管家决策（非阻塞，弹窗仍显示、用户仍可手动点）；
     // 用户侧（含手机远程）始终只走弹窗手动审批，不唤醒管家。
@@ -814,7 +830,15 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       list: () => ctx.memory.listBySession(sessionContext.getStore() ?? ctx.currentSessionId ?? ''),
     },
   })
-  const askTools: ToolContract[] = createAskTools(ctx.askService, () => sessionContext.getStore() ?? ctx.currentSessionId ?? '')
+  const askTools: ToolContract[] = createAskTools(
+    ctx.askService,
+    () => sessionContext.getStore() ?? ctx.currentSessionId ?? '',
+    () => {
+      const sid = sessionContext.getStore() ?? ctx.currentSessionId ?? ''
+      const dm = ctx.supervisorDmContext.get(sid)
+      return dm ? { channelId: dm.channelId, peerMemberId: dm.peerMemberId, fromName: dm.fromName } : undefined
+    },
+  )
 
   // —— 复合技能插件（skill_list / skill_read / skill_run）+ MCP 客户端插件（mcp_list_tools / mcp_call）——
   // 技能与 MCP 都是山海自有能力插件：技能从 ~/.shanhai/skills/<id>/SKILL.md 加载，MCP 配置读 ~/.shanhai/mcp.json。
@@ -828,6 +852,57 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   const uploadFile = async (dataBase64: string, mimeType?: string, fileName?: string): Promise<string | null> => {
     if (!ctx.memberToken) return null
     return uploadFileToCloud({ dataBase64, token: ctx.memberToken, mimeType, fileName })
+  }
+  // —— 无障碍读树接线（任务128）：内核 computer-use 技能无合法路径直接调插件工具，
+  // 这里在 ComputerUseService 缝上注入 readTree，委托 selfmod 的插件工具分派去调 computer-access 插件的 computer_access_read_tree。
+  // 单一真相源 = 插件里的 Swift AX 引擎，内核不复制（避免两份实现漂移）。
+  // 降级：插件未安装 / 非 macOS / 读不到时，readTree 返回可见降级原因（不抛错、不静默空树），AI 据此回落到 screenshot+ocr。
+  // 隐私：默认只读「当前前台 App」（pid=0），不主动读山海自身窗口；山海自身 bundleId=com.shanhai.desktop，读到时如实拒绝。
+  ctx.computerUse.readTree = async (params) => {
+    const targetPid = params && typeof params.pid === 'number' ? params.pid : 0
+    try {
+      // 隐私边界：显式指定 pid 时才允许读指定进程；默认 0 只读前台，且拒绝前台是山海自身
+      if (targetPid === 0) {
+        const r = (await ctx.selfmod.dispatchPluginTool('computer-access', 'computer_access_read_tree', params ?? {})) as Record<string, unknown>
+        if (r && r.status === 'ok' && r.bundleId === 'com.shanhai.desktop') {
+          return {
+            ok: false,
+            degraded: true,
+            status: 'privacy_blocked',
+            reason: 'shanhai_self',
+            message: '当前前台是山海自身窗口，为避免泄出会话标题与账号信息，本轮不主动读它的无障碍树。请先聚焦要操作的目标 App 再读。',
+          }
+        }
+        return r as ReadTreeResult
+      }
+      return (await ctx.selfmod.dispatchPluginTool('computer-access', 'computer_access_read_tree', params ?? {})) as ReadTreeResult
+    } catch (err) {
+      return {
+        ok: false,
+        degraded: true,
+        reason: 'plugin_unavailable',
+        message: `无障碍读树不可用（computer-access 插件未安装或调用失败：${err instanceof Error ? err.message : String(err)}）。请改用 computer_screenshot + computer_ocr 定位。`,
+      }
+    }
+  }
+  // —— 无障碍写操作接线（任务130）：内核 computer-use 的 action 升级为「坐标 + 可选 role/text 定位」，
+  // 这里在 ComputerUseService 缝上注入 performAction，委托 selfmod 的插件工具分派去调 computer-access 插件的 computer_access_perform_action。
+  // 单一真相源 = 插件里的 Swift AX 引擎（读/写共用同一份 normalize + 门禁），内核不复制。
+  // 三态透传：success / unconfirmed / failed；unconfirmed 由内核层如实附「未确认生效」引导，绝不冒充成功、也不当失败重试。
+  // 隐私门禁（山海自身/安全输入/高危语义）由插件二期统一实现，内核只调用不复制第二份判定。
+  // 降级：插件未安装 / 非 macOS / 无权限 / 前台漂移 → 回落到既有 CGEvent 坐标路径并给出可见原因。
+  ctx.computerUse.performAction = async (params) => {
+    try {
+      const r = (await ctx.selfmod.dispatchPluginTool('computer-access', 'computer_access_perform_action', (params ?? {}) as Record<string, unknown>)) as PerformActionResult
+      return r
+    } catch (err) {
+      return {
+        status: 'failed',
+        reason: 'plugin_unavailable',
+        platform: process.platform,
+        message: `无障碍写操作不可用（computer-access 插件未安装或调用失败：${err instanceof Error ? err.message : String(err)}）。请改用 computer_action 坐标路径（click/type/key/scroll）。`,
+      }
+    }
   }
   ctx.skillService.registerExecutable(createComputerUseSkill(ctx.computerUse, uploadImage))
   ctx.skillService.registerExecutable(createBrowserUseSkill(ctx.browserUse, uploadImage))
@@ -1308,6 +1383,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
         toolName: p.toolName,
         args: p.args,
         riskLevel: p.riskLevel,
+        dmChannelId: p.dmChannelId,
+        dmPeerId: p.dmPeerId,
+        dmFromName: p.dmFromName,
       }))
     },
     onApprovalResolved(cb) {
@@ -1450,7 +1528,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       return executionModule.runInSession(sid, message, opts, meta?.modelId ?? ctx.defaultModelId)
     },
 
-    runSupervisor: (message, attachments) => executionModule.runSupervisorInternal(message, attachments),
+    runSupervisor: (message, attachments, dmContext) => executionModule.runSupervisorInternal(message, attachments, undefined, dmContext),
 
     resend: async (sessionId, userMessageIndex, newContent) => {
       const meta = ctx.sessions.get(sessionId)

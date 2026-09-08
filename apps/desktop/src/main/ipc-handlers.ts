@@ -209,9 +209,9 @@ export function registerIpc(): void {
   })
 
   // —— 会话管家（主 Agent，独立 supervisor 窗口）——
-  ipcMain.handle('supervisor:run', async (_e, message: string, attachments?: Array<Record<string, unknown>>) => {
+  ipcMain.handle('supervisor:run', async (_e, message: string, attachments?: Array<Record<string, unknown>>, dmContext?: { channelId?: string; peerMemberId?: string; fromName?: string }) => {
     try {
-      return await runtime.runSupervisor(message, attachments as never)
+      return await runtime.runSupervisor(message, attachments as never, dmContext as never)
     } catch (err) {
       // 统一记录完整错误便于排查；__retry_exhausted__ 等带语义的错误原样抛给渲染进程识别（弹重试/取消窗）
       console.error('[ipc] supervisor:run 失败:', err)

@@ -8,11 +8,19 @@ import { ASK_CANCELLED, type AskService } from './ask'
  * 复用审批的「阻塞等待 + UI 卡片」链路：execute 挂起（AskService.ask），UI 弹交互式卡片，
  * 用户提交后 resolve，答案作为工具结果回喂给模型继续执行。
  */
-export function createAskTools(service: AskService, getSessionId: () => string): ToolContract[] {
-  return [askUserTool(service, getSessionId)]
+export function createAskTools(
+  service: AskService,
+  getSessionId: () => string,
+  getDmContext?: () => { channelId?: string; peerMemberId?: string; fromName?: string } | undefined,
+): ToolContract[] {
+  return [askUserTool(service, getSessionId, getDmContext)]
 }
 
-function askUserTool(service: AskService, getSessionId: () => string): ToolContract {
+function askUserTool(
+  service: AskService,
+  getSessionId: () => string,
+  getDmContext?: () => { channelId?: string; peerMemberId?: string; fromName?: string } | undefined,
+): ToolContract {
   return {
     name: 'ask_user',
     description:
@@ -59,6 +67,7 @@ function askUserTool(service: AskService, getSessionId: () => string): ToolContr
         placeholder,
         sessionId: getSessionId(),
         reasoning: toolReasoningContext.getStore(),
+        dmContext: getDmContext?.(),
       })
       // 用户取消回答/选择（或会话被删除导致提问被取消）时，返回错误而非把取消标记当答案回喂模型
       if (answer === ASK_CANCELLED) return { ok: false, error: '用户取消了回答' }

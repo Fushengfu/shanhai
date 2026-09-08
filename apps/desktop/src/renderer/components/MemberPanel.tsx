@@ -4,13 +4,17 @@ import { WindowTitleBar } from '../components/WindowTitleBar'
 import { IconChat, IconCheck, IconChevronDown, IconClose, IconPlus, IconRefresh, IconSearch, IconTrash, IconUsers, IconWarn } from '../components/icons'
 import { btn, smallIconBtn } from '../components/ui'
 import { ImagePreview } from '../components/ImagePreview'
+import { AskCard } from './AskCard'
+import { ApprovalCard } from './ApprovalCard'
+import { SessionPicker } from './SessionPicker'
+import { ModelPicker } from './ModelPicker'
 import { DmComposer } from './DmComposer'
 import { DmQuotePicker, type DmQuoteTarget } from './DmQuotePicker'
 import { DmToast, useDmToast } from './dm-toast'
 import { dmContentPreview } from '../../shared/dm-attachment'
 import { DM_MAX_CONTENT_BYTES, encodeDmContent, utf8Bytes } from '../../shared/dm-attachment'
 import type { DmAttachmentPayload } from '../../shared/dm-attachment'
-import { patchUiStore, useUiStoreSelector } from '../store-client'
+import { getUiStoreSnapshot, patchUiStore, useUiStoreSelector } from '../store-client'
 import { DmAvatar, DmMessageRow, DmTimeDivider, DmUnreadDivider, LEFT_WIDTH_NARROW_PX, LEFT_WIDTH_PX, NARROW_WIDTH_PX, buildChatRows, fmtListTime, statusLabelOf, threadPreview } from './DmIm'
 // 【i18n 期1】取词函数导入成 tKey：本文件多处把会话条目命名为 t（visibleThreads.map((t) => …) 等），
 // 直接 import { t } 会在那些回调里被遮蔽。用别名最稳，不去改既有回调的形参名。
@@ -22,7 +26,7 @@ import { displayNameOf as displayNameOfShared } from '../../shared/member-displa
 import { renderRich, useLocaleSync } from '../locale'
 import { useDmMessageScroll } from './useDmMessageScroll'
 import type { DmRow } from './DmIm'
-import type { CredentialSnapshot, DmDraftStore, DmFriend, DmFriendRequest, DmMessage, DmThread, DmUnread, MemberChannelStatus, MemberNotice, MemberResult } from '../types'
+import type { ApprovalRequest, AskRequest, CredentialSnapshot, DmDraftStore, DmFriend, DmFriendRequest, DmMessage, DmThread, DmUnread, MemberChannelStatus, MemberNotice, MemberResult } from '../types'
 
 /**
  * 「私信」应用窗口（会员实时通讯底线的内置 UI）：两个分区 —— 私信 / 好友。
@@ -44,6 +48,10 @@ import type { CredentialSnapshot, DmDraftStore, DmFriend, DmFriendRequest, DmMes
  */
 
 type Tab = 'dm' | 'friends'
+
+/** 会话管家超级会话的固定 id（与 @shanhai/runtime 的 SUPERVISOR_ID 同值；渲染层写常量避免跨包耦合）。
+ *  私信面板要「就地回答」挂起的提问/审批，取的是管家会话（SUPERVISOR_SID）队列的头一个请求。 */
+const SUPERVISOR_SID = 'supervisor'
 
 /**
  * 【任务113】单条私信 content 字节上限不再在本文件写字面量：与主进程同取 src/shared/dm-attachment.ts
@@ -914,8 +922,99 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
   const peerName = displayNameOf(active?.peerName, active?.peerId)
   const myName = displayNameOf(status?.username ?? ui.username ?? undefined, status?.memberId ?? undefined)
 
+  /** 管家会话挂起的审批 / 提问队列头项：复用共享 store 的 approvalQueues / askQueues（不另建第二份真相），
+   *  取 SUPERVISOR_SID 队列的头一个请求 —— 与 SupervisorApp.tsx 取队口径一致。 */
+  const pending = useUiStoreSelector((s) => ({
+    approval: (s.approvalQueues[SUPERVISOR_SID] ?? [])[0] ?? null,
+    ask: (s.askQueues[SUPERVISOR_SID] ?? [])[0] ?? null,
+  }))
+  const curApproval = pending.approval
+  const curAsk = pending.ask
+
+  // 【任务154】私信弹窗归属到对应好友：挂起的审批/提问带 dmChannelId/dmPeerId 时，先切到该好友聊天界面再显示卡片。
+  // 复用既有 openThread 切换逻辑（不新建第二份选中态真相）；无归属（dmChannelId/dmPeerId 均空）退回 152 面板级行为。
+  const pendingDmTarget = curApproval?.dmChannelId ?? curAsk?.dmChannelId ?? curApproval?.dmPeerId ?? curAsk?.dmPeerId ?? ''
+  const pendingDmSeenRef = useRef<string>('')
+  useEffect(() => {
+    if (!pendingDmTarget) return
+    // 已切到该好友（按 channelId 或 peerId 命中）：不重复切
+    if (active?.channelId === pendingDmTarget || active?.peerId === pendingDmTarget) return
+    const t = threadsRef.current.find((x) => x.channelId === pendingDmTarget || x.peerId === pendingDmTarget)
+    if (!t) {
+      // 失败分支可见：目标好友会话不在本地列表，提示但不静默吞掉弹窗（卡片仍显示，只是切不过去）
+      if (pendingDmSeenRef.current !== pendingDmTarget) {
+        pendingDmSeenRef.current = pendingDmTarget
+        setErrorText(tKey('dm.respond.friendNotFound'))
+        setNotice(null)
+      }
+      return
+    }
+    pendingDmSeenRef.current = pendingDmTarget
+    void openThreadRef.current?.(t)
+  }, [pendingDmTarget, active?.channelId, active?.peerId, threads])
+
+  /** 就地回答管家会话的审批请求（复用 window.shanhai.respondApproval 既有 IPC，不新增通道）。
+   *  失败分支全部可见：无待审批 / 桥不可用 / 抛异常 → 面板顶部错误条，绝不静默。 */
+  const respondApproval = useCallback(async (outcome: 'allowed-once' | 'rejected'): Promise<void> => {
+    const req = (getUiStoreSnapshot().approvalQueues[SUPERVISOR_SID] ?? [])[0]
+    if (!req) {
+      setErrorText(tKey('dm.respond.noPendingApproval'))
+      setNotice(null)
+      return
+    }
+    if (!window.shanhai?.respondApproval) {
+      setErrorText(tKey('dm.respond.noBridge'))
+      setNotice(null)
+      return
+    }
+    try {
+      await window.shanhai.respondApproval(outcome, req.id)
+    } catch (e) {
+      setErrorText(tKey('dm.respond.approvalFailed', { error: e instanceof Error ? e.message : String(e) }))
+      setNotice(null)
+    }
+  }, [])
+
+  /** 就地回答管家会话的 AI 提问（复用 window.shanhai.respondAsk 既有 IPC）。 */
+  const respondAsk = useCallback(async (answer: string): Promise<void> => {
+    const req = (getUiStoreSnapshot().askQueues[SUPERVISOR_SID] ?? [])[0]
+    if (!req) {
+      setErrorText(tKey('dm.respond.noPendingAsk'))
+      setNotice(null)
+      return
+    }
+    if (!window.shanhai?.respondAsk) {
+      setErrorText(tKey('dm.respond.noBridge'))
+      setNotice(null)
+      return
+    }
+    try {
+      await window.shanhai.respondAsk(req.id, answer)
+    } catch (e) {
+      setErrorText(tKey('dm.respond.askFailed', { error: e instanceof Error ? e.message : String(e) }))
+      setNotice(null)
+    }
+  }, [])
+
+  /** 就地取消管家会话的 AI 提问（复用 window.shanhai.cancelAsk 既有 IPC）。 */
+  const cancelAsk = useCallback(async (): Promise<void> => {
+    const req = (getUiStoreSnapshot().askQueues[SUPERVISOR_SID] ?? [])[0]
+    if (!req) return
+    if (!window.shanhai?.cancelAsk) {
+      setErrorText(tKey('dm.respond.noBridge'))
+      setNotice(null)
+      return
+    }
+    try {
+      await window.shanhai.cancelAsk(req.id)
+    } catch (e) {
+      setErrorText(tKey('dm.respond.cancelFailed', { error: e instanceof Error ? e.message : String(e) }))
+      setNotice(null)
+    }
+  }, [])
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden', background: 'var(--bg-app)', color: 'var(--text)', fontFamily: 'system-ui, sans-serif' }}>
+    <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden', background: 'var(--bg-app)', color: 'var(--text)', fontFamily: 'system-ui, sans-serif' }}>
       <WindowTitleBar
         icon={<IconChat />}
         title={tKey('dm.title')}
@@ -1498,6 +1597,23 @@ export function MemberPanel(p: MemberPanelProps): React.JSX.Element {
           onClose={closeQuotePicker}
         />
       )}
+
+      {/* 管家会话挂起的审批 / 提问：私信面板就地回答（复用 ChatPlugin 的 ApprovalCard / AskCard /
+          SessionPicker / ModelPicker，不另画一套）。取队来源与 respond 通道都复用既有 store 与 IPC，
+          不建第二份队列真相。挂载方式选内联插入：MemberPanel 根容器已加 position:relative，
+          卡片 absolute 定位相对于根容器（整个私信窗口内容区）底部，浮在输入区上方，与 ChatPlugin/SupervisorApp
+          体验一致；MemberPanel 的消息流滚动容器**没有** contain:'layout'（那是 ChatPlugin/SupervisorApp 的
+          VirtualList 才有的），故不存在「contain 把 absolute 后代顶出可视区」的坑。 */}
+      {curApproval && (
+        <ApprovalCard req={curApproval} onAllow={() => void respondApproval('allowed-once')} onReject={() => void respondApproval('rejected')} />
+      )}
+      {curAsk && curAsk.kind === 'session-picker' ? (
+        <SessionPicker req={curAsk} onSubmit={(answer) => void respondAsk(answer)} onCancel={() => void cancelAsk()} />
+      ) : curAsk && curAsk.kind === 'model-picker' ? (
+        <ModelPicker req={curAsk} onSubmit={(answer) => void respondAsk(answer)} onCancel={() => void cancelAsk()} />
+      ) : curAsk ? (
+        <AskCard req={curAsk} onSubmit={(answer) => void respondAsk(answer)} onCancel={() => void cancelAsk()} />
+      ) : null}
     </div>
   )
 }

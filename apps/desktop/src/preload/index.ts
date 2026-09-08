@@ -499,7 +499,7 @@ export interface ShanhaiBridge {
   // 聊天
   run(message: string, attachments?: ContentPart[]): Promise<string>
   // 会话管家（主 Agent，独立 supervisor 窗口）
-  supervisorRun(message: string, attachments?: ContentPart[]): Promise<string>
+  supervisorRun(message: string, attachments?: ContentPart[], dmContext?: { channelId?: string; peerMemberId?: string; fromName?: string }): Promise<string>
   getSupervisorHistory(): Promise<Array<{ kind: 'user' | 'assistant' | 'tool'; content?: string; reasoningContent?: string; trace?: ToolTrace; attachments?: unknown[]; turnSeq?: number; turnDuration?: number }>>
   /** 管家自己的模型 id（supervisor 会话级，独立于其他会话与全局默认） */
   supervisorGetModel(): Promise<string>
@@ -974,7 +974,7 @@ const bridge: ShanhaiBridge = {
   respondApproval: (outcome, requestId) => ipcRenderer.invoke('approval:respond', outcome, requestId),
   respondCapabilityApproval: (requestId, approved, rememberForSession) => ipcRenderer.invoke('capability-approval:respond', requestId, approved, rememberForSession),
   run: (message, attachments) => ipcRenderer.invoke('chat:run', message, attachments),
-  supervisorRun: (message, attachments) => ipcRenderer.invoke('supervisor:run', message, attachments),
+  supervisorRun: (message, attachments, dmContext) => ipcRenderer.invoke('supervisor:run', message, attachments, dmContext),
   getSupervisorHistory: () => ipcRenderer.invoke('supervisor:history'),
   supervisorGetModel: () => ipcRenderer.invoke('supervisor:getModel'),
   supervisorGetApproval: () => ipcRenderer.invoke('supervisor:getApproval'),

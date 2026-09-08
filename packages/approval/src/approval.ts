@@ -9,6 +9,12 @@ export interface ApprovalRequest {
   riskLevel: string
   /** 发起审批的会话 id（并行会话时用于路由展示） */
   sessionId?: string
+  /** 本次审批归属的私信好友会话 id（channelId；管家在私信接管模式下处理某好友时透传，供私信面板切到该好友聊天界面） */
+  dmChannelId?: string
+  /** 本次审批归属的好友 memberId（与 dmChannelId 二选一） */
+  dmPeerId?: string
+  /** 好友显示名（用于界面归属展示，绝不是会员 id） */
+  dmFromName?: string
 }
 
 export type Approver = (req: ApprovalRequest) => ApprovalOutcome | Promise<ApprovalOutcome>

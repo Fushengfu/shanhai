@@ -34,7 +34,7 @@ export interface ExecutionModule {
   notifySupervisorResult(sid: string, title: string, result?: string, error?: string): void
   drainSupervisorQueue(sid: string): void
   buildSupervisorLoopTools(): ToolContract[]
-  runSupervisorInternal(message: string, attachments?: ContentPart[], modelIdOverride?: string): Promise<string>
+  runSupervisorInternal(message: string, attachments?: ContentPart[], modelIdOverride?: string, dmContext?: DmPendingReply): Promise<string>
   drainSupervisorWake(): Promise<void>
   wakeSupervisorForApproval(req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }): void
   wakeSupervisorForAsk(req: AskRequest): void
@@ -226,6 +226,7 @@ export function createExecutionModule(
     // 普通派活（不含 dmReplyTarget）绝不记录 → 会话完成绝不触发回发（防误触发）；队列/插入模式（busy 提前返回）不覆盖映射。
     if (origin === 'supervisor' && dmReplyTarget && dmReplyTarget.fromName) {
       ctx.dmPendingReplies.set(sid, dmReplyTarget)
+      ctx.supervisorDmContext.set(sid, dmReplyTarget)
     }
 
     const title = meta.title
@@ -325,6 +326,7 @@ export function createExecutionModule(
                 currentRequest: s.currentRequest,
               })),
             sessionId: SUPERVISOR_ID,
+            dmContext: ctx.supervisorDmContext.get(SUPERVISOR_ID),
           })
           .then((answer) => (answer === ASK_CANCELLED ? '' : answer)),
       askModelPicker: (question) =>
@@ -333,6 +335,7 @@ export function createExecutionModule(
             kind: 'model-picker',
             modelOptions: allModels().map((m) => ({ id: m.id, name: m.displayName ?? m.name ?? m.id })),
             sessionId: SUPERVISOR_ID,
+            dmContext: ctx.supervisorDmContext.get(SUPERVISOR_ID),
           })
           .then((answer) => (answer === ASK_CANCELLED ? '' : answer)),
       resolveApproval: (requestId, outcome) => {
@@ -381,16 +384,21 @@ export function createExecutionModule(
     ...createSupervisorLedgerTools().map(wrapTool),
   ]
 
-  const runSupervisorInternal = async (message: string, attachments?: ContentPart[], modelIdOverride?: string): Promise<string> => {
+  const runSupervisorInternal = async (message: string, attachments?: ContentPart[], modelIdOverride?: string, dmContext?: DmPendingReply): Promise<string> => {
     const supMeta = ctx.sessions.get(SUPERVISOR_ID)
     const supModel = modelIdOverride ?? supMeta?.modelId
     const targetModelId = supModel ?? ctx.defaultModelId
     const savedModelId = ctx.currentModelId
     if (targetModelId) modelProvider.applyModel(targetModelId)
     ctx.approval.setPolicy(sessions.sessionApprovalPolicy(SUPERVISOR_ID))
+    // 记录本轮管家会话正在为哪个好友服务（keyed by 会话 id），供本轮的 ask/approval 请求反查并携带 dm 归属
+    if (dmContext && (dmContext.channelId || dmContext.peerMemberId)) {
+      ctx.supervisorDmContext.set(SUPERVISOR_ID, dmContext)
+    }
     try {
       return await runInSession(SUPERVISOR_ID, message, attachments ? { attachments } : undefined)
     } finally {
+      ctx.supervisorDmContext.delete(SUPERVISOR_ID)
       if (savedModelId) modelProvider.applyModel(savedModelId)
       ctx.approval.setPolicy(sessions.sessionApprovalPolicy())
     }

@@ -1,7 +1,7 @@
 import { memo, useMemo, useState } from 'react'
 import type { ToolTrace } from '../types'
 import { IconActivity, IconAvatar, IconChevronDown, IconClock, IconCode, IconEdit, IconFile, IconGlobe, IconImage, IconMonitor, IconPlus, IconRefresh, IconSend, IconShield, IconTerminal, IconTrash, IconTree, IconUsers, IconWrench } from './icons'
-import { redactSecret, stringifyResult, truncate } from './ui'
+import { formatDuration, redactSecret, stringifyResult, truncate } from './ui'
 import { t } from '../../shared/i18n'
 import { useLocaleSync } from '../locale'
 
@@ -70,6 +70,7 @@ function skillActionMeta(skillId: string, action: string): { k: string; icon: Re
   const map: Record<string, { k: string; icon: React.ReactNode }> = {
     'computer-use:screenshot': { k: 'chat.tool.computer_screenshot', icon: <IconMonitor /> },
     'computer-use:ocr': { k: 'chat.tool.computer_ocr', icon: <IconMonitor /> },
+    'computer-use:read_tree': { k: 'chat.tool.computer_read_tree', icon: <IconMonitor /> },
     'computer-use:action': { k: 'chat.tool.computer_action', icon: <IconMonitor /> },
     'browser-use:create': { k: 'chat.tool.browser_create', icon: <IconGlobe /> },
     'browser-use:list': { k: 'chat.tool.browser_list', icon: <IconGlobe /> },
@@ -489,10 +490,16 @@ export function renderToolResult(name: string, result: unknown, error: string | 
 }
 
 /** 工具执行步骤：单行摘要（中文标题 + 摘要）+ 折叠的类型卡片 */
-export const ToolStep = memo(function ToolStep({ trace }: { trace: ToolTrace }) {
+export const ToolStep = memo(function ToolStep({ trace, expanded, onToggle }: { trace: ToolTrace; expanded?: boolean; onToggle?: () => void }) {
   // 机制类工具（如 ask_user 提问）已有专用交互卡片，这里不再渲染工具步骤，避免暴露内部工具名
   if (HIDDEN_STEP_TOOLS.has(trace.name)) return null
-  const [expanded, setExpanded] = useState(false)
+  const [innerExpanded, setInnerExpanded] = useState(false)
+  // 受控展开（外层 ToolGroup 传入）优先；未传时退回内部 state（兼容既有三处直接 <ToolStep/> 的调用）
+  const isExpanded = expanded !== undefined ? expanded : innerExpanded
+  const toggleExpanded = () => {
+    if (onToggle) onToggle()
+    else setInnerExpanded((v) => !v)
+  }
   const [reasoningOpen, setReasoningOpen] = useState(false)
   useLocaleSync()
   const isCall = trace.kind === 'tool-call'
@@ -533,7 +540,7 @@ export const ToolStep = memo(function ToolStep({ trace }: { trace: ToolTrace }) 
         </div>
       )}
       <div
-        onClick={() => expandable && setExpanded((v) => !v)}
+        onClick={() => expandable && toggleExpanded()}
         style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0', cursor: expandable ? 'pointer' : 'default' }}
       >
         <span style={{ color: stateColor, display: 'inline-flex', flexShrink: 0 }}>{meta.icon}</span>
@@ -549,14 +556,178 @@ export const ToolStep = memo(function ToolStep({ trace }: { trace: ToolTrace }) 
           <span style={{ fontSize: 11, padding: '0 6px', borderRadius: 4, background: 'var(--tint-orange)', color: 'var(--warning-text)', flexShrink: 0 }}>{t('chat.tool.pendingApproval')}</span>
         )}
         {expandable && (
-          <span style={{ marginLeft: 'auto', color: 'var(--text-faint)', display: 'inline-flex', flexShrink: 0, transform: expanded ? 'rotate(180deg)' : 'none', transition: 'transform .15s' }}>
+          <span style={{ marginLeft: 'auto', color: 'var(--text-faint)', display: 'inline-flex', flexShrink: 0, transform: isExpanded ? 'rotate(180deg)' : 'none', transition: 'transform .15s' }}>
             <IconChevronDown />
           </span>
         )}
       </div>
-      {expanded && expandable && (
+      {isExpanded && expandable && (
         <div style={{ marginTop: 3, marginLeft: 18, borderLeft: '2px solid var(--border)', overflow: 'hidden' }}>
           {resultBody}
+        </div>
+      )}
+    </div>
+  )
+})
+
+/** 工具调用开合状态的 localStorage 持久化键（与 theme / 草稿缓存同机制，跨切换会话 / 重进窗口保留） */
+const TOOL_GROUP_STATE_KEY = 'shanhai-tool-group-state'
+
+interface ToolGroupState {
+  /** 外层「整段工具调用」折叠状态：groupKey → collapsed */
+  groups: Record<string, boolean>
+  /** 内层各工具步骤展开状态：stepKey → expanded（只存 true，默认折叠不占存储） */
+  steps: Record<string, boolean>
+}
+
+/** 读开合状态（容错：JSON 坏 / localStorage 不可用都回退空表，不崩溃） */
+function readToolGroupState(): ToolGroupState {
+  try {
+    if (typeof window === 'undefined') return { groups: {}, steps: {} }
+    const raw = window.localStorage.getItem(TOOL_GROUP_STATE_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object') {
+        return {
+          groups: (parsed.groups && typeof parsed.groups === 'object') ? parsed.groups as Record<string, boolean> : {},
+          steps: (parsed.steps && typeof parsed.steps === 'object') ? parsed.steps as Record<string, boolean> : {},
+        }
+      }
+    }
+  } catch {
+    /* 忽略：localStorage 不可用（隐私模式）时静默回退 */
+  }
+  return { groups: {}, steps: {} }
+}
+
+/** 写开合状态（try/catch 容错，与 theme.ts 同口径） */
+function writeToolGroupState(state: ToolGroupState): void {
+  try {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(TOOL_GROUP_STATE_KEY, JSON.stringify(state))
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/** 一段工具调用的分组键：sessionId + 首个 callId，唯一标识同一轮次（callId 为 `${name}-${ts}-${random}` 全局唯一） */
+function toolGroupKey(tools: ToolTrace[]): string {
+  const first = tools[0]
+  return first ? `${first.sessionId}:${first.callId}` : ''
+}
+
+/** 单个工具步骤的持久化键 */
+function toolStepKey(t: ToolTrace): string {
+  return `${t.sessionId}:${t.callId}`
+}
+
+/**
+ * 外层「整段工具调用」折叠容器：摘要行（N 步 · 总耗时 · 异常徽标）+ 展开后内层各条 ToolStep（受控展开）。
+ * - 外层折叠时**不挂载**内部内容（条件渲染），长会话上百条工具调用不常驻 DOM。
+ * - 内层各步骤开合状态提升到本组件持有并持久化，外层折叠卸载内层后重开仍恢复原开合态。
+ * - 异常（失败 / 高危待审批）在外层折叠行上以徽标透出，即使收起也可见。
+ */
+export const ToolGroup = memo(function ToolGroup({ tools, live }: { tools: ToolTrace[]; live?: boolean }) {
+  useLocaleSync()
+  const groupKey = useMemo(() => toolGroupKey(tools), [tools])
+  const stepKeys = useMemo(() => tools.map(toolStepKey), [tools])
+
+  // 统计：失败数 / 高危（待审批）数 / 已完成工具耗时（durationMs 求和；拿不到就不显示）
+  const stats = useMemo(() => {
+    let failed = 0
+    let highRisk = 0
+    let doneMs = 0
+    for (const t of tools) {
+      if (t.kind === 'tool-result') {
+        if (t.error) failed++
+        doneMs += t.durationMs ?? 0
+      }
+      if (t.approvalRequired) highRisk++
+    }
+    return { failed, highRisk, doneMs }
+  }, [tools])
+
+  // 外层折叠：执行中（live）强制展开让用户看到 AI 在干活；历史消息默认收起为摘要行；
+  // 用户手动开合写入 localStorage 后以用户选择为准（不再自动改）。
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    const state = readToolGroupState()
+    if (groupKey && typeof state.groups[groupKey] === 'boolean') return state.groups[groupKey]!
+    if (live) return false
+    return true
+  })
+
+  // 内层各步骤展开状态：提升到本组件持有（外层折叠卸载内层时不丢失），持久化
+  const [innerExpanded, setInnerExpanded] = useState<Record<string, boolean>>(() => {
+    const state = readToolGroupState()
+    const map: Record<string, boolean> = {}
+    for (const k of stepKeys) {
+      if (state.steps[k] === true) map[k] = true
+    }
+    return map
+  })
+
+  const toggleGroup = () => {
+    const next = !collapsed
+    setCollapsed(next)
+    if (groupKey) {
+      const state = readToolGroupState()
+      state.groups[groupKey] = next
+      writeToolGroupState(state)
+    }
+  }
+
+  const toggleInner = (stepKey: string) => {
+    setInnerExpanded((prev) => {
+      const next = { ...prev, [stepKey]: !prev[stepKey] }
+      const state = readToolGroupState()
+      if (next[stepKey]) state.steps[stepKey] = true
+      else delete state.steps[stepKey]
+      writeToolGroupState(state)
+      return next
+    })
+  }
+
+  if (tools.length === 0) return null
+
+  return (
+    <div style={{ marginBottom: 4, fontSize: 13 }}>
+      {/* 外层摘要行：chevron + N 步 + 总耗时 + 异常徽标（折叠态下徽标也可见） */}
+      <div
+        onClick={toggleGroup}
+        style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0', cursor: 'pointer', userSelect: 'none' }}
+      >
+        <span style={{ display: 'inline-flex', color: 'var(--text-faint)', flexShrink: 0, transform: collapsed ? 'rotate(-90deg)' : 'none', transition: 'transform .15s' }}>
+          <IconChevronDown />
+        </span>
+        <span style={{ color: 'var(--text-muted)', fontSize: 12, flexShrink: 0 }}>{t('chat.toolGroup.summary', { n: tools.length })}</span>
+        {stats.doneMs > 0 && (
+          <>
+            <span style={{ color: 'var(--text-faint)', flexShrink: 0 }}>·</span>
+            <span style={{ color: 'var(--text-muted)', fontSize: 12, flexShrink: 0 }}>{formatDuration(stats.doneMs)}</span>
+          </>
+        )}
+        {live && <span style={{ color: 'var(--accent)', fontSize: 12, flexShrink: 0 }}>{t('chat.tool.running')}</span>}
+        {stats.failed > 0 && (
+          <span style={{ fontSize: 11, padding: '0 6px', borderRadius: 4, background: 'var(--tint-red)', color: 'var(--danger-text)', flexShrink: 0 }}>{t('chat.toolGroup.failedBadge', { n: stats.failed })}</span>
+        )}
+        {stats.highRisk > 0 && (
+          <span style={{ fontSize: 11, padding: '0 6px', borderRadius: 4, background: 'var(--tint-orange)', color: 'var(--warning-text)', flexShrink: 0 }}>{t('chat.toolGroup.highRiskBadge', { n: stats.highRisk })}</span>
+        )}
+      </div>
+      {/* 展开才挂载内层（条件渲染），折叠不占 DOM */}
+      {!collapsed && (
+        <div style={{ marginTop: 2, marginLeft: 10, borderLeft: '2px solid var(--border)', paddingLeft: 6 }}>
+          {tools.map((t) => {
+            const key = toolStepKey(t)
+            return (
+              <ToolStep
+                key={t.callId}
+                trace={t}
+                expanded={innerExpanded[key] === true}
+                onToggle={() => toggleInner(key)}
+              />
+            )
+          })}
         </div>
       )}
     </div>

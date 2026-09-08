@@ -8,6 +8,14 @@ const execFile = promisify(execFileCallback)
 /** run_command 命令执行超时（毫秒）：超时后 kill 子进程并返回错误，防止命令永久卡死堵塞任务循环（等机器类的兜底，区别于 ask_user 等「等用户」工具的不超时） */
 const RUN_COMMAND_TIMEOUT_MS = 5 * 60 * 1000
 
+/**
+ * edit_file 删除量异常阈值：单次替换的净删除行数/字符数达到此阈值时，在返回结果中附 warning 字段，
+ * 防止「空替换=静默删除大段代码 + ok:true」的缺陷（曾真实咬掉提词器项目 home_repository.go 的整段函数）。
+ * 阈值依据：20 行 ≈ 一个中等函数的规模，500 字符 ≈ 15~20 行代码或一段长文本；两者任一命中即视为「大段删除」。
+ */
+const EDIT_DELETE_WARN_LINES = 20
+const EDIT_DELETE_WARN_CHARS = 500
+
 /** 工具风险等级（安全属性内嵌于契约） */
 export type RiskLevel = 'readonly' | 'reversible' | 'irreversible' | 'high'
 
@@ -220,6 +228,13 @@ export function sanitizeBinaryOutput(text: string): string {
   // 3. 连续不可打印字符块（cat 二进制文件吐出的乱码）
   out = out.replace(/[^\x20-\x7E\n\r\t]{64,}/g, '[二进制数据已省略]')
   return out
+}
+
+/** 统计文本行数：空串 = 0；尾部换行不额外计数（如 "a\nb\n" 计 2 行而非 3）。用于 edit_file 的 changed 摘要。 */
+function countLines(s: string): number {
+  if (s === '') return 0
+  const parts = s.split('\n')
+  return parts[parts.length - 1] === '' ? parts.length - 1 : parts.length
 }
 
 /**
@@ -531,15 +546,17 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
       '编辑已有文件：将 oldText 精确替换为 newText（替换模式，只需提供要改的片段，无需重传全文，token 开销小）。' +
       'path 可以是绝对路径，也可以是相对于当前工作目录的相对路径。' +
       '默认只替换首次命中；当 oldText 在文件中出现多次时，需设置 replaceAll=true 替换全部，或提供更长的 oldText 上下文精确定位唯一命中；' +
-      '也可设置 expectedOccurrences 声明期望命中次数，实际命中不符则报错。修改文件默认需用户确认。',
+      '也可设置 expectedOccurrences 声明期望命中次数，实际命中不符则报错。修改文件默认需用户确认。' +
+      'newText 为空（缺失/空串/纯空白）会被视为删除 oldText 并报错；仅当确需删除该片段时才可显式传 allowDelete=true。',
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: '文件路径（绝对路径，或相对当前工作目录的相对路径）' },
         oldText: { type: 'string', description: '需要被替换的原文本（必须精确匹配）' },
-        newText: { type: 'string', description: '替换后的新文本' },
+        newText: { type: 'string', description: '替换后的新文本；为空（缺失/空串/纯空白）会删除 oldText，需同时传 allowDelete=true 才允许' },
         replaceAll: { type: 'boolean', description: '是否替换全部命中，默认 false（只替换首个命中）' },
         expectedOccurrences: { type: 'number', description: '期望 oldText 出现的次数，实际不符则报错（可选）' },
+        allowDelete: { type: 'boolean', description: '显式声明允许删除：newText 为空时只有它为 true 才放行，防止误删（可选，默认 false）' },
       },
       required: ['path', 'oldText', 'newText'],
     },
@@ -566,7 +583,16 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
       }
       const path = resolvePath(args.path)
       const oldText = args.oldText
-      const newText = String(args.newText ?? '')
+      const allowDelete = args.allowDelete === true
+      // newText 运行时校验：缺失/非字符串 → 报错；空/纯空白 → 需显式 allowDelete=true 才放行。
+      // （修复「空替换=静默删除 oldText + ok:true」缺陷，曾真实咬掉提词器项目两段代码）
+      if (args.newText === undefined || args.newText === null || typeof args.newText !== 'string') {
+        throw new Error('edit_file 缺少 newText 参数：请提供替换后的新文本；若确需删除 oldText 片段，请显式传 allowDelete=true')
+      }
+      const newText = args.newText.trim() === '' ? '' : args.newText
+      if (newText === '' && !allowDelete) {
+        throw new Error('edit_file newText 为空：空替换会删除 oldText 内容。若确需删除该片段，请显式传 allowDelete=true')
+      }
       const replaceAll = args.replaceAll === true
       const expectedOccurrences = typeof args.expectedOccurrences === 'number' ? args.expectedOccurrences : undefined
 
@@ -597,6 +623,28 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
         ? before.split(oldText).join(newText)
         : before.slice(0, before.indexOf(oldText)) + newText + before.slice(before.indexOf(oldText) + oldText.length)
 
+      // changed 摘要：新增/删除行数与字符数，让调用方一眼看到删了多少（避免 ok:true 掩盖删除）
+      const occurrences = replaceAll ? count : 1
+      const deletedLines = countLines(oldText) * occurrences
+      const addedLines = countLines(newText) * occurrences
+      const deletedChars = oldText.length * occurrences
+      const addedChars = newText.length * occurrences
+      const changed = {
+        occurrences,
+        addedLines,
+        deletedLines,
+        netLines: addedLines - deletedLines,
+        addedChars,
+        deletedChars,
+      }
+      // 删除量异常检查：净删除行数/字符数超阈值时附 warning 字段，不静默通过
+      const netDeletedLines = deletedLines - addedLines
+      const netDeletedChars = deletedChars - addedChars
+      let warning: string | undefined
+      if (netDeletedLines >= EDIT_DELETE_WARN_LINES || netDeletedChars >= EDIT_DELETE_WARN_CHARS) {
+        warning = `本次替换净删除 ${netDeletedLines} 行 / ${netDeletedChars} 字符，超过常规编辑规模，请确认是否误删`
+      }
+
       // 写前快照：备份原文件，支撑回滚
       let snapshotId: string | undefined
       if (snapshot) {
@@ -607,7 +655,7 @@ export function createAtomicTools(getCwd: () => string, snapshot?: SnapshotFn): 
         }
       }
       await fs.writeFile(path, after, 'utf8')
-      return { ok: true, path, occurrences: replaceAll ? count : 1, before, after, snapshotId }
+      return { ok: true, path, occurrences, before, after, snapshotId, changed, ...(warning ? { warning } : {}) }
     },
   }
 

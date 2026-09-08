@@ -125,8 +125,8 @@ export interface RuntimeContext {
 
   // —— 工具过程 + 审批桥 ——
   toolTraceCallbacks: Set<(trace: ToolTrace) => void>
-  approvalCallbacks: Set<(req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }) => void>
-  pendingApprovals: Map<string, { resolve: (outcome: ApprovalOutcome) => void; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string }>
+  approvalCallbacks: Set<(req: { id: string; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string; dmChannelId?: string; dmPeerId?: string; dmFromName?: string }) => void>
+  pendingApprovals: Map<string, { resolve: (outcome: ApprovalOutcome) => void; sessionId?: string; toolName: string; args: Record<string, unknown>; riskLevel: string; dmChannelId?: string; dmPeerId?: string; dmFromName?: string }>
   approvalResolvedCallbacks: Set<(requestId: string) => void>
   askResolvedCallbacks: Set<(requestId: string) => void>
   // —— 能力级审批（阶段2b）：插件跨插件调用带元数据能力（write/destructive）时的审批桥 ——
@@ -225,6 +225,11 @@ export interface RuntimeContext {
   /** 私信管家接管·待回发映射：会话 id → 目标好友。仅「管家因某好友私信而派活」时记录，
    *  会话完成后 wakeSupervisorForResult 消费并清除；普通会话完成时无此记录，绝不触发回发。内存 Map，不落盘。 */
   dmPendingReplies: Map<string, DmPendingReply>
+  /** 会话当前正在为哪个好友服务的上下文映射：sessionId → 目标好友。
+   *  管家会话在 runSupervisorInternal 记录（SUPERVISOR_ID → 好友），被派活会话在 dispatchToSession 记录；
+   *  ask / approval 请求产生时据此反查并把 dmChannelId/dmPeerId/dmFromName 写入请求对象，供私信面板切到对应好友聊天界面。
+   *  与 dmPendingReplies 不同：dmPendingReplies 是「完成后回发一次」的消费型标记，这里是「执行期间归属」的存续型映射。内存 Map，不落盘。 */
+  supervisorDmContext: Map<string, DmPendingReply>
 
   // —— 事件回调 ——
   sessionActivityCallbacks: Set<(sessionId: string, kind: 'start' | 'end') => void>

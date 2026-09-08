@@ -297,7 +297,11 @@ export function SupervisorApp(): React.JSX.Element {
             `若直接回复，请用 dm_send 工具（params 传 channelId=${payload.channelId} 或 peerMemberId=${payload.from}）；若需要安排会话处理：` +
             `① 先用 dm_send 给对方发一条「收到，正在处理，稍后回复你」；② 用 send_message 给目标会话派活时，把 dmReplyTarget（{ channelId, peerMemberId, fromName }，channelId=${payload.channelId}、peerMemberId=${payload.from}、fromName=「${payload.fromName}」）一并传给该工具，这样会话完成后会自动把结果用 dm_send 回发给该好友。` +
             `若一个好友的需求需要分多步、由同一会话持续推进，请只在最后一次下发任务时附 dmReplyTarget，避免中间步骤被回发给好友。`
-      void window.shanhai?.supervisorRun(intro)
+      void window.shanhai?.supervisorRun(intro, undefined, {
+        channelId: typeof payload.channelId === 'string' ? payload.channelId : undefined,
+        peerMemberId: typeof payload.from === 'string' ? payload.from : undefined,
+        fromName: typeof payload.fromName === 'string' ? payload.fromName : '',
+      })
     })
     return off
   }, [cur.busy])

@@ -11,7 +11,6 @@ import { localeOptionOf, useI18n, useLocaleSync } from '../locale'
 // tKey：httpTraces.map((t, i) => …) 的循环变量叫 t，会在该回调里遮蔽取词函数 →
 // 那几处一律用别名 tKey（同一个函数，只是不被遮蔽）。
 import { t, t as tKey } from '../../shared/i18n'
-
 /** 单个开关项：标签 + 描述 + 切换开关 */
 function ToggleRow({
   label,

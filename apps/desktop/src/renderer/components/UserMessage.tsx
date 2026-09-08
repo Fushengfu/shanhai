@@ -1,7 +1,10 @@
 import { memo, useState } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { IconClock, IconCopy, IconEdit, IconRefresh, IconShare } from './icons'
 import { MessageActions } from './MessageActions'
 import { DmSharePicker } from './DmSharePicker'
+import { makeMarkdownComponents, normalizeTreeBlocks } from './Markdown'
 import { copyText } from './ui'
 import { t } from '../../shared/i18n'
 import { useLocaleSync } from '../locale'
@@ -68,8 +71,12 @@ export const UserMessage = memo(function UserMessage({ content, images, userInde
         </div>
       ) : content ? (
         <>
-          <div style={{ maxWidth: '70%', minWidth: 0, padding: '8px 14px', borderRadius: 16, borderBottomRightRadius: 4, background: 'var(--accent)', color: '#fff', fontSize: 14, lineHeight: 1.6, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word', opacity: pending ? 0.65 : 1, userSelect: 'text', WebkitUserSelect: 'text' }}>
-            {content}
+          <div style={{ maxWidth: '70%', minWidth: 0, padding: '8px 14px', borderRadius: 16, borderBottomRightRadius: 4, background: 'var(--accent)', color: '#fff', fontSize: 14, lineHeight: 1.6, overflowWrap: 'anywhere', wordBreak: 'break-word', opacity: pending ? 0.65 : 1, userSelect: 'text', WebkitUserSelect: 'text' }}>
+            <div style={{ minWidth: 0, maxWidth: '100%', overflowX: 'auto' }}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMarkdownComponents(onPreviewImage, 'accent')}>
+                {normalizeTreeBlocks(content)}
+              </ReactMarkdown>
+            </div>
           </div>
           {pending ? (
             <div style={{ fontSize: 11, color: 'var(--warning)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>

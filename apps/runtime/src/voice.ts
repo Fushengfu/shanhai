@@ -84,8 +84,8 @@ export function createSystemVoiceService(): VoiceService {
 }
 
 /** 网关 ASR：PCM(Int16 16kHz) base64 → 文字。
- *  对齐 taco voice.recognize：POST {baseUrl}/audio/asr，模型 stepaudio-2.5-asr，
- *  body { audioData: pcmBase64, language: 'zh', model: 'stepaudio-2.5-asr' }，Accept: text/event-stream。 */
+ *  POST {baseUrl}/audio/asr，body { audioData: pcmBase64, language: 'zh' }，Accept: text/event-stream。
+ *  不再指定 model：用哪个 ASR 模型由网关侧决定（按 model_type='asr' 取启用且密钥非空的模型，sort_order 最小优先）。 */
 export async function gatewayAsrTranscribe(pcmBase64: string, apiKey: string, baseUrl: string): Promise<string> {
   const url = `${baseUrl.replace(/\/+$/, '')}/audio/asr`
   const controller = new AbortController()
@@ -98,7 +98,7 @@ export async function gatewayAsrTranscribe(pcmBase64: string, apiKey: string, ba
         'Content-Type': 'application/json',
         Accept: 'text/event-stream',
       },
-      body: JSON.stringify({ audioData: pcmBase64, language: 'zh', model: 'stepaudio-2.5-asr' }),
+      body: JSON.stringify({ audioData: pcmBase64, language: 'zh' }),
       signal: controller.signal,
     })
     if (!res.ok) {

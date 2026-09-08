@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { IconActivity, IconClock, IconClose, IconMaximize, IconMinimize, IconMonitor, IconMoon, IconRestore, IconSettings, IconSidebar, IconSun, IconTerminal } from '../components/icons'
+import { IconActivity, IconClock, IconClose, IconMaximize, IconMinimize, IconMonitor, IconMoon, IconRestore, IconSidebar, IconSun } from '../components/icons'
 import { smallIconBtn } from '../components/ui'
 import { WindowControlButton } from '../components/WindowTitleBar'
 import { DmEntryButton } from '../components/DmEntryButton'
@@ -57,22 +57,6 @@ function HeaderSlot(): React.JSX.Element {
         >
           <IconActivity />
           {t('app.trace.name')}
-        </button>
-        <button
-          onClick={() => void window.shanhai?.openApp('settings')}
-          title={t('app.settings.name')}
-          style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer', ...({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) }}
-        >
-          <IconSettings />
-          {t('app.settings.name')}
-        </button>
-        <button
-          onClick={() => void window.shanhai?.openApp('terminal')}
-          title={t('panels.header.terminalTip')}
-          style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer', ...({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) }}
-        >
-          <IconTerminal />
-          {t('app.terminal.name')}
         </button>
         <button
           onClick={ctx.toggleTheme}

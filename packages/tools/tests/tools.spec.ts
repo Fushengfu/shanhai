@@ -187,4 +187,67 @@ describe('原子工具', () => {
     await expect(editFileTool.execute({ path: 'f.txt', oldText: 'hello', newText: 'x' })).rejects.toThrow(/命中 2 处/)
     await fs.rm(dir, { recursive: true, force: true })
   })
+
+  it('edit_file 缺失 newText 时报错（不静默删除）', async () => {
+    const dir = join('/tmp', `shanhai-tools-${Date.now()}`)
+    await fs.mkdir(dir, { recursive: true })
+    await fs.writeFile(join(dir, 'f.txt'), 'const a = 1\nconst b = 2\n')
+    const editFileTool = createAtomicTools(() => dir).find((t) => t.name === 'edit_file')!
+    await expect(editFileTool.execute({ path: 'f.txt', oldText: 'const a = 1' })).rejects.toThrow(/缺少 newText/)
+    // 文件未被改动
+    expect(await fs.readFile(join(dir, 'f.txt'), 'utf8')).toBe('const a = 1\nconst b = 2\n')
+    await fs.rm(dir, { recursive: true, force: true })
+  })
+
+  it('edit_file newText 为空/纯空白时报错，除非 allowDelete=true', async () => {
+    const dir = join('/tmp', `shanhai-tools-${Date.now()}`)
+    await fs.mkdir(dir, { recursive: true })
+    await fs.writeFile(join(dir, 'f.txt'), 'const a = 1\nconst b = 2\n')
+    const editFileTool = createAtomicTools(() => dir).find((t) => t.name === 'edit_file')!
+    // 空串 → 报错
+    await expect(editFileTool.execute({ path: 'f.txt', oldText: 'const a = 1', newText: '' })).rejects.toThrow(/newText 为空/)
+    // 纯空白 → 报错
+    await expect(editFileTool.execute({ path: 'f.txt', oldText: 'const a = 1', newText: '   ' })).rejects.toThrow(/newText 为空/)
+    // 文件未被改动
+    expect(await fs.readFile(join(dir, 'f.txt'), 'utf8')).toBe('const a = 1\nconst b = 2\n')
+    // allowDelete=true + 空串 → 删除成功
+    const result = (await editFileTool.execute({ path: 'f.txt', oldText: 'const a = 1\n', newText: '', allowDelete: true })) as { after: string }
+    expect(result.after).toBe('const b = 2\n')
+    await fs.rm(dir, { recursive: true, force: true })
+  })
+
+  it('edit_file newText 含 $&/$1 等字符原样保留（非正则替换）', async () => {
+    const dir = join('/tmp', `shanhai-tools-${Date.now()}`)
+    await fs.mkdir(dir, { recursive: true })
+    await fs.writeFile(join(dir, 'f.txt'), 'abc\n')
+    const editFileTool = createAtomicTools(() => dir).find((t) => t.name === 'edit_file')!
+    const result = (await editFileTool.execute({ path: 'f.txt', oldText: 'abc', newText: '$& $1 $`' })) as { after: string }
+    expect(result.after).toBe('$& $1 $`\n')
+    await fs.rm(dir, { recursive: true, force: true })
+  })
+
+  it('edit_file 返回 changed 摘要（新增/删除行数字符数）', async () => {
+    const dir = join('/tmp', `shanhai-tools-${Date.now()}`)
+    await fs.mkdir(dir, { recursive: true })
+    await fs.writeFile(join(dir, 'f.txt'), 'l1\nl2\nl3\n')
+    const editFileTool = createAtomicTools(() => dir).find((t) => t.name === 'edit_file')!
+    const result = (await editFileTool.execute({ path: 'f.txt', oldText: 'l2\n', newText: 'x\ny\n' })) as {
+      changed: { deletedLines: number; addedLines: number; netLines: number }
+    }
+    expect(result.changed.deletedLines).toBe(1)
+    expect(result.changed.addedLines).toBe(2)
+    expect(result.changed.netLines).toBe(1)
+    await fs.rm(dir, { recursive: true, force: true })
+  })
+
+  it('edit_file 大段删除（allowDelete=true）触发 warning 字段', async () => {
+    const dir = join('/tmp', `shanhai-tools-${Date.now()}`)
+    await fs.mkdir(dir, { recursive: true })
+    const manyLines = Array.from({ length: 30 }, (_, i) => `line${i + 1}`).join('\n')
+    await fs.writeFile(join(dir, 'f.txt'), `${manyLines}\ntail\n`)
+    const editFileTool = createAtomicTools(() => dir).find((t) => t.name === 'edit_file')!
+    const result = (await editFileTool.execute({ path: 'f.txt', oldText: manyLines, newText: '', allowDelete: true })) as { warning?: string }
+    expect(result.warning).toContain('净删除 30 行')
+    await fs.rm(dir, { recursive: true, force: true })
+  })
 })

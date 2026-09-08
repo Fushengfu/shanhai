@@ -116,31 +116,50 @@ export function MermaidBlock({ code }: { code: string }) {
   )
 }
 
+/**
+ * Markdown 渲染语境：'panel' 浅色气泡（AI 回复 / 私信对方，深字浅底），
+ * 'accent' 强调色气泡（用户消息 / 私信自己，白字蓝底）。
+ * 行内代码 / 链接 / 表格据此换配色——accent 气泡里 var(--accent) 与背景同色会看不见、var(--text) 深字在蓝底上不可读。
+ */
+export type MarkdownTone = 'panel' | 'accent'
+
 /** 图片点击预览回调（模块级可变引用）：让 components 对象保持稳定引用，避免每次渲染重建导致 ReactMarkdown 子树（代码块/图表）重挂载闪屏 */
 let latestImageClick: ((url: string) => void) | undefined
 
-function MarkdownCode(props: { className?: string; children?: React.ReactNode }): React.JSX.Element {
-  const cls = props.className ?? ''
-  const lang = /language-([\w-]+)/.exec(cls)?.[1]
-  if (!cls || !lang) {
-    return (
-      <code style={{ background: 'var(--bg-hover)', padding: '2px 5px', borderRadius: 4, fontSize: '0.9em', fontFamily: 'ui-monospace, monospace' }}>
-        {props.children}
-      </code>
-    )
+/** 行内代码 / 代码块 / Mermaid：tone 只影响行内代码配色（accent 蓝底用半透明白，panel 用 bg-hover），代码块固定深色两种语境通用 */
+function makeCode(tone: MarkdownTone) {
+  return function MarkdownCode(props: { className?: string; children?: React.ReactNode }): React.JSX.Element {
+    const cls = props.className ?? ''
+    const lang = /language-([\w-]+)/.exec(cls)?.[1]
+    if (!cls || !lang) {
+      const style: React.CSSProperties =
+        tone === 'accent'
+          ? { background: 'rgba(255,255,255,0.18)', color: '#fff', padding: '2px 5px', borderRadius: 4, fontSize: '0.9em', fontFamily: 'ui-monospace, monospace' }
+          : { background: 'var(--bg-hover)', padding: '2px 5px', borderRadius: 4, fontSize: '0.9em', fontFamily: 'ui-monospace, monospace' }
+      return (
+        <code style={style}>
+          {props.children}
+        </code>
+      )
+    }
+    if (lang === 'mermaid') {
+      return <MermaidBlock code={extractCodeText(props.children)} />
+    }
+    return <CodeBlock>{props.children}</CodeBlock>
   }
-  if (lang === 'mermaid') {
-    return <MermaidBlock code={extractCodeText(props.children)} />
-  }
-  return <CodeBlock>{props.children}</CodeBlock>
 }
 
-function MarkdownLink(props: { href?: string; children?: React.ReactNode }): React.JSX.Element {
-  return (
-    <a href={props.href} target="_blank" rel="noreferrer" style={{ color: 'var(--accent)' }}>
-      {props.children}
-    </a>
-  )
+/** 链接：accent 蓝底里 var(--accent) 与背景同色看不见，改白色+下划线；panel 保持 var(--accent) */
+function makeLink(tone: MarkdownTone) {
+  return function MarkdownLink(props: { href?: string; children?: React.ReactNode }): React.JSX.Element {
+    const style: React.CSSProperties =
+      tone === 'accent' ? { color: '#fff', textDecoration: 'underline' } : { color: 'var(--accent)' }
+    return (
+      <a href={props.href} target="_blank" rel="noreferrer" style={style}>
+        {props.children}
+      </a>
+    )
+  }
 }
 
 function MarkdownImage(props: { src?: string; alt?: string }): React.JSX.Element {
@@ -165,55 +184,54 @@ function MarkdownTable(props: { children?: React.ReactNode }): React.JSX.Element
   )
 }
 
-/** 表头单元格：背景底色 + 边框 + 加粗左对齐，与普通单元格形成视觉区分 */
-function MarkdownTh(props: { children?: React.ReactNode }): React.JSX.Element {
-  return (
-    <th
-      style={{
-        border: '1px solid var(--border-strong)',
-        background: 'var(--bg-hover)',
-        padding: '6px 12px',
-        textAlign: 'left',
-        fontWeight: 600,
-        color: 'var(--text)',
-        whiteSpace: 'nowrap',
-      }}
-    >
-      {props.children}
-    </th>
-  )
+/** 表头单元格：背景底色 + 边框 + 加粗左对齐，与普通单元格形成视觉区分。accent 蓝底改半透明白底+白字 */
+function makeTh(tone: MarkdownTone) {
+  return function MarkdownTh(props: { children?: React.ReactNode }): React.JSX.Element {
+    const style: React.CSSProperties =
+      tone === 'accent'
+        ? { border: '1px solid rgba(255,255,255,0.35)', background: 'rgba(255,255,255,0.12)', padding: '6px 12px', textAlign: 'left', fontWeight: 600, color: '#fff', whiteSpace: 'nowrap' }
+        : { border: '1px solid var(--border-strong)', background: 'var(--bg-hover)', padding: '6px 12px', textAlign: 'left', fontWeight: 600, color: 'var(--text)', whiteSpace: 'nowrap' }
+    return <th style={style}>{props.children}</th>
+  }
 }
 
-/** 表格单元格：边框 + 内边距 + 顶部对齐 */
-function MarkdownTd(props: { children?: React.ReactNode }): React.JSX.Element {
-  return (
-    <td
-      style={{
-        border: '1px solid var(--border-strong)',
-        padding: '6px 12px',
-        color: 'var(--text)',
-        verticalAlign: 'top',
-      }}
-    >
-      {props.children}
-    </td>
-  )
+/** 表格单元格：边框 + 内边距 + 顶部对齐。accent 蓝底改白字+半透明白边框 */
+function makeTd(tone: MarkdownTone) {
+  return function MarkdownTd(props: { children?: React.ReactNode }): React.JSX.Element {
+    const style: React.CSSProperties =
+      tone === 'accent'
+        ? { border: '1px solid rgba(255,255,255,0.35)', padding: '6px 12px', color: '#fff', verticalAlign: 'top' }
+        : { border: '1px solid var(--border-strong)', padding: '6px 12px', color: 'var(--text)', verticalAlign: 'top' }
+    return <td style={style}>{props.children}</td>
+  }
 }
 
-/** 稳定引用的 components（模块级只创建一次），避免每次 render 新建组件导致代码块/Mermaid 图表子树重挂载（输入时闪屏的根因） */
-const MARKDOWN_COMPONENTS = {
-  code: MarkdownCode,
-  a: MarkdownLink,
-  img: MarkdownImage,
-  table: MarkdownTable,
-  th: MarkdownTh,
-  td: MarkdownTd,
+/** 稳定引用的 components：按 tone 各缓存一份，避免每次 render 新建组件导致代码块/Mermaid 图表子树重挂载（输入时闪屏的根因） */
+const COMPONENTS_CACHE = new Map<MarkdownTone, ReturnType<typeof buildComponents>>()
+
+function buildComponents(tone: MarkdownTone) {
+  return {
+    code: makeCode(tone),
+    a: makeLink(tone),
+    img: MarkdownImage,
+    table: MarkdownTable,
+    th: makeTh(tone),
+    td: makeTd(tone),
+  }
 }
 
-/** 生成 react-markdown 的 components 配置（代码块高亮 / mermaid 图表 / 行内代码 / 链接 / 图片宽度限制） */
-export function makeMarkdownComponents(onImageClick?: (url: string) => void) {
+/**
+ * 生成 react-markdown 的 components 配置（代码块高亮 / mermaid 图表 / 行内代码 / 链接 / 图片宽度限制）。
+ * @param tone 'panel' = 浅色气泡（AI 回复 / 私信对方），'accent' = 强调色气泡（用户消息 / 私信自己）
+ */
+export function makeMarkdownComponents(onImageClick?: (url: string) => void, tone: MarkdownTone = 'panel') {
   latestImageClick = onImageClick
-  return MARKDOWN_COMPONENTS
+  let c = COMPONENTS_CACHE.get(tone)
+  if (!c) {
+    c = buildComponents(tone)
+    COMPONENTS_CACHE.set(tone, c)
+  }
+  return c
 }
 
 /** 树结构 / 目录树 / 框线图用到的 box-drawing 字符（U+2500 系列），用于识别「未用代码块包裹的等宽树形文本」 */

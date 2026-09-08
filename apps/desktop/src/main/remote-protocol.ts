@@ -173,6 +173,28 @@ function buildHistoryPayload(sessionId: string, payload: Record<string, unknown>
   return sliceHistoryByTurns(history, MAX_HISTORY_TURNS)
 }
 
+/**
+ * 异步执行「长命令」：不阻塞 cmd_result 返回，结果靠既有事件流（session_activity / delta）回推。
+ *
+ * 背景（任务138/139）：run_supervisor / resume / resend / retry 会完整跑完 agent 循环（可能远超手机端
+ * 60s 等待），若 await 完再回 cmd_result 会造成「下游还在执行、上游手机端已先判 60s 命令超时」的倒挂。
+ * 改为 fire-and-forget 后立即回 ack，执行进度由 runInSession 内部广播的 session_activity(start/end) +
+ * delta 事件实时渲染，收尾（_busy=false）靠 session_activity(end)，不再依赖 cmd_result 的返回时机。
+ *
+ * 错误处理：异步失败只落日志、不回 cmd_result（ack 已回，重复回同 id 手机端 _pending 已 remove、无效）。
+ * 对普通会话 resume/resend/retry，「会话不存在」等前置校验错误本就发不出 session_activity(start)，
+ * 手机端不设 busy、无卡死；对 run_supervisor（管家会话恒在）此分支实际不可达。
+ */
+function runDetached(cmd: string, task: () => Promise<unknown>): void {
+  void (async () => {
+    try {
+      await task()
+    } catch (err) {
+      console.error(`[remote-protocol] 命令 ${cmd} 异步执行失败:`, err instanceof Error ? err.message : err)
+    }
+  })()
+}
+
 /** 处理一条命令，结果通过 send 回调返回（send 由调用方注入：局域网 socket 或网关连接） */
 export async function handleCommand(send: (obj: unknown) => void, msg: IncomingCmd): Promise<void> {
   const runtime = getRuntime()
@@ -189,9 +211,19 @@ export async function handleCommand(send: (obj: unknown) => void, msg: IncomingC
       case 'get_supervisor_history':
         data = buildHistoryPayload(SUPERVISOR_ID, payload)
         break
-      case 'run_supervisor':
-        data = await runtime.runSupervisor(String(payload.message ?? ''))
+      case 'run_supervisor': {
+        const message = String(payload.message ?? '')
+        const dmCtx = payload.dmContext && typeof payload.dmContext === 'object'
+          ? {
+              channelId: typeof (payload.dmContext as any).channelId === 'string' ? (payload.dmContext as any).channelId : undefined,
+              peerMemberId: typeof (payload.dmContext as any).peerMemberId === 'string' ? (payload.dmContext as any).peerMemberId : undefined,
+              fromName: typeof (payload.dmContext as any).fromName === 'string' ? (payload.dmContext as any).fromName : '',
+            }
+          : undefined
+        runDetached('run_supervisor', () => runtime.runSupervisor(message, undefined, dmCtx))
+        data = { ok: true, message: '已下发管家任务，将异步执行' }
         break
+      }
       case 'get_models':
         data = await runtime.listModels()
         break
@@ -206,15 +238,26 @@ export async function handleCommand(send: (obj: unknown) => void, msg: IncomingC
         runtime.stopSession(String(payload.sessionId ?? ''))
         data = { ok: true }
         break
-      case 'resend':
-        data = await runtime.resend(String(payload.sessionId ?? ''), Number(payload.userMessageIndex ?? 0), payload.newContent as string | undefined)
+      case 'resend': {
+        const sessionId = String(payload.sessionId ?? '')
+        const userMessageIndex = Number(payload.userMessageIndex ?? 0)
+        const newContent = payload.newContent as string | undefined
+        runDetached('resend', () => runtime.resend(sessionId, userMessageIndex, newContent))
+        data = { ok: true }
         break
-      case 'resume':
-        data = await runtime.resume(String(payload.sessionId ?? ''))
+      }
+      case 'resume': {
+        const sessionId = String(payload.sessionId ?? '')
+        runDetached('resume', () => runtime.resume(sessionId))
+        data = { ok: true }
         break
-      case 'retry':
-        data = await runtime.retrySession(String(payload.sessionId ?? ''))
+      }
+      case 'retry': {
+        const sessionId = String(payload.sessionId ?? '')
+        runDetached('retry', () => runtime.retrySession(sessionId))
+        data = { ok: true }
         break
+      }
       case 'create_session':
         data = { sessionId: runtime.createSession(payload.title as string | undefined, payload.workdir as string | undefined) }
         break

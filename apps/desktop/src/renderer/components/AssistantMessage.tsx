@@ -4,7 +4,7 @@ import remarkGfm from 'remark-gfm'
 import { IconCopy, IconImage, IconShare } from './icons'
 import { MessageActions, copyAssistantAsImage } from './MessageActions'
 import { ReasoningBlock } from './ReasoningBlock'
-import { StepStats, ToolStep } from './ToolStep'
+import { StepStats, ToolGroup } from './ToolStep'
 import { makeMarkdownComponents, normalizeTreeBlocks, stripWrappedRecordTag } from './Markdown'
 import { DmSharePicker } from './DmSharePicker'
 import { copyText, formatDuration } from './ui'
@@ -38,9 +38,7 @@ export const AssistantMessage = memo(function AssistantMessage({ content, reason
         )}
         {hasTools && (
           <div style={{ margin: '0 0 2px' }}>
-            {tools.map((t) => (
-              <ToolStep key={t.callId} trace={t} />
-            ))}
+            <ToolGroup tools={tools} />
           </div>
         )}
         {hasReasoning && <ReasoningBlock content={reasoningContent} />}
