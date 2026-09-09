@@ -6,54 +6,121 @@ import type { Session } from '@shanhai/session'
 import type { ApprovalService } from '@shanhai/approval'
 
 /**
- * 历史 assistant 消息隔离标签（replay-assistant）：仅在事件日志回放（resumeRun 断点续跑 / run 全新任务执行）时，
- * 把「历史助手的正文发言」包裹进这对标签，向模型声明这是「历史任务处理结果」而非当前模型的发言，
- * 防三种幻觉（模仿历史口吻/格式/详略、语义延续、把历史旧结论误当当前任务真实状态）。
- * 注意：只包裹 assistant 正文（assistant/message）；tool/call（工具调用）、tool/result（事实产物）保持原样。
+ * 历史 assistant 消息：不再做任何标签包裹，回放时按标准 role=assistant 原样进上下文。
+ * （曾用隔离标签包裹以防「模仿历史口吻/语义延续/把历史旧结论当当前状态」三类幻觉，
+ *  现按产品口径取消；防幻觉改由系统提示词的「历史回放隔离」条款承担——
+ *  明确声明上下文里的历史 assistant 发言不是本轮结果、不代表当前任务已完成。）
  */
-const REPLAY_ASSISTANT_OPEN = '<replay-assistant>'
-const REPLAY_ASSISTANT_CLOSE = '</replay-assistant>'
 
 /**
- * 历史 user 提问标记标签（replay-user，来源标记，非隔离）：仅在事件日志回放时把「历史用户问过的问题」包裹进这对标签，
- * 向模型声明这是「历史用户提问（来源）」而非「本轮刚下的新指令」，用于对齐目标/理解背景，避免把历史旧问题误当当前指令执行。
- * 注意：只包裹历史回放里的 user/message；本轮任务内的用户消息不经过 replayHistory、保持原样不包裹。
+ * 用户消息标签（user_query）：所有「用户说的话」进模型上下文时一律包裹进这对标签，覆盖两种来源——
+ * 1. 本轮真实用户消息（run() 追加的当前消息）；
+ * 2. 历史回放里的用户提问（replayHistory 读出的 user/message）。
+ * 两者共用同一标签，靠「位置」区分：上下文中最后一条 <user_query> 才是用户此刻刚提的要求，
+ * 在它之前的都是历史回放（仅作来源标记与背景理解）。该区分规则由系统提示词显式声明，模型必须遵守。
+ * 注意：标签只在「发给模型的内容」上施加，事件日志（user/message）永远落盘原始文本，
+ * 因此渲染层/会话历史/回放都不会看到裸标签，也不会二次包裹（嵌套）。
  */
-const REPLAY_USER_OPEN = '<replay-user>'
-const REPLAY_USER_CLOSE = '</replay-user>'
+const USER_QUERY_OPEN = '<user_query>'
+const USER_QUERY_CLOSE = '</user_query>'
 
-/** 转义历史文本里可能出现的同款系统保留标签字符，防止模型分不清边界（穿模）。 */
-function escapeReplayTag(content: string): string {
-  return content
-    .replaceAll(REPLAY_ASSISTANT_OPEN, '&lt;replay-assistant&gt;')
-    .replaceAll(REPLAY_ASSISTANT_CLOSE, '&lt;/replay-assistant&gt;')
-    .replaceAll(REPLAY_USER_OPEN, '&lt;replay-user&gt;')
-    .replaceAll(REPLAY_USER_CLOSE, '&lt;/replay-user&gt;')
+/**
+ * 系统上下文块标签族（沿用 workbuddy 的标签化形态，不用裸文本）：
+ * <system-reminder data-role="user-context">   外层：系统注入的上下文，不是用户说的话
+ *   ├ <user_info>            运行环境明细（只注入在首条用户消息）
+ *   └ <additional_data>
+ *       └ <current_time>     该条用户消息自己的时间（每条都有；历史用落盘真实时间，本轮用当下）
+ * 铁律：整块只在「发给模型那一刻」构造——不落盘、不进事件日志、不进回放；
+ *       且一律放在 <user_query> 之外（块在前、用户原话标签在后）。
+ */
+const SYSTEM_REMINDER_OPEN = '<system-reminder data-role="user-context">'
+const SYSTEM_REMINDER_CLOSE = '</system-reminder>'
+const USER_INFO_OPEN = '<user_info>'
+const USER_INFO_CLOSE = '</user_info>'
+const ADDITIONAL_DATA_OPEN = '<additional_data>'
+const ADDITIONAL_DATA_CLOSE = '</additional_data>'
+const CURRENT_TIME_OPEN = '<current_time>'
+const CURRENT_TIME_CLOSE = '</current_time>'
+
+/** 系统保留标签名清单（单一真相源之一：逐个登记的「具名标签」，转义 / 检测 / 剥离三处都由它派生） */
+const SYSTEM_RESERVED_TAG_NAMES = ['user_query', 'system-reminder', 'additional_data', 'current_time', 'user_info'] as const
+
+/**
+ * 系统保留标签「前缀族」（单一真相源之二）：整族由一条泛化规则覆盖，**不逐个登记名字**。
+ * - replay-：旧版历史回放标签（本仓已不再注入该族，保留是为了旧会话/旧审计日志里的泄漏仍能被剥掉）。
+ * - sh_：系统提示词的协议模块标签族（角色 / 工作方法 / 合规 / 嘴炮铁律 / 台账约定… 全部以 sh_ 开头）。
+ *   提示词模块会随协议增删，若把每个标签名一条条加进名单，必然与提示词漂移；用固定前缀 + 一条泛化
+ *   规则，新增模块标签自动被转义 / 检测 / 剥离三处覆盖，无需再改正则。
+ */
+const SYSTEM_RESERVED_TAG_PREFIX_PATTERNS = ['replay-[a-zA-Z][a-zA-Z0-9-]*', 'sh_[a-z][a-z0-9_]*'] as const
+
+/**
+ * 上下文块里的时间格式：年月日 + 星期 + 时:分:秒 + 显式 GMT 偏移。
+ * 选它的理由：① 模型能直接判先后（有日期也有时分秒，跨天/跨月可比）；② 带星期，判断"周末/工作日"不必换算；
+ * ③ 带 GMT 偏移，跨时区或落盘时间与本地不一致时模型能自己校正；④ 不用裸 Unix 秒（弱模型算不来）。
+ * 历史消息与本轮消息用同一个格式，避免模型把"格式不同"误读成"来源不同"。
+ */
+const CONTEXT_TIME_FMT = new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' })
+function formatContextTime(ms: number): string {
+  const d = new Date(ms)
+  const parts = CONTEXT_TIME_FMT.formatToParts(d)
+  const pick = (t: Intl.DateTimeFormatPartTypes): string => parts.find((p) => p.type === t)?.value ?? ''
+  const offsetMin = -d.getTimezoneOffset()
+  const abs = Math.abs(offsetMin)
+  const tz = `GMT${offsetMin >= 0 ? '+' : '-'}${Math.floor(abs / 60)}${abs % 60 ? `:${String(abs % 60).padStart(2, '0')}` : ''}`
+  return `${pick('year')}年${pick('month')}月${pick('day')}日 ${pick('weekday')} ${pick('hour')}:${pick('minute')}:${pick('second')} ${tz}`
 }
 
-/** 把历史助手正文包裹进隔离标签（仅回放上下文用）。 */
-function wrapReplayAssistant(content: string): string {
-  return `${REPLAY_ASSISTANT_OPEN}\n${escapeReplayTag(content)}\n${REPLAY_ASSISTANT_CLOSE}`
+/** 转义待包裹文本里可能出现的同款系统保留标签（含带属性形态），防止模型分不清边界（穿模）。 */
+function escapeReservedTags(content: string): string {
+  return content.replace(SYSTEM_RESERVED_TAG_RE, (tag) => tag.replace(/^</, '&lt;').replace(/>$/, '&gt;'))
 }
 
-/** 把历史用户提问包裹进来源标记标签（仅回放上下文用）。 */
-function wrapReplayUser(content: string): string {
-  return `${REPLAY_USER_OPEN}\n${escapeReplayTag(content)}\n${REPLAY_USER_CLOSE}`
+/** 把用户原话包裹进 <user_query>（本轮消息与历史回放共用；标签外内容一律不是用户指令）。 */
+function wrapUserQuery(content: string): string {
+  return `${USER_QUERY_OPEN}\n${escapeReservedTags(content)}\n${USER_QUERY_CLOSE}`
+}
+
+/** 系统上下文块（包在 <user_query> 之前；块内内容不是用户指令）。 */
+function wrapUserContext(envLines: string[], atMs: number): string {
+  const envPart = envLines.length > 0 ? `${USER_INFO_OPEN}\n${envLines.join('\n')}\n${USER_INFO_CLOSE}\n` : ''
+  const timePart = `${ADDITIONAL_DATA_OPEN}\n${CURRENT_TIME_OPEN}${formatContextTime(atMs)}${CURRENT_TIME_CLOSE}\n${ADDITIONAL_DATA_CLOSE}`
+  return `${SYSTEM_REMINDER_OPEN}\n${envPart}${timePart}\n${SYSTEM_REMINDER_CLOSE}`
+}
+
+/** 把环境明细补进某条用户消息已有的上下文块里（幂等：已带 <user_info> 则原样返回）。 */
+function injectEnvIntoContextText(text: string, envLines: string[]): string {
+  if (!text.startsWith(SYSTEM_REMINDER_OPEN) || text.includes(USER_INFO_OPEN)) return text
+  return `${SYSTEM_REMINDER_OPEN}\n${USER_INFO_OPEN}\n${envLines.join('\n')}\n${USER_INFO_CLOSE}\n${text.slice(SYSTEM_REMINDER_OPEN.length + 1)}`
+}
+
+/** 剥掉文本里的系统上下文块（含块内全部内容），用于「注入内容不进事件日志」。 */
+function stripUserContextBlocks(text: string): string {
+  return text.replace(new RegExp(`${SYSTEM_REMINDER_OPEN}[\\s\\S]*?${SYSTEM_REMINDER_CLOSE}\\n?`, 'g'), '')
 }
 
 /**
- * 系统保留标签正则：匹配 <replay-assistant> / </replay-assistant>、<replay-user> / </replay-user> 以及形似 <replay-xxx> 的系统内置标签。
- * 用「replay-」前缀按命名约定泛化匹配（覆盖 replay-assistant / replay-user / 未来 replay-* 的历史回放标签）。
- * 刻意不匹配通用 HTML/XML 标签（<div>/<span> 等）与转义文本（&lt;...&gt;），避免误伤用户正常展示内容。带 g 标志用于 replace 全量替换。
+ * 系统保留标签模式串（唯一一份；转义 / 检测 / 剥离三处都由它构造，禁止再出现第二处硬编码标签正则）：
+ * - 具名标签来自 SYSTEM_RESERVED_TAG_NAMES（一处增删，三处同步生效）；
+ * - 前缀族来自 SYSTEM_RESERVED_TAG_PREFIX_PATTERNS（replay- 旧标签 / sh_ 提示词协议模块标签族），
+ *   整族一条泛化规则覆盖，新增模块标签不必改这里。
+ * ★属性支持是必须的：<system-reminder data-role="user-context"> 带属性，旧写法（只允许 \s* 直接收尾）
+ *   根本匹配不上、剥不掉，会让半截属性文本残留在用户可见正文里。故统一用 (?:\s[^>]*)? 允许任意属性。
+ * 刻意不匹配通用 HTML/XML 标签（<div>/<span> 等）与转义文本（&lt;...&gt;），避免误伤用户正常展示内容。
  */
-const SYSTEM_RESERVED_TAG_RE = /<\/?replay-[a-zA-Z][a-zA-Z0-9-]*\s*>/g
+const SYSTEM_RESERVED_TAG_PATTERN = `<\\/?(?:${[...SYSTEM_RESERVED_TAG_NAMES, ...SYSTEM_RESERVED_TAG_PREFIX_PATTERNS].join('|')})(?:\\s[^>]*)?>`
 
-/** 检测文本是否含系统保留标签（无 g 标志，避免 test 的 lastIndex 状态污染）。 */
+/** 剥离用（带 g 标志，全量替换）。 */
+const SYSTEM_RESERVED_TAG_RE = new RegExp(SYSTEM_RESERVED_TAG_PATTERN, 'g')
+
+/** 检测用（无 g 标志，避免 test 的 lastIndex 状态污染）。 */
+const SYSTEM_RESERVED_TAG_TEST_RE = new RegExp(SYSTEM_RESERVED_TAG_PATTERN)
+
 function hasSystemReservedTag(text: string): boolean {
-  return /<\/?replay-[a-zA-Z][a-zA-Z0-9-]*\s*>/.test(text)
+  return SYSTEM_RESERVED_TAG_TEST_RE.test(text)
 }
 
-/** 剥离系统保留标签本身（<replay-xxx> / </replay-xxx>），正文原样保留。 */
+/** 剥离系统保留标签本身（<user_query> / <replay-xxx> 等），正文原样保留。 */
 function stripSystemReservedTags(text: string): string {
   return text.replace(SYSTEM_RESERVED_TAG_RE, '')
 }
@@ -91,6 +158,10 @@ export interface AgentLoopOptions {
    * 无最终 assistant 正文，则连同其后的 tool 消息一起丢弃，只回放完整问答轮，避免与新任务的 user 叠成
    * 「连续两条 user、第一条无正文」。resumeRun（断点续跑）与管家会话不传（保持原回放，不裁剪未完成轮）。 */
   dropIncompleteTurn?: boolean
+  /** 系统注入的运行环境快照行（单一真相源：由宿主 apps/runtime 的 collectEnvironment 渲染，本包不参与计算）。
+   * 只在「发给模型那一刻」拼进首条用户消息前的系统上下文块，绝不落盘、不进事件日志、不进回放。
+   * 未传时本轮不注入环境块（行为与改造前一致）。 */
+  userContext?: string[]
 }
 
 /**
@@ -143,6 +214,11 @@ export class AgentLoop {
         onReasoning?: (text: string) => void
       })
     | undefined
+  /** 回放出的 user 消息 → 该条消息落盘时的真实时间戳（ms）。只在内存里，不参与序列化/落盘。
+   * 用 WeakMap：消息对象被裁剪丢弃后自动回收，不会跨轮累积（注入内容不落盘、不进回放的硬要求）。 */
+  private readonly userMessageTimes = new WeakMap<ChatMessage, number>()
+  /** 本轮的运行环境快照行（宿主传入，未传 = 不注入环境块），供 retry() 重新注入用 */
+  private lastUserContext: string[] | undefined
 
   constructor(
     private readonly model: Model,
@@ -221,23 +297,35 @@ export class AgentLoop {
     this.trimHistoryToRecentTurns(messages, maxHistoryTurns, options?.preserveToolCalls, options?.dropIncompleteTurn)
 
     // 追加当前消息（含多模态附件，附件一并写入事件日志，回放时还原）。
-    // 落盘永远保留原始 message + attachments；发给模型的内容在有 modelContent 时用降级后的文字（如图片降级）
+    // 落盘永远保留原始 message + attachments（渲染层/会话历史读的都是无标签原文，不会出现裸标签，回放也不会二次包裹）；
+    // 只有「发给模型的内容」才用 <user_query> 包裹用户原话——与历史回放（replayHistory）共用同一标签，
+    // 靠位置区分当前指令与历史提问（规则见系统提示词）。附件是数据不是用户原话，留在标签外。
+    // 发给模型的内容在有 modelContent 时用降级后的文字（如图片降级）
     const attachments = options?.attachments
     this.session.append('user/message', { content: message, attachments: (attachments ?? []) as unknown[] })
-    if (options?.modelContent !== undefined) {
-      // 非视觉模型降级路径：发给模型的是降级后的文字（字符串）
-      messages.push({ role: 'user', content: options.modelContent })
-    } else if (this.supportsVision) {
-      // 多模态模型：所有用户消息统一用数组结构（标准多模态格式），无附件时也保持数组，
-      // 避免 content 一会儿字符串一会儿数组，保证网关/模型对结构一致性不敏感。
-      const parts: ContentPart[] = [{ type: 'text', text: message }]
-      if (attachments && attachments.length > 0) parts.push(...attachments)
-      messages.push({ role: 'user', content: parts })
-    } else if (attachments && attachments.length > 0) {
-      messages.push({ role: 'user', content: [{ type: 'text', text: message }, ...attachments] })
-    } else {
-      messages.push({ role: 'user', content: message })
-    }
+    // 发给模型的当前这条用户消息：记下它的当下时间（上下文块用），并持有对象引用供 applyUserContext 注入
+    const currentUserMsg: ChatMessage =
+      options?.modelContent !== undefined
+        // 非视觉模型降级路径：发给模型的是降级后的文字（字符串）
+        ? { role: 'user', content: wrapUserQuery(options.modelContent) }
+        : this.supportsVision
+          ? // 多模态模型：所有用户消息统一用数组结构（标准多模态格式），无附件时也保持数组，
+            // 避免 content 一会儿字符串一会儿数组，保证网关/模型对结构一致性不敏感。
+            (() => {
+              const parts: ContentPart[] = [{ type: 'text', text: wrapUserQuery(message) }]
+              if (attachments && attachments.length > 0) parts.push(...attachments)
+              return { role: 'user', content: parts }
+            })()
+          : attachments && attachments.length > 0
+            ? { role: 'user', content: [{ type: 'text', text: wrapUserQuery(message) }, ...attachments] }
+            : { role: 'user', content: wrapUserQuery(message) }
+    this.userMessageTimes.set(currentUserMsg, Date.now())
+    messages.push(currentUserMsg)
+
+    // 在「发给模型那一刻」给每条用户消息前置系统上下文块（环境快照 + 各条自己的时间）。
+    // 必须在裁剪之后做：保证环境块落在最终上下文里的第一条用户消息上，不会因早期历史被裁掉而丢失。
+    this.lastUserContext = options?.userContext
+    this.applyUserContext(messages)
 
     this.session.append('turn/start', { turn: 1 })
     const onDelta = options?.onDelta
@@ -273,26 +361,34 @@ export class AgentLoop {
       if (!e) continue
       if (e.type === 'user/message') {
         const d = e.data as { content: string; attachments?: ContentPart[] }
+        // 记下该条消息落盘时的真实时间（事件 timestamp，Date.now() 毫秒）：上下文块里的时间必须用它，
+        // 绝不能用「现在」——否则历史消息会被伪装成刚发的，模型把旧提问当当前任务，正是我们要防的嘴炮。
+        const atMs = e.timestamp
         if (this.supportsVision) {
           // 多模态模型：历史用户消息统一用数组结构（重发 https 附件），与当前消息结构保持一致；
           // 非视觉模型仍走 replayUserContent 的占位符（避免 400 / 重复计费）。
-          // 历史 user 正文包裹 <replay-user> 来源标记（非隔离），声明这是「历史用户提问」而非本轮新指令。
+          // 历史 user 正文与本轮消息同样包裹 <user_query>（共用标签，靠位置区分：最后一条才是当前指令）。
+          // 落盘原文里若混进过系统上下文块（旧版本/异常路径），先剥掉再包裹，避免多轮累积与二次注入。
           const parts: ContentPart[] = []
-          if (d.content) parts.push({ type: 'text', text: wrapReplayUser(d.content) })
+          if (d.content) parts.push({ type: 'text', text: wrapUserQuery(stripUserContextBlocks(d.content)) })
           if (d.attachments && d.attachments.length > 0) parts.push(...d.attachments)
-          messages.push({ role: 'user', content: parts.length > 0 ? parts : [{ type: 'text', text: wrapReplayUser('') }] })
+          const historyMsg: ChatMessage = { role: 'user', content: parts.length > 0 ? parts : [{ type: 'text', text: wrapUserQuery('') }] }
+          this.userMessageTimes.set(historyMsg, atMs)
+          messages.push(historyMsg)
         } else {
           // 历史附件只回放占位符，不重新发送 base64（避免请求体巨大 / 非视觉模型 400 / 重复计费）
-          // 历史 user 正文包裹 <replay-user> 来源标记（非隔离），声明这是「历史用户提问」而非本轮新指令。
-          messages.push({ role: 'user', content: wrapReplayUser(replayUserContent(d.content, d.attachments)) })
+          // 历史 user 正文与本轮消息同样包裹 <user_query>（共用标签，靠位置区分：最后一条才是当前指令）。
+          const historyMsg: ChatMessage = { role: 'user', content: wrapUserQuery(stripUserContextBlocks(replayUserContent(d.content, d.attachments))) }
+          this.userMessageTimes.set(historyMsg, atMs)
+          messages.push(historyMsg)
         }
       } else if (e.type === 'assistant/message') {
         const d = e.data as { content: string; reasoningContent?: string }
-        // 历史 assistant 正文做标签隔离：声明这是「历史任务处理结果」而非当前模型发言，防模仿口吻/语义延续/状态误判三类幻觉。
-        // 只包裹正文；tool/call（工具调用）、tool/result（事实产物）保持原样。
+        // 历史 assistant 正文：不再做任何标签包裹，按标准 role=assistant 原样回放（产品口径：历史发言就是模型自己说过的话）。
+        // 「历史内容不代表本轮结果」这条防幻觉约束改由系统提示词的「历史回放隔离」条款承担。
         messages.push({
           role: 'assistant',
-          content: wrapReplayAssistant(d.content),
+          content: d.content,
           reasoningContent: includeReasoning ? d.reasoningContent : undefined,
         })
       } else if (e.type === 'tool/call') {
@@ -382,12 +478,72 @@ export class AgentLoop {
     return [...systemMsgs, ...kept]
   }
 
+  /** 在「发给模型那一刻」给每条用户消息前置系统上下文块（块在前、<user_query> 在后，块内内容不进用户原话标签）：
+   * - 每条用户消息：带该条消息自己的时间（历史用它落盘时的真实时间戳，当前消息用当下；
+   *   时间未知的消息一律不注入，绝不拿 now 冒充历史时间）；
+   * - 上下文里的第一条用户消息：额外带运行环境快照（宿主传入，本包不计算）。
+   * 只在内存里构造：落盘的用户消息永远是原文，故注入内容不进 events.jsonl、不进回放、不显示给用户。
+   * 幂等：已带块的文本不会被二次注入（retry 复用同一批 messages 对象时安全）。 */
+  private applyUserContext(messages: ChatMessage[]): void {
+    const envLines = (this.lastUserContext ?? []).filter((l) => l.trim().length > 0)
+    let envPlaced = false
+    for (const m of messages) {
+      if (m.role !== 'user') continue
+      const atMs = this.userMessageTimes.get(m)
+      const decorate = (text: string): string => {
+        // 已带块（retry 复用同一批 messages 对象 / 中途追加后再走一遍）：不重复注入，只可能补一次环境明细
+        if (text.startsWith(SYSTEM_REMINDER_OPEN)) {
+          if (envPlaced || envLines.length === 0) return text
+          envPlaced = true
+          return injectEnvIntoContextText(text, envLines)
+        }
+        // 时间未知（非本层构造的消息，如运行护栏提示、压缩摘要）一律不注入，绝不拿 now 冒充历史时间
+        if (atMs === undefined) return text
+        const withEnv = !envPlaced && envLines.length > 0
+        if (withEnv) envPlaced = true
+        return `${wrapUserContext(withEnv ? envLines : [], atMs)}\n${text}`
+      }
+      if (typeof m.content === 'string') {
+        m.content = decorate(m.content)
+      } else if (Array.isArray(m.content)) {
+        // 多模态数组：只给第一个 text 片段加块，附件（图片/音视频）留在标签外，是数据不是用户原话
+        const firstText = m.content.find((p): p is { type: 'text'; text: string } => p.type === 'text')
+        if (firstText) firstText.text = decorate(firstText.text)
+      }
+    }
+  }
+
+  /** 深拷贝一份 messages 并剥掉所有系统上下文块：专给 retry/snapshot 落盘用（注入内容不进事件日志）。
+   * 内存里的那份保持原样，同进程 retry 仍能用与失败完全一致的 body 重发请求。 */
+  private withoutUserContextBlocks(messages: ChatMessage[]): ChatMessage[] {
+    return messages.map((m) => {
+      if (m.role !== 'user') return m
+      if (typeof m.content === 'string') {
+        const stripped = stripUserContextBlocks(m.content)
+        return stripped === m.content ? m : { ...m, content: stripped }
+      }
+      if (Array.isArray(m.content)) {
+        let changed = false
+        const parts = m.content.map((p) => {
+          if (p.type !== 'text') return p
+          const stripped = stripUserContextBlocks(p.text)
+          if (stripped === p.text) return p
+          changed = true
+          return { ...p, text: stripped }
+        })
+        return changed ? { ...m, content: parts } : m
+      }
+      return m
+    })
+  }
+
   /** 断点续跑（「继续执行」用）：从会话事件日志回放已执行的历史（含完整工具回合），不追加新 user 消息、不新建 turn，
    * 直接继续 ReAct 循环。用户停止后 session 日志已完整记录已执行步骤，回放即恢复进度，从断点继续而非重新生成。 */
   async resumeRun(
     systemPrompt: string | undefined,
     onDelta?: (text: string) => void,
     onReasoning?: (text: string) => void,
+    userContext?: string[],
   ): Promise<string> {
     // 清理上次中断残留的流式增量（半截 assistant/delta）：回放时虽忽略，但残留会污染持久化文件与后续重建
     const events = this.session.list()
@@ -399,6 +555,9 @@ export class AgentLoop {
     const messages: ChatMessage[] = []
     if (systemPrompt) messages.push({ role: 'system', content: systemPrompt })
     this.replayHistory(messages)
+    // 断点续跑同样注入上下文块（历史用它落盘时的真实时间，第一条带环境快照）
+    this.lastUserContext = userContext
+    this.applyUserContext(messages)
     // 断点续跑不裁剪：保留全量已执行历史，确保从断点继续时上下文完整（按长度裁剪只对用户发起新任务生效，见 run()）
     return this.runLoop(messages, 0, maxSteps, onDelta, onReasoning)
   }
@@ -428,10 +587,15 @@ export class AgentLoop {
         // 落盘：此处上一轮工具回合（tool/call + tool/result）已完整落盘，追加到事件日志末尾才是「最后面」
         for (const m of injected) this.session.append('user/message', { content: m, injected: true })
         const list = injected.map((m, i) => `${i + 1}. ${m}`).join('\n')
-        messages.push({
+        // 追加的用户需求也是「用户说过的话」：先建对象记下当下时间，再统一由 applyUserContext 补上下文块
+        const injectedMsg: ChatMessage = {
           role: 'user',
           content: `【任务执行期间，用户追加了以下新需求/新问题】\n${list}\n\n请按以下步骤处理，不要中断原有任务：\n1. 继续完成原有任务。\n2. 对上述每条新增需求逐条评估：判断是否需要在当前任务内实际执行、是否可行、优先级如何。\n3. 对可执行的新增需求，请像处理原任务一样调用工具实际去完成（不要只做文字回应），直到这些新增需求也得到落实；确实无法完成的需求，说明原因。\n4. 全部完成后，在最终回答正文中用「新增需求完成情况」小节，按上述编号逐条列出：需求内容 → 评估结论 → 完成状态（已完成 / 部分完成 / 无法完成并说明原因）。`,
-        })
+        }
+        this.userMessageTimes.set(injectedMsg, Date.now())
+        messages.push(injectedMsg)
+        // 追加的用户需求同样补一条它自己时刻的上下文块（applyUserContext 幂等：已带块的历史消息不会被二次注入）
+        this.applyUserContext(messages)
       }
       // 压缩：token 超预算时把早期对话历史压成摘要，避免上下文窗口溢出
       messages = await this.maybeCompact(messages)
@@ -557,8 +721,16 @@ export class AgentLoop {
   ): void {
     this.suspended = { messages: [...messages], step, maxSteps, onDelta, onReasoning, atLimit, reason }
     // 落盘快照（先移除旧快照再 append，保证事件日志里最多一条、且反映「当前是否有挂起任务」）
+    // ★落盘前剥掉系统上下文块：注入内容只在「发给模型那一刻」存在，绝不进 events.jsonl（内存里那份保持原样，
+    //   同进程 retry 仍用与失败完全一致的 body 重发）。
     this.session.removeLast('retry/snapshot')
-    this.session.append('retry/snapshot', { messages: [...messages], step, maxSteps, atLimit, reason })
+    this.session.append('retry/snapshot', {
+      messages: this.withoutUserContextBlocks(messages),
+      step,
+      maxSteps,
+      atLimit,
+      reason,
+    })
   }
 
   /** 用户点击「重试」：用失败节点相同的 messages 快照重新提交请求，继续循环（不重新开始、不重新回放历史）。
@@ -897,7 +1069,7 @@ const MAX_HISTORY_TURNS = 20
 const COMPACTION_THRESHOLD = 0.7
 
 /** 压缩时单条消息内容最多参与摘要的字符数（超过截断，控制摘要请求体积） */
-const MAX_SUMMARY_MSG_CHARS = 10000
+const MAX_SUMMARY_MSG_CHARS = 40000
 
 /** 判断一条 assistant 消息是否为「工具调用」消息（带 toolCall/toolCalls），用于区分「最终回复正文」与「工具调用过程」。 */
 function isToolCallMessage(m: ChatMessage): boolean {

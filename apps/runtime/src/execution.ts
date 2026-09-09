@@ -143,6 +143,8 @@ export function createExecutionModule(
         loop.run(message, {
           ...opts,
           systemPrompt: isSupervisorRun ? prompts.buildSupervisorSystemPrompt(message) : prompts.buildSystemPrompt(meta.workDir, prompts.buildMemoryContext(message, meta.id)),
+          // 运行环境明细的唯一真相源：注入到「发给模型的首条用户消息」之前的系统上下文块（不落盘、不进回放）
+          userContext: prompts.buildUserContextBlock(meta.workDir),
           attachments: opts?.attachments,
           modelContent,
           // 管家历史回放轮数比普通会话多（30 vs 20），便于跨会话编排时保留更长上下文主线
@@ -605,6 +607,8 @@ export function createExecutionModule(
             ctx.deltaCallbacks.forEach((cb) => cb(sid, text))
           },
           (text) => ctx.reasoningCallbacks.forEach((cb) => cb(sid, text)),
+          // 断点续跑同样注入系统上下文块（首条用户消息带运行环境明细、每条带自己的真实时间）
+          prompts.buildUserContextBlock(meta.workDir),
         ),
       )
     } catch (err) {

@@ -249,7 +249,7 @@ export const zhCN = {
   'dm.composer.attImageTip': '{name}（{size}），点击看大图',
   'dm.composer.attFailedTip': '{name}（{size}）：{error}',
   'dm.composer.attRemoveTitle': '不发了（移除这个附件）',
-  'dm.composer.attachTitle': '添加附件（图片 ≤ {imgMax}；文档 pdf/docx/txt/md/xlsx ≤ {docMax}；也可直接 Cmd+V 粘贴截图）',
+  'dm.composer.attachTitle': '添加附件（不限文件类型；图片 ≤ {imgMax}，其它 ≤ {docMax}；也可直接 Cmd+V 粘贴截图）',
   'dm.composer.byteTitle': '附件只传云存储引用（URL），不传文件内容；引用本身也计入这 {max} 字节',
   'dm.composer.byteLine': '{bytes} / {max} 字节',
   'dm.composer.byteOver': ' · 已超出上限',
@@ -1025,7 +1025,7 @@ export const zhCN = {
   //   模块加载期绝不求值（历轮 9 次同一个坑：常量表存中文会被加载期固化）。
   // 附件六道闸门拒因（shared/dm-attachment.ts，私信与聊天输入框共用同一份规矩）
   'dm.gate.imageTooLarge': '图片太大：{size}，上限 {limit}（可截图缩小或裁一部分再发）',
-  'dm.gate.avNotAllowed': '私信只支持图片和文档，不支持音频/视频文件（可以先传到云盘，再把链接当文字发）',
+  'dm.gate.avNotAllowed': '私信不支持音频/视频文件（可先把它传到云盘，再把链接当文字发）',
   'dm.gate.audioTooLarge': '音频太大：{size}，上限 {limit}',
   'dm.gate.videoTooLarge': '视频太大：{size}，上限 {limit}',
   'dm.gate.fileTooLarge': '文件太大：{size}，上限 {limit}',

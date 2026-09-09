@@ -1621,6 +1621,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
               ctx.deltaCallbacks.forEach((cb) => cb(sid, text))
             },
             (text) => ctx.reasoningCallbacks.forEach((cb) => cb(sid, text)),
+            // 断点续跑同样注入系统上下文块（首条用户消息带运行环境明细、每条带自己的真实时间）
+            promptsModule.buildUserContextBlock(meta.workDir),
           ),
         )
       } catch (err) {

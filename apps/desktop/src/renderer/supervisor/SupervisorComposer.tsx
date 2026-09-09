@@ -73,7 +73,7 @@ const SupervisorComposerInner = forwardRef<SupervisorComposerHandle, SupervisorC
     const [attachments, setAttachments] = useState<AttachmentItem[]>([])
     const [recording, setRecording] = useState(false)
     const [voiceNotice, setVoiceNotice] = useState('')
-    /** 附件被规矩拒掉时的可见原因（超限 / 类型不允许）；与聊天窗口同一套 shared 规矩 */
+    /** 附件被规矩拒掉时的可见原因（【任务171】只剩超限；类型不再拦）；与聊天窗口同一套 shared 规矩 */
     const [attachNotice, setAttachNotice] = useState('')
     /**
      * 模型下拉 / 安全模式下拉的开合状态。
@@ -175,7 +175,8 @@ const SupervisorComposerInner = forwardRef<SupervisorComposerHandle, SupervisorC
       const files = e.target.files
       if (!files) return
       for (const file of Array.from(files)) {
-        // 【P3 同步到管家窗口】附件规矩（图片 ≤10MB / 文档 ≤20MB / 禁可执行与脚本）由 shared 统一判定；
+        // 【P3 同步到管家窗口】附件规矩由 shared 统一判定；【任务171】类型闸门已取消，只剩大小
+        // （图片 ≤10MB / 其它 ≤20MB），json / csv / zip 等任意文件都能带上。
         // 音视频放行 —— 管家本来就把它们编成 input_audio / input_video 发给模型，一刀切会砍掉既有功能。
         const cls = classifyAttachmentFile({ name: file.name, mime: file.type, size: file.size }, { allowAudioVideo: true })
         if (!cls.ok) {

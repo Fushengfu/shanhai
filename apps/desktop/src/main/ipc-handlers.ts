@@ -261,6 +261,13 @@ export function registerIpc(): void {
     // 以「发起请求的主窗口」为父窗口（而非 getAllWindows()[0]，避免拿到先创建的浏览器窗口导致其被激活/显示）
     const win = BrowserWindow.fromWebContents(e.sender)
     const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+    // 【任务166】原生面板关闭后必须纠正窗口层级：macOS 上 showOpenDialog(win) 以 sheet 挂在发起窗口上，
+    // 面板（含取消）关闭后，全屏桌面壳可能因焦点变化被抬到发起窗口【之上】，表现为「选完目录整个子会话窗口
+    // 被隐藏」（实际是被壁纸大小的桌面壳盖住，不是 hide()——本仓该路径不存在任何 hide 调用）。
+    // 修法沿用 closeApp 的既有口径：交还给单一真相源 restoreAboveDesktop()（内部 ensureDesktopLayer +
+    // keepDesktopAtBottom），不新增 hide/show 通路、不改选择器交互形态；它只抬升【已可见】窗口，
+    // 因此若窗口真是被 hide() 也不会被它"救回来"，不会掩盖真正的隐藏。
+    restoreAboveDesktop()
     if (result.canceled || result.filePaths.length === 0) return null
     return result.filePaths[0]
   })

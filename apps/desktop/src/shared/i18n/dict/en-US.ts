@@ -247,7 +247,7 @@ const en = {
   'dm.composer.attImageTip': '{name} ({size}), click to view full size',
   'dm.composer.attFailedTip': '{name} ({size}): {error}',
   'dm.composer.attRemoveTitle': 'Do not send this (remove the attachment)',
-  'dm.composer.attachTitle': 'Add attachment (images ≤ {imgMax}; documents pdf/docx/txt/md/xlsx ≤ {docMax}; you can also paste a screenshot with Cmd+V)',
+  'dm.composer.attachTitle': 'Add attachment (any file type; images ≤ {imgMax}, everything else ≤ {docMax}; you can also paste a screenshot with Cmd+V)',
   'dm.composer.byteTitle': 'Attachments upload only a cloud-storage reference (a URL), never the file content; the reference itself also counts against these {max} bytes',
   'dm.composer.byteLine': '{bytes} / {max} bytes',
   'dm.composer.byteOver': ' · over the limit',
@@ -989,7 +989,7 @@ const en = {
   'native.attAttached': '{text} (with {labels})',
   // ———— i18n 期5B: main-process business copy (attachment gates / member channel / credentials) ————
   'dm.gate.imageTooLarge': 'Image is too large: {size} (limit {limit}). Shrink the screenshot or crop it before sending.',
-  'dm.gate.avNotAllowed': 'Direct messages support images and documents only - audio/video files are not supported (upload them to a drive and send the link as text instead).',
+  'dm.gate.avNotAllowed': 'Direct messages do not support audio/video files (upload them to a drive and send the link as text instead).',
   'dm.gate.audioTooLarge': 'Audio is too large: {size} (limit {limit}).',
   'dm.gate.videoTooLarge': 'Video is too large: {size} (limit {limit}).',
   'dm.gate.fileTooLarge': 'File is too large: {size} (limit {limit}).',

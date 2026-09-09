@@ -20,9 +20,12 @@
 //   取词用 shared 门面的**进程内镜像**（t()）：主进程那份由 main/locale-store.ts 写、渲染层那份由
 //   renderer/locale.tsx 写 —— 每进程只有一个写入者，所以这里既不用加 locale 参数，也不用动
 //   member-channel.ts（本期边界禁止碰它）。
-// 【i18n 期5B】classifyAttachmentFile 的**六道闸门拒因**也走词条：它们的 reason 会被
+// 【i18n 期5B】classifyAttachmentFile 的**闸门拒因**也走词条：它们的 reason 会被
 //   DmComposer / ChatComposer / SupervisorComposer 直接显示到界面上（cls.reason → 提示条），
-//   英文界面里出现整条中文拒因就是漏翻。判定条件（大小上限、白名单、FORBIDDEN_EXTS）一字未动。
+//   英文界面里出现整条中文拒因就是漏翻。
+// 【任务171 变更】闸门从「六道」缩到「大小 + 私信音视频」：类型（白名单 / FORBIDDEN_EXTS）不再作为
+//   拒绝依据，dm.gate.forbiddenExt / unsupportedExt / unsupportedBare 三条词条因此成为**死词条**
+//   （保留不删：将来若要恢复类型闸门可直接用，且删了要同步动两份词典、扩大改动面）。
 // ⚠️ dmContentToPlainText **刻意不翻**：它的产物是「引用到会话」后交给模型阅读的正文，
 //   期1 定的契约形态就是 `[图片] 名字 → URL`；改它会改变模型看到的输入，属另一件事。
 
@@ -59,12 +62,18 @@ export const DM_MAX_CONTENT_BYTES = 40000
 
 /** 允许的图片扩展名（用户拍板的清单，逐字照抄） */
 export const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic'] as const
-/** 允许的文档扩展名（用户拍板的清单，逐字照抄） */
+/**
+ * 文档扩展名清单。
+ * 【任务171】自本轮起**不再作为闸门**（任何非图非音视频的文件都归 'file'），保留是为了：
+ *  ① 不删既有导出（历轮纪律：禁止顺手清理没人用的代码）；② 将来要恢复类型闸门可直接复用。
+ */
 export const DOC_EXTS = ['pdf', 'docx', 'txt', 'md', 'xlsx'] as const
 /**
- * 明确禁止的可执行与脚本扩展名。
- * ⚠️ 真正的判定是**白名单制**（不在白名单里一律拒），这份清单只用来把拒因说得更准，
- *    避免用户看到「不支持的文件类型」却不知道自己能传什么。
+ * 可执行与脚本扩展名清单。
+ * 【任务171】同样**不再作为拒绝依据**（用户拍板「只限制文件大小」）。保留理由同上。
+ * ⚠️ 安全边界：附件全程只「写盘 / 云传」，无任何执行路径（已取证：saveUploadedFile 只做
+ *    fs.writeFile + basename 防穿越；主进程 shell.openPath 仅用于日志目录与更新包，与附件无关；
+ *    预览走 <img>，不执行内容）。放开的是「能不能当附件带上」，不是「会不会被执行」。
  */
 export const FORBIDDEN_EXTS = [
   'sh', 'bash', 'zsh', 'command', 'exe', 'msi', 'app', 'dmg', 'pkg', 'deb', 'rpm',
@@ -114,7 +123,6 @@ export function classifyAttachmentFile(
   const isImage = mime.startsWith('image/') || (IMAGE_EXTS as readonly string[]).includes(ext)
   const isAudio = mime.startsWith('audio/')
   const isVideo = mime.startsWith('video/')
-  const isDoc = (DOC_EXTS as readonly string[]).includes(ext)
 
   if (isImage) {
     if (file.size > MAX_IMAGE_BYTES) {
@@ -131,25 +139,27 @@ export function classifyAttachmentFile(
     }
     return { ok: true, kind: isAudio ? 'audio' : 'video' }
   }
-  if (isDoc) {
-    if (file.size > MAX_FILE_BYTES) {
-      return { ok: false, reason: t('dm.gate.fileTooLarge', { size: formatBytesShared(file.size), limit: formatBytesShared(MAX_FILE_BYTES) }) }
-    }
-    return { ok: true, kind: 'file' }
+  // 【任务171 · 类型闸门取消】用户 2026-09-09 拍板：附件**只按大小拦**，不再按扩展名/MIME 拦。
+  // 除图片与音视频之外的任何文件（json / csv / zip / 可执行 / 无后缀…）一律归 'file'，
+  // 只受 MAX_FILE_BYTES 约束。原白名单判定（DOC_EXTS / FORBIDDEN_EXTS / unsupportedExt /
+  // unsupportedBare）不再作为拒绝依据，相关词条保留但已成死词条（见回传）。
+  if (file.size > MAX_FILE_BYTES) {
+    return { ok: false, reason: t('dm.gate.fileTooLarge', { size: formatBytesShared(file.size), limit: formatBytesShared(MAX_FILE_BYTES) }) }
   }
-  if ((FORBIDDEN_EXTS as readonly string[]).includes(ext)) {
-    return { ok: false, reason: t('dm.gate.forbiddenExt', { ext, images: IMAGE_EXTS.join('/'), docs: DOC_EXTS.join('/') }) }
-  }
-  return { ok: false, reason: ext
-    ? t('dm.gate.unsupportedExt', { ext, images: IMAGE_EXTS.join('/'), docs: DOC_EXTS.join('/') })
-    : t('dm.gate.unsupportedBare', { images: IMAGE_EXTS.join('/'), docs: DOC_EXTS.join('/') }) }
+  return { ok: true, kind: 'file' }
 }
 
-/** 文件选择框的 accept 白名单（照抄规矩，别让用户在弹窗里挑到一个注定被拒的文件） */
+/**
+ * 文件选择框的 accept 属性。
+ * 【任务171】类型不再是拒绝依据 ⇒ accept 一律返回「任意类型」通配（星号 + 斜杠 + 星号），
+ * 弹窗里不再置灰任何文件（原先的白名单会让 json / csv 等「灰到选不中」，正是用户报的症状）。
+ * ⚠️ 私信（allowAudioVideo:false）的**音视频拒绝逻辑一行未动**：仍由 classifyAttachmentFile
+ *    的 avNotAllowed 分支 + DmComposer 的 `cls.kind === 'audio' || 'video'` 显式守卫拦下，
+ *    并给出可见提示。唯一变化的是弹窗不再替我们预先隐藏候选。
+ */
 export function acceptAttrFor(opts: ClassifyOptions): string {
-  const parts = [...IMAGE_EXTS.map((e) => `.${e}`), ...DOC_EXTS.map((e) => `.${e}`)]
-  if (opts.allowAudioVideo) parts.push('audio/*', 'video/*')
-  return parts.join(',')
+  void opts
+  return '*/*'
 }
 
 // —————————————————————————— 私信消息体（附件引用）——————————————————————————

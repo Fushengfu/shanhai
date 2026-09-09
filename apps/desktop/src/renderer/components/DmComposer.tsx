@@ -176,7 +176,7 @@ export function DmComposer(p: DmComposerProps): React.JSX.Element {
     [patchAtt],
   )
 
-  /** 收下一个文件：先过规矩（类型 / 大小），拒因立刻可见；通过才读盘 + 上传（粘贴后先本地预览、可取消） */
+  /** 收下一个文件：先过规矩（【任务171】只剩大小 + 私信音视频两道），拒因立刻可见；通过才读盘 + 上传（粘贴后先本地预览、可取消） */
   const acceptFile = useCallback(
     async (file: File, fallbackName: string): Promise<void> => {
       const name = file.name || fallbackName

@@ -72,6 +72,23 @@ function toTemperature(v: string | number | undefined): number | undefined {
   return n
 }
 
+/** 用户自定义模型的缺省采样温度：用户没有显式配置过时用 0（采样最确定，弱模型最不易跑偏） */
+const CUSTOM_MODEL_DEFAULT_TEMPERATURE = 0
+
+/**
+ * 解析要下发给上游的 temperature（单一真相源，resolveProvider 与 logout 后的模型恢复分支两处共用，避免两处口径漂移）：
+ * - 用户自定义模型（custom === true）：用户在模型配置里显式配过合法数值就尊重他的值，没配过才缺省 0；
+ * - 系统内置网关模型（custom 不为 true）：一律不下发（undefined），由网关按它自己的模型配置决定，
+ *   山海侧不注入也不覆盖。
+ * 判据用 custom 字段（山海侧唯一的自定义标记：新增/编辑/恢复自定义模型时写入 true，网关下发的模型不带该字段），
+ * 不用模型名前缀这类脆弱判据。
+ * 注：思考模式（reasoningEffort / thinking）下 provider 层本就不下发采样参数，该分支不受此处返回值影响。
+ */
+function resolveTemperature(target: GatewayModel): number | undefined {
+  if (target.custom !== true) return undefined
+  return toTemperature(target.temperature) ?? CUSTOM_MODEL_DEFAULT_TEMPERATURE
+}
+
 /**
  * 从会员 JWT 的 payload 里解出有效期（exp / iat，单位秒 → 毫秒）。
  * 只读本地已有 token 的 payload，不校验签名、不外发；解不出返回 { expiresAt: null, ttlSeconds: null }。
@@ -122,7 +139,7 @@ export function createModelProviderModule(
     if (target?.source === 'deepseek-bridge') {
       provider = createDeepSeekModel({ chat: deepSeekBridge.deepSeekChat, getWorkspace: currentWorkDir })
     } else if (target?.baseUrl) {
-      provider = createModelProvider({ apiKey: target.apiKey, baseUrl: target.baseUrl, model: target.model ?? target.id, protocol: target.protocol, maxTokens: target.maxTokens, onUsage: tokenStats.onUsage, onTrace: tokenStats.onHttpTrace, supportsReasoning: target.supportsReasoning, temperature: toTemperature(target.temperature), reasoningEffort: toReasoningEffort(target.reasoningEffort) })
+      provider = createModelProvider({ apiKey: target.apiKey, baseUrl: target.baseUrl, model: target.model ?? target.id, protocol: target.protocol, maxTokens: target.maxTokens, onUsage: tokenStats.onUsage, onTrace: tokenStats.onHttpTrace, supportsReasoning: target.supportsReasoning, temperature: resolveTemperature(target), reasoningEffort: toReasoningEffort(target.reasoningEffort) })
     }
     ctx.modelProviders.set(modelId, provider)
     return provider
@@ -307,7 +324,7 @@ export function createModelProviderModule(
     if (target?.source === 'deepseek-bridge') {
       ctx.model = createDeepSeekModel({ chat: deepSeekBridge.deepSeekChat, getWorkspace: currentWorkDir })
     } else if (target?.baseUrl) {
-      ctx.model = createModelProvider({ apiKey: target.apiKey, baseUrl: target.baseUrl, model: target.model ?? target.id, protocol: target.protocol, maxTokens: target.maxTokens, onUsage: tokenStats.onUsage, onTrace: tokenStats.onHttpTrace, supportsReasoning: target.supportsReasoning, temperature: toTemperature(target.temperature), reasoningEffort: toReasoningEffort(target.reasoningEffort) })
+      ctx.model = createModelProvider({ apiKey: target.apiKey, baseUrl: target.baseUrl, model: target.model ?? target.id, protocol: target.protocol, maxTokens: target.maxTokens, onUsage: tokenStats.onUsage, onTrace: tokenStats.onHttpTrace, supportsReasoning: target.supportsReasoning, temperature: resolveTemperature(target), reasoningEffort: toReasoningEffort(target.reasoningEffort) })
     } else {
       ctx.model = await createGatewayModel(tokenStats.onUsage, tokenStats.onHttpTrace)
     }
