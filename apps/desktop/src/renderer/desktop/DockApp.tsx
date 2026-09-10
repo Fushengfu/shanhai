@@ -4,7 +4,9 @@ import { useThemeSync } from '../theme'
 import { applyLocale, useLocaleSync } from '../locale'
 import { t } from '../../shared/i18n'
 import { useUiStore, patchUiStore } from '../store-client'
-import { IconAvatar, IconMonitor, IconGrid } from '../components/icons'
+// 【任务181】Dock 三个自有槽位改用专用图标族：IconMonitor 原与「管家」同字形（用户分不清），
+// IconAvatar 换成与全族同尺寸 / 同描边的头像；IconGrid 换成同口径的 2×2 网格。
+import { IconDockAccount, IconDockDesktop, IconDockAppMenu } from '../components/icons'
 import { PluginAppIcon } from '../components/PluginAppIcon'
 
 /**
@@ -149,10 +151,12 @@ export function DockApp(): React.JSX.Element {
           width: 'max-content',
         }}
       >
-        {/* 应用菜单入口（靠左，类似开始菜单，点击在桌面顶部弹出已安装应用列表） */}
+        {/* 应用菜单入口（靠左，类似开始菜单）：【任务187】点击只通知主进程开/关专用置顶浮层窗口，
+            不再由本窗口写 ui.appMenuOpen —— 主进程是唯一写者（它切窗口可见态后把真实状态广播回来，
+            本按钮的高亮据此渲染），避免「Dock 以为开着、浮层其实已关」两份真相导致「点了没反应」。 */}
         <button
           data-dock-icon
-          onClick={() => patchUiStore({ appMenuOpen: !ui.appMenuOpen })}
+          onClick={() => void window.shanhai?.setAppMenu(!ui.appMenuOpen)}
           title={t('panels.dockAppMenuTip')}
           style={{
             display: 'flex',
@@ -176,7 +180,7 @@ export function DockApp(): React.JSX.Element {
           }}
         >
           <span style={{ transform: 'scale(1.6)', display: 'inline-flex' }}>
-            <IconGrid />
+            <IconDockAppMenu />
           </span>
           <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{t('panels.dockApps')}</span>
         </button>
@@ -328,7 +332,7 @@ export function DockApp(): React.JSX.Element {
             }}
           >
             <span style={{ position: 'relative', display: 'inline-flex', transform: 'scale(1.6)' }}>
-              <IconAvatar />
+              <IconDockAccount />
               <span
                 style={{
                   position: 'absolute',
@@ -444,7 +448,7 @@ export function DockApp(): React.JSX.Element {
           }}
         >
           <span style={{ transform: 'scale(1.6)', display: 'inline-flex' }}>
-            <IconMonitor />
+            <IconDockDesktop />
           </span>
           <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', maxWidth: 64, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {t('panels.dockExit')}

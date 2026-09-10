@@ -63,6 +63,11 @@ async function bootstrap(): Promise<void> {
   } else if (windowType === 'supervisor') {
     const { SupervisorApp } = await import('./supervisor/SupervisorApp')
     await mount(<SupervisorApp />)
+  } else if (windowType === 'app-menu') {
+    // 【任务187·方案 P】应用菜单专用置顶浮层窗口：整窗就是「透明遮罩 + 贴 Dock 上方的面板」，
+    // 直接挂 AppMenuPanel（它自带 useThemeSync/useLocaleSync，是独立窗口的根）。
+    const { AppMenuPanel } = await import('./desktop/AppMenuPanel')
+    await mount(<AppMenuPanel />)
   } else if (windowType === 'supervisor-bubble') {
     const { SupervisorBubble } = await import('./supervisor/SupervisorBubble')
     await mount(<SupervisorBubble />)

@@ -52,7 +52,7 @@ export interface SessionsModule {
   setSupervisorModelInternal(modelId: string): { ok: boolean; message: string }
   setSupervisorApprovalInternal(policy: ApprovalPolicy): { ok: boolean; message: string }
   switchSessionInternal(id: string): { ok: boolean; message: string }
-  stopSessionInternal(sid: string): void
+  stopSessionInternal(sid: string, opts?: { explicit?: boolean }): void
   getSessionHistory(id?: string): Array<{ kind: 'user' | 'assistant' | 'tool'; content?: string; reasoningContent?: string; trace?: ToolTrace; attachments?: unknown[]; turnSeq?: number; turnDuration?: number }>
   getSessionTrace(id?: string): Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string; reasoningContent?: string; toolCalls?: Array<{ id: string; name: string; args: Record<string, unknown> }>; toolCallId?: string; toolName?: string; result?: unknown; error?: string; turn: number; timestamp: number }>
   getHistory(): Array<{ role: 'user' | 'assistant' | 'tool'; content: string; toolName?: string }>
@@ -411,10 +411,24 @@ export function createSessionsModule(
     return { ok: true, message: `已激活会话「${target.title}」(${id})` }
   }
 
-  const stopSessionInternal = (sid: string): void => {
+  /**
+   * 停止某会话：置停止标志 + abort 正在跑的 loop + 解开该会话挂着的审批/投递等待。
+   * opts.explicit：调用方是否显式带了 sessionId（true=按 id 精确停；false=走「无参兜底 → 全局当前会话」，
+   * 那条路径在桌面壳/手机端切走 currentSessionId 后会停错对象，故落事件区分开，事后可核对）。
+   */
+  const stopSessionInternal = (sid: string, opts?: { explicit?: boolean }): void => {
     if (!sid) return
+    const hadRunningLoop = ctx.runningLoops.has(sid)
     ctx.stoppedSessions.add(sid)
     ctx.runningLoops.get(sid)?.abort()
+    // 停止落事件（⑤）：此前停止只改内存标志，events.jsonl 零痕迹 → 「点停止后到底停没停、多久停、
+    // 停的是不是这个会话」事后完全无法核对。落一条可按 sessionId 过滤的记录，并立即持久化，
+    // 保证即使 loop 卡住不再产生事件（非流式/长工具）也已经有一条写盘。
+    const meta = ctx.sessions.get(sid)
+    if (meta) {
+      meta.session.append('session/stopped', { sessionId: sid, hadRunningLoop, explicit: opts?.explicit === true })
+      void persistSession(meta)
+    }
     for (const [requestId, p] of ctx.pendingApprovals) {
       if (p.sessionId === sid) {
         p.resolve('rejected')

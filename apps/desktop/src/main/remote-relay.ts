@@ -64,10 +64,88 @@ let authFailed = false
  */
 let pendingAuthRecovery = false
 
+/**
+ * 【任务197 S2-2】待发 cmd_result 队列上限（relay 全局一份）。
+ * 取值理由同 remote-server：单条 cmd_result 是一小段 JSON，手机端同时在途的命令通常个位数，
+ * 50 条给足冗余，同时把最坏内存占用限制在「50 × 单条最大 payload」以内。
+ */
+const PENDING_RESULT_LIMIT = 50
+
+/**
+ * 【任务197 S2-2】补发有效期：超过手机端等待窗口（60s）的结果再补发已无意义
+ * （手机端此时必已 remove 并报「命令超时」），且可能落到**另一台**同账号设备的同号命令上（id 冲突，手机端 `_cmdSeq` 是实例内自增）。
+ * 因此只在有效期内的结果才补发，过期的丢弃并 warn。
+ * ★注意：本值不改变手机端 60s 超时（那属 S3），只是「补发的有效期」。
+ */
+const PENDING_RESULT_TTL_MS = 60 * 1000
+
+/**
+ * 【任务197 S2-2】待发 cmd_result 队列（模块级一份：网关 host 连接断开后会重建新 socket，
+ * 队列必须跨 socket 存活，才能在新连接 open 后补发）。
+ * 改前：`hostWs` 非 OPEN 时 `sendToRelay()` 直接什么都不做 ⇒ cmd_result 静默蒸发 ⇒ 手机端白等满 60s。
+ * 改后：记 warn + 入队，`ws.on('open')` 与每次成功发送前按 id 顺序补发。
+ * `Map<id, {payload, at}>` 天然按 cmd id 去重，并保持插入序（Map 迭代序 = 插入序）。
+ */
+const pendingResults = new Map<number, { payload: string; at: number }>()
+
+/** 入队（同 id 覆盖 = 去重；溢出丢弃最旧一条并 warn） */
+function queuePendingResult(id: number, payload: string): void {
+  if (pendingResults.has(id)) {
+    pendingResults.set(id, { payload, at: Date.now() })
+    return
+  }
+  if (pendingResults.size >= PENDING_RESULT_LIMIT) {
+    const oldest = pendingResults.keys().next().value as number | undefined
+    if (oldest !== undefined) pendingResults.delete(oldest)
+    console.warn(`[relay] 待发结果队列已满(${PENDING_RESULT_LIMIT})，丢弃最旧一条 id=${oldest}；本条 id=${id} 已入队`)
+  }
+  pendingResults.set(id, { payload, at: Date.now() })
+}
+
+/** 网关连接可用时按 id（插入顺序）补发积压结果；过期的丢弃并 warn */
+function flushPendingResults(): void {
+  if (pendingResults.size === 0) return
+  if (!hostWs || hostWs.readyState !== WebSocket.OPEN) return
+  const now = Date.now()
+  const items = [...pendingResults.entries()]
+  pendingResults.clear()
+  let sent = 0
+  let expired = 0
+  for (const [id, item] of items) {
+    if (now - item.at > PENDING_RESULT_TTL_MS) {
+      expired += 1
+      console.warn(`[relay] 待发结果 id=${id} 已过期(>${PENDING_RESULT_TTL_MS}ms)，丢弃不补发`)
+      continue
+    }
+    try {
+      hostWs.send(item.payload)
+      sent += 1
+    } catch (err) {
+      console.error(`[relay] 补发结果 id=${id} 失败:`, err instanceof Error ? err.message : err)
+    }
+  }
+  if (sent > 0) console.log(`[relay] 网关连接恢复，已补发 ${sent} 条待发 cmd_result`)
+  if (expired > 0) console.log(`[relay] 本次补发共丢弃 ${expired} 条过期结果（见上 warn）`)
+}
+
 function sendToRelay(obj: unknown): void {
   if (hostWs && hostWs.readyState === WebSocket.OPEN) {
+    // 连接可用：先把此前积压的待发结果按 id 顺序补发，再发本条
+    flushPendingResults()
     hostWs.send(JSON.stringify(obj))
+    return
   }
+  // 非 OPEN：不再静默丢弃 —— 仅 cmd_result 入队补发（事件是状态同步，手机端重连后会重新拉取，维持既有「跳过」语义不刷日志）
+  const rec = obj as { type?: string; id?: number }
+  if (rec && rec.type === 'cmd_result' && typeof rec.id === 'number') {
+    queuePendingResult(rec.id, JSON.stringify(obj))
+    console.warn(
+      `[relay] 网关连接不可用(readyState=${hostWs ? hostWs.readyState : 'null'})，cmd_result id=${rec.id} 未能发送，已入待发队列(size=${pendingResults.size})`,
+    )
+    return
+  }
+  if (rec && rec.type === 'event') return
+  console.warn(`[relay] 网关连接不可用(readyState=${hostWs ? hostWs.readyState : 'null'})，消息 type=${rec?.type ?? '?'} 未能发送(不入队)`)
 }
 
 /** 事件转发：发给网关（网关再转发给已配对的 Client） */
@@ -127,6 +205,8 @@ function connect(): void {
     pendingAuthRecovery = false
     startPing() // 心跳保活
     unsubscribeSync() // 数据同步延迟到手机连上后再建立
+    // 【任务197 S2-2】网关连接恢复：补发断线期间积压的 cmd_result（按 id 顺序，幂等）
+    flushPendingResults()
     broadcastRelayStatus()
   })
 
@@ -322,6 +402,11 @@ export function stopRemoteRelay(): void {
   stopPing()
   reconnectAttempts = 0
   unsubscribeSync()
+  // 【任务197 S2-2】中继停止：积压结果无法再送达，清空并 warn（不静默滞留）
+  if (pendingResults.size > 0) {
+    console.warn(`[relay] 网关中继已停止，丢弃 ${pendingResults.size} 条未能补发的 cmd_result`)
+    pendingResults.clear()
+  }
   if (hostWs) {
     hostWs.close()
     hostWs = null

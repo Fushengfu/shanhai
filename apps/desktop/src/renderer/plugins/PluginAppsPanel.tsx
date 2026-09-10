@@ -2,6 +2,14 @@ import { useEffect, useRef, useState } from 'react'
 import { PluginAppIcon } from '../components/PluginAppIcon'
 import { t } from '../../shared/i18n'
 import { useLocaleSync } from '../locale'
+import { useUiStore } from '../store-client'
+import {
+  buildTitleStyles,
+  estimateWallpaperLuminance,
+  pickTitleScheme,
+  CHIP_PADDING,
+  CHIP_RADIUS,
+} from '../wallpaper-contrast'
 
 /** 与 preload listPluginApps 返回项对齐的插件应用信息 */
 export interface PluginAppInfo {
@@ -39,7 +47,8 @@ const GRID_GAP = '16px 24px'
  * - 图标【按注册顺序依次排布，flex-wrap 换行，彼此不重叠】（任务163：去掉自由摆放，重叠根因即自由坐标）；
  * - 点击（无拖拽，指针偏移 < 阈值）打开对应插件窗口；
  * - 按住拖拽超阈值后仍可通过把图标拖到 Dock 窗口释放来「固定到 Dock」（复用 beginPluginDrag 广播）；
- * - 卡片背景透明：图标 + 名称直接贴在壁纸上（名称带文字阴影保证可读），不再有实色卡片遮挡。
+ * - 卡片背景透明：图标直接贴在壁纸上；标题不再依赖"某一个固定色"，而是走
+ *   半透明底板 + 随壁纸亮度翻转的文字色（见 wallpaper-contrast.ts，任务188）。
  *
  * 挂在 DesktopApp 全屏 overlay 上（absolute + inset:0 + pointerEvents:none），
  * 卡片自身 pointerEvents:auto，点击空白壁纸仍能透传到桌面壳的 restoreAboveDesktop。
@@ -49,8 +58,24 @@ export function PluginAppsPanel(): React.JSX.Element | null {
   useLocaleSync()
   const [apps, setApps] = useState<PluginAppInfo[]>([])
   const [draggingId, setDraggingId] = useState<string | null>(null)
+  // 壁纸亮度（null=估不出来，走兜底档）。订阅 ui.wallpaper：换壁纸即时重算
+  const ui = useUiStore()
+  const [wallpaperLum, setWallpaperLum] = useState<number | null>(null)
 
   const dragRef = useRef<DragState | null>(null)
+
+  // 标题配色档：亮度未知 → 兜底（主题同向底板），已知 → 随壁纸翻转
+  const titleStyles = buildTitleStyles(pickTitleScheme(wallpaperLum))
+
+  useEffect(() => {
+    let cancelled = false
+    void estimateWallpaperLuminance(ui.wallpaper).then((lum) => {
+      if (!cancelled) setWallpaperLum(lum)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [ui.wallpaper])
 
   useEffect(() => {
     let mounted = true
@@ -167,16 +192,20 @@ export function PluginAppsPanel(): React.JSX.Element | null {
             }}
           >
             <PluginAppIcon appId={app.appId} size={44} />
+            {/* 标题可读性（任务188）：底板与文字色由 wallpaper-contrast 按壁纸亮度选档；
+                估不出亮度时自动退回「主题同向底板」档，不存在"换某张壁纸就看不清"的档位。 */}
             <span
               style={{
                 fontSize: 12,
                 fontWeight: 600,
-                color: 'var(--text)',
                 maxWidth: 76,
+                boxSizing: 'border-box',
+                padding: CHIP_PADDING,
+                borderRadius: CHIP_RADIUS,
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap',
-                textShadow: '0 1px 2px rgba(0,0,0,0.55), 0 0 8px rgba(0,0,0,0.25)',
+                ...titleStyles,
               }}
             >
               {app.name}

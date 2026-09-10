@@ -62,7 +62,7 @@ function defaultAppSize(appId: string): { width: number; height: number } {
  * - chat：聊天窗口（浮动在桌面之上，承载对话主界面）
  * - app：应用窗口（终端/轨迹/记忆/设置/模型管理等独立插件应用，按 appId 区分，可多开）
  */
-export type WindowType = 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble'
+export type WindowType = 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble' | 'app-menu'
 
 /** 窗口类型通过 additionalArguments 注入渲染进程，preload 用 process.argv 读取（同步、无竞态） */
 const WINDOW_TYPE_ARG = '--shanhai-window-type='
@@ -187,6 +187,13 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
       width: bw,
       height: bh,
     }
+  } else if (type === 'app-menu') {
+    // 【任务187·方案 P】应用菜单专用置顶浮层：铺满工作区（workArea）的透明窗口。
+    // 面板与「点外部关闭」遮罩的坐标语义（bottom: dockTop + 12 / inset:0）与原桌面壳完全一致，
+    // 所以换宿主窗口不需要改任何视觉参数（磨砂/网格/圆角/配色/字号原样搬）。
+    // 为什么必须独立窗口而不是留在桌面壳里：桌面壳被 keepDesktopAtBottom 永久压在山海窗口栈最底，
+    // 而 app/插件窗口创建时带 alwaysOnTop:true（见下方 type==='app' 分支），跨窗口 z-order 渲染层改不了。
+    shellBounds = { x: display.workArea.x, y: display.workArea.y, width: display.workArea.width, height: display.workArea.height }
   } else if (type === 'app') {
     // 应用/插件弹窗：贴 Dock 上方弹出（不顶到屏幕最顶部），水平居中。
     // 取 Dock 窗口实际 bounds 对齐（Dock 尺寸随内容自适应），Dock 不可见时回退到工作区底部默认值。
@@ -215,10 +222,13 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
     // desktop/dock 额外 focusable:false（不接受键盘焦点，点击不抢焦点，但仍可接收鼠标事件）。
     // supervisor 保持可聚焦（它是可交互的聊天窗口）。
     ...(shellBounds ? { frame: false, focusable: false } : { frame: false }),
-    ...(type === 'dock' || type === 'supervisor-bubble' || (isWin && (type === 'chat' || type === 'supervisor' || type === 'app' || type === 'desktop'))
+    // app-menu 必须是透明窗口：它铺满整个 workArea，只有面板本体有背景，其余区域要透出桌面与下层窗口。
+    ...(type === 'dock' || type === 'supervisor-bubble' || type === 'app-menu' || (isWin && (type === 'chat' || type === 'supervisor' || type === 'app' || type === 'desktop'))
       ? { transparent: true, backgroundColor: '#00000000', hasShadow: false }
       : {}),
     ...(type === 'supervisor-bubble' ? { alwaysOnTop: true, resizable: false, minimizable: false, maximizable: false, skipTaskbar: true } : {}),
+    // 【任务187·方案 P】应用菜单浮层：置顶 + 不进任务栏/不可缩放最小化（它只在打开时存在，关闭=隐藏复用）。
+    ...(type === 'app-menu' ? { alwaysOnTop: true, resizable: false, minimizable: false, maximizable: false, skipTaskbar: true } : {}),
     // 会话管家窗口：不再置顶（与普通窗口一样可被其它窗口遮挡）。仅浮动悬浮图标(supervisor-bubble)保持置顶。
     // 用户要求（2026-09）：管家主窗口不需置顶所有窗口，只有悬浮按钮置顶所有窗口。
     // 注意：不删上面的 supervisor-bubble 分支的 alwaysOnTop —— 那是浮动图标，要始终置顶。
@@ -253,7 +263,7 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
   // 点击桌面时由渲染进程 mousedown 调 restoreAboveDesktop 把聊天/应用窗口带回前面。
   // （focusable:false 仍会点击提升 z-order，但 mousedown 恢复 + 不抢焦点即可闭环，且不再触发系统级隐藏。）
 
-  if (type === 'chat' || type === 'desktop' || type === 'dock') {
+  if (type === 'chat' || type === 'desktop' || type === 'dock' || type === 'app-menu') {
     win.on('close', (e) => {
       if (!isQuitting) {
         e.preventDefault()
@@ -468,6 +478,10 @@ export function hideChatWindow(): void {
 export function keepDesktopAtBottom(): void {
   for (const meta of windows.values()) {
     if (meta.type === 'desktop') continue
+    // 【任务187·方案 P 风险②】app-menu 必须排除在本循环之外：本函数是「把窗口抬到桌面壳之上」，
+    // 而应用菜单浮层是 alwaysOnTop 的置顶浮层，一旦被卷进逐窗口 moveTop 的排序里，
+    // 后遍历到的普通窗口会排在它之上 → 面板被压回底部（正是本任务要修的原始症状）。
+    if (meta.type === 'app-menu') continue
     if (meta.win.isDestroyed() || !meta.win.isVisible()) continue
     meta.win.moveTop()
   }
@@ -476,6 +490,11 @@ export function keepDesktopAtBottom(): void {
     if (win.isDestroyed() || !win.isVisible()) continue
     win.moveTop()
   }
+  // 【任务187·方案 P 风险②的另一半】被排除出上面循环后，必须在这里补一次「最后抬升」：
+  // ensureDesktopLayer 是先 desktop.moveTop() 再调本函数的，若本函数完全不碰 app-menu，
+  // 它就只剩 alwaysOnTop 一层保障；显式排在所有窗口之后抬，才能保证面板永远在山海窗口栈最顶。
+  const menu = findWindow('app-menu')
+  if (menu && !menu.win.isDestroyed() && menu.win.isVisible()) menu.win.moveTop()
 }
 
 /** 注册外部窗口（如浏览器窗口），使其参与桌面层级纠正（被桌面壳盖住时能被抬回） */
@@ -686,6 +705,48 @@ export function listWindows(): Array<{ type: WindowType; appId?: string }> {
   }
   return out
 }
+
+// ==================== 应用菜单浮层窗口（任务187·方案 P）====================
+
+/**
+ * 应用菜单浮层的显隐唯一入口（关闭=hide 复用，不 destroy）：
+ * 全进程【最多一个】app-menu 实例（严格单例，走 findWindow('app-menu') 复用），
+ * 因此反复开关不会累积窗口实例。
+ *
+ * 为什么必须独立窗口：面板原先挂在桌面壳里，而桌面壳被 keepDesktopAtBottom 永久压在山海窗口栈最底、
+ * app/插件窗口带 alwaysOnTop:true → 面板结构上不可能盖住它们（任务184 定性的架构性层级缺陷）。
+ *
+ * @returns 本次调用后面板是否可见（供 IPC 层写回共享状态，保证 Dock 高亮与真实可见态一致）
+ */
+export function setAppMenuWindowVisible(open: boolean): boolean {
+  const found = findWindow('app-menu')
+  if (!open) {
+    if (found && !found.win.isDestroyed() && found.win.isVisible()) found.win.hide()
+    return false
+  }
+  if (found) {
+    if (!found.win.isVisible()) found.win.show()
+    found.win.moveTop()
+    return true
+  }
+  const win = createWindow({ type: 'app-menu' })
+  void loadWindowContent(win).then(() => {
+    if (win.isDestroyed()) return
+    win.show()
+    win.moveTop()
+  })
+  return true
+}
+
+/** 应用菜单浮层当前是否可见（主进程侧唯一判据；共享状态 appMenuOpen 由它派生，不各写一半） */
+export function isAppMenuWindowVisible(): boolean {
+  const found = findWindow('app-menu')
+  return !!found && !found.win.isDestroyed() && found.win.isVisible()
+}
+
+// 注：「退出到桌面」（hideToSystemDesktop）不需要为本浮层写专用收起函数——
+// 那里的收起循环【没有】排除 app-menu，浮层与其它窗口一起被 hide()，
+// 因此不会出现「其它窗口都收了、只剩一个置顶浮层孤零零挂在系统桌面上」。
 
 // ==================== 窗口磁吸 + 联动移动（snap & dock）====================
 

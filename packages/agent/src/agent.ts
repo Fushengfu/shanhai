@@ -6,10 +6,10 @@ import type { Session } from '@shanhai/session'
 import type { ApprovalService } from '@shanhai/approval'
 
 /**
- * 历史 assistant 消息：不再做任何标签包裹，回放时按标准 role=assistant 原样进上下文。
- * （曾用隔离标签包裹以防「模仿历史口吻/语义延续/把历史旧结论当当前状态」三类幻觉，
- *  现按产品口径取消；防幻觉改由系统提示词的「历史回放隔离」条款承担——
- *  明确声明上下文里的历史 assistant 发言不是本轮结果、不代表当前任务已完成。）
+ * 历史 assistant 消息：回放时包进 <replay-assistant>（防「模仿历史口吻/语义延续/把历史旧结论当当前状态、
+ * 把历史回放当成本轮已完成」三类幻觉——本项目有多起实测前科）。标签只在「发给模型那一刻」构造，
+ * 事件日志（assistant/message）永远落盘原始正文，渲染层与回放都看不到裸标签，也不会二次包裹。
+ * 「历史内容不代表本轮结果」这条约束同时由系统提示词的「历史回放隔离」条款承担（两处一致，不冲突）。
  */
 
 /**
@@ -25,11 +25,24 @@ const USER_QUERY_OPEN = '<user_query>'
 const USER_QUERY_CLOSE = '</user_query>'
 
 /**
- * 系统上下文块标签族（沿用 workbuddy 的标签化形态，不用裸文本）：
+ * 历史回放标签（replay- 前缀族，与 <user_query> 一样由一条前缀泛化规则覆盖，不进具名名单）：
+ *   <replay-assistant>  包「上下文回放里的历史 AI 回复」——标签内是过去发生的事，不是本轮结果、
+ *                       不是模型此刻的发言，更不得作为「已完成」的依据（防把历史当本轮已完成的嘴炮）。
+ * 铁律与用户消息一致：标签只存在于「发给模型那一刻」的上下文，绝不写进事件日志/落盘正文；
+ * 多轮不累积（回放每次都从落盘原文重新构造，不会在旧标签上再套一层）。
+ * 历史用户提问不自成一套：它与本轮消息共用 <user_query>（174 口径，靠"最后一条才是当前指令"区分），
+ * 所以这里只需要 assistant 一枚，禁止另起第二套回放包裹实现。
+ */
+const REPLAY_ASSISTANT_OPEN = '<replay-assistant>'
+const REPLAY_ASSISTANT_CLOSE = '</replay-assistant>'
+
+/**
+ * 系统提示标签族（<system-reminder> 这一族，沿用 workbuddy 的标签化形态，不用裸文本）：
  * <system-reminder data-role="user-context">   外层：系统注入的上下文，不是用户说的话
  *   ├ <user_info>            运行环境明细（只注入在首条用户消息）
- *   └ <additional_data>
- *       └ <current_time>     该条用户消息自己的时间（每条都有；历史用落盘真实时间，本轮用当下）
+ *   ├ <additional_data>
+ *   │     └ <current_time>   该条用户消息自己的时间（每条都有；历史用落盘真实时间，本轮用当下）
+ *   └ <sh_mandate>           反编造硬约束（每条都有；sh_ 前缀 → 自动进保留标签名单，无需改名）
  * 铁律：整块只在「发给模型那一刻」构造——不落盘、不进事件日志、不进回放；
  *       且一律放在 <user_query> 之外（块在前、用户原话标签在后）。
  */
@@ -41,13 +54,16 @@ const ADDITIONAL_DATA_OPEN = '<additional_data>'
 const ADDITIONAL_DATA_CLOSE = '</additional_data>'
 const CURRENT_TIME_OPEN = '<current_time>'
 const CURRENT_TIME_CLOSE = '</current_time>'
+const MANDATE_OPEN = '<sh_mandate>'
+const MANDATE_CLOSE = '</sh_mandate>'
 
 /** 系统保留标签名清单（单一真相源之一：逐个登记的「具名标签」，转义 / 检测 / 剥离三处都由它派生） */
 const SYSTEM_RESERVED_TAG_NAMES = ['user_query', 'system-reminder', 'additional_data', 'current_time', 'user_info'] as const
 
 /**
  * 系统保留标签「前缀族」（单一真相源之二）：整族由一条泛化规则覆盖，**不逐个登记名字**。
- * - replay-：旧版历史回放标签（本仓已不再注入该族，保留是为了旧会话/旧审计日志里的泄漏仍能被剥掉）。
+ * - replay-：历史回放标签（回放历史 AI 回复时注入 <replay-assistant>；该族靠这一条前缀规则覆盖，
+ *   不进具名名单——否则每加一枚回放标签都要改一次名单，必然漂移。同时兜底旧会话/旧审计日志里的泄漏）。
  * - sh_：系统提示词的协议模块标签族（角色 / 工作方法 / 合规 / 嘴炮铁律 / 台账约定… 全部以 sh_ 开头）。
  *   提示词模块会随协议增删，若把每个标签名一条条加进名单，必然与提示词漂移；用固定前缀 + 一条泛化
  *   规则，新增模块标签自动被转义 / 检测 / 剥离三处覆盖，无需再改正则。
@@ -81,7 +97,15 @@ function wrapUserQuery(content: string): string {
   return `${USER_QUERY_OPEN}\n${escapeReservedTags(content)}\n${USER_QUERY_CLOSE}`
 }
 
-/** 系统上下文块（包在 <user_query> 之前；块内内容不是用户指令）。 */
+/** 把历史 AI 回复包裹进 <replay-assistant>（只用于回放，本轮新输出不包；与 wrapUserQuery 同一套转义路径，
+ * 标签内正文若自带同款标签会被转义、不会提前闭合穿模；标签内是过去发生的事，不得当作本轮已完成的依据）。 */
+function wrapReplayAssistant(content: string): string {
+  return `${REPLAY_ASSISTANT_OPEN}\n${escapeReservedTags(content)}\n${REPLAY_ASSISTANT_CLOSE}`
+}
+
+/** 系统提示标签块（包在 <user_query> 之前；块内内容不是用户指令）。
+ * 结构：外层 <system-reminder>，块内依次 <user_info>（只首条）→ <additional_data>/<current_time>（每条）
+ *      → <sh_mandate>（每条，反编造硬约束，放在最靠近用户原话的一侧，弱模型对尾部内容更敏感）。 */
 function wrapUserContext(envLines: string[], atMs: number): string {
   const envPart = envLines.length > 0 ? `${USER_INFO_OPEN}\n${envLines.join('\n')}\n${USER_INFO_CLOSE}\n` : ''
   const timePart = `${ADDITIONAL_DATA_OPEN}\n${CURRENT_TIME_OPEN}${formatContextTime(atMs)}${CURRENT_TIME_CLOSE}\n${ADDITIONAL_DATA_CLOSE}`
@@ -94,7 +118,15 @@ function injectEnvIntoContextText(text: string, envLines: string[]): string {
   return `${SYSTEM_REMINDER_OPEN}\n${USER_INFO_OPEN}\n${envLines.join('\n')}\n${USER_INFO_CLOSE}\n${text.slice(SYSTEM_REMINDER_OPEN.length + 1)}`
 }
 
-/** 剥掉文本里的系统上下文块（含块内全部内容），用于「注入内容不进事件日志」。 */
+/** 剥掉历史回放包裹（供挂起快照落盘用）：只去外层标签，正文原样返回；不是包裹形态则不动。
+ * 与 <user_query> 不同——user_query 属于「发给模型的 body」本体，快照必须原样保留才能重发同一请求；
+ * 而 replay-assistant 与系统提示标签块一样是「只在发给模型那一刻构造」的注入标签，绝不进事件日志。 */
+function unwrapReplayAssistant(text: string): string {
+  if (!text.startsWith(REPLAY_ASSISTANT_OPEN) || !text.endsWith(REPLAY_ASSISTANT_CLOSE)) return text
+  return text.slice(REPLAY_ASSISTANT_OPEN.length + 1, text.length - REPLAY_ASSISTANT_CLOSE.length - 1)
+}
+
+/** 剥掉文本里的系统提示标签块（含块内全部内容），用于「注入内容不进事件日志」。 */
 function stripUserContextBlocks(text: string): string {
   return text.replace(new RegExp(`${SYSTEM_REMINDER_OPEN}[\\s\\S]*?${SYSTEM_REMINDER_CLOSE}\\n?`, 'g'), '')
 }
@@ -159,7 +191,7 @@ export interface AgentLoopOptions {
    * 「连续两条 user、第一条无正文」。resumeRun（断点续跑）与管家会话不传（保持原回放，不裁剪未完成轮）。 */
   dropIncompleteTurn?: boolean
   /** 系统注入的运行环境快照行（单一真相源：由宿主 apps/runtime 的 collectEnvironment 渲染，本包不参与计算）。
-   * 只在「发给模型那一刻」拼进首条用户消息前的系统上下文块，绝不落盘、不进事件日志、不进回放。
+   * 只在「发给模型那一刻」拼进首条用户消息前的系统提示标签块，绝不落盘、不进事件日志、不进回放。
    * 未传时本轮不注入环境块（行为与改造前一致）。 */
   userContext?: string[]
 }
@@ -322,7 +354,7 @@ export class AgentLoop {
     this.userMessageTimes.set(currentUserMsg, Date.now())
     messages.push(currentUserMsg)
 
-    // 在「发给模型那一刻」给每条用户消息前置系统上下文块（环境快照 + 各条自己的时间）。
+    // 在「发给模型那一刻」给每条用户消息前置系统提示标签块（环境快照 + 各条自己的时间）。
     // 必须在裁剪之后做：保证环境块落在最终上下文里的第一条用户消息上，不会因早期历史被裁掉而丢失。
     this.lastUserContext = options?.userContext
     this.applyUserContext(messages)
@@ -368,7 +400,7 @@ export class AgentLoop {
           // 多模态模型：历史用户消息统一用数组结构（重发 https 附件），与当前消息结构保持一致；
           // 非视觉模型仍走 replayUserContent 的占位符（避免 400 / 重复计费）。
           // 历史 user 正文与本轮消息同样包裹 <user_query>（共用标签，靠位置区分：最后一条才是当前指令）。
-          // 落盘原文里若混进过系统上下文块（旧版本/异常路径），先剥掉再包裹，避免多轮累积与二次注入。
+          // 落盘原文里若混进过系统提示标签块（旧版本/异常路径），先剥掉再包裹，避免多轮累积与二次注入。
           const parts: ContentPart[] = []
           if (d.content) parts.push({ type: 'text', text: wrapUserQuery(stripUserContextBlocks(d.content)) })
           if (d.attachments && d.attachments.length > 0) parts.push(...d.attachments)
@@ -384,11 +416,13 @@ export class AgentLoop {
         }
       } else if (e.type === 'assistant/message') {
         const d = e.data as { content: string; reasoningContent?: string }
-        // 历史 assistant 正文：不再做任何标签包裹，按标准 role=assistant 原样回放（产品口径：历史发言就是模型自己说过的话）。
-        // 「历史内容不代表本轮结果」这条防幻觉约束改由系统提示词的「历史回放隔离」条款承担。
+        // 历史 assistant 正文：包进 <replay-assistant> 再回放——标签内是「过去发生的事」，不是本轮结果、
+        // 不是模型此刻的发言，不得作为「已完成」的依据（防模仿历史口吻/语义延续/把旧结论当当前状态三类幻觉）。
+        // 与用户消息同一套做法：只在发给模型这一刻构造，落盘的 assistant/message 永远是原始正文，
+        // 所以回放读到的原文不含标签 → 每轮重新包裹一次即可，不会多轮累积成嵌套。
         messages.push({
           role: 'assistant',
-          content: d.content,
+          content: wrapReplayAssistant(d.content),
           reasoningContent: includeReasoning ? d.reasoningContent : undefined,
         })
       } else if (e.type === 'tool/call') {
@@ -478,7 +512,7 @@ export class AgentLoop {
     return [...systemMsgs, ...kept]
   }
 
-  /** 在「发给模型那一刻」给每条用户消息前置系统上下文块（块在前、<user_query> 在后，块内内容不进用户原话标签）：
+  /** 在「发给模型那一刻」给每条用户消息前置系统提示标签块（块在前、<user_query> 在后，块内内容不进用户原话标签）：
    * - 每条用户消息：带该条消息自己的时间（历史用它落盘时的真实时间戳，当前消息用当下；
    *   时间未知的消息一律不注入，绝不拿 now 冒充历史时间）；
    * - 上下文里的第一条用户消息：额外带运行环境快照（宿主传入，本包不计算）。
@@ -513,10 +547,16 @@ export class AgentLoop {
     }
   }
 
-  /** 深拷贝一份 messages 并剥掉所有系统上下文块：专给 retry/snapshot 落盘用（注入内容不进事件日志）。
+  /** 深拷贝一份 messages 并剥掉所有「只在发给模型那一刻构造」的注入标签：专给 retry/snapshot 落盘用（注入内容不进事件日志）。
+   * - user 消息：剥掉系统提示标签块（环境快照 / 时间 / mandate）；
+   * - assistant 消息：剥掉历史回放包裹 <replay-assistant>（它同样是注入标签，落盘会污染事件日志）。
    * 内存里的那份保持原样，同进程 retry 仍能用与失败完全一致的 body 重发请求。 */
   private withoutUserContextBlocks(messages: ChatMessage[]): ChatMessage[] {
     return messages.map((m) => {
+      if (m.role === 'assistant' && typeof m.content === 'string') {
+        const plain = unwrapReplayAssistant(m.content)
+        return plain === m.content ? m : { ...m, content: plain }
+      }
       if (m.role !== 'user') return m
       if (typeof m.content === 'string') {
         const stripped = stripUserContextBlocks(m.content)
@@ -721,7 +761,7 @@ export class AgentLoop {
   ): void {
     this.suspended = { messages: [...messages], step, maxSteps, onDelta, onReasoning, atLimit, reason }
     // 落盘快照（先移除旧快照再 append，保证事件日志里最多一条、且反映「当前是否有挂起任务」）
-    // ★落盘前剥掉系统上下文块：注入内容只在「发给模型那一刻」存在，绝不进 events.jsonl（内存里那份保持原样，
+    // ★落盘前剥掉系统提示标签块：注入内容只在「发给模型那一刻」存在，绝不进 events.jsonl（内存里那份保持原样，
     //   同进程 retry 仍用与失败完全一致的 body 重发）。
     this.session.removeLast('retry/snapshot')
     this.session.append('retry/snapshot', {

@@ -390,3 +390,413 @@ export function IconChat() {
     </svg>
   )
 }
+
+/* ── Dock 内置图标族（实体感·11 槽全量）─────────────────────────────
+ * 【为什么另起一族而不改上面那些】上面通用图标被标题栏 / 顶栏 / 面板等数十处复用
+ * （实测 IconMonitor 25 处、IconWrench 19 处、IconTerminal 13 处…），改字形会牵连全站；
+ * 本族只服务 Dock 的 11 个槽位，一处一形，互不重复。
+ * 【族内常量，逐项写死，禁止各自漂】（与 8 个插件图标同一语言：圆角底板 + 渐变 + 填充实体）
+ *   画布 128×128（与插件图标同画布，便于直接并排比对）
+ *   底板 rect 128×128 rx=28（实测插件图标 9/10 都是 rx=28）
+ *   底板渐变固定 135° 对角：x1=0,y1=0 → x2=1,y2=1
+ *   主体渐变固定竖向受光：--dock-ink（顶）→ --dock-ink-2（底）
+ *   高光固定顶部 26%（sheen 0.26→0）且必须裁进 clipPath；接触阴影固定 --dock-shade @ 16%
+ *   主体占板约 66% 宽 / 55% 高，四周留白 ≥22 单位
+ *   ★ 颜色一律走 CSS 变量（唯一真相源在样式表里），组件内禁止出现任何十六进制 / rgb() /
+ *     stroke 描边：明暗自适应全靠这套变量，写死颜色就会在暗色下刺眼、亮色下化掉
+ *   ★ 内禀尺寸 18.75：Dock 外层 span 有 transform:scale(1.6) → 18.75×1.6 = 30px，
+ *     与插件图标 size={30} 完全同档，不会比邻居小一圈
+ *   ★ 最小特征下限：1 画布单位 = 30/128 = 0.234px；任何实体 ≥8 单位(1.88px)、
+ *     任何间隙 ≥10 单位(2.34px)——低于此的一律不画（实测插件图标里 angry-birds 0.19px /
+ *     fish-hunter 0.16px 的细节在 30px 下等于不存在，就是本族要避免的反面案例）
+ *   ★ 渐变 / clip 的 id 一律带图标名前缀（dockAppMenu… 等），避免同页多图标串色
+ *   ★ 元素之间只允许「端点精确搭接」（距离 0），不允许真交叉，也不允许 0~10u 的贴线细缝
+ * ───────────────────────────────────────────────────────────────── */
+
+/** Dock·应用菜单入口：2×2 圆角方块，左上角一枚用点缀色标成"入口" */
+export function IconDockAppMenu() {
+  return (
+    <svg width="18.75" height="18.75" viewBox="0 0 128 128" style={{ flexShrink: 0 }} aria-hidden="true">
+      <defs>
+        <linearGradient id="dockAppMenuPlate" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-plate-a)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-plate-b)' }} />
+        </linearGradient>
+        <linearGradient id="dockAppMenuInk" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-ink)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-ink-2)' }} />
+        </linearGradient>
+        <linearGradient id="dockAppMenuSheen" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0.26 }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0 }} />
+        </linearGradient>
+        <clipPath id="dockAppMenuClip">
+          <rect width="128" height="128" rx="28" />
+        </clipPath>
+      </defs>
+      <rect width="128" height="128" rx="28" fill="url(#dockAppMenuPlate)" />
+      <g clipPath="url(#dockAppMenuClip)">
+        <rect width="128" height="66" fill="url(#dockAppMenuSheen)" />
+      </g>
+      {/* 四块 36×36、间隙 12（=2.81px）、圆角 8；方块本身即最小实体，无细缝 */}
+      <rect x="22" y="22" width="36" height="36" rx="8" style={{ fill: 'var(--dock-accent-appmenu)' }} />
+      <rect x="70" y="22" width="36" height="36" rx="8" fill="url(#dockAppMenuInk)" />
+      <rect x="22" y="70" width="36" height="36" rx="8" fill="url(#dockAppMenuInk)" />
+      <rect x="70" y="70" width="36" height="36" rx="8" fill="url(#dockAppMenuInk)" />
+      <ellipse cx="64" cy="112" rx="34" ry="5" style={{ fill: 'var(--dock-shade)' }} opacity="0.16" />
+    </svg>
+  )
+}
+
+/** Dock·创意空间（插件市场）：购物袋 = 袋身 + 9u 宽带提手 + 点缀色扣 */
+export function IconDockMarketplace() {
+  return (
+    <svg width="18.75" height="18.75" viewBox="0 0 128 128" style={{ flexShrink: 0 }} aria-hidden="true">
+      <defs>
+        <linearGradient id="dockMarketplacePlate" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-plate-a)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-plate-b)' }} />
+        </linearGradient>
+        <linearGradient id="dockMarketplaceInk" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-ink)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-ink-2)' }} />
+        </linearGradient>
+        <linearGradient id="dockMarketplaceSheen" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0.26 }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0 }} />
+        </linearGradient>
+        <clipPath id="dockMarketplaceClip">
+          <rect width="128" height="128" rx="28" />
+        </clipPath>
+      </defs>
+      <rect width="128" height="128" rx="28" fill="url(#dockMarketplacePlate)" />
+      <g clipPath="url(#dockMarketplaceClip)">
+        <rect width="128" height="66" fill="url(#dockMarketplaceSheen)" />
+      </g>
+      {/* 提手用「填充带」画（外 r21 / 内 r12 → 厚 9u），不用描边，避免描边语言回潮 */}
+      <path d="M43 44 A21 21 0 0 1 85 44 L76 44 A12 12 0 0 0 52 44 Z" fill="url(#dockMarketplaceInk)" />
+      <rect x="24" y="44" width="80" height="60" rx="14" fill="url(#dockMarketplaceInk)" />
+      <circle cx="64" cy="74" r="10" style={{ fill: 'var(--dock-accent-marketplace)' }} />
+      <ellipse cx="64" cy="110" rx="30" ry="5" style={{ fill: 'var(--dock-shade)' }} opacity="0.16" />
+    </svg>
+  )
+}
+
+/** Dock·私信（会员 1v1）：信封 + 信封折痕（折痕用点缀色填充带，与「聊天」气泡彻底区分） */
+export function IconDockMessages() {
+  return (
+    <svg width="18.75" height="18.75" viewBox="0 0 128 128" style={{ flexShrink: 0 }} aria-hidden="true">
+      <defs>
+        <linearGradient id="dockMessagesPlate" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-plate-a)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-plate-b)' }} />
+        </linearGradient>
+        <linearGradient id="dockMessagesInk" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-ink)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-ink-2)' }} />
+        </linearGradient>
+        <linearGradient id="dockMessagesSheen" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0.26 }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0 }} />
+        </linearGradient>
+        <clipPath id="dockMessagesClip">
+          <rect width="128" height="128" rx="28" />
+        </clipPath>
+      </defs>
+      <rect width="128" height="128" rx="28" fill="url(#dockMessagesPlate)" />
+      <g clipPath="url(#dockMessagesClip)">
+        <rect width="128" height="66" fill="url(#dockMessagesSheen)" />
+      </g>
+      <rect x="22" y="34" width="84" height="60" rx="12" fill="url(#dockMessagesInk)" />
+      {/* 折痕：垂直厚 14u、垂直臂厚 ≈8.8u（≥8u 下限），完全落在信封内，四周留 ≥10u */}
+      <path d="M34 46 L64 70 L94 46 L94 60 L64 84 L34 60 Z" style={{ fill: 'var(--dock-accent-messages)' }} />
+      <ellipse cx="64" cy="104" rx="32" ry="5" style={{ fill: 'var(--dock-shade)' }} opacity="0.16" />
+    </svg>
+  )
+}
+
+/** Dock·聊天（主会话）：对话气泡 + 尾巴 + 两枚输入点（气泡语义，与信封的私信不撞形） */
+export function IconDockChat() {
+  return (
+    <svg width="18.75" height="18.75" viewBox="0 0 128 128" style={{ flexShrink: 0 }} aria-hidden="true">
+      <defs>
+        <linearGradient id="dockChatPlate" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-plate-a)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-plate-b)' }} />
+        </linearGradient>
+        <linearGradient id="dockChatInk" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-ink)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-ink-2)' }} />
+        </linearGradient>
+        <linearGradient id="dockChatSheen" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0.26 }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0 }} />
+        </linearGradient>
+        <clipPath id="dockChatClip">
+          <rect width="128" height="128" rx="28" />
+        </clipPath>
+      </defs>
+      <rect width="128" height="128" rx="28" fill="url(#dockChatPlate)" />
+      <g clipPath="url(#dockChatClip)">
+        <rect width="128" height="66" fill="url(#dockChatSheen)" />
+      </g>
+      <rect x="22" y="28" width="84" height="56" rx="18" fill="url(#dockChatInk)" />
+      {/* 尾巴：直角三角形，最小高 15.6u（面积法实测），不是细线 */}
+      <path d="M40 84 L40 106 L62 84 Z" fill="url(#dockChatInk)" />
+      <circle cx="46" cy="56" r="9" style={{ fill: 'var(--dock-accent-chat)' }} />
+      <circle cx="82" cy="56" r="9" style={{ fill: 'var(--dock-accent-chat)' }} />
+      <ellipse cx="64" cy="114" rx="28" ry="5" style={{ fill: 'var(--dock-shade)' }} opacity="0.16" />
+    </svg>
+  )
+}
+
+/** Dock·管家：领结（两枚梯形翼 + 点缀色居结）—— 领结是「管家/侍者」最直接的符号，
+    不像服务铃那样易被读成「通知/提醒」；翼用梯形不用三角（尖角是零宽特征），翼与结同线精确搭接 */
+export function IconDockSupervisor() {
+  return (
+    <svg width="18.75" height="18.75" viewBox="0 0 128 128" style={{ flexShrink: 0 }} aria-hidden="true">
+      <defs>
+        <linearGradient id="dockSupervisorPlate" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-plate-a)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-plate-b)' }} />
+        </linearGradient>
+        <linearGradient id="dockSupervisorInk" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-ink)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-ink-2)' }} />
+        </linearGradient>
+        <linearGradient id="dockSupervisorSheen" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0.26 }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0 }} />
+        </linearGradient>
+        <clipPath id="dockSupervisorClip">
+          <rect width="128" height="128" rx="28" />
+        </clipPath>
+      </defs>
+      <rect width="128" height="128" rx="28" fill="url(#dockSupervisorPlate)" />
+      <g clipPath="url(#dockSupervisorClip)">
+        <rect width="128" height="66" fill="url(#dockSupervisorSheen)" />
+      </g>
+      {/* 左翼 / 右翼：梯形（外缘 24u、靠结一侧 48u），内缘与居结同线精确搭接（距离 0，无贴线缝、无交叉） */}
+      <path d="M24 52 L56 40 L56 88 L24 76 Z" fill="url(#dockSupervisorInk)" />
+      <path d="M104 52 L72 40 L72 88 L104 76 Z" fill="url(#dockSupervisorInk)" />
+      {/* 居结：16u 宽实体（本图标最小特征 16u=3.75px），点缀色 */}
+      <rect x="56" y="44" width="16" height="40" rx="6" style={{ fill: 'var(--dock-accent-supervisor)' }} />
+      <ellipse cx="64" cy="98" rx="32" ry="5" style={{ fill: 'var(--dock-shade)' }} opacity="0.16" />
+    </svg>
+  )
+}
+
+/** Dock·终端：命令行窗口 + 两行命令（长/短），无描边、无小于下限的笔画 */
+export function IconDockTerminal() {
+  return (
+    <svg width="18.75" height="18.75" viewBox="0 0 128 128" style={{ flexShrink: 0 }} aria-hidden="true">
+      <defs>
+        <linearGradient id="dockTerminalPlate" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-plate-a)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-plate-b)' }} />
+        </linearGradient>
+        <linearGradient id="dockTerminalInk" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-ink)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-ink-2)' }} />
+        </linearGradient>
+        <linearGradient id="dockTerminalSheen" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0.26 }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0 }} />
+        </linearGradient>
+        <clipPath id="dockTerminalClip">
+          <rect width="128" height="128" rx="28" />
+        </clipPath>
+      </defs>
+      <rect width="128" height="128" rx="28" fill="url(#dockTerminalPlate)" />
+      <g clipPath="url(#dockTerminalClip)">
+        <rect width="128" height="66" fill="url(#dockTerminalSheen)" />
+      </g>
+      <rect x="22" y="30" width="84" height="68" rx="14" fill="url(#dockTerminalInk)" />
+      <rect x="38" y="52" width="44" height="12" rx="6" style={{ fill: 'var(--dock-accent-terminal)' }} />
+      <rect x="38" y="74" width="26" height="12" rx="6" style={{ fill: 'var(--dock-accent-terminal)' }} />
+      <ellipse cx="64" cy="110" rx="30" ry="5" style={{ fill: 'var(--dock-shade)' }} opacity="0.16" />
+    </svg>
+  )
+}
+
+/** Dock·设置：圆角底板 + 两条滑杆 + 两个滑块（实体感族首个，其余 10 槽按同一常量铺开） */
+export function IconDockSettings() {
+  return (
+    <svg width="18.75" height="18.75" viewBox="0 0 128 128" style={{ flexShrink: 0 }} aria-hidden="true">
+      <defs>
+        <linearGradient id="dockSettingsPlate" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-plate-a)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-plate-b)' }} />
+        </linearGradient>
+        <linearGradient id="dockSettingsInk" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-ink)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-ink-2)' }} />
+        </linearGradient>
+        <linearGradient id="dockSettingsSheen" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0.26 }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0 }} />
+        </linearGradient>
+        <clipPath id="dockSettingsClip">
+          <rect width="128" height="128" rx="28" />
+        </clipPath>
+      </defs>
+      {/* 底板 + 顶部高光（高光裁进板内，不外溢成方角） */}
+      <rect width="128" height="128" rx="28" fill="url(#dockSettingsPlate)" />
+      <g clipPath="url(#dockSettingsClip)">
+        <rect width="128" height="66" fill="url(#dockSettingsSheen)" />
+      </g>
+      {/* 上轨：右端贴滑块，左端从留白起 */}
+      <rect x="22" y="38" width="54" height="12" rx="6" fill="url(#dockSettingsInk)" />
+      {/* 下轨 */}
+      <rect x="52" y="78" width="54" height="12" rx="6" fill="url(#dockSettingsInk)" />
+      {/* 接触阴影：滑块下方各一片，制造"浮在板上"的厚度 */}
+      <ellipse cx="91" cy="61" rx="13" ry="4" style={{ fill: 'var(--dock-shade)' }} opacity="0.16" />
+      <ellipse cx="37" cy="101" rx="13" ry="4" style={{ fill: 'var(--dock-shade)' }} opacity="0.16" />
+      {/* 两个滑块（圆盘）+ 语义点缀色芯 */}
+      <circle cx="91" cy="44" r="15" fill="url(#dockSettingsInk)" />
+      <circle cx="37" cy="84" r="15" fill="url(#dockSettingsInk)" />
+      <circle cx="91" cy="44" r="5" style={{ fill: 'var(--dock-accent-settings)' }} />
+      <circle cx="37" cy="84" r="5" style={{ fill: 'var(--dock-accent-settings)' }} />
+    </svg>
+  )
+}
+
+/** Dock·模型：芯片（AI 模型）+ 四边各两根引脚 + 点缀色内核 */
+export function IconDockModels() {
+  return (
+    <svg width="18.75" height="18.75" viewBox="0 0 128 128" style={{ flexShrink: 0 }} aria-hidden="true">
+      <defs>
+        <linearGradient id="dockModelsPlate" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-plate-a)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-plate-b)' }} />
+        </linearGradient>
+        <linearGradient id="dockModelsInk" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-ink)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-ink-2)' }} />
+        </linearGradient>
+        <linearGradient id="dockModelsSheen" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0.26 }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0 }} />
+        </linearGradient>
+        <clipPath id="dockModelsClip">
+          <rect width="128" height="128" rx="28" />
+        </clipPath>
+      </defs>
+      <rect width="128" height="128" rx="28" fill="url(#dockModelsPlate)" />
+      <g clipPath="url(#dockModelsClip)">
+        <rect width="128" height="66" fill="url(#dockModelsSheen)" />
+      </g>
+      {/* 引脚 8×12（最小实体 8u），端边与芯片轮廓精确搭接（距离 0），不交叉、不留细缝 */}
+      <rect x="36" y="36" width="56" height="56" rx="12" fill="url(#dockModelsInk)" />
+      <rect x="48" y="24" width="8" height="12" rx="4" fill="url(#dockModelsInk)" />
+      <rect x="72" y="24" width="8" height="12" rx="4" fill="url(#dockModelsInk)" />
+      <rect x="48" y="92" width="8" height="12" rx="4" fill="url(#dockModelsInk)" />
+      <rect x="72" y="92" width="8" height="12" rx="4" fill="url(#dockModelsInk)" />
+      <rect x="24" y="48" width="12" height="8" rx="4" fill="url(#dockModelsInk)" />
+      <rect x="24" y="72" width="12" height="8" rx="4" fill="url(#dockModelsInk)" />
+      <rect x="92" y="48" width="12" height="8" rx="4" fill="url(#dockModelsInk)" />
+      <rect x="92" y="72" width="12" height="8" rx="4" fill="url(#dockModelsInk)" />
+      <rect x="54" y="54" width="20" height="20" rx="6" style={{ fill: 'var(--dock-accent-models)' }} />
+      <ellipse cx="64" cy="112" rx="30" ry="5" style={{ fill: 'var(--dock-shade)' }} opacity="0.16" />
+    </svg>
+  )
+}
+
+/** Dock·壁纸：画框 + 地平（横条）+ 日（圆），全部为 ≥11u 的实体，无山尖等亚阈值细节 */
+export function IconDockWallpaper() {
+  return (
+    <svg width="18.75" height="18.75" viewBox="0 0 128 128" style={{ flexShrink: 0 }} aria-hidden="true">
+      <defs>
+        <linearGradient id="dockWallpaperPlate" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-plate-a)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-plate-b)' }} />
+        </linearGradient>
+        <linearGradient id="dockWallpaperInk" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-ink)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-ink-2)' }} />
+        </linearGradient>
+        <linearGradient id="dockWallpaperSheen" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0.26 }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0 }} />
+        </linearGradient>
+        <clipPath id="dockWallpaperClip">
+          <rect width="128" height="128" rx="28" />
+        </clipPath>
+      </defs>
+      <rect width="128" height="128" rx="28" fill="url(#dockWallpaperPlate)" />
+      <g clipPath="url(#dockWallpaperClip)">
+        <rect width="128" height="66" fill="url(#dockWallpaperSheen)" />
+      </g>
+      <rect x="22" y="30" width="84" height="68" rx="14" fill="url(#dockWallpaperInk)" />
+      <circle cx="84" cy="52" r="11" style={{ fill: 'var(--dock-accent-wallpaper)' }} />
+      <rect x="34" y="74" width="60" height="14" rx="7" style={{ fill: 'var(--dock-accent-wallpaper)' }} />
+      <ellipse cx="64" cy="110" rx="30" ry="5" style={{ fill: 'var(--dock-shade)' }} opacity="0.16" />
+    </svg>
+  )
+}
+
+/** Dock·登录态：头像（点缀色头部 + 肩部实体），与「管家」的领结不撞形 */
+export function IconDockAccount() {
+  return (
+    <svg width="18.75" height="18.75" viewBox="0 0 128 128" style={{ flexShrink: 0 }} aria-hidden="true">
+      <defs>
+        <linearGradient id="dockAccountPlate" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-plate-a)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-plate-b)' }} />
+        </linearGradient>
+        <linearGradient id="dockAccountInk" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-ink)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-ink-2)' }} />
+        </linearGradient>
+        <linearGradient id="dockAccountSheen" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0.26 }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0 }} />
+        </linearGradient>
+        <clipPath id="dockAccountClip">
+          <rect width="128" height="128" rx="28" />
+        </clipPath>
+      </defs>
+      <rect width="128" height="128" rx="28" fill="url(#dockAccountPlate)" />
+      <g clipPath="url(#dockAccountClip)">
+        <rect width="128" height="66" fill="url(#dockAccountSheen)" />
+      </g>
+      <circle cx="64" cy="44" r="18" style={{ fill: 'var(--dock-accent-account)' }} />
+      <rect x="24" y="74" width="80" height="32" rx="16" fill="url(#dockAccountInk)" />
+      <ellipse cx="64" cy="114" rx="30" ry="5" style={{ fill: 'var(--dock-shade)' }} opacity="0.16" />
+    </svg>
+  )
+}
+
+/** Dock·退出到桌面：显示器 + 立柱 + 底座（回到系统桌面），与「终端」的窗口+两行不撞形 */
+export function IconDockDesktop() {
+  return (
+    <svg width="18.75" height="18.75" viewBox="0 0 128 128" style={{ flexShrink: 0 }} aria-hidden="true">
+      <defs>
+        <linearGradient id="dockDesktopPlate" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-plate-a)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-plate-b)' }} />
+        </linearGradient>
+        <linearGradient id="dockDesktopInk" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-ink)' }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-ink-2)' }} />
+        </linearGradient>
+        <linearGradient id="dockDesktopSheen" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0.26 }} />
+          <stop offset="1" style={{ stopColor: 'var(--dock-sheen)', stopOpacity: 0 }} />
+        </linearGradient>
+        <clipPath id="dockDesktopClip">
+          <rect width="128" height="128" rx="28" />
+        </clipPath>
+      </defs>
+      <rect width="128" height="128" rx="28" fill="url(#dockDesktopPlate)" />
+      <g clipPath="url(#dockDesktopClip)">
+        <rect width="128" height="66" fill="url(#dockDesktopSheen)" />
+      </g>
+      <rect x="22" y="26" width="84" height="54" rx="14" fill="url(#dockDesktopInk)" />
+      <rect x="38" y="42" width="52" height="22" rx="8" style={{ fill: 'var(--dock-accent-desktop)' }} />
+      <rect x="58" y="80" width="12" height="12" fill="url(#dockDesktopInk)" />
+      <rect x="38" y="92" width="52" height="12" rx="6" fill="url(#dockDesktopInk)" />
+      <ellipse cx="64" cy="112" rx="26" ry="5" style={{ fill: 'var(--dock-shade)' }} opacity="0.16" />
+    </svg>
+  )
+}

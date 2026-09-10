@@ -234,10 +234,15 @@ export async function handleCommand(send: (obj: unknown) => void, msg: IncomingC
         data = await runtime.runSession(sessionId, message, mode)
         break
       }
-      case 'stop_session':
-        runtime.stopSession(String(payload.sessionId ?? ''))
+      case 'stop_session': {
+        // ★任务193 P3-c：缺 sessionId 不再「静默 no-op 却回 ok:true」（旧行为＝手机端以为停了、其实什么都没做）。
+        //   抛错走本函数既有的 catch → { ok:false, error } 回给手机端，不新增任何协议字段/命令类型。
+        const stopSid = String(payload.sessionId ?? '').trim()
+        if (!stopSid) throw new Error('stop_session 缺少 sessionId（停止必须明确指定要停哪个会话）')
+        runtime.stopSession(stopSid)
         data = { ok: true }
         break
+      }
       case 'resend': {
         const sessionId = String(payload.sessionId ?? '')
         const userMessageIndex = Number(payload.userMessageIndex ?? 0)

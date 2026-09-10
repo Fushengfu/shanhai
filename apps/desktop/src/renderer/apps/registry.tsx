@@ -1,5 +1,17 @@
 import type { ComponentType } from 'react'
-import { IconChat, IconMonitor, IconTerminal, IconActivity, IconClock, IconSettings, IconWrench, IconImage, IconStore } from '../components/icons'
+import { IconActivity, IconClock } from '../components/icons'
+// 【任务181】Dock 槽位改用专用图标族：原来「私信 / 聊天」同为 IconChat、「管家 / 退出到桌面」同为 IconMonitor，
+// 同排里两个槽位一个字形，用户无法区分；且通用图标被标题栏等处复用，不能就地改。
+import {
+  IconDockChat,
+  IconDockMarketplace,
+  IconDockMessages,
+  IconDockSupervisor,
+  IconDockTerminal,
+  IconDockSettings,
+  IconDockModels,
+  IconDockWallpaper,
+} from '../components/icons'
 import { t } from '../../shared/i18n'
 
 /**
@@ -29,18 +41,18 @@ export interface AppManifest {
 }
 
 export const APP_REGISTRY: AppManifest[] = [
-  { id: 'marketplace', nameKey: 'app.marketplace.name', descKey: 'app.marketplace.desc', Icon: IconStore },
+  { id: 'marketplace', nameKey: 'app.marketplace.name', descKey: 'app.marketplace.desc', Icon: IconDockMarketplace },
   // 私信（会员实时通讯底线的内置 UI）：占 Dock 图标位，便于发现与看到未读红点
-  { id: 'messages', nameKey: 'app.messages.name', descKey: 'app.messages.desc', Icon: IconChat },
-  { id: 'chat', nameKey: 'app.chat.name', descKey: 'app.chat.desc', Icon: IconChat },
-  { id: 'supervisor', nameKey: 'app.supervisor.name', descKey: 'app.supervisor.desc', Icon: IconMonitor },
-  { id: 'terminal', nameKey: 'app.terminal.name', descKey: 'app.terminal.desc', Icon: IconTerminal },
+  { id: 'messages', nameKey: 'app.messages.name', descKey: 'app.messages.desc', Icon: IconDockMessages },
+  { id: 'chat', nameKey: 'app.chat.name', descKey: 'app.chat.desc', Icon: IconDockChat },
+  { id: 'supervisor', nameKey: 'app.supervisor.name', descKey: 'app.supervisor.desc', Icon: IconDockSupervisor },
+  { id: 'terminal', nameKey: 'app.terminal.name', descKey: 'app.terminal.desc', Icon: IconDockTerminal },
   // 轨迹 / 记忆：不直接占 Dock 图标位，入口收敛到聊天窗口顶栏（HeaderPlugin 的「记忆」「轨迹」按钮）
   { id: 'trace', nameKey: 'app.trace.name', descKey: 'app.trace.desc', Icon: IconActivity, showInDock: false },
   { id: 'memory', nameKey: 'app.memory.name', descKey: 'app.memory.desc', Icon: IconClock, showInDock: false },
-  { id: 'settings', nameKey: 'app.settings.name', descKey: 'app.settings.desc', Icon: IconSettings },
-  { id: 'models', nameKey: 'app.models.name', descKey: 'app.models.desc', Icon: IconWrench },
-  { id: 'wallpaper', nameKey: 'app.wallpaper.name', descKey: 'app.wallpaper.desc', Icon: IconImage },
+  { id: 'settings', nameKey: 'app.settings.name', descKey: 'app.settings.desc', Icon: IconDockSettings },
+  { id: 'models', nameKey: 'app.models.name', descKey: 'app.models.desc', Icon: IconDockModels },
+  { id: 'wallpaper', nameKey: 'app.wallpaper.name', descKey: 'app.wallpaper.desc', Icon: IconDockWallpaper },
 ]
 
 /** Dock 直接显示的应用（过滤掉 showInDock === false 的二级入口应用） */

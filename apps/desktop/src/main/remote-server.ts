@@ -53,10 +53,108 @@ function getLanIp(): string {
   return '127.0.0.1'
 }
 
+/**
+ * 【任务197 S2-1】待发 cmd_result 队列上限（每条连接一份）。
+ * 取值理由：单条 cmd_result 是一小段 JSON（结构：id/ok/data|error），手机端同一时刻在途的命令通常只有个位数
+ * （UI 多为串行调用：list_sessions / get_history / get_pending_requests…），50 条给足冗余，
+ * 同时把最坏内存占用限制在「50 × 单条最大 payload（历史快照量级）」以内，不会无限堆积。
+ */
+const PENDING_RESULT_LIMIT = 50
+
+/**
+ * 【任务197 S2-1】补发有效期：超过手机端等待窗口（60s）的结果再补发已无意义
+ * （手机端此时必已 remove 并报「命令超时」），且可能落到**另一台**同账号设备的同号命令上（id 冲突）。
+ * 因此只在有效期内的结果才补发，过期的丢弃并 warn（丢弃事实必须可审计）。
+ * ★注意：本值不改变手机端 60s 超时（那属 S3），只是「补发的有效期」。
+ */
+const PENDING_RESULT_TTL_MS = 60 * 1000
+
+/**
+ * 【任务197 S2-1】每条连接各有一个「待发 cmd_result」队列。
+ * 改前：连接非 OPEN 时 `send()` 直接什么都不做 ⇒ cmd_result 静默蒸发 ⇒ 手机端白等满 60s 报「命令超时」。
+ * 改后：非 OPEN 时记 warn 并入队，连接回到 OPEN 时按 id 补发。
+ * 用 `Map<id, 序列化串>` 天然按 cmd id 去重（同 id 只保留一份），并保持插入顺序（Map 迭代序 = 插入序）。
+ */
+const pendingResults = new Map<WebSocket, Map<number, { payload: string; at: number }>>()
+
+/** 入队一条待发 cmd_result（同 id 覆盖 = 去重；溢出丢弃最旧一条并 warn） */
+function queuePendingResult(sock: WebSocket, id: number, payload: string): void {
+  let q = pendingResults.get(sock)
+  if (!q) {
+    q = new Map()
+    pendingResults.set(sock, q)
+  }
+  if (q.has(id)) {
+    // 同 id 重复回包：覆盖内容即幂等，不新增条目（手机端收到即 remove，重复回包本就无效）
+    q.set(id, { payload, at: Date.now() })
+    return
+  }
+  if (q.size >= PENDING_RESULT_LIMIT) {
+    const oldest = q.keys().next().value as number | undefined
+    if (oldest !== undefined) q.delete(oldest)
+    console.warn(
+      `[remote] 待发结果队列已满(${PENDING_RESULT_LIMIT})，丢弃最旧一条 id=${oldest}；本条 id=${id} 已入队`,
+    )
+  }
+  q.set(id, { payload, at: Date.now() })
+}
+
+/** 连接可用时按 id（插入顺序）补发积压结果；过期的丢弃并 warn */
+function flushPendingResults(sock: WebSocket): void {
+  const q = pendingResults.get(sock)
+  if (!q || q.size === 0) return
+  if (sock.readyState !== WebSocket.OPEN) return
+  const now = Date.now()
+  const items = [...q.entries()]
+  q.clear()
+  let sent = 0
+  let expired = 0
+  for (const [id, item] of items) {
+    if (now - item.at > PENDING_RESULT_TTL_MS) {
+      expired += 1
+      console.warn(`[remote] 待发结果 id=${id} 已过期(>${PENDING_RESULT_TTL_MS}ms)，丢弃不补发`)
+      continue
+    }
+    try {
+      sock.send(item.payload)
+      sent += 1
+    } catch (err) {
+      console.error(`[remote] 补发结果 id=${id} 失败:`, err instanceof Error ? err.message : err)
+    }
+  }
+  if (sent > 0) console.log(`[remote] 连接恢复，已补发 ${sent} 条待发 cmd_result`)
+  if (expired > 0) console.log(`[remote] 本次补发共丢弃 ${expired} 条过期结果（见上 warn）`)
+}
+
+/** 丢弃某连接的全部待发结果（连接彻底关闭/服务停止时调用，避免内存滞留） */
+function dropPendingResults(sock: WebSocket, reason: string): void {
+  const q = pendingResults.get(sock)
+  if (!q || q.size === 0) {
+    pendingResults.delete(sock)
+    return
+  }
+  console.warn(`[remote] ${reason}，丢弃 ${q.size} 条未能补发的 cmd_result`)
+  pendingResults.delete(sock)
+}
+
 function send(sock: WebSocket, obj: unknown): void {
   if (sock.readyState === WebSocket.OPEN) {
+    // 连接可用：先把此前积压的待发结果按 id 顺序补发，再发本条
+    flushPendingResults(sock)
     sock.send(JSON.stringify(obj))
+    return
   }
+  // 非 OPEN：不再静默丢弃 —— 记 warn + 入队（仅 cmd_result 可补发，其余消息只告警不出队）
+  const rec = obj as { type?: string; id?: number }
+  if (rec && rec.type === 'cmd_result' && typeof rec.id === 'number') {
+    queuePendingResult(sock, rec.id, JSON.stringify(obj))
+    const size = pendingResults.get(sock)?.size ?? 0
+    console.warn(
+      `[remote] 连接不可用(readyState=${sock.readyState})，cmd_result id=${rec.id} 未能发送，已入待发队列(size=${size})`,
+    )
+    return
+  }
+  console.warn(`[remote] 连接不可用(readyState=${sock.readyState})，消息 type=${rec?.type ?? '?'} 未能发送(不入队)`)
 }
 
 /** 广播事件给所有已配对连接 */
@@ -128,6 +226,8 @@ export function startRemoteServer(port: number = DEFAULT_PORT): RemoteStatus {
     })
     sock.on('close', () => {
       authedClients.delete(sock)
+      // 【任务197 S2-1】连接彻底关闭：该连接不可能再回到 OPEN，待发结果无法补发，丢弃并 warn（不静默滞留）
+      dropPendingResults(sock, '连接已关闭')
       if (authedClients.size === 0) unsubscribeSync() // 最后一台手机断开 → 停止同步
     })
   })
@@ -157,6 +257,9 @@ export function refreshPairingCode(): RemoteStatus {
 /** 关闭远程服务：清理事件订阅 + 断开所有连接。幂等。 */
 export function stopRemoteServer(): void {
   unsubscribeSync()
+  // 【任务197 S2-1】服务停止：所有连接的待发结果都无法再送达，清空并 warn（避免内存滞留 + 丢弃可审计）
+  for (const [sock] of pendingResults) dropPendingResults(sock, '远程服务已停止')
+  pendingResults.clear()
   authedClients.clear()
   if (wss) {
     wss.close()

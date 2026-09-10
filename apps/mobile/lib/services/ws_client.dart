@@ -27,7 +27,134 @@ class CmdResult {
   final bool ok;
   final dynamic data;
   final String? error;
-  CmdResult(this.ok, this.data, this.error);
+
+  /// 这次失败是不是「挂满 60 秒兜底超时」才失败的（见 [WsClient.sendCommand] 的 onTimeout）。
+  ///
+  /// 为什么要在结果里带上这个：重试口径按失败原因分岔 ——
+  /// 「断线 / 没送出去」可以重试（重发一次就有机会成功），
+  /// 「跑满超时」**不重试**（命令很可能早就到桌面端并被执行了，只是回包丢了；
+  /// 再等一个 60 秒只会把用户从「弹一次超时」拖成「干等三分钟」）。
+  /// 之前只能靠 error 文案判断，而文案是本地化过的（中英双语），靠字符串比对必错。
+  final bool timedOut;
+
+  CmdResult(this.ok, this.data, this.error, {this.timedOut = false});
+}
+
+/// 只读命令白名单：这些命令**不改变桌面端状态**（核过 remote-protocol.ts 的 case 分支，
+/// 全部只是读数据），断线后重发不会造成副作用，因此允许自动重试（见 [sendCommandWithRetry]）。
+///
+/// 写类命令**一律不在本表内**（send_message / resume / resend / run_supervisor /
+/// create_session / rename_session / delete_session / respond_ask / cancel_ask /
+/// respond_approval / stop_session）：重试 = 同一需求被下发两遍（甚至两次执行），
+/// 宁可按失败如实告诉用户，由页面用 get_history 对账，也不自动重发。
+const Set<String> idempotentCommands = <String>{
+  'list_sessions', // case 'list_sessions': data = listSessionsFull()（只读）
+  'get_history', // case 'get_history': data = buildHistoryPayload(...)（只读）
+  'get_supervisor_history', // case 'get_supervisor_history': 同上，固定 SUPERVISOR_ID（只读）
+  'get_models', // case 'get_models': data = await runtime.listModels()（只读，当前手机端未下发）
+  'get_pending_requests', // case 'get_pending_requests': 只读查询待处理审批/提问（恢复弹窗用）
+  'get_token_stats', // case 'get_token_stats': data = runtime.getTokenStats()（只读，当前手机端未下发）
+};
+
+/// 一条命令最多尝试几次：只读命令 3 次（1 次原始 + 2 次重试），写类命令恒为 1（不重试）。
+/// 写死常数、不做「重试到成功为止」——上界是硬要求，否则弱网下会永远重试。
+const int maxReadOnlyAttempts = 3;
+
+int commandMaxAttempts(String cmd) =>
+    idempotentCommands.contains(cmd) ? maxReadOnlyAttempts : 1;
+
+/// 这次失败**值不值得重试** —— 只认失败原因，不看文案（文案是本地化的，中英两份）。
+///
+/// 口径（管家 2026-09-10 裁决，收窄 199 的初版）：
+///  · 「断线 / 没送出去」（连接断开被 [PendingCommands.failAll] 统一失败、_canSend 为假、
+///    sink.add 抛异常）：允许重试 —— 重发一次就有机会成功，且只读命令重发无副作用。
+///  · 「挂满 60 秒兜底超时」（[CmdResult.timedOut]）：**一次都不重试**。
+///    理由：用户要的是「别老弹超时」，让他干等 3×60s 比如实弹一次更糟；
+///    而且超时往往意味着命令早已送达并被桌面端执行，重发只是再等一遍。
+bool shouldRetryFailure(CmdResult r) => !r.ok && !r.timedOut;
+
+/// 重试之间的退避：400ms → 800ms（递增、有上界）。
+/// 取值理由：单条命令的 60 秒超时本身已很慢（见 [WsClient.sendCommand]），
+/// 重试必须「几乎无感」才有意义；两次退避合计 1.2 秒，给了抖动/重连恢复的窗口，
+/// 又不至于把一次真失败拖成「点了没反应」。上界 2 秒防止将来调大尝试次数时退避失控。
+Duration commandRetryBackoff(int attempt) {
+  final ms = min(400 * pow(2, attempt - 1), 2000).round();
+  return Duration(milliseconds: ms);
+}
+
+/// 带重试的命令发送循环（[WsClient.sendCommand] 走的就是这一份实现，不存在第二份策略）。
+/// 抽成顶层函数是为了让「只读重试 / 写类不重试 / 超时不重试 / 重试有上界」能被直接断言（无需 socket）。
+/// 注意循环条件是 [shouldRetryFailure]（按**失败原因**判定），不是「只要 !ok 就重试」——
+/// 后者会把一次 60 秒超时放大成 3 次，正是 202 要收窄的那条。
+/// [sleepFor] 仅供断言退避节奏时注入，生产路径不传（走真实延时）。
+Future<CmdResult> sendCommandWithRetry(
+  String cmd,
+  Future<CmdResult> Function() sendOnce, {
+  Future<void> Function(Duration)? sleepFor,
+}) async {
+  final maxAttempts = commandMaxAttempts(cmd);
+  var result = await sendOnce();
+  for (var attempt = 1; attempt < maxAttempts && shouldRetryFailure(result); attempt++) {
+    final wait = commandRetryBackoff(attempt);
+    if (sleepFor != null) {
+      await sleepFor(wait);
+    } else {
+      await Future<void>.delayed(wait);
+    }
+    result = await sendOnce();
+  }
+  return result;
+}
+
+/// 一条在途命令：命令名（决定要不要重试）+ 等待结果的 completer。
+class _PendingCmd {
+  final String cmd;
+  final Completer<CmdResult> completer;
+  _PendingCmd(this.cmd, this.completer);
+}
+
+/// 在途命令登记表。
+///
+/// 存在的理由：连接断开（拔线 / 切 Wi‑Fi↔4G / 桌面端休眠 / 用户主动切设备）时，
+/// 这些命令**不可能**再拿到结果，必须立刻失败并告诉用户，而不是各自白等满 60 秒
+/// 才报「命令超时」——用户在弱网下看到的就是那个 60 秒。
+class PendingCommands {
+  final Map<int, _PendingCmd> _items = <int, _PendingCmd>{};
+
+  int get length => _items.length;
+  bool get isEmpty => _items.isEmpty;
+  bool contains(int id) => _items.containsKey(id);
+
+  void add(int id, String cmd, Completer<CmdResult> completer) {
+    _items[id] = _PendingCmd(cmd, completer);
+  }
+
+  /// 取走并移除（收到 cmd_result 时用）：取走即从此不可能被二次完成。
+  Completer<CmdResult>? take(int id) => _items.remove(id)?.completer;
+
+  /// 让所有在途命令立即失败并**清空**登记表，返回被完成的条数。
+  ///
+  /// 三条硬约束（都有对应断言）：
+  ///  ① 一条不丢：先整体快照再逐条处理，不做「边遍历边删」；
+  ///  ② 幂等：已被超时/回包处理掉的条目不会被完成第二次（表空时直接返回 0）；
+  ///  ③ 返回时表必定为空——残留一条都可能在重连后与新的同号命令撞上。
+  int failAll(String reason) {
+    if (_items.isEmpty) return 0;
+    final entries = _items.entries.toList(growable: false);
+    var done = 0;
+    for (final e in entries) {
+      // 逐条「取走再完成」：其间即使有并发（超时定时器 / 迟到的回包）把该条移走，
+      // 也不会出现二次完成（Completer 二次 complete 会抛 StateError）。
+      final pending = _items.remove(e.key);
+      if (pending == null) continue;
+      if (!pending.completer.isCompleted) {
+        pending.completer.complete(CmdResult(false, null, reason));
+        done += 1;
+      }
+    }
+    _items.clear(); // 兜底：正常路径上面已清空，这里保证「绝不残留」
+    return done;
+  }
 }
 
 /// WebSocket 客户端：连接桌面端远程服务、配对、发命令、收事件。
@@ -36,7 +163,9 @@ class WsClient {
   WebSocketChannel? _channel;
   StreamSubscription? _sub;
   int _cmdSeq = 0;
-  final Map<int, Completer<CmdResult>> _pending = {};
+  /// 在途命令登记表。连接一旦不可用就整体立即失败（[PendingCommands.failAll]），
+  /// 绝不让调用方白等满 60 秒的超时。
+  final PendingCommands _pending = PendingCommands();
 
   // —— relay 模式（网关中继）自动重连所需状态 ——
   String? _relayUrl;
@@ -172,6 +301,12 @@ class WsClient {
     if (ch != null) {
       unawaited(ch.sink.close().catchError((_) {}));
     }
+  }
+
+  /// 连接已不可用时，让所有在途命令**立即**失败（文案 = wsCmdConnLost），不再白等 60 秒。
+  /// 幂等：表空时什么都不做，可在多个时机（断开/出错/换连接/销毁）重复调用。
+  void _failInFlightCommands() {
+    _pending.failAll(_l.wsCmdConnLost);
   }
 
   /// 连接并等待 WebSocket 握手完成（局域网直连模式）
@@ -314,6 +449,8 @@ class WsClient {
     _sub = null;
     if (sub != null) await sub.cancel();
     _abortChannel();
+    // 旧连接被主动废弃（切设备），它上面的在途命令不可能再回来：立即如实失败。
+    _failInFlightCommands();
     if (_autoReconnect && _relayUrl != null && _relayToken != null) {
       try {
         await _doConnectRelay();
@@ -341,6 +478,8 @@ class WsClient {
     _sub = null;
     if (sub != null) await sub.cancel();
     _abortChannel();
+    // 用户主动重试 = 旧连接已被放弃，在途命令同样立即失败（避免回退到旧 id 上等 60 秒）。
+    _failInFlightCommands();
     try {
       await _doConnectRelay();
       return true;
@@ -415,7 +554,8 @@ class WsClient {
         break;
       case 'cmd_result':
         final id = map['id'] as int?;
-        final c = _pending.remove(id);
+        // take = 取走即移出登记表：同一 id 的迟到重发回包拿到 null，不会二次完成（幂等）。
+        final c = id == null ? null : _pending.take(id);
         c?.complete(CmdResult(map['ok'] == true, map['data'], map['error'] as String?));
         break;
       case 'error':
@@ -444,11 +584,15 @@ class WsClient {
     // 否则切设备/重试后旧 channel 的关闭事件会把新页面又拽回加载态。
     if (seq != _connSeq) return;
     _setState(ConnState.disconnected);
+    // 连接已关闭：在途命令不可能再拿到结果，立即如实失败，不让调用方白等满 60 秒。
+    _failInFlightCommands();
     _scheduleReconnect();
   }
 
   void _onError(int seq, Object e) {
     if (seq != _connSeq) return;
+    // 同上：连接出错即视为不可用，在途命令立即失败。
+    _failInFlightCommands();
     if (!_events.isClosed) _events.add(ServerEvent('error', {'message': e.toString()}));
     _scheduleReconnect();
   }
@@ -456,6 +600,11 @@ class WsClient {
   /// 连接断开后延迟自动重连（仅 relay 模式；局域网模式配对码需用户重新输入，不自动重连）。
   /// 用可取消的 Timer 而非 Future.delayed：用户主动重试/切设备/退出时必须能打断排队中的重连。
   void _scheduleReconnect() {
+    // 走到这里 = 连接已经不可用（关闭 / 出错 / 握手失败 / 切设备后重连失败）：
+    // 先把在途命令全部立即失败，再决定要不要调度重连。放在三个早返回之前是刻意的——
+    // 局域网模式（不自动重连）与凭证失效（不重连）下同样必须失败，否则那些场景里的
+    // 在途命令仍要白等满 60 秒。该动作幂等，重复调用无副作用。
+    _failInFlightCommands();
     if (!_autoReconnect || _reconnecting) return;
     // 凭证已确认不可恢复（refresh 也失败）：不再空转重连——那只会反复拿同一份废 token 撞 401，
     // 直到用户点「重新登录」/「重试」（reconnectNow 会清掉这个标记）才恢复。
@@ -509,26 +658,38 @@ class WsClient {
     return sendCommand('get_pending_requests');
   }
 
-  /// 发送命令，返回结果（带超时兜底）。
+  /// 发送命令，返回结果（带 60 秒兜底超时 + 只读命令的有限重试）。
   /// 未连接时**立即失败返回**：之前把命令写进一个不存在/已关闭的 sink，
   /// 要么 _channel 为 null 时静默不发、白等 60 秒超时，要么对已关闭 sink add 直接抛异常，
   /// 在「已登录但未连上任何桌面端」的场景下会让会话列表转圈一分钟。
+  ///
+  /// 重试：只有 [idempotentCommands] 里的只读命令会重试（最多 [maxReadOnlyAttempts] 次尝试，
+  /// 退避见 [commandRetryBackoff]）；写类命令一次都不重试 —— 重试 = 同一需求跑两遍。
+  /// 且只重试「断线 / 没送出去」这类失败；**跑满 60 秒兜底超时的不重试**（见 [shouldRetryFailure]）。
+  /// 于是最坏耗时仍是「一次 60 秒」（旧口径下的 3×60s 已消除），且不因此少了一次重试的机会：
+  /// 断线那条路径本来就几乎瞬时返回，重试它本来就不占时间。
   Future<CmdResult> sendCommand(String cmd, [Map<String, dynamic>? payload]) {
+    return sendCommandWithRetry(cmd, () => _sendCommandOnce(cmd, payload));
+  }
+
+  /// 单次发送（不含重试策略）：挂进 [_pending] 等回包，60 秒兜底超时。
+  Future<CmdResult> _sendCommandOnce(String cmd, [Map<String, dynamic>? payload]) {
     if (!_canSend) {
       return Future.value(CmdResult(false, null, _l.wsNotConnected));
     }
     final id = ++_cmdSeq;
     final c = Completer<CmdResult>();
-    _pending[id] = c;
+    _pending.add(id, cmd, c);
     try {
       _channel!.sink.add(jsonEncode({'type': 'cmd', 'id': id, 'cmd': cmd, 'payload': payload ?? const {}}));
     } catch (e) {
-      _pending.remove(id);
+      _pending.take(id);
       return Future.value(CmdResult(false, null, _l.wsSendFailed('$e')));
     }
     return c.future.timeout(const Duration(seconds: 60), onTimeout: () {
-      _pending.remove(id);
-      return CmdResult(false, null, _l.wsCmdTimeout);
+      _pending.take(id);
+      // timedOut: true —— 让重试判定认出「这是超时，不是断线」，从而不再重发（见 shouldRetryFailure）。
+      return CmdResult(false, null, _l.wsCmdTimeout, timedOut: true);
     });
   }
 
@@ -539,6 +700,8 @@ class WsClient {
     await _sub?.cancel();
     _sub = null;
     _abortChannel();
+    // 销毁即放弃：在途命令立即失败并清表，不留悬挂的 future。
+    _failInFlightCommands();
     await _events.close();
     await _stateCtrl.close();
   }

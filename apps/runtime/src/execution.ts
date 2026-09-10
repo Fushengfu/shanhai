@@ -26,12 +26,22 @@ import type { PromptsModule } from './prompts'
 import type { ModelProviderModule } from './model-provider'
 import type { SessionsModule } from './sessions'
 
+/**
+ * runInSession 的出参（④ 如实上报停止）：调用方传一个空对象进来，函数在里面写回「本轮是否被用户停止」。
+ * 为什么用出参而不是改返回类型：runInSession 的返回值是给用户看的正文字符串，且有 6 处调用点
+ * （bootstrap 的 run/resend/retry + execution 的管家/续跑路径），改成结构体会把改动面扩散到主进程 API；
+ * 只有 dispatchToSession 需要知道「被停止」这一状态，故用可选出参，其它调用点行为完全不变。
+ */
+export interface RunStatus {
+  stoppedByUser: boolean
+}
+
 export interface ExecutionModule {
-  runInSession(sid: string, message: string, opts?: { maxSteps?: number; attachments?: ContentPart[] }, modelIdOverride?: string, origin?: 'user' | 'supervisor'): Promise<string>
-  dispatchToSession(sid: string, message: string, mode: 'insert' | 'queue', onDone: (sid: string, title: string, result?: string, error?: string) => void, origin?: 'user' | 'supervisor', dmReplyTarget?: DmPendingReply): Promise<{ ok: boolean; message: string; result?: string }>
+  runInSession(sid: string, message: string, opts?: { maxSteps?: number; attachments?: ContentPart[] }, modelIdOverride?: string, origin?: 'user' | 'supervisor', status?: RunStatus): Promise<string>
+  dispatchToSession(sid: string, message: string, mode: 'insert' | 'queue', onDone: (sid: string, title: string, result?: string, error?: string, stopped?: boolean) => void, origin?: 'user' | 'supervisor', dmReplyTarget?: DmPendingReply): Promise<{ ok: boolean; message: string; result?: string }>
   sendMessageToSession(sid: string, message: string, mode: 'insert' | 'queue', dmReplyTarget?: DmPendingReply): Promise<{ ok: boolean; message: string; result?: string }>
   runSession(sid: string, message: string, mode?: 'insert' | 'queue'): Promise<{ ok: boolean; message: string; result?: string }>
-  notifySupervisorResult(sid: string, title: string, result?: string, error?: string): void
+  notifySupervisorResult(sid: string, title: string, result?: string, error?: string, stopped?: boolean): void
   drainSupervisorQueue(sid: string): void
   buildSupervisorLoopTools(): ToolContract[]
   runSupervisorInternal(message: string, attachments?: ContentPart[], modelIdOverride?: string, dmContext?: DmPendingReply): Promise<string>
@@ -80,6 +90,7 @@ export function createExecutionModule(
     opts?: { maxSteps?: number; attachments?: ContentPart[] },
     modelIdOverride?: string,
     origin: 'user' | 'supervisor' = 'user',
+    status?: RunStatus,
   ): Promise<string> => {
     const meta = ctx.sessions.get(sid)
     if (!meta) throw new Error(`会话不存在: ${sid}`)
@@ -143,7 +154,7 @@ export function createExecutionModule(
         loop.run(message, {
           ...opts,
           systemPrompt: isSupervisorRun ? prompts.buildSupervisorSystemPrompt(message) : prompts.buildSystemPrompt(meta.workDir, prompts.buildMemoryContext(message, meta.id)),
-          // 运行环境明细的唯一真相源：注入到「发给模型的首条用户消息」之前的系统上下文块（不落盘、不进回放）
+          // 运行环境明细的唯一真相源：注入到「发给模型的首条用户消息」之前的系统提示标签块（不落盘、不进回放）
           userContext: prompts.buildUserContextBlock(meta.workDir),
           attachments: opts?.attachments,
           modelContent,
@@ -169,6 +180,9 @@ export function createExecutionModule(
     } catch (err) {
       if (err instanceof Error && err.message === '__stopped__') {
         stoppedByUser = true
+        // ④ 把「被用户停止」透出给调用方（此前只 return 一个字符串，调用方无从分辨「停止」与「正常完成」，
+        // 于是 dispatchToSession 把「没做完」当「✅ 执行完成」上报管家 —— 这是诱导误报完成的污染源）。
+        if (status) status.stoppedByUser = true
         return '（已中断，历史已保留，可点击「继续执行」续跑）'
       }
       if (err instanceof Error && err.message.startsWith('__retry_exhausted__')) {
@@ -184,7 +198,14 @@ export function createExecutionModule(
       meta.lastActiveAt = Date.now()
       await sessions.persistSession(meta)
       tokenStats.emitTokenStats()
-      drainSupervisorQueue(sid)
+      // ③ 排队任务不被自动复活：用户显式点停止后不再 drain（原来无条件 drain → 停了立刻自动开下一条，
+      // 观感就是「按了停，任务又自己跑起来」）。语义＝停当前轮、队列保留：ctx.supervisorQueue 不清空，
+      // 已排队的后续需求原样留着，等下一次自然结束或用户再发起时才继续，不会丢。
+      if (stoppedByUser) {
+        console.log('[supervisor-queue] 用户停止，本轮不 drain 队列（排队需求保留）：', sid)
+      } else {
+        drainSupervisorQueue(sid)
+      }
       if (sid === SUPERVISOR_ID && !suspended && !stoppedByUser) {
         console.log('[supervisor-wake] 管家 loop 结束（finally），触发 drain，suspended=', suspended)
         void drainSupervisorWake()
@@ -199,7 +220,7 @@ export function createExecutionModule(
     sid: string,
     message: string,
     mode: 'insert' | 'queue',
-    onDone: (sid: string, title: string, result?: string, error?: string) => void,
+    onDone: (sid: string, title: string, result?: string, error?: string, stopped?: boolean) => void,
     origin: 'user' | 'supervisor' = 'user',
     dmReplyTarget?: DmPendingReply,
   ): Promise<{ ok: boolean; message: string; result?: string }> {
@@ -236,9 +257,13 @@ export function createExecutionModule(
     const turnSeq = countNonInjectedUserMessages(meta.session) + 1
     ctx.userMessageCallbacks.forEach((cb) => cb(sid, content, turnSeq))
     void (async () => {
+      // ④ 用一个出参对象接住「本轮是否被用户停止」，再透传给 onDone。
+      // 为什么不能只看返回值：被停止时 runInSession 是 return 一个提示字符串（不 throw），
+      // 于是这里会走「成功完成」分支，把「没做完」当「✅ 执行完成」上报给管家 —— 这就是停不干净的污染源。
+      const runStatus: RunStatus = { stoppedByUser: false }
       try {
-        const result = await runInSession(sid, content, undefined, targetModelId, origin)
-        onDone(sid, title, result)
+        const result = await runInSession(sid, content, undefined, targetModelId, origin, runStatus)
+        onDone(sid, title, result, undefined, runStatus.stoppedByUser)
       } catch (err) {
         onDone(sid, title, undefined, err instanceof Error ? err.message : String(err))
       }
@@ -247,21 +272,37 @@ export function createExecutionModule(
   }
 
   function sendMessageToSession(sid: string, message: string, mode: 'insert' | 'queue', dmReplyTarget?: DmPendingReply): Promise<{ ok: boolean; message: string; result?: string }> {
-    return dispatchToSession(sid, message, mode, (sid, title, result, error) => notifySupervisorResult(sid, title, result, error), 'supervisor', dmReplyTarget)
+    return dispatchToSession(sid, message, mode, (sid, title, result, error, stopped) => notifySupervisorResult(sid, title, result, error, stopped), 'supervisor', dmReplyTarget)
   }
 
   function runSession(sid: string, message: string, mode: 'insert' | 'queue' = 'insert'): Promise<{ ok: boolean; message: string; result?: string }> {
     return dispatchToSession(sid, message, mode, () => {}, 'user')
   }
 
-  const notifySupervisorResult = (sid: string, title: string, result?: string, error?: string): void => {
+  /**
+   * ④ 子会话结果回传管家。三态而非两态：失败 ⚠️ / 被用户停止 ⏹ / 真正完成 ✅。
+   * 被停止时以前会拼成「✅ 执行完成」，并把「（已中断…）」当成结果正文喂给管家，
+   * 管家据此认为任务 done 并继续下发下一条 —— 这就是「把没做完当做完上报」的机制性污染源。
+   * 现在：如实写「⏹ 已被用户停止」，且【不唤醒管家】（不自动接力下发），
+   * 但正文仍落进管家会话历史（用户在管家窗口看得见这条停止记录）。
+   */
+  const notifySupervisorResult = (sid: string, title: string, result?: string, error?: string, stopped?: boolean): void => {
     const text = error
       ? `⚠️ 会话「${title}」(${sid}) 执行失败：${error}`
-      : `✅ 会话「${title}」(${sid}) 执行完成：\n\n${result ?? '（无正文输出）'}`
+      : stopped
+        ? `⏹ 会话「${title}」(${sid}) 已被用户停止：本轮未完成（不是执行完成），历史已保留，可由用户点「继续执行」续跑；已排队的后续需求保留未执行。请勿把本条当作任务 done。`
+        : `✅ 会话「${title}」(${sid}) 执行完成：\n\n${result ?? '（无正文输出）'}`
     const supMeta = ctx.sessions.get(SUPERVISOR_ID)
     supMeta?.session.append('assistant/message', { content: text })
     if (supMeta) void sessions.persistSession(supMeta)
+    // supervisorResultCallbacks 的签名（4 参）保持不变：它只被用于「刷新管家会话历史显示」与手机端广播，
+    // 停止状态已经写进上面落盘的正文里，不需要扩这个对外回调契约（扩它会牵动 runtime/types.ts 与 remote-protocol）。
     ctx.supervisorResultCallbacks.forEach((cb) => cb(sid, title, result, error))
+    // 被用户停止 → 不唤醒管家（不自动接力下发下一条），也不入 supervisorWakeQueue
+    if (stopped) {
+      console.log('[supervisor-wake] 子会话被用户停止，不唤醒管家：', sid)
+      return
+    }
     wakeSupervisorForResult(sid, title, result, error)
   }
 
@@ -607,7 +648,7 @@ export function createExecutionModule(
             ctx.deltaCallbacks.forEach((cb) => cb(sid, text))
           },
           (text) => ctx.reasoningCallbacks.forEach((cb) => cb(sid, text)),
-          // 断点续跑同样注入系统上下文块（首条用户消息带运行环境明细、每条带自己的真实时间）
+          // 断点续跑同样注入系统提示标签块（首条用户消息带运行环境明细、每条带自己的真实时间）
           prompts.buildUserContextBlock(meta.workDir),
         ),
       )

@@ -429,6 +429,8 @@ const en = {
   'chat.plugin.thinking': 'Thinking',
   'chat.plugin.resumeTitle': 'The last task did not finish; click to continue',
   'chat.plugin.resume': 'Continue',
+  'chat.plugin.scrollBottom': 'Back to latest',
+  'chat.plugin.scrollBottomTitle': 'Back to the latest messages (you are browsing older ones)',
   'chat.ask.header': 'The AI needs your confirmation',
   'chat.ask.noQuestion': '(The AI gave no explanation; judge from the options below)',
   'chat.ask.whyBg': 'Why is the AI asking? (click for background)',

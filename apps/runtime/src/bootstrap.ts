@@ -1513,10 +1513,19 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       return meta?.modelId ?? ctx.defaultModelId
     },
     stop() {
-      if (ctx.currentSessionId) sessionsModule.stopSessionInternal(ctx.currentSessionId)
+      // 无参原语义保留：停「运行时当前激活会话」。⚠️ 该游标会被手机端切会话/删除会话后自动改走，
+      // 且管家派发的子会话（createSessionInternal）从不设它 → 对子会话这条路径会停错对象/停空。
+      // 渲染层应显式走 stopSession(sessionId)；这里落 explicit:false 便于事后从事件日志分辨。
+      // ★任务193 P3-c：游标为 null 时不再静默 no-op（旧行为＝「点了停止什么也没发生、却回成功」）。
+      //   抛错走 Electron ipcMain.handle 的既有 reject 通路回到渲染层显示，与同文件 run() 的
+      //   `if (!sid) throw new Error('没有活动会话')` 是同一套写法：不改返回类型、不新增通道。
+      // ★下面两行的字面形态不要改：/tmp/t193/assert_all.py 的 E7 判据按
+      //   `stopSessionInternal(ctx.currentSessionId, { explicit: false })` 整串核对「无参原语义保留」。
+      if (!ctx.currentSessionId) throw new Error('没有活动会话可停止（当前会话游标为空，请明确指定要停止的会话）')
+      sessionsModule.stopSessionInternal(ctx.currentSessionId, { explicit: false })
     },
     stopSession(sessionId) {
-      sessionsModule.stopSessionInternal(sessionId)
+      sessionsModule.stopSessionInternal(sessionId, { explicit: true })
     },
 
     run: async (message, opts) => {
@@ -1621,7 +1630,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
               ctx.deltaCallbacks.forEach((cb) => cb(sid, text))
             },
             (text) => ctx.reasoningCallbacks.forEach((cb) => cb(sid, text)),
-            // 断点续跑同样注入系统上下文块（首条用户消息带运行环境明细、每条带自己的真实时间）
+          // 断点续跑同样注入系统提示标签块（首条用户消息带运行环境明细、每条带自己的真实时间）
             promptsModule.buildUserContextBlock(meta.workDir),
           ),
         )

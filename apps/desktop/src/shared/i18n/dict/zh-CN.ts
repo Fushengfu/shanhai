@@ -433,6 +433,8 @@ export const zhCN = {
   'chat.plugin.thinking': '思考中',
   'chat.plugin.resumeTitle': '上次任务未完成，点击继续执行',
   'chat.plugin.resume': '继续执行',
+  'chat.plugin.scrollBottom': '回到最新消息',
+  'chat.plugin.scrollBottomTitle': '回到最新消息底部（你正在往上查看历史消息）',
   'chat.ask.header': 'AI 需要你的确认',
   'chat.ask.noQuestion': '（AI 未提供说明，请结合下方选项判断）',
   'chat.ask.whyBg': 'AI 为什么问你（点开看背景）',

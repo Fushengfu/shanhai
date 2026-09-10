@@ -15,7 +15,7 @@ import { t, tf } from '../../shared/i18n'
 import { renderRich, useLocaleSync } from '../locale'
 import { UserMessage } from '../components/UserMessage'
 import { VirtualList } from '../components/VirtualList'
-import { IconCode, IconRefresh } from '../components/icons'
+import { IconChevronDown, IconCode, IconRefresh } from '../components/icons'
 import { btn, LiveDuration, ThinkingDots } from '../components/ui'
 import { registerSlot, SlotView, AppendSlotView } from '../slots'
 import { useUIContext } from '../ui-context'
@@ -51,6 +51,9 @@ function ChatSlot(): React.JSX.Element {
   // 用户是否在底部：仅由滚动事件维护，不参与「内容增长」的计算。
   // 之前的实现每次内容更新都重算 nearBottom，流式内容一次性增长超过阈值时会被误判为「用户已上翻」而停止跟随。
   const atBottomRef = useRef(true)
+  // 「回到最新消息」按钮的显隐：atBottomRef 是 ref（不触发重渲染），按钮要显隐必须另存一份可触发渲染的镜像。
+  // 仅由滚动事件（handleScroll）与滚到底的动作同步，不参与「内容增长」计算 —— 与 atBottomRef 同一份真相，不引入第二套判定。
+  const [showScrollBottom, setShowScrollBottom] = useState(false)
 
   // —— 卡顿优化：稳定历史消息交互回调引用。原先直接把不稳定的 ctx.resendMessage / ctx.editResend
   //     放进 history useMemo 依赖，导致每次 ui:state 广播（工具步骤等）都重新创建引用 → 全量重建历史列表。
@@ -83,7 +86,10 @@ function ChatSlot(): React.JSX.Element {
   const handleScroll = (): void => {
     const el = listRef.current
     if (!el) return
-    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+    atBottomRef.current = atBottom
+    // 不在底部才显示「回到最新消息」按钮（阈值与 atBottomRef 同一份判定，不另设数值）
+    setShowScrollBottom(!atBottom)
   }
 
   // 消息更新 / 思考流 / 审批弹窗出现时：只要用户在底部就跟随滚到底。
@@ -96,9 +102,20 @@ function ChatSlot(): React.JSX.Element {
   // 切换会话：重置「在底部」并立即滚到底
   useEffect(() => {
     atBottomRef.current = true
+    setShowScrollBottom(false)
     const el = listRef.current
     if (el) el.scrollTop = el.scrollHeight
   }, [ctx.currentSessionId])
+
+  // 点击「回到最新消息」：滚到底并收起按钮。
+  // 滚底动作与既有两处（吸底 effect / 切会话 effect）写法一致（scrollTop = scrollHeight），不另抽公共函数。
+  const handleScrollToBottom = (): void => {
+    const el = listRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+    atBottomRef.current = true
+    setShowScrollBottom(false)
+  }
 
   // 历史消息节点缓存：streaming 变化时 items/busy 都不变，返回缓存的 nodes，
   // 避免每个 token 都重建全部历史消息 VNode（React 对相同 element 引用做 bailout，跳过子树渲染）。
@@ -161,6 +178,24 @@ function ChatSlot(): React.JSX.Element {
 
   return (
     <>
+      {/* 「回到最新消息」按钮的定位容器（只包住消息列表）。
+          为什么需要这一层：按钮用 position:absolute 定位，包含块决定了 bottom 从哪儿量。此前按钮直接挂在本层，
+          包含块是主区容器（App.tsx 里那个 position:relative 的 flex 列，里面除聊天区外还有输入区与状态栏），
+          于是 bottom:158 量的是「主区底 → 上 158」，而主区底还含着输入区与状态栏 —— 输入区一长高（窗口变窄，
+          输入框内容换行）按钮就陷进输入区里，用户看到「按钮被挤进输入框」。
+          本层 position:relative 后成为按钮的包含块：它的底边 === 聊天区底 === 输入区顶，
+          输入区高度再怎么变都不影响按钮位置（纯 flex/CSS，不引入 ResizeObserver、不新增状态）。
+          只包 VirtualList；审批卡 / 提问卡 / chat.below 仍留在外层，继续按原 bottom:158 锚定，行为一字未改。 */}
+      <div
+        style={{
+          flex: ctx.isEmpty ? '0 0 auto' : 1,
+          minWidth: 0,
+          minHeight: 0,
+          position: 'relative',
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
       <VirtualList
         containerRef={listRef}
         items={history.nodes}
@@ -243,6 +278,41 @@ function ChatSlot(): React.JSX.Element {
               }
         }
       />
+
+        {/* 「回到最新消息」浮动按钮：用户上滑查看历史（不在底部）时才出现，点一下滚回底部并自动消失。
+            锚定在上面那层定位容器里（不是消息滚动容器内 —— 该容器带 contain:'layout' + overflow，放进去会被裁），
+            bottom 相对聊天区底 === 输入区顶，故输入区高度随窗口宽度变化也不再影响它。
+            bottom:14 与 left:'50%'+translateX(-50%) 照抄全仓既有同款「滚回底部」按钮（MemberPanel 私信
+            「有新消息」按钮 :1506-1513 就是这套写法），不另设第三种。 */}
+        {showScrollBottom && (
+          <button
+            onClick={handleScrollToBottom}
+            title={t('chat.plugin.scrollBottomTitle')}
+            style={{
+              position: 'absolute',
+              bottom: 14,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              padding: '6px 14px',
+              borderRadius: 14,
+              border: '1px solid var(--accent)',
+              background: 'var(--bg-panel)',
+              color: 'var(--accent)',
+              fontSize: 13,
+              cursor: 'pointer',
+              boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--tint-blue-soft)')}
+            onMouseLeave={(e) => (e.currentTarget.style.background = 'var(--bg-panel)')}
+          >
+            <IconChevronDown />
+            {t('chat.plugin.scrollBottom')}
+          </button>
+        )}
+      </div>
 
       {/* 追加型扩展点：消息流下方（agent 往这里追加组件，不替换核心消息流） */}
       <AppendSlotView slot="chat.below" />

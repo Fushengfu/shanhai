@@ -23,7 +23,7 @@ import { t as tKey, tf as tfKey } from '../../shared/i18n'
 import { applyLocale, renderRich, useLocaleSync } from '../locale'
 import { DmEntryButton } from '../components/DmEntryButton'
 import { VirtualList } from '../components/VirtualList'
-import { IconMonitor, IconWarn, IconMoon, IconSun } from '../components/icons'
+import { IconChevronDown, IconMonitor, IconWarn, IconMoon, IconSun } from '../components/icons'
 import { btn, formatBytes, prettyValue, LiveDuration, ThinkingDots } from '../components/ui'
 import { useThemeSync, readTheme, applyTheme, type ThemeMode } from '../theme'
 
@@ -217,12 +217,27 @@ export function SupervisorApp(): React.JSX.Element {
   // 是否在底部：仅由滚动事件维护（对齐 ChatPlugin 已被验证正常的吸底写法）。
   // 初始为 true：窗口首次加载历史时（cur.items 从空 → 填充）自动滚到底部最新消息。
   const atBottomRef = useRef(true)
+  // 「回到最新消息」按钮的显隐：atBottomRef 是 ref（不触发重渲染），按钮要显隐必须另存一份可触发渲染的镜像。
+  // 与聊天窗口（ChatPlugin）同一份实现，仅由滚动事件（handleScroll）与滚到底的动作同步，不引入第二套判定。
+  const [showScrollBottom, setShowScrollBottom] = useState(false)
 
-  // 用户滚动（滚轮/拖条/键盘）时更新「是否在底部」状态，供吸底 effect gate 用。
+  // 用户滚动（滚轮/拖条/键盘）时更新「是否在底部」状态，供吸底 effect gate 用；
+  // 同时用同一份判定决定「回到最新消息」按钮的显隐（阈值 120px 一字未改）。
   const handleScroll = useCallback((): void => {
     const el = listRef.current
     if (!el) return
-    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+    atBottomRef.current = atBottom
+    setShowScrollBottom(!atBottom)
+  }, [])
+
+  // 点击「回到最新消息」：滚到底并收起按钮（滚底写法与既有吸底 effect 一致，不另抽公共函数）。
+  const handleScrollToBottom = useCallback((): void => {
+    const el = listRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+    atBottomRef.current = true
+    setShowScrollBottom(false)
   }, [])
 
   // 主题：订阅主进程广播，跟随聊天窗口切换（亮/暗实时同步）
@@ -414,7 +429,14 @@ export function SupervisorApp(): React.JSX.Element {
         return
       }
       try {
-        await window.shanhai.stop(SUPERVISOR_SID)
+        // ★任务194 ⑦-②：主进程现在把成/败与原因结构化回传（旧写法拿不到成败）。ok:false 与抛错
+        //   走同一条既有可见通知路径（setStopNotice + 既有键 sup.stop.sendFailed）：不新增 i18n 键、
+        //   不新增通道、不新增状态字段。管家侧一直显式传 SUPERVISOR_SID，这条分支语义未变。
+        const res = await window.shanhai.stop(SUPERVISOR_SID)
+        if (res && res.ok === false) {
+          setStopNotice({ level: 'error', text: tKey('sup.stop.sendFailed', { err: res.reason || tKey('common.unknown') }) })
+          return
+        }
       } catch (err) {
         setStopNotice({ level: 'error', text: tKey('sup.stop.sendFailed', { err: err instanceof Error ? err.message : String(err) }) })
         return
@@ -715,6 +737,23 @@ export function SupervisorApp(): React.JSX.Element {
         </div>
       )}
 
+      {/* 「回到最新消息」按钮的定位容器（只包住消息列表）。与聊天窗口同一处修法：
+          按钮用 position:absolute，包含块决定 bottom 从哪儿量。此前按钮直接挂在本层，包含块是根容器
+          （height:100vh，里面除消息区外还有输入区与状态栏），bottom:158 量的是「窗口底 → 上 158」，
+          输入区/状态栏一长高（窗口变窄、内容换行）按钮就陷进输入区。
+          本层 position:relative 后成为按钮的包含块，其底边 === 消息区底 === 输入区顶，
+          输入区高度再怎么变都不影响按钮位置（纯 flex/CSS，不引入 ResizeObserver、不新增状态）。
+          只包 VirtualList；审批卡 / 能力审批卡仍留在外层，继续按原 bottom:158 锚定，行为一字未改。 */}
+      <div
+        style={{
+          flex: 1,
+          minWidth: 0,
+          minHeight: 0,
+          position: 'relative',
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
       <VirtualList
         containerRef={listRef}
         items={nodes}
@@ -786,6 +825,41 @@ export function SupervisorApp(): React.JSX.Element {
           contain: 'layout',
         }}
       />
+
+        {/* 「回到最新消息」浮动按钮：用户上滑查看历史（不在底部）时才出现，点一下滚回底部并自动消失。
+            与聊天窗口同一份实现（含水平居中写法）；锚定在上面那层定位容器里（不是消息滚动容器内 ——
+            该容器带 contain:'layout' + overflow，放进去会被裁），bottom 相对消息区底 === 输入区顶。 */}
+        {showScrollBottom && (
+          <button
+            onClick={handleScrollToBottom}
+            title={tKey('chat.plugin.scrollBottomTitle')}
+            style={{
+              position: 'absolute',
+              // 水平居中：与聊天窗口 / 私信「回到最新消息」按钮同一写法（left:'50%' + translateX(-50%)）。
+              // 包含块是上面的定位容器（position:'relative'），横向即整个消息区宽。
+              left: '50%',
+              transform: 'translateX(-50%)',
+              bottom: 14,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              padding: '6px 14px',
+              borderRadius: 14,
+              border: '1px solid var(--accent)',
+              background: 'var(--bg-panel)',
+              color: 'var(--accent)',
+              fontSize: 13,
+              cursor: 'pointer',
+              boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--tint-blue-soft)')}
+            onMouseLeave={(e) => (e.currentTarget.style.background = 'var(--bg-panel)')}
+          >
+            <IconChevronDown />
+            {tKey('chat.plugin.scrollBottom')}
+          </button>
+        )}
+      </div>
 
       {/* 输入区：自包含 SupervisorComposer（附件 / 模型 / 安全模式 / 麦克风 / 发送），键入只重渲染本子树 */}
       <SupervisorComposer

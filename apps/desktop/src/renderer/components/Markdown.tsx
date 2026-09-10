@@ -175,6 +175,19 @@ function MarkdownImage(props: { src?: string; alt?: string }): React.JSX.Element
   )
 }
 
+/**
+ * 围栏代码块的外层 pre：react-markdown 对「无语言围栏」与「四空格缩进代码」不会给 code 加 language-*，
+ * makeCode 走行内 code 分支，此时唯一的块级元素就是这个 UA <pre>（white-space: pre + overflow: visible + 无 max-width），
+ * 它既不折行也不自身滚动，溢出会一路上抛到消息级的 overflow-x:auto 容器 ⇒ 整条消息出现左右滚动条。
+ * 修法照抄 CodeBlock 里那个 pre 的既有正确写法（限宽 + 自身横向滚动），只动容器样式、不动解析与配色：
+ * 宽内容由代码块自己滚，外层消息容器不再整体左右滚。
+ */
+function MarkdownPre(props: { children?: React.ReactNode }): React.JSX.Element {
+  return (
+    <pre style={{ maxWidth: '100%', overflowX: 'auto', boxSizing: 'border-box', whiteSpace: 'pre' }}>{props.children}</pre>
+  )
+}
+
 /** 表格外层：加横向滚动容器，宽表格不会被气泡 maxWidth 挤压换行 */
 function MarkdownTable(props: { children?: React.ReactNode }): React.JSX.Element {
   return (
@@ -214,6 +227,7 @@ function buildComponents(tone: MarkdownTone) {
     code: makeCode(tone),
     a: makeLink(tone),
     img: MarkdownImage,
+    pre: MarkdownPre,
     table: MarkdownTable,
     th: makeTh(tone),
     td: makeTd(tone),

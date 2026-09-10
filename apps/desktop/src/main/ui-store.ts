@@ -295,9 +295,9 @@ export function filterUiStateForPlugin(s: UiStoreState): PluginUiState {
   return { loggedIn: s.loggedIn, username: s.username, wallpaper: s.wallpaper }
 }
 
-/** 判断窗口类型是否消费共享状态（仅 supervisor-bubble 纯静态悬浮图标不消费，广播时跳过；dock 需消费登录态） */
+/** 判断窗口类型是否消费共享状态（supervisor-bubble 纯静态悬浮图标、app-menu 纯静态应用菜单浮层不消费，广播时跳过；dock 需消费登录态） */
 export function windowConsumesUiState(type: WindowType | undefined): boolean {
-  return type !== 'supervisor-bubble'
+  return type !== 'supervisor-bubble' && type !== 'app-menu'
 }
 
 export function subscribeUiState(cb: () => void): () => void {

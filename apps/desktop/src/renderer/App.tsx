@@ -914,15 +914,60 @@ export function App() {
     patchSession(sid, { incompleteTurn: incomplete })
   }
 
+  /**
+   * 「停止」入口（任务193 修复）：三件事缺一不可，少任何一件都会复现「点了暂停停不下来」。
+   * ① 必须把 sessionId 显式传给主进程：不传时 preload 传 undefined → runtime.stop() 停的是
+   *    ctx.currentSessionId（全局游标），而该游标会被手机端 switch_session、删除会话后的自动切换改走，
+   *    且管家派发子会话走 createSessionInternal 从不设它 → 停错对象/停空（191 实测的主因）。
+   * ② 用的 id 必须是「屏幕上这个会话」：取渲染真值 currentSessionId（它只在 await switchSession 之后、
+   *    且 switchSeqRef 令牌仍是最新时才写，见 switchToSession），不能用 currentSessionIdRef —— 那个 ref
+   *    在 switchToSession 里是「进函数就写」，切换在途期间 ref 已指向新会话而画面还是旧会话，
+   *    此时点停止会停到没显示的那个会话。把赋值整体后移会连带把 send() 也退回旧会话
+   *    （草稿在 await 前就已切到新会话），故选择「停止按画面真值」这条不改共享 ref 的路。
+   * ③ 不得假停：不再本地乐观置 busy:false。busy 一律以主进程 runningLoops 真值（既有 session:list 广播）为准，
+   *    停成功才翻回发送态；没停住就继续显示「执行中」。代价＝点下去可能 1~2 秒后才变（用户已知情接受），
+   *    换来的是不再出现「按钮说停了、文字还在吐」这种自相矛盾的界面。
+   */
   const stopSend = useCallback((): void => {
-    const sid = currentSessionIdRef.current
-    // 立即给用户反馈：停止三点动画/流式渲染，busy 置 false（对齐 taco：点停止即停，不再等后端慢慢返回才刷新）。
-    // 后端 stop() 会中止运行中的 loop，run() 返回后 doRun 的 finally 兜底再次置 false（幂等）。
-    if (sid) {
+    const sid = currentSessionId
+    void (async () => {
+      // ★任务193 P3-c：停止请求本身失败不再静默吞掉 —— 复用既有错误呈现（会话里一条 assistant 错误气泡，
+      //   与 send()/resume() 的 catch 同一套 t('chat.shell.errorPrefix')），不新增状态字段、不新增设置项。
+      let stopError: unknown = null
+      try {
+        // sid 为空时传 undefined，保持「无参 → 停全局当前会话」的原语义（不新增任何通道，preload/ipc 早已支持可选参数）
+        const res = await window.shanhai?.stop(sid || undefined)
+        // ★任务194 ⑦-②：主进程现在把成/败结构化回传（旧写法无 return ⇒ 渲染层拿不到成败）。
+        //   ok:false 与抛错走同一条既有可见呈现路径（会话里一条 t('chat.shell.errorPrefix') 气泡），
+        //   不新增状态字段、不新增设置项、不新增通道。
+        if (res && res.ok === false) stopError = new Error(res.reason || t('common.unknown'))
+      } catch (err) {
+        stopError = err // 主进程游标为空时已改为抛错（见 bootstrap 的无参停止入口）→ 这里如实显示，禁止「点了什么都不发生」
+      }
+      if (!sid) {
+        // 渲染层没有当前会话：无处可贴气泡（会话 id 为空），只能落日志；此路径下停止按钮本就不可点（busy 恒 false）
+        if (stopError) console.error('[chat] 停止失败（渲染层无当前会话）：', stopError)
+        return
+      }
+      let running = false
+      try {
+        const list = (await window.shanhai?.listSessions()) ?? []
+        running = list.find((s) => s.id === sid)?.busy === true
+      } catch {
+        running = false
+      }
+      if (stopError) {
+        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: t('chat.shell.errorPrefix', { msg: String(stopError instanceof Error ? stopError.message : stopError) }) }] }))
+      }
+      if (running) {
+        // 真值说还在跑：保持/写回 busy=true，绝不清 streaming（清了会文字闪断，更像「停了但没停」）
+        patchSession(sid, { busy: true })
+        return
+      }
       patchSession(sid, { busy: false, streaming: '', streamingReasoning: '' })
-    }
-    void window.shanhai?.stop()
-  }, [patchSession])
+      void refreshSessions()
+    })()
+  }, [currentSessionId, patchSession])
 
   // 空状态：当前会话还没有任何消息（新建会话 / 首次使用默认会话）
   const isEmpty = cur.items.length === 0

@@ -3,7 +3,7 @@ import { SUPERVISOR_ID } from '@shanhai/runtime'
 import { safeSend } from './safe-send'
 import { syncLocaleFromSettings } from './locale-store'
 import { getRuntime } from './runtime'
-import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow, toggleMaximizeWindow, resizeDockWindow, hideSupervisorToBubble, showSupervisorFromBubble, moveSupervisorBubble, hideToSystemDesktop, getWindowType, getWindowAppId, getDockTopOffset } from './window-manager'
+import { openApp, closeApp, restoreAboveDesktop, hideChatWindow, minimizeWindow, toggleMaximizeWindow, resizeDockWindow, hideSupervisorToBubble, showSupervisorFromBubble, moveSupervisorBubble, hideToSystemDesktop, getWindowType, getWindowAppId, getDockTopOffset, setAppMenuWindowVisible } from './window-manager'
 import { getPluginApp, listPluginApps, resolvePluginIconDataUrl } from './plugin-apps'
 import { listDockPluginApps, beginPluginDrag, cancelPluginDrag, completePluginDrag } from './dock-plugins'
 import { getUiState, getUiStateRev, patchUiState, getWallpaper, setWallpaper, filterUiStateForWindow, filterUiStateForPlugin, type UiStoreState } from './ui-store'
@@ -204,8 +204,23 @@ export function registerIpc(): void {
   //   信任面未扩大：同族的 chat:resume / chat:retry / chat:inject / chat:resend 本来就接受任意 sessionId。
   ipcMain.handle('chat:stop', async (_e, sessionId?: string) => {
     const sid = typeof sessionId === 'string' ? sessionId.trim() : ''
-    if (sid) runtime.stopSession(sid)
-    else runtime.stop()
+    // ★任务194 ⑦-②：旧写法无 return ⇒ 渲染层拿不到成败（只能靠 rejected promise 猜）。现在把
+    //   成/败 + 原因结构化回传。不新增 IPC 通道（仍只有这一个 chat:stop）、不改 preload 参数形态
+    //   （invoke 本就回传 resolve 值）、不改 runtime 的 stop()/stopSession() 签名（它们仍是 void）。
+    //   ⚠️ catch 到的正是任务193 P3-c 在「游标为 null」时抛的错：这里转成结构化失败是为了带上原因，
+    //   不是把失败吞掉 —— 渲染层（App.tsx / SupervisorApp.tsx）必须把 reason 显示出来。
+    try {
+      if (sid) {
+        runtime.stopSession(sid)
+        return { ok: true as const, sessionId: sid, explicit: true }
+      }
+      runtime.stop()
+      // 无参分支：停的是主进程游标指向的会话，这里回不到具体 id（runtime 不暴露该游标），
+      // 故只回 explicit:false；界面一律用既有 listSessions() 真值回读判定「是否真停」。
+      return { ok: true as const, explicit: false }
+    } catch (err) {
+      return { ok: false as const, sessionId: sid || undefined, explicit: sid.length > 0, reason: err instanceof Error ? err.message : String(err) }
+    }
   })
 
   // —— 会话管家（主 Agent，独立 supervisor 窗口）——
@@ -290,9 +305,22 @@ export function registerIpc(): void {
   // Dock 窗口根据图标栏内容自适应尺寸（渲染进程测量后回调，fire-and-forget）
   ipcMain.on('window:resizeDock', (_e, width: number, height: number) => resizeDockWindow(width, height))
   // 退出到桌面：隐藏所有山海窗口回到系统界面，应用后台运行（托盘/快捷键恢复）
-  ipcMain.handle('window:hideToDesktop', async () => hideToSystemDesktop())
+  ipcMain.handle('window:hideToDesktop', async () => {
+    hideToSystemDesktop()
+    // 【任务187】app-menu 浮层也在「隐藏全部窗口」的循环里被收掉，但共享状态里的 appMenuOpen
+    // 必须跟着复位：否则 Dock 按钮仍显示"已打开"，用户再点一次只是把 true 改成 false（屏幕上什么都不发生），
+    // 要点第二次才开得了 —— 正是本任务禁止的「点了没反应」失败分支。
+    patchUiState({ appMenuOpen: false })
+  })
   // 获取 Dock 顶部距桌面壳底部的距离（应用菜单面板据此定位在 Dock 上方弹出）
   ipcMain.handle('window:getDockTop', async () => getDockTopOffset())
+  // 【任务187·方案 P】应用菜单浮层开/关：主进程是唯一写者（同时切窗口可见态 + 写回共享状态），
+  // 渲染层不再各自 patchUiStore({appMenuOpen})，避免「Dock 以为开着 / 浮层其实已关」两份真相。
+  ipcMain.handle('window:setAppMenu', async (_e, open: boolean) => {
+    const visible = setAppMenuWindowVisible(!!open)
+    patchUiState({ appMenuOpen: visible })
+    return visible
+  })
 
   // —— 主题切换（亮/暗）：聊天窗口切换后广播给所有窗口，让各独立窗口（会话管家/Dock/桌面壳/应用窗口）实时跟随 ——
   ipcMain.on('theme:set', (_e, theme: 'light' | 'dark') => {

@@ -5,7 +5,6 @@ import { useThemeSync } from '../theme'
 import { applyLocale, useLocaleSync } from '../locale'
 import { t } from '../../shared/i18n'
 import { PluginAppsPanel } from '../plugins/PluginAppsPanel'
-import { AppMenuPanel } from './AppMenuPanel'
 
 /**
  * 桌面壳窗口（多窗口桌面系统的「桌面」背景层）。
@@ -82,8 +81,9 @@ export function DesktopApp(): React.JSX.Element {
       {/* 底部占位（应用 Dock 已拆到独立 dock 窗口） */}
       <div style={{ height: 128 }} />
 
-      {/* 顶部应用菜单面板：Dock 入口点击（ui.appMenuOpen）后在此弹出已安装应用列表 */}
-      {ui.appMenuOpen && <AppMenuPanel />}
+      {/* 【任务187】应用菜单面板不再挂在桌面壳里：桌面壳被 keepDesktopAtBottom 永久压在山海窗口栈最底，
+          而 app/插件窗口带 alwaysOnTop:true，面板挂这里结构上永远盖不过它们（=「被挡住」的真因）。
+          现由主进程专用 app-menu 置顶浮层窗口承载（见 window-manager.setAppMenuWindowVisible）。 */}
     </div>
   )
 }

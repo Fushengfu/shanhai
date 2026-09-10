@@ -45,6 +45,29 @@
   --titlebar-btn-color: #666a73;
   --titlebar-btn-hover-bg: #e9ebee;
   --titlebar-btn-danger: #dc2626;
+  /* ── Dock 内置图标「实体感」族内常量（唯一真相源，图标组件内禁止出现任何十六进制）──
+     真实感来自固定数值而非各画各的：底板渐变走 135° 对角（x1=0,y1=0→x2=1,y2=1）、
+     主体自上而下受光（--dock-ink → --dock-ink-2）、顶部 26% 高光、接触阴影 16%。
+     色相族：冷蓝板（与 8 个插件图标的暖橙/绿/海洋主色错开，不撞色）。
+     亮色板更亮更饱和（坐在 #fafafa 上），暗色板更深一档（坐在 #232325 上不刺眼）。 */
+  --dock-plate-a: #5b8def;
+  --dock-plate-b: #2f5ec4;
+  --dock-ink: #ffffff;
+  --dock-ink-2: #d7e4ff;
+  --dock-sheen: #ffffff;
+  --dock-shade: #0b1b3a;
+  /* 每槽一个语义点缀色（11 槽全量，亮暗同名一一对应；全部留在冷蓝族内，只随语义微调色相） */
+  --dock-accent-settings: #1f4fa8;
+  --dock-accent-appmenu: #2b5fc0;
+  --dock-accent-marketplace: #1f6f9e;
+  --dock-accent-messages: #24509e;
+  --dock-accent-chat: #2f6fd0;
+  --dock-accent-supervisor: #1e4f8f;
+  --dock-accent-terminal: #2a6a7a;
+  --dock-accent-models: #33559e;
+  --dock-accent-wallpaper: #1f5f9e;
+  --dock-accent-account: #2f5ec4;
+  --dock-accent-desktop: #274f9e;
 }
 
 /* 暗色 */
@@ -86,6 +109,29 @@ html[data-theme='dark'] {
   --titlebar-btn-color: #b0b3ba;
   --titlebar-btn-hover-bg: #333438;
   --titlebar-btn-danger: #f85149;
+  /* ── Dock 内置图标「实体感」族内常量（暗色，与亮色同名一一对应，禁止只改一边）──
+     暗色板比亮色板压暗一档、降饱和，避免坐在 #232325 上刺眼；主体由纯白降到冷白，避免过曝。
+     验收口径（WCAG 1.4.11 非文本对比度）：主体/底板 ≥3:1、点缀色/主体 ≥3:1；
+     实测 主体 4.81、主体暗部 3.26、点缀 11.76、底板/侧栏 2.92（信息项，另由 1px 边框兜底）。 */
+  --dock-plate-a: #5580c8;
+  --dock-plate-b: #2f568c;
+  --dock-ink: #eef3fb;
+  --dock-ink-2: #b9cbe8;
+  --dock-sheen: #cfe0ff;
+  --dock-shade: #000000;
+  /* 每槽语义点缀色（暗色）：比亮色同名字段再压深一档，因为暗色主体是冷白 #eef3fb/浅蓝 #b9cbe8，
+     点缀色必须同时压过「主体亮部」和「主体暗部」两级才看得见（实测取两者中较低的对比度）。 */
+  --dock-accent-settings: #12305c;
+  --dock-accent-appmenu: #24509e;
+  --dock-accent-marketplace: #1a5f88;
+  --dock-accent-messages: #1d4288;
+  --dock-accent-chat: #275cb5;
+  --dock-accent-supervisor: #17407a;
+  --dock-accent-terminal: #215664;
+  --dock-accent-models: #294584;
+  --dock-accent-wallpaper: #1a4f88;
+  --dock-accent-account: #24498f;
+  --dock-accent-desktop: #1f4084;
 }
 
 html,
@@ -101,6 +147,15 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
     'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
   transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* 【任务187】应用菜单置顶浮层窗口（app-menu）整窗必须透明：它铺满整个 workArea，
+   只有面板本体该有背景色。若不显式透明化，body 的 --bg-app 会把整块工作区刷成不透明色，
+   反而把所有下层窗口都盖住（比原来的「被挡住」更糟）。与 Windows 圆角规则同一套选择器写法。 */
+html[data-window='app-menu'],
+html[data-window='app-menu'] body,
+html[data-window='app-menu'] #root {
+  background: transparent;
 }
 
 /* Windows 窗口圆角：Electron 的 roundedCorners 选项仅 macOS 有效，Windows frameless 窗口是直角。

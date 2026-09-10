@@ -369,6 +369,8 @@
   "@wsSendFailed": {"description": "{err} 是异常原文", "placeholders": {"err": {}}},
   "wsCmdTimeout": "The command timed out",
   "@wsCmdTimeout": {"description": "60 秒超时兜底"},
+  "wsCmdConnLost": "The connection was lost before the command returned a result. Please retry.",
+  "@wsCmdConnLost": {"description": "S1-a 断线即失败：连接断开时在途命令的统一失败文案（写进 CmdResult.error 直接上屏）"},
   "updSvcCheckFailed": "Update check failed: {msg}",
   "@updSvcCheckFailed": {"description": "{msg} 可能是 HTTP 状态码（山海拼的结构值）或网关 message 原文（口径④）", "placeholders": {"msg": {}}},
   "updSvcBadJson": "The update check response could not be parsed",

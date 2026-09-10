@@ -483,7 +483,7 @@ declare global {
   interface Window {
     shanhai?: {
       /** 当前窗口类型（desktop/chat/app/supervisor/supervisor-bubble） */
-      windowType: 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble'
+      windowType: 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble' | 'app-menu'
       /** 运行平台（process.platform：darwin/win32/linux） */
       platform: string
       /** app 类型窗口的应用 id，非 app 窗口为 undefined */
@@ -516,6 +516,8 @@ declare global {
       onPluginDragEnd(cb: () => void): () => void
       /** 获取 Dock 窗口顶部距桌面壳底部的距离（应用菜单面板据此定位在 Dock 上方） */
       getDockTop(): Promise<number>
+      /** 【任务187】打开/关闭「应用菜单」专用置顶浮层窗口（主进程是唯一写者：同时切可见态与 appMenuOpen） */
+      setAppMenu(open: boolean): Promise<boolean>
       /** 桌面被点击时，把聊天/应用窗口带回桌面之上（fire-and-forget） */
       restoreAboveDesktop(): void
       /** 隐藏聊天窗口（自定义关闭按钮，聊天窗口常驻不销毁） */
@@ -724,8 +726,9 @@ declare global {
       onReasoning(cb: (sessionId: string, text: string) => void): () => void
       switchModel(id: string): Promise<void>
       getCurrentModelId(): Promise<string>
-      /** 停止执行；不传 sessionId = 停当前激活会话，传了 = 按 id 精确停（管家窗口传 'supervisor'） */
-      stop(sessionId?: string): Promise<void>
+      /** 停止执行；不传 sessionId = 停当前激活会话，传了 = 按 id 精确停（管家窗口传 'supervisor'）。
+       * ★任务194 ⑦-②：回传成/败与原因（与 preload 的声明同步改；参数形态与通道名未动）。 */
+      stop(sessionId?: string): Promise<{ ok: boolean; sessionId?: string; explicit?: boolean; reason?: string }>
       speak(text: string): Promise<void>
       transcribeAudio(audioBase64: string, format?: string): Promise<string>
       getTokenStats(sessionId?: string): Promise<TokenSnapshot>

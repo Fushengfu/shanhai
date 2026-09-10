@@ -253,7 +253,7 @@ export interface UiStateEnvelope {
 
 export interface ShanhaiBridge {
   /** 当前窗口类型（desktop/chat/app/supervisor），由主进程 additionalArguments 注入、preload 读 process.argv 得到 */
-  windowType: 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble'
+  windowType: 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble' | 'app-menu'
   /** 运行平台（process.platform：darwin/win32/linux），渲染层据此做平台差异化（如 Windows 窗口圆角） */
   platform: string
   /** app 类型窗口的应用 id（terminal/trace/memory/settings/models），非 app 窗口为 undefined */
@@ -286,6 +286,12 @@ export interface ShanhaiBridge {
   onPluginDragEnd(cb: () => void): () => void
   /** 获取 Dock 窗口顶部距桌面壳底部的距离（应用菜单面板据此定位在 Dock 上方） */
   getDockTop(): Promise<number>
+  /**
+   * 【任务187】打开/关闭「应用菜单」专用置顶浮层窗口（方案 P）。
+   * 开/关的唯一写者在主进程：它同时切窗口可见态并写回共享状态 appMenuOpen，
+   * 渲染层（Dock 入口 / 面板遮罩）都只调这一个方法，不再各写一半状态。
+   */
+  setAppMenu(open: boolean): Promise<boolean>
   /** 桌面被点击时，把聊天/应用窗口带回桌面之上（fire-and-forget） */
   restoreAboveDesktop(): void
   /** 隐藏聊天窗口（自定义关闭按钮，聊天窗口常驻不销毁） */
@@ -524,8 +530,10 @@ export interface ShanhaiBridge {
   // 模型 / 中断 / 语音 / 电脑
   switchModel(id: string): Promise<void>
   getCurrentModelId(): Promise<string>
-  /** 停止执行；不传 sessionId = 停「当前激活会话」（聊天窗口），传了 = 按 id 精确停（管家窗口传 'supervisor'） */
-  stop(sessionId?: string): Promise<void>
+  /** 停止执行；不传 sessionId = 停「当前激活会话」（聊天窗口），传了 = 按 id 精确停（管家窗口传 'supervisor'）。
+   * ★任务194 ⑦-②：回传成/败与原因（旧声明 Promise<void> ⇒ 渲染层拿不到成败）。
+   * 只改返回类型标注，参数形态与通道名一字未动（不新增 IPC 通道）。 */
+  stop(sessionId?: string): Promise<{ ok: boolean; sessionId?: string; explicit?: boolean; reason?: string }>
   speak(text: string): Promise<void>
   transcribeAudio(audioBase64: string, format?: string): Promise<string>
   // token 用量（会话级）
@@ -745,7 +753,7 @@ function readArg(prefix: string): string | undefined {
   const arg = process.argv.find((a) => a.startsWith(prefix))
   return arg ? arg.slice(prefix.length) : undefined
 }
-const windowType: 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble' = (readArg('--shanhai-window-type=') as 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble') ?? 'chat'
+const windowType: 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble' | 'app-menu' = (readArg('--shanhai-window-type=') as 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble' | 'app-menu') ?? 'chat'
 const windowAppId: string | undefined = readArg('--shanhai-app-id=')
 
 const bridge: ShanhaiBridge = {
@@ -782,6 +790,7 @@ const bridge: ShanhaiBridge = {
     return () => ipcRenderer.removeListener('dock-plugin-drag:end', listener)
   },
   getDockTop: () => ipcRenderer.invoke('window:getDockTop'),
+  setAppMenu: (open) => ipcRenderer.invoke('window:setAppMenu', open),
   restoreAboveDesktop: () => ipcRenderer.send('window:restoreAboveDesktop'),
   hideChatWindow: () => ipcRenderer.invoke('window:hideChat'),
   hideSelf: () => ipcRenderer.invoke('window:hideSelf'),

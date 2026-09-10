@@ -22,6 +22,8 @@ export type AgentEventType =
   | 'approval/request'
   | 'approval/outcome'
   | 'retry/snapshot'
+  /** 用户点「停止」的落点记录（停止取证用）：见 EventData 注释 */
+  | 'session/stopped'
 
 /**
  * 审批策略（安全模式，会话级）：
@@ -52,6 +54,16 @@ export interface EventData {
   'approval/outcome': { id: string; outcome: ApprovalOutcome }
   /** 失败重试挂起快照：重试耗尽后保存「失败节点发给模型的完整 messages 快照 + 重入位置」，供重启后精确重试（body 与失败完全一致） */
   'retry/snapshot': { messages: unknown[]; step: number; maxSteps: number; atLimit: boolean; reason?: string }
+  /**
+   * 用户点「停止」的落点记录（停止取证用）。
+   * 为什么需要：此前停止只在内存里置一个标志位（ctx.stoppedSessions），events.jsonl 里零痕迹，
+   * 导致「点了停止到底停没停、多久才停、停的是不是这个会话」事后完全无法核对。
+   * 用法（按 sessionId 过滤）：本事件 timestamp 之后若还出现该会话的 tool/call 或 usage/record，
+   * 即「没停住 / 停得慢」；到下一条 turn/end 的间隔就是「多久才真停」。
+   * hadRunningLoop=false 表示点时该会话根本没有在跑的 loop（停空），explicit=false 表示走的是
+   * 「无参兜底 → 按全局当前会话」这条会停错对象的老路径。
+   */
+  'session/stopped': { sessionId: string; hadRunningLoop: boolean; explicit: boolean }
 }
 
 export interface SessionEvent<T extends AgentEventType = AgentEventType> {
