@@ -3,6 +3,8 @@ import type { ReactNode } from 'react'
 import type { AppSettings, AppSettingsPatch, AppUpdateCheckResult, AppUpdateDownloadProgress, GatewayModel, HttpTraceRecord, MobileApkInfo, RemoteStatus, RelayStatus } from '../types'
 import { IconActivity, IconGlobe, IconHelp, IconSettings, IconTerminal, IconWrench } from './icons'
 import { formatBytes, smallIconBtn } from './ui'
+// 【任务230 第2条】移动端下载二维码抽成共用件：账号悬停弹窗与设置页共用同一份实现与 URL 生成点
+import { MobileQrImage, mobileQrHint } from './mobileDownload'
 import { WindowTitleBar } from './WindowTitleBar'
 // 进度「状态行」文案与全局浮层同源（期5C A 方案：主进程只发 phase，句子在渲染层取词）
 import { updateStatusLine } from './UpdateProgressOverlay'
@@ -855,15 +857,11 @@ export function SettingsPanel({ left, top, onClose, variant = 'panel' }: { left?
                     ) : null}
                     {mobileApk ? (
                       <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 10 }}>
-                        <img
-                          src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(mobileApk.downloadUrl)}`}
-                          alt={t('settings.apk.qrAlt')}
-                          width={160}
-                          height={160}
-                          style={{ borderRadius: 8, border: '1px solid var(--border-soft)' }}
-                        />
+                        {/* 二维码改用共用件（components/mobileDownload.tsx）：账号弹窗用的是同一份，
+                            src/尺寸/圆角/描边/alt 与改前逐字一致（默认参数就是原值） */}
+                        <MobileQrImage downloadUrl={mobileApk.downloadUrl} />
                         <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-                          {mobileApk.version ? t('settings.apk.scanHintV', { v: mobileApk.version }) : t('settings.apk.scanHint')}
+                          {mobileQrHint(mobileApk.version)}
                         </div>
                         <a
                           href={mobileApk.downloadUrl}

@@ -67,11 +67,20 @@ export type WindowType = 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 's
 /** 窗口类型通过 additionalArguments 注入渲染进程，preload 用 process.argv 读取（同步、无竞态） */
 const WINDOW_TYPE_ARG = '--shanhai-window-type='
 const APP_ID_ARG = '--shanhai-app-id='
+/**
+ * 【任务223】应用窗口的「目标会话」同样经 additionalArguments 注入（与 windowType/appId 同一条既有通路）。
+ * 为什么不用全局状态：222 刚修过的串台 bug 就是「同一渲染进程里两条订阅同时生效」——
+ * 跨窗口全局字段属同类风险面；argv 注入是每个窗口各一份的真相源，天然不会串。
+ * 不传 = 不注入该参数 = 应用窗口回落 currentSessionId，与本改动前逐字节等价。
+ */
+const APP_SESSION_ID_ARG = '--shanhai-app-session-id='
 
 /** 窗口注册表：key 为「type[:appId]:序号」，唯一标识每个窗口实例 */
 export interface WindowMeta {
   type: WindowType
   appId?: string
+  /** app 窗口的目标会话（任务223）；undefined = 未指定，窗口内回落 currentSessionId */
+  appSessionId?: string
   win: BrowserWindow
 }
 
@@ -135,6 +144,11 @@ export interface CreateWindowOptions {
   type: WindowType
   /** app 类型窗口的应用 id（terminal/trace/memory/settings/models 等），用于多开区分 */
   appId?: string
+  /**
+   * 【任务223】app 窗口要展示的「目标会话」（memory/trace 等按会话取数的应用）。
+   * 不传 = 不注入 argv 参数 = 窗口内回落 currentSessionId（与本改动前完全一致）。
+   */
+  appSessionId?: string
   width?: number
   height?: number
   fullscreen?: boolean
@@ -148,7 +162,7 @@ export interface CreateWindowOptions {
  * 关闭语义按类型区分：chat/desktop 点关闭只隐藏（常驻，托盘/快捷键恢复）；app 直接销毁（用完即关）。
  */
 export function createWindow(opts: CreateWindowOptions): BrowserWindow {
-  const { type, appId, isPlugin } = opts
+  const { type, appId, isPlugin, appSessionId } = opts
   // 桌面壳窗口：无边框 + 覆盖屏幕工作区（workArea = 屏幕减去系统菜单栏与 Dock，保留系统 UI 可见；
   // 非原生 fullscreen space，避免聊天窗口被切到别的 Space）
   // Dock 窗口：无边框、底部居中的 Dock 栏（应用图标，独立于桌面壳以便可点击）
@@ -250,12 +264,13 @@ export function createWindow(opts: CreateWindowOptions): BrowserWindow {
       additionalArguments: [
         `${WINDOW_TYPE_ARG}${type}`,
         ...(appId ? [`${APP_ID_ARG}${appId}`] : []),
+        ...(appSessionId ? [`${APP_SESSION_ID_ARG}${appSessionId}`] : []),
       ],
     },
   })
 
   const key = `${type}${appId ? `:${appId}` : ''}:${++seq}`
-  windows.set(key, { type, appId, win })
+  windows.set(key, { type, appId, appSessionId, win })
 
   // 桌面壳窗口：保持 focusable:false（不抢键盘焦点），但【必须接收鼠标事件】。
   // 之前用 setIgnoreMouseEvents(true) 让点击穿透，结果穿透到了 macOS 系统墙纸，触发系统「点按墙纸以显示桌面」，
@@ -353,6 +368,8 @@ function showWindow(win: BrowserWindow | undefined): void {
 
 /** 显示聊天窗口（聊天窗口是常驻主窗口，销毁则重建） */
 export function showChatWindow(): void {
+  // 【任务221 · 第3条】主窗口（合并后的唯一窗口）可见 ⇒ 悬浮图标必须收起（互斥点仍是 syncSupervisorBubble）。
+  syncSupervisorBubble(true)
   const found = findWindow('chat')
   if (found) {
     showWindow(found.win)
@@ -365,30 +382,17 @@ export function showChatWindow(): void {
 }
 
 /**
- * 取或建「会话管家」窗口 —— 全进程【唯一】的管家窗口创建入口（严格单例）。
- *
- * 任何调用方（启动流程 / Dock 图标 / 悬浮图标 / 托盘 / 主进程内部）都必须经这里拿窗口：
- * 注册表里已有存活的 supervisor 窗口（哪怕处于 hide 状态）就原样返回，**绝不再 new 一个**。
- * 旧实现是「启动路径直接 createWindow + showSupervisorWindow 里再 createWindow」两个入口并存，
- * 且启动那个带了 appId 导致按类型查找失配 → 恢复时判定「不存在」→ 又开一个 → 屏幕上两个管家窗口。
- *
- * @returns created=true 表示本次真的新建了窗口，调用方需负责 loadWindowContent。
- */
-export function getOrCreateSupervisorWindow(size?: { width: number; height: number }): { win: BrowserWindow; created: boolean } {
-  const found = findWindow('supervisor')
-  if (found) return { win: found.win, created: false }
-  const win = createWindow({ type: 'supervisor', width: size?.width, height: size?.height })
-  return { win, created: true }
-}
-
-/**
- * 管家窗口 ↔ 悬浮图标的【唯一】互斥同步点：两者显隐一律由「管家窗口当前是否可见」推导。
+ * 【主窗口 ↔ 悬浮图标】的【唯一】互斥同步点：两者显隐一律由「主窗口当前是否可见」推导。
+ * （函数名沿用历史；单窗口化后唯一的「主窗口」是 chat —— 独立管家窗口已取消，见 showSupervisorWindow。）
  *
  * 旧实现把互斥逻辑拆在两处各写一半（showSupervisorWindow 里 hide 气泡、hideSupervisorToBubble 里
  * 【无条件】show 气泡），一旦窗口查找失配就退化成「窗口还开着、气泡也冒出来」。现在所有路径
  * （显示窗口 / 关闭窗口 / close 事件 / closed 销毁兜底）都只调这一个函数，显隐状态不可能漂移。
  *
- * @param winVisible true=管家窗口可见 → 气泡必须消失；false=管家窗口不可见 → 气泡必须给出（唯一返回入口）
+ * 调用点（任务221 后）：showChatWindow(true) / hideChatWindow(false) / hideToSystemDesktop(false) /
+ * supervisor 与 supervisor-bubble 的 closed 兜底。
+ *
+ * @param winVisible true=主窗口可见 → 气泡必须消失；false=主窗口不可见 → 气泡必须给出（唯一返回入口）
  */
 function syncSupervisorBubble(winVisible: boolean): void {
   const bubble = findWindow('supervisor-bubble')
@@ -408,18 +412,15 @@ function syncSupervisorBubble(winVisible: boolean): void {
   })
 }
 
-/** 显示会话管家窗口（常驻，销毁则重建）。与悬浮图标的互斥由 syncSupervisorBubble 统一处理 */
+/**
+ * 【任务221 · 第2条】原「显示会话管家窗口」入口 —— 独立管家窗口已取消（用户明确要求单窗口）。
+ *
+ * 保留函数名（仍有 IPC / 其它模块按名字调用）但**不再创建任何独立窗口**：
+ * 一律转发到合并后的主窗口 chat。`getOrCreateSupervisorWindow`（全进程唯一的管家窗口创建入口）
+ * 随之删除，因此这条线上已不存在任何能 new 出 supervisor 窗口的代码路径。
+ */
 export function showSupervisorWindow(): void {
-  const { win, created } = getOrCreateSupervisorWindow()
-  if (created) {
-    void loadWindowContent(win).then(() => {
-      showWindow(win)
-      syncSupervisorBubble(true)
-    })
-    return
-  }
-  showWindow(win)
-  syncSupervisorBubble(true)
+  showChatWindow()
 }
 
 /**
@@ -442,16 +443,22 @@ export function hideSupervisorToBubble(sender?: BrowserWindow): void {
   syncSupervisorBubble(false)
 }
 
-/** 兜底：悬浮图标被销毁而管家窗口仍藏在后台时，把管家窗口带回前台，避免用户失去唯一返回入口 */
+/**
+ * 兜底：悬浮图标被销毁而主窗口仍藏在后台时，把主窗口带回前台，避免用户失去唯一返回入口。
+ * 【任务221】原先找的是 supervisor 窗口；单窗口化后唯一的主窗口是 chat。
+ */
 function recoverHiddenSupervisor(): void {
-  const found = findWindow('supervisor')
+  const found = findWindow('chat')
   if (!found || found.win.isVisible()) return
   showWindow(found.win)
 }
 
-/** 点击悬浮图标 → 隐藏图标 + 恢复管家窗口 */
+/**
+ * 【任务221 · 第3条】点击悬浮图标 → 收起图标 + 打开**合并后的主窗口**（chat）。
+ * 原实现是 showSupervisorWindow()（恢复独立管家窗口）；独立窗口取消后，入口统一指向主窗口。
+ */
 export function showSupervisorFromBubble(): void {
-  showSupervisorWindow()
+  showChatWindow()
 }
 
 /** 拖动悬浮图标：按位移增量移动窗口（渲染进程 mousemove 时调用） */
@@ -462,12 +469,17 @@ export function moveSupervisorBubble(dx: number, dy: number): void {
   bubble.win.setPosition(Math.round(b.x + dx), Math.round(b.y + dy))
 }
 
-/** 隐藏聊天窗口（自定义关闭按钮用：聊天窗口常驻，点关闭只隐藏，托盘/快捷键恢复） */
+/**
+ * 隐藏聊天窗口（自定义关闭按钮用：聊天窗口常驻，点关闭只隐藏，托盘/快捷键恢复）。
+ * 【任务221 · 第3条】隐藏后给出悬浮图标：单窗口化后它是「关掉窗口还想再回来」的唯一浮动入口，
+ * 点它走 showSupervisorFromBubble → showChatWindow 打开合并后的主窗口。
+ */
 export function hideChatWindow(): void {
   const found = findWindow('chat')
   if (found && !found.win.isDestroyed()) {
     found.win.hide()
   }
+  syncSupervisorBubble(false)
 }
 
 /**
@@ -549,7 +561,10 @@ export function hideToSystemDesktop(): void {
     if (meta.win.isDestroyed() || !meta.win.isVisible()) continue
     // 悬浮图标：保持显示 + 保持置顶，不参与「回到桌面」的隐藏
     if (meta.type === 'supervisor-bubble') continue
-    if (meta.type === 'supervisor') supervisorHidden = true
+    // 【任务221 · 第3条】合并后「主窗口」= chat：它被「回到桌面」收起时必须给出悬浮图标，
+    // 否则用户回到桌面后既没有窗口也没有浮标，只能重启应用（旧实现只认 supervisor 类型，
+    // 单窗口化后那个类型已不存在 ⇒ 浮标永远不会出现）。
+    if (meta.type === 'supervisor' || meta.type === 'chat') supervisorHidden = true
     meta.win.hide()
   }
   // 收起的是管家主窗口 → 按互斥语义补出悬浮图标（syncSupervisorBubble 是唯一互斥同步点，不另写一半）
@@ -646,7 +661,7 @@ export function toggleChatWindow(): void {
 }
 
 /** 打开插件应用窗口：已有则聚焦，否则创建。app 窗口可多开（terminal 支持多个），此处按 appId 复用单实例 */
-export async function openApp(appId: string): Promise<boolean> {
+export async function openApp(appId: string, appSessionId?: string): Promise<boolean> {
   // 会话管家是独立常驻窗口（非 app 类型），Dock 图标点击转发到 supervisor 窗口
   if (appId === 'supervisor') {
     showSupervisorWindow()
@@ -659,11 +674,19 @@ export async function openApp(appId: string): Promise<boolean> {
   }
   const existing = findWindow('app', appId)
   if (existing) {
-    showWindow(existing.win)
-    return true
+    // 【任务223】目标会话变了（例：会话侧开着「记忆」窗，用户切到管家面板再点「记忆」）：
+    // 直接复用旧窗口会让它继续显示上一个会话的数据 —— 属「静默显示错的数据」。
+    // argv 是窗口创建时注入的，改不了，故销毁重建（仍是「按 appId 复用单实例」，只是重新指向新目标）。
+    if (existing.meta.appSessionId !== appSessionId) {
+      existing.win.destroy()
+      restoreAboveDesktop()
+    } else {
+      showWindow(existing.win)
+      return true
+    }
   }
   const savedSize = readWindowBounds()[appId] ?? defaultAppSize(appId)
-  const win = createWindow({ type: 'app', appId, width: savedSize.width, height: savedSize.height, isPlugin: isPluginApp(appId) })
+  const win = createWindow({ type: 'app', appId, appSessionId, width: savedSize.width, height: savedSize.height, isPlugin: isPluginApp(appId) })
   // t7/P7 私信面板拖动/缩放后按 appId 持久化尺寸（防抖 300ms），不监听其它 app 避免写入噪声
   if (appId === DM_PANEL_APP_ID) {
     let saveTimer: ReturnType<typeof setTimeout> | undefined

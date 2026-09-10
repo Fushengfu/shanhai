@@ -1,8 +1,9 @@
 import { useState } from 'react'
-import { IconActivity, IconClock, IconClose, IconMaximize, IconMinimize, IconMonitor, IconMoon, IconRestore, IconSidebar, IconSun } from '../components/icons'
+import { IconClose, IconMaximize, IconMinimize, IconMonitor, IconRestore, IconSidebar } from '../components/icons'
 import { smallIconBtn } from '../components/ui'
 import { WindowControlButton } from '../components/WindowTitleBar'
 import { DmEntryButton } from '../components/DmEntryButton'
+import { HeaderActionButtons } from '../components/HeaderActionButtons'
 import { registerSlot, AppendSlotView } from '../slots'
 import { useUIContext } from '../ui-context'
 import { t } from '../../shared/i18n'
@@ -42,29 +43,8 @@ function HeaderSlot(): React.JSX.Element {
         </button>
         <div style={{ fontWeight: 600, fontSize: 14 }}>{t('chat.brand')}</div>
         <DmEntryButton loggedIn={ctx.loggedIn} labeled style={{ marginLeft: 'auto' }} />
-        <button
-          onClick={() => void window.shanhai?.openApp('memory')}
-          title={t('panels.header.memoryTip')}
-          style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer', ...({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) }}
-        >
-          <IconClock />
-          {t('app.memory.name')}
-        </button>
-        <button
-          onClick={() => void window.shanhai?.openApp('trace')}
-          title={t('panels.header.traceTip')}
-          style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer', ...({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) }}
-        >
-          <IconActivity />
-          {t('app.trace.name')}
-        </button>
-        <button
-          onClick={ctx.toggleTheme}
-          title={ctx.theme === 'light' ? t('common.themeToDark') : t('common.themeToLight')}
-          style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 10px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer', ...({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) }}
-        >
-          {ctx.theme === 'light' ? <IconMoon /> : <IconSun />}
-        </button>
+        {/* 功能按钮组（记忆 / 轨迹 / 主题）：与管家面板标题栏共用 components/HeaderActionButtons 一份实现 */}
+        <HeaderActionButtons theme={ctx.theme} onToggleTheme={ctx.toggleTheme} />
         <WindowControlButton title={t('common.winMinimize')} onClick={handleMinimize}>
           <IconMinimize />
         </WindowControlButton>

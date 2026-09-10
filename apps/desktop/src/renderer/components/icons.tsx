@@ -139,6 +139,66 @@ export function IconStop() {
   )
 }
 
+/**
+ * 手机端图标（左下角账号区的「下载手机端」入口）。
+ * 风格与同文件其它图标**逐项一致**：viewBox 24 / 16×16 / fill none / stroke currentColor /
+ * strokeWidth 2 / round 线帽与线接（对照上方 IconMonitor、IconLogout）。
+ */
+export function IconMobile() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="6" y="2" width="12" height="20" rx="2.5" />
+      <path d="M11 18.5h2" />
+    </svg>
+  )
+}
+
+/**
+ * 【任务232】管家浮标图标族（三个候选，同风格：viewBox 24 / fill none / stroke currentColor /
+ * strokeWidth 2 / round 线帽与线接 —— 与本文件上面 IconMonitor、IconLogout 逐项一致）。
+ *
+ * 【语义口径】合并后浮标点开的是**主窗口（会话管家主入口）**，不再是「另开一个独立管家窗口」，
+ * 所以三个候选都刻意避开「新窗口框 / 加号 / 外链箭头」这类「再开一个」的图形语言。
+ * 落地的是 IconHome；另两个作为候选一并留在文件里，换图标只需把
+ * `supervisor/SupervisorBubble.tsx` 里的 `<IconHome />` 换成候选名（一行）。
+ */
+
+/** 候选①【已落地】主入口：房子轮廓 —— 「回到 / 进入主窗口」最直接、最无歧义的通用语义 */
+export function IconHome() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 10.5 12 3l9 7.5" />
+      <path d="M5.5 9.8V19a1.5 1.5 0 0 0 1.5 1.5h10A1.5 1.5 0 0 0 18.5 19V9.8" />
+    </svg>
+  )
+}
+
+/** 候选② 调度中枢：中心节点 + 三个外围节点 + 三条连线 —— 表达「管家在编排各会话」（不是窗口） */
+export function IconHub() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="3" />
+      <circle cx="12" cy="4" r="2" />
+      <circle cx="5" cy="18" r="2" />
+      <circle cx="19" cy="18" r="2" />
+      <path d="M12 9V6" />
+      <path d="M9.7 13.9 6.3 16.7" />
+      <path d="M14.3 13.9 17.7 16.7" />
+    </svg>
+  )
+}
+
+/** 候选③ 管家：圆环内的人形（头 + 肩） —— 「管家/主入口背后的人」，与 IconAvatar 同族但多了外环 */
+export function IconSteward() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9" />
+      <circle cx="12" cy="9.8" r="2.6" />
+      <path d="M7.2 18.1a5.4 5.4 0 0 1 9.6 0" />
+    </svg>
+  )
+}
+
 export function IconChevronDown() {
   return (
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

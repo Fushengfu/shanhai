@@ -209,6 +209,8 @@ export interface RuntimeContext {
   authService: AuthService
   loggedIn: boolean
   username: string | null
+  /** 【任务235】当前登录用户自己的头像 URL（未登录 / 网关未下发 / 老配置无该字段时为 null）。只读暴露给渲染层。 */
+  avatar: string | null
   selectedTier: ModelTier
   modelsChangedCallbacks: Set<() => void>
   authExpiredCallbacks: Set<() => void>

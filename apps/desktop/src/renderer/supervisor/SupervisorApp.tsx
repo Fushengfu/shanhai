@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as React from 'react'
 import { createPortal } from 'react-dom'
-import { getUiStoreSnapshot, patchUiStore, useUiStoreSelector, useStreaming } from '../store-client'
+import { getUiStoreSnapshot, patchUiStore, useUiStoreSelector } from '../store-client'
 import { EMPTY_SESSION, type ChatItem, type ContentPart, type DmQuotePayload, type HistoryItem, type SessionListItem, type SessionUIState } from '../types'
 import { WindowTitleBar } from '../components/WindowTitleBar'
 import { AiOrb } from '../components/AiOrb'
@@ -22,8 +22,13 @@ import { dmContentToPlainText } from '../../shared/dm-attachment'
 import { t as tKey, tf as tfKey } from '../../shared/i18n'
 import { applyLocale, renderRich, useLocaleSync } from '../locale'
 import { DmEntryButton } from '../components/DmEntryButton'
-import { VirtualList } from '../components/VirtualList'
-import { IconChevronDown, IconMonitor, IconWarn, IconMoon, IconSun } from '../components/icons'
+import { HeaderActionButtons } from '../components/HeaderActionButtons'
+import { MessageScrollArea } from '../components/MessageScrollArea'
+import { ScrollToBottomButton } from '../components/ScrollToBottomButton'
+import { useScrollToBottom } from '../hooks/useScrollToBottom'
+import { appendErrorBubble, ERROR_RESET_STATE } from '../components/errorBubble'
+import { buildSupervisorFeed, useSupervisorFeedData } from '../feed/supervisor-feed'
+import { IconMonitor, IconWarn } from '../components/icons'
 import { btn, formatBytes, prettyValue, LiveDuration, ThinkingDots } from '../components/ui'
 import { useThemeSync, readTheme, applyTheme, type ThemeMode } from '../theme'
 
@@ -149,11 +154,16 @@ function supervisorArgsSummary(args: Record<string, unknown>, sessions: SessionL
 }
 
 /**
- * 会话管家窗口（主 Agent）：独立常驻的单会话聊天界面。
+ * 会话管家（主 Agent）：单会话聊天界面。
  * 只显示管家超级会话（sessionMap['supervisor']）的消息流，发送走 supervisorRun（IPC → runtime.runSupervisor）。
  * 输入框复用聊天窗口的 Composer（附件 / 模型 / 安全模式 / 麦克风 / 发送 完全一致）。
+ *
+ * @param props.onClosePanel 【任务218 · 单窗口合并】仅「内嵌面板形态」传入：聊天窗口右列渲染管家时，
+ *   标题栏关闭按钮 = 收起面板回到当前会话。不传时保持独立窗口形态的既有行为
+ *   （hideSupervisorToBubble：隐藏窗口并给出悬浮图标）—— main.tsx 以 `<SupervisorApp />` 挂载，
+ *   走的正是这条默认路径，独立窗口行为一字未变。
  */
-export function SupervisorApp(): React.JSX.Element {
+export function SupervisorApp(props: { onClosePanel?: () => void; dmQuote?: DmQuotePayload | null; onDmQuoteApplied?: () => void } = {}): React.JSX.Element {
   // 卡顿优化（P0）：窄订阅替代全量 useUiStore()。仅订阅 supervisor 会话自身相关的窄字段，
   // 其他会话的工具步骤 / token / 审批 / 流式等高频变化不再触发管家整窗重渲染（浅比较不变的字段返回缓存引用）。
   const ui = useUiStoreSelector((s) => ({
@@ -169,9 +179,17 @@ export function SupervisorApp(): React.JSX.Element {
     tokenStats: s.tokenStatsBySession[SUPERVISOR_SID] ?? null,
   }))
   const cur = ui.cur
-  const streaming = useStreaming(SUPERVISOR_SID)
-  const curApproval = ui.curApproval
-  const curAsk = ui.curAsk
+  // —— 消息流数据面统一走 SessionFeed 适配器（feed/supervisor-feed.ts）——
+  // 与聊天窗口（plugins/ChatPlugin 经 feed/chat-feed.ts）**同一套字段名、同一套接法**（原引用直通、零转换）。
+  // 放在原 `useStreaming(SUPERVISOR_SID)` 的位置：adapter 内部仍只有这一个订阅（同一会话 id），
+  // 因此 hook 顺序与订阅数与改造前完全一致。
+  // 数据面必须在组件早期就绪：下面的节流 ref、私信自动路由 effect、吸底跟随 effect、send 的依赖
+  // 都在本段之后、动作回调之前求值，若整套 feed 放到组件后段组装会踩 const 的 TDZ。
+  const feedData = useSupervisorFeedData({ sessionId: SUPERVISOR_SID, cur, curApproval: ui.curApproval, curAsk: ui.curAsk })
+  // 以下三个局部别名只为让 return 块（渲染 JSX）保持不变而保留，取值全部来自 adapter（与原来源是同一引用）
+  const streaming = feedData.streaming
+  const curApproval = feedData.approval
+  const curAsk = feedData.ask
   const capabilityApproval = ui.capabilityApproval
 
   // 卡顿优化（P0）：流式正文 markdown 节流（对齐 ChatPlugin）。streaming.text 每帧都在变长，
@@ -214,31 +232,14 @@ export function SupervisorApp(): React.JSX.Element {
   // 塞进去的提示会被抹掉（该重建发生在 stop 之后、run 返回之前）。
   const [stopNotice, setStopNotice] = useState<{ level: 'ok' | 'warn' | 'error'; text: string } | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
-  // 是否在底部：仅由滚动事件维护（对齐 ChatPlugin 已被验证正常的吸底写法）。
-  // 初始为 true：窗口首次加载历史时（cur.items 从空 → 填充）自动滚到底部最新消息。
-  const atBottomRef = useRef(true)
-  // 「回到最新消息」按钮的显隐：atBottomRef 是 ref（不触发重渲染），按钮要显隐必须另存一份可触发渲染的镜像。
-  // 与聊天窗口（ChatPlugin）同一份实现，仅由滚动事件（handleScroll）与滚到底的动作同步，不引入第二套判定。
-  const [showScrollBottom, setShowScrollBottom] = useState(false)
-
-  // 用户滚动（滚轮/拖条/键盘）时更新「是否在底部」状态，供吸底 effect gate 用；
-  // 同时用同一份判定决定「回到最新消息」按钮的显隐（阈值 120px 一字未改）。
-  const handleScroll = useCallback((): void => {
-    const el = listRef.current
-    if (!el) return
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120
-    atBottomRef.current = atBottom
-    setShowScrollBottom(!atBottom)
-  }, [])
-
-  // 点击「回到最新消息」：滚到底并收起按钮（滚底写法与既有吸底 effect 一致，不另抽公共函数）。
-  const handleScrollToBottom = useCallback((): void => {
-    const el = listRef.current
-    if (!el) return
-    el.scrollTop = el.scrollHeight
-    atBottomRef.current = true
-    setShowScrollBottom(false)
-  }, [])
+  // 【任务223】标题栏「记忆 / 轨迹」不再由本文件在面板内盖一层子面板（220 的做法），
+  // 改为与会话侧**同一条 openApp 路径**开独立应用窗口，只是把目标会话（SUPERVISOR_SID）经
+  // HeaderActionButtons 的 sessionId 传下去（→ openApp(appId, sessionId) → 窗口 argv）。
+  // 用户实测反馈 220 的内嵌版「跟子会话的不一样，搞得很特立」，故收敛回统一行为。
+  // 是否在底部 + 「回到最新消息」按钮的显隐与滚底动作：与聊天窗口（ChatPlugin）共用一份实现
+  // （hooks/useScrollToBottom，阈值 120 与滚底写法一字未改）。
+  // 吸底跟随 effect 仍留在本文件下方：其依赖数组与聊天窗口不同（见该 effect 的注释），属有意差异，未并入 hook。
+  const { atBottomRef, showScrollBottom, handleScroll, handleScrollToBottom } = useScrollToBottom(listRef)
 
   // 主题：订阅主进程广播，跟随聊天窗口切换（亮/暗实时同步）
   useThemeSync()
@@ -278,8 +279,17 @@ export function SupervisorApp(): React.JSX.Element {
    * 并显示来源提示条。明确不做：不自动发送、不写 items、不进 Agent 上下文、不触发工具执行或审批。
    */
   useEffect(() => {
+    // 【任务222 · 第1条】被主窗口内嵌时（App 恒传入 dmQuote 控制值 ⇒ props.dmQuote !== undefined），
+    // 引用由宿主经 props 投递（见下方 useeffect），这里**不再自订阅**：同窗口若两条路径都生效，
+    // 私信原文会被追加进管家输入框两遍。独立窗口形态（main.tsx 的 <SupervisorApp />）不传该 prop，
+    // 走的仍是这条自订阅路径，行为与从前一致。
+    if (props.dmQuote !== undefined) return
     const off = window.shanhai?.onDmQuoteToSession((payload) => {
       if (!payload?.text) return
+      // ★只在目标确实就是管家时写入：主进程现在把「管家 / 普通会话」两种目标都投给 chat 窗口
+      //   （见 main/member-channel.ts 的 quoteDmToSession），不判目标的话，引用到普通会话的内容
+      //   会被同时追加进管家输入框（跨会话串台）。
+      if (payload.sessionId !== SUPERVISOR_SID) return
       // 【真机 bug 兜底】与聊天窗口 App.tsx 同一处修法：主进程 quoteDmToSession 已把附件私信的
       // 紧凑 JSON 引用展开成「正文 + [图片] 名字 → URL」，但主进程只在 app 启动时读一次 dist/main，
       // 渲染层每次开窗口都读最新 dist/renderer —— 版本偏斜时投来的就是裸 JSON。
@@ -288,7 +298,20 @@ export function SupervisorApp(): React.JSX.Element {
       setDmQuote(payload)
     })
     return off
-  }, [])
+  }, [props.dmQuote])
+
+  /**
+   * 【任务222 · 第1条】内嵌形态下由宿主（App）投递的私信引用：追加进管家输入框 + 显示来源提示条，
+   * 然后回调宿主清空（本组件只消费一次，避免切走再切回时重复追加）。
+   * 只依赖载荷本身：一次投递恰好执行一次追加。
+   */
+  useEffect(() => {
+    if (!props.dmQuote?.text) return
+    composerRef.current?.appendInput(dmContentToPlainText(props.dmQuote.text))
+    setDmQuote(props.dmQuote)
+    props.onDmQuoteApplied?.()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.dmQuote])
 
   // 【管家接管·t6 好友消息自动路由】好友发来消息 → 若「管家接管」开（member-channel 只在 dmAutoReply 时广播），
   // 由这里订阅并触发一轮管家「理解 → 决定（直接回复 / 安排会话处理后回复 / 忽略）」。
@@ -298,7 +321,7 @@ export function SupervisorApp(): React.JSX.Element {
   useEffect(() => {
     const off = window.shanhai?.onDmAutoRoute(async (payload) => {
       if (!payload?.content) return
-      if (cur.busy) return // 管家正在跑一轮：不打断、不并线，丢弃本次（下次好友消息再触发）
+      if (feedData.busy) return // 管家正在跑一轮：不打断、不并线，丢弃本次（下次好友消息再触发）
       // 口吻设置（对外措辞，B=assistant 默认；user 占位第一版不实现，统一按 assistant 基线）
       let mode: 'assistant' | 'user' = 'assistant'
       try {
@@ -319,7 +342,7 @@ export function SupervisorApp(): React.JSX.Element {
       })
     })
     return off
-  }, [cur.busy])
+  }, [feedData.busy])
 
   // 启动时加载管家会话历史（跨重启保留）+ 管家工作目录
   useEffect(() => {
@@ -354,7 +377,8 @@ export function SupervisorApp(): React.JSX.Element {
     if (atBottomRef.current) el.scrollTop = el.scrollHeight
     // 依赖 streamedText（120ms 节流后的 state）而非 streaming.text/reasoning（每帧变长），
     // 避免 rAF 期间每帧触发同步 reflow（scrollTop = scrollHeight 强制 layout）
-  }, [cur.items, streamedText, curApproval])
+    // 元素与顺序保持改造前的 [items, streamedText, approval] 三项不变，仅取值改经 feed adapter（引用恒等）
+  }, [feedData.items, streamedText, feedData.approval])
 
   /** 任务完成自动语音播报：受「语音播报」开关控制，清洗 markdown 后截断播报，播报期间显示 3D 特效 */
   async function speakResult(text: string): Promise<void> {
@@ -480,10 +504,8 @@ export function SupervisorApp(): React.JSX.Element {
       })
       .catch((err) => {
         patchSession((s) => ({
-          items: [...s.items, { kind: 'assistant', content: tKey('chat.shell.errorPrefix', { msg: err instanceof Error ? err.message : String(err) }), turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: 0 }],
-          streaming: '',
-          streamingReasoning: '',
-          busy: false,
+          items: appendErrorBubble(s.items, err instanceof Error ? err.message : String(err), { turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: 0 }),
+          ...ERROR_RESET_STATE,
         }))
       })
   }, [patchSession])
@@ -507,10 +529,8 @@ export function SupervisorApp(): React.JSX.Element {
       })
       .catch((err) => {
         patchSession((s) => ({
-          items: [...s.items, { kind: 'assistant', content: tKey('chat.shell.errorPrefix', { msg: err instanceof Error ? err.message : String(err) }), turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: 0 }],
-          streaming: '',
-          streamingReasoning: '',
-          busy: false,
+          items: appendErrorBubble(s.items, err instanceof Error ? err.message : String(err), { turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: 0 }),
+          ...ERROR_RESET_STATE,
         }))
       })
   }, [patchSession])
@@ -520,7 +540,7 @@ export function SupervisorApp(): React.JSX.Element {
     const input = composerRef.current?.getInput() ?? ''
     const attachments = composerRef.current?.getAttachments() ?? []
     const text = input.trim()
-    if (!text || cur.busy) return
+    if (!text || feedData.busy) return
     // 【P3 修静默失败·与聊天窗口同一根因】判定条件一字未改，只把「静默 return」换成可见原因
     const notReady = attachments.filter((a) => a.type === 'image' && a.uploadStatus !== 'done')
     if (notReady.length > 0) {
@@ -603,11 +623,24 @@ export function SupervisorApp(): React.JSX.Element {
       }
     } catch (err) {
       const base = (await authoritativeItems()) ?? getUiStoreSnapshot().sessionMap[SUPERVISOR_SID]?.items ?? []
-      patchSession({ items: [...base, { kind: 'assistant', content: tKey('chat.shell.errorPrefix', { msg: err instanceof Error ? err.message : String(err) }), turnSeq: base.filter((it) => it.kind === 'user').length, turnDuration: Date.now() - startTs }] })
+      patchSession({ items: appendErrorBubble(base, err instanceof Error ? err.message : String(err), { turnSeq: base.filter((it) => it.kind === 'user').length, turnDuration: Date.now() - startTs }) })
     } finally {
       patchSession({ busy: false })
     }
-  }, [cur.busy, patchSession])
+  }, [feedData.busy, patchSession])
+
+  // 消息流**接口面**组装（数据面 feedData + 本窗口动作面）：供下方渲染/分组逻辑统一按 SessionFeed 字段取数，
+  // 与聊天窗口 ChatPlugin 经 useChatFeed() 取数的方式一致。纯组装：字段全是原引用直通，不做转换、不兜底。
+  const feed = buildSupervisorFeed(feedData, {
+    resendMessage,
+    editResend,
+    setPreviewImage,
+    respondApproval,
+    respondAsk,
+    cancelAsk,
+    send,
+    stop: stopSend,
+  })
 
   // 消息流渲染（按轮次分组：user 后收集 tool，遇 assistant 聚合进回复气泡）
   // 用 useMemo 缓存历史消息节点：streaming 变化时 items/busy/resend/edit 引用均不变，返回缓存的 nodes，
@@ -629,7 +662,7 @@ export function SupervisorApp(): React.JSX.Element {
         </div>,
       )
     }
-    for (const it of cur.items as ChatItem[]) {
+    for (const it of feed.items as ChatItem[]) {
       if (it.kind === 'user') {
         flushTools(`u${seq}`)
         const idx = userIdx++
@@ -639,10 +672,10 @@ export function SupervisorApp(): React.JSX.Element {
               content={it.content}
               images={it.images}
               userIndex={idx}
-              busy={cur.busy}
+              busy={feed.busy}
               pending={it.pending}
-              onResend={resendMessage}
-              onEditResend={editResend}
+              onResend={feed.resendMessage}
+              onEditResend={feed.editResend}
               onPreviewImage={handlePreviewImage}
             />
           </div>,
@@ -665,9 +698,9 @@ export function SupervisorApp(): React.JSX.Element {
         toolBuffer.push(it.trace)
       }
     }
-    if (!cur.busy) flushTools('tail')
+    if (!feed.busy) flushTools('tail')
     return { nodes, pendingTools: toolBuffer }
-  }, [cur.items, cur.busy, resendMessage, editResend, handlePreviewImage])
+  }, [feed.items, feed.busy, feed.resendMessage, feed.editResend, handlePreviewImage])
 
   return (
     <div
@@ -687,19 +720,18 @@ export function SupervisorApp(): React.JSX.Element {
         title={tKey('common.supervisorSession')}
         subtitle={tKey('sup.subtitle')}
         tone="purple"
-        onClose={() => void window.shanhai?.hideSupervisorToBubble()}
+        onClose={props.onClosePanel ?? (() => void window.shanhai?.hideSupervisorToBubble())}
         actions={
           <>
             {/* 私信入口：与聊天窗口顶栏同一个组件、同一真值源（member:unread / member:friends 广播），
                 管家窗口较窄用仅图标形态；未登录/凭证失效时按钮置红 + 红点，不显示「0 未读」假装正常 */}
-            <DmEntryButton loggedIn={ui.loggedIn} />
-            <button
-              onClick={toggleTheme}
-              title={theme === 'light' ? tKey('common.themeToDark') : tKey('common.themeToLight')}
-              style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 10px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-panel)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer' }}
-            >
-              {theme === 'light' ? <IconMoon /> : <IconSun />}
-            </button>
+            <DmEntryButton loggedIn={ui.loggedIn} labeled />
+            {/* 功能按钮组（记忆 / 轨迹 / 主题）：与普通会话窗口顶栏（HeaderPlugin）**共用同一份实现**，
+                此前管家侧只有「私信 + 主题」两个入口，与会话侧四个不一致（用户实测反馈）。
+                【任务223】记忆/轨迹传 sessionId='supervisor'：与会话侧走**同一条 openApp 路径**开独立
+                应用窗口（视觉/交互一致），只是窗口目标会话是管家自己 —— 管家会话不是、也不能是
+                currentSessionId，故必须显式传下去，不能靠全局游标。 */}
+            <HeaderActionButtons theme={theme} onToggleTheme={toggleTheme} sessionId={SUPERVISOR_SID} />
           </>
         }
       />
@@ -744,18 +776,8 @@ export function SupervisorApp(): React.JSX.Element {
           本层 position:relative 后成为按钮的包含块，其底边 === 消息区底 === 输入区顶，
           输入区高度再怎么变都不影响按钮位置（纯 flex/CSS，不引入 ResizeObserver、不新增状态）。
           只包 VirtualList；审批卡 / 能力审批卡仍留在外层，继续按原 bottom:158 锚定，行为一字未改。 */}
-      <div
-        style={{
-          flex: 1,
-          minWidth: 0,
-          minHeight: 0,
-          position: 'relative',
-          display: 'flex',
-          flexDirection: 'column',
-        }}
-      >
-      <VirtualList
-        containerRef={listRef}
+      <MessageScrollArea
+        listRef={listRef}
         items={nodes}
         onScroll={handleScroll}
         isEmpty={cur.items.length === 0 && !cur.busy}
@@ -808,58 +830,20 @@ export function SupervisorApp(): React.JSX.Element {
             </div>
           ) : null
         }
-        style={{
-          flex: 1,
-          minHeight: 0,
-          width: '100%',
-          maxWidth: '100%',
-          minWidth: 0,
-          boxSizing: 'border-box',
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'stretch',
-          overflowY: 'auto',
-          overflowX: 'hidden',
-          padding: 16,
-          background: 'var(--bg-sidebar)',
-          contain: 'layout',
-        }}
-      />
+      >
 
         {/* 「回到最新消息」浮动按钮：用户上滑查看历史（不在底部）时才出现，点一下滚回底部并自动消失。
-            与聊天窗口同一份实现（含水平居中写法）；锚定在上面那层定位容器里（不是消息滚动容器内 ——
-            该容器带 contain:'layout' + overflow，放进去会被裁），bottom 相对消息区底 === 输入区顶。 */}
+            与聊天窗口共用一份实现（components/ScrollToBottomButton，含水平居中写法）；挂在 MessageScrollArea
+            的定位层里（不是消息滚动容器内 —— 该容器带 contain:'layout' + overflow，放进去会被裁），
+            bottom 相对消息区底 === 输入区顶。 */}
         {showScrollBottom && (
-          <button
+          <ScrollToBottomButton
             onClick={handleScrollToBottom}
             title={tKey('chat.plugin.scrollBottomTitle')}
-            style={{
-              position: 'absolute',
-              // 水平居中：与聊天窗口 / 私信「回到最新消息」按钮同一写法（left:'50%' + translateX(-50%)）。
-              // 包含块是上面的定位容器（position:'relative'），横向即整个消息区宽。
-              left: '50%',
-              transform: 'translateX(-50%)',
-              bottom: 14,
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 6,
-              padding: '6px 14px',
-              borderRadius: 14,
-              border: '1px solid var(--accent)',
-              background: 'var(--bg-panel)',
-              color: 'var(--accent)',
-              fontSize: 13,
-              cursor: 'pointer',
-              boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
-            }}
-            onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--tint-blue-soft)')}
-            onMouseLeave={(e) => (e.currentTarget.style.background = 'var(--bg-panel)')}
-          >
-            <IconChevronDown />
-            {tKey('chat.plugin.scrollBottom')}
-          </button>
+            label={tKey('chat.plugin.scrollBottom')}
+          />
         )}
-      </div>
+      </MessageScrollArea>
 
       {/* 输入区：自包含 SupervisorComposer（附件 / 模型 / 安全模式 / 麦克风 / 发送），键入只重渲染本子树 */}
       <SupervisorComposer

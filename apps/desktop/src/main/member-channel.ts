@@ -2335,7 +2335,9 @@ export function getUnread(): DmUnread {
  * 明确不做：不调 runtime.run / injectMessage / chat:run，不写 sessionMap/items，不碰审批队列。
  * 来源标记放在载荷（fromName / msgId / ts）而不是拼进正文：渲染层用输入区引用卡片呈现，
  * 避免伪装前缀文本被 resendMessage / editResend 重放进模型上下文。
- * 投递面：普通会话只投 chat 窗口、管家会话只投 supervisor 窗口，且跳过发起窗口；插件窗口一律不投。
+ * 投递面：两种目标都投 **chat 窗口**（218 单窗口化后管家面板就在主窗口右列，不再有独立 supervisor 窗口；
+ * 由渲染层按 payload.sessionId 再分派：管家 → 管家面板，普通会话 → 会话输入框），且跳过发起窗口；
+ * 插件窗口一律不投。
  */
 export function quoteDmToSession(input: { sessionId: string; channelId: string; msgId: string }, senderWebContentsId: number): MemberResult {
   const sessionId = (input.sessionId ?? '').trim()
@@ -2357,7 +2359,12 @@ export function quoteDmToSession(input: { sessionId: string; channelId: string; 
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed() || win.webContents.isDestroyed()) continue
     const type = getWindowType(win)
-    if (isSupervisor ? type !== 'supervisor' : type !== 'chat') continue
+    // 【任务222 · 第1条】改前这里是 `isSupervisor ? type !== 'supervisor' : type !== 'chat'`：管家目标只投
+    // 「独立管家窗口」。218 单窗口化后那个窗口已不再存在（221 起连入口都收敛了），于是 **引用到管家恒判
+    // 「窗口未打开」**（用户真机反馈：提示「会话管家窗口未打开，无法写入输入框」）——功能永久报错。
+    // 现在两种目标都投 chat 窗口，由渲染层按 payload.sessionId 分派（App.tsx：管家 → 管家面板 prop，
+    // 普通会话 → 会话输入框）；不改任何 runtime 侧语义，也不新增 IPC。
+    if (type !== 'chat') continue
     if (win.webContents.id === senderWebContentsId) continue
     safeSend(win, 'dm:quote-to-session', payload)
     delivered += 1

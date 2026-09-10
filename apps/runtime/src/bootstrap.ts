@@ -304,6 +304,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   ctx.authService = new AuthService({ baseUrl: 'https://agent.bjctykj.com' })
   ctx.loggedIn = false
   ctx.username = null as string | null
+  // 【任务235】头像 URL 与 username 同生命周期：初始为 null，登录/注册由 applyAuthSession 写入，
+  // 启动恢复由 restoreCredentials 从 config.json 读回（老配置无该字段 → 仍为 null）。
+  ctx.avatar = null as string | null
   ctx.selectedTier = 'flagship' as ModelTier
   ctx.modelsChangedCallbacks = new Set<() => void>()
   ctx.authExpiredCallbacks = new Set<() => void>()
@@ -1139,6 +1142,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     },
     get username() {
       return ctx.username
+    },
+    // 【任务235】只读暴露「自己」的头像 URL（未登录/网关未下发时 null）。绝不涉及 memberId。
+    get avatar() {
+      return ctx.avatar
     },
     getMemberToken() {
       return ctx.memberToken

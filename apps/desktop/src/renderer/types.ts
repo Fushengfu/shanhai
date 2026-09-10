@@ -1,4 +1,10 @@
 import type { ComponentType } from 'react'
+// 本机技能 / MCP 只读清单的共用形状（与主进程、preload 同源，见 src/shared/account-services.ts）
+import type { McpServerListResult, McpToolCountResult, SkillListResult } from '../shared/account-services'
+// 技能市场（第三方市场搜索 / 详情审计 / 安装）的共用形状（与主进程、preload 同源，见 src/shared/skills-market.ts）
+import type { SkillInstallProgress, SkillInstallResult, SkillMarketSearchResult, SkillPreview, SkillUninstallResult } from '../shared/skills-market'
+// MCP 管理（编辑 / 启停）的共用形状（与主进程 main/mcp-config.ts 同源）
+import type { McpManageListResult, McpManageResult, McpServerPatch } from '../shared/mcp-manage'
 
 /** Web Speech API 最小类型（renderer 端语音识别，Electron 内基于系统语音服务） */
 export interface SpeechRecognitionAlternativeLike {
@@ -488,8 +494,10 @@ declare global {
       platform: string
       /** app 类型窗口的应用 id，非 app 窗口为 undefined */
       windowAppId?: string
-      /** 打开（或聚焦）一个插件应用窗口 */
-      openApp(appId: string): Promise<boolean>
+      /** 【任务223】本 app 窗口的目标会话（主进程注入；未指定为 undefined → 回落 currentSessionId） */
+      windowAppSessionId?: string
+      /** 打开（或聚焦）一个插件应用窗口。sessionId 可选：指定则该窗口展示该会话的数据（任务223） */
+      openApp(appId: string, sessionId?: string): Promise<boolean>
       /** 关闭一个插件应用窗口 */
       closeApp(appId: string): Promise<void>
       /** 查询动态插件窗口应用（appId = 插件持久化 id），返回 { appId, name, icon? } 或 null */
@@ -663,9 +671,9 @@ declare global {
       onUiState(cb: (payload: UiStateEnvelope) => void): () => void
       /** 更新全局 UI 共享状态（字段级 patch） */
       patchUiState(patch: Partial<GlobalUiState>): Promise<void>
-      status(): Promise<{ loggedIn: boolean; username: string | null }>
-      login(u: string, p: string): Promise<{ username: string; nickname?: string }>
-      register(u: string, p: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string }>
+      status(): Promise<{ loggedIn: boolean; username: string | null; avatar: string | null }>
+      login(u: string, p: string): Promise<{ username: string; nickname?: string; avatar?: string }>
+      register(u: string, p: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string; avatar?: string }>
       logout(): Promise<void>
       listModels(): Promise<GatewayModel[]>
       refreshModels(): Promise<GatewayModel[]>
@@ -741,6 +749,32 @@ declare global {
       onClientRemove(cb: (pkgId: string) => void): () => void
       listMemory(sessionId: string): Promise<MemoryEntry[]>
       removeMemory(id: number): Promise<void>
+      /** 本机技能清单（只读：内置说明书技能 + ~/.shanhai/skills 用户技能） */
+      listSkills(): Promise<SkillListResult>
+      /** 本机已配置的 MCP 服务器（只读：id/command/args，不含 env 等敏感字段） */
+      listMcpServers(): Promise<McpServerListResult>
+      /** 各 MCP 服务器的工具数（只读探测，主进程带 5s 超时与逐台降级） */
+      listMcpToolCounts(): Promise<McpToolCountResult>
+      /** 技能市场：搜索（两源合并去重，按下载量倒序） */
+      searchSkillMarket(query: string, source?: 'all' | 'clawhub' | 'skillhub', category?: string): Promise<SkillMarketSearchResult>
+      /** 技能市场：拉取 SKILL.md + 安全审计预览（失败返回 { error }） */
+      previewSkillMarket(source: 'clawhub' | 'skillhub', slug: string): Promise<SkillPreview | { error: string }>
+      /** 技能市场：安装到 ~/.shanhai/skills/<id>/（高危须 confirmRisk=true，否则回 needConfirm 且不下载） */
+      installSkillFromMarket(payload: { source: 'clawhub' | 'skillhub'; slug: string; confirmRisk?: boolean }): Promise<SkillInstallResult>
+      /** 技能市场：订阅安装进度（仅发起安装的窗口能收到） */
+      onSkillInstallProgress(cb: (p: SkillInstallProgress) => void): () => void
+      /**
+       * 技能市场：卸载一个**用户技能**（删除 ~/.shanhai/skills/<id>/ 整个目录）。
+       * 破坏性操作：主进程侧做 id 合法性 / 只能删 user 技能 / 路径夹取四道校验，
+       * 任何一步不过只回 { ok:false, error } 且**不删任何东西**；内置技能一律拒绝。
+       */
+      uninstallSkill(id: string): Promise<SkillUninstallResult>
+      /** MCP 管理：列出服务（启用 + 停用；env 只给键名 + 掩码，原始值不下发） */
+      listMcpManaged(): Promise<McpManageListResult>
+      /** MCP 管理：保存服务的 command / args / env（env 里 value=null 表示保持原值） */
+      saveMcpServer(patch: McpServerPatch): Promise<McpManageResult>
+      /** MCP 管理：启用 / 停用（停用 = 移出 servers 段，AI 侧不可见） */
+      setMcpServerEnabled(id: string, enabled: boolean): Promise<McpManageResult>
       getSettings(): Promise<AppSettings>
       setSettings(patch: AppSettingsPatch): Promise<AppSettings>
       getHttpTrace(id?: string): Promise<HttpTraceRecord[]>

@@ -9,6 +9,8 @@ import { CustomModelDrawer } from '../components/CustomModelDrawer'
 import { TerminalPanel } from '../components/TerminalPanel'
 import { WallpaperPanel } from '../components/WallpaperPanel'
 import { PluginMarketApp } from '../apps/PluginMarketApp'
+import { SkillMarketApp } from '../apps/SkillMarketApp'
+import { McpManagerApp } from '../apps/McpManagerApp'
 import { MemberPanel } from '../components/MemberPanel'
 import { useThemeSync } from '../theme'
 import { applyLocale, useLocaleSync } from '../locale'
@@ -21,6 +23,16 @@ import { t } from '../../shared/i18n'
 export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
   const manifest = getAppManifest(appId)
   const ui = useUiStore()
+  /**
+   * 【任务223】本窗口的「目标会话」：主进程在建窗时经 additionalArguments 注入（argv，每个窗口各一份，
+   * 不用跨窗口全局字段 —— 那正是 222 修过的串台 bug 的风险面）。
+   * undefined = 未指定 → 各处回落到 ui.currentSessionId，**与本改动前逐字节等价**。
+   * 典型用法：会话侧顶栏点「记忆/轨迹」= 不传（看当前会话）；管家面板点同一对按钮 =
+   * openApp('memory'|'trace', 'supervisor')（看管家自己的数据）。
+   */
+  const targetSessionId = window.shanhai?.windowAppSessionId
+  /** 会话类应用实际要展示的会话：显式指定优先，否则回落 currentSessionId */
+  const sessionId = targetSessionId ?? ui.currentSessionId
   const close = (): void => {
     void window.shanhai?.closeApp(appId)
   }
@@ -45,7 +57,7 @@ export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
   const [streamingReasoning, setStreamingReasoning] = useState('')
   useEffect(() => {
     if (appId !== 'trace') return
-    const sid = ui.currentSessionId
+    const sid = sessionId
     setStreaming('')
     setStreamingReasoning('')
     if (!sid) return
@@ -59,7 +71,7 @@ export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
       offDelta?.()
       offReasoning?.()
     }
-  }, [appId, ui.currentSessionId])
+  }, [appId, sessionId])
 
   // 模型管理应用：增删改查走 IPC，结果 patch 到主进程 store（聊天窗口自动同步）
   const customModels = ui.models.filter((m) => m.custom)
@@ -89,14 +101,15 @@ export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
 
   switch (appId) {
     case 'memory':
-      return <MemoryPanel variant="window" onClose={close} />
+      // sessionId 为 undefined 时 MemoryPanel 内部回落 currentSessionId（与原行为一致）
+      return <MemoryPanel variant="window" sessionId={targetSessionId} onClose={close} />
     case 'settings':
       return <SettingsPanel variant="window" onClose={close} />
     case 'trace':
       return (
         <TracePanel
           variant="window"
-          sessionId={ui.currentSessionId}
+          sessionId={sessionId}
           busy={false}
           streamingReasoning={streamingReasoning}
           streaming={streaming}
@@ -121,6 +134,12 @@ export function AppWindow({ appId }: { appId: string }): React.JSX.Element {
       return <WallpaperPanel variant="window" onClose={close} />
     case 'marketplace':
       return <PluginMarketApp onClose={close} />
+    case 'skills-market':
+      // 技能市场（第三方技能搜索 / 详情审计 / 安装）：入口在账号悬停弹窗的「技能」区
+      return <SkillMarketApp onClose={close} />
+    case 'mcp-manager':
+      // MCP 管理（本机 MCP 服务的编辑 / 启停）：入口在账号悬停弹窗的「MCP 服务」区
+      return <McpManagerApp onClose={close} />
     case 'messages':
       // 会员私信与好友（内置 App 窗口，走 window.shanhai 的 member:* 接口，不经插件白名单）
       return <MemberPanel onClose={close} />

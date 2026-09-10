@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import * as React from 'react'
-import { IconMonitor } from '../components/icons'
+import { IconHome } from '../components/icons'
 import { useThemeSync } from '../theme'
 import { t } from '../../shared/i18n'
 import { applyLocale, useLocaleSync } from '../locale'
@@ -85,7 +85,11 @@ export function SupervisorBubble(): React.JSX.Element {
         }}
       >
         <span style={{ display: 'inline-flex', transform: 'scale(1.5)' }}>
-          <IconMonitor />
+          {/* 【任务232】浮标图标：IconHome（主入口语义）。
+              合并后本浮标点开的是**主窗口**，不再是「另开一个独立管家窗口」，
+              故换成「回到/进入主入口」的房子图标；尺寸档位不变（同 16×16 + scale(1.5)），
+              换候选只需把这里的组件名换成 IconHub / IconSteward（icons.tsx 里另两个候选）。 */}
+          <IconHome />
         </span>
       </div>
     </div>

@@ -42,6 +42,9 @@ import {
 } from './member-channel'
 import { checkAndPromptForUpdate, getLastUpdateCheckResult, getLastDownloadProgress, cancelUpdateDownload, fetchMobileApkInfo } from './app-updater'
 import { listMarketPlugins, downloadAndInstallPlugin, submitPluginToMarket, listMyPlugins, uninstallMarketPlugin } from './marketplace'
+import { listSkills, listMcpServers, listMcpToolCounts, refreshSkills, uninstallSkill } from './skills-mcp'
+import { listManagedServers, saveServer, setServerEnabled } from './mcp-config'
+import { searchMarket, previewSkill, installFromMarket } from './skills-market'
 
 /**
  * 渲染进程 → 主进程 调用（IPC handler）。
@@ -52,7 +55,7 @@ export function registerIpc(): void {
   const runtime = getRuntime()
 
   // —— 认证 ——
-  ipcMain.handle('auth:status', async () => ({ loggedIn: runtime.loggedIn, username: runtime.username }))
+  ipcMain.handle('auth:status', async () => ({ loggedIn: runtime.loggedIn, username: runtime.username, avatar: runtime.avatar }))
   ipcMain.handle('auth:login', async (_e, u: string, p: string) => {
     const result = await runtime.login(u, p)
     // 登录成功后自动开启远程连接（外网中继 + 局域网），不再依赖手动开关
@@ -153,6 +156,53 @@ export function registerIpc(): void {
   // —— 长期记忆 ——
   ipcMain.handle('memory:list', async (_e, sessionId: string) => runtime.listMemory(sessionId))
   ipcMain.handle('memory:remove', async (_e, id: number) => runtime.removeMemory(id))
+
+  // —— 本机技能 / MCP（账号悬停弹窗的只读展示，见 main/skills-mcp.ts）——
+  // 全部只读；MCP 工具数探测带 5s 超时与逐台降级，拿不到就回 error，不编数字。
+  ipcMain.handle('skills:list', async () => listSkills())
+  ipcMain.handle('mcp:servers', async () => listMcpServers())
+  ipcMain.handle('mcp:tool-counts', async () => listMcpToolCounts())
+
+  // —— MCP 管理（编辑 / 启停，见 main/mcp-config.ts）——
+  // 与上面三条只读通道分开：这两条会**写 `~/.shanhai/mcp.json`**。
+  // 凭证红线：下发只给 env 的键名 + 常量掩码；收上来用 value:null 表示「保持原值」，原值不回传
+  // （渲染层只拿得到掩码，物理上构造不出原值）。写盘原子（tmp + rename）且写前留 .bak。
+  // 停用 = 把条目移到 `disabledServers` 段 —— McpService 只读 servers 段，故对 AI 侧是真不可见。
+  ipcMain.handle('mcp:manage-list', async () => listManagedServers())
+  ipcMain.handle('mcp:manage-save', async (_e, patch: unknown) => saveServer((patch ?? {}) as never))
+  ipcMain.handle('mcp:manage-set-enabled', async (_e, id: string, enabled: boolean) => setServerEnabled(String(id ?? ''), !!enabled))
+
+  // —— 技能市场（第三方市场搜索 / 详情审计 / 下载安装，见 main/skills-market.ts）——
+  // 与上面的「本机只读清单」分开：这三条会**访问公网**并**写磁盘**（skills:market-install）。
+  // 安装是危险动作，故：① 必须传确认标志才能装高风险技能；② 装完刷新本机技能缓存（refreshSkills）；
+  // ③ 进度经 e.sender 只回发给发起安装的那个窗口（不外广播，避免别的窗口莫名出现进度条）。
+  ipcMain.handle('skills:market-search', async (_e, query: string, source?: string, category?: string) =>
+    searchMarket(String(query ?? ''), source === 'clawhub' || source === 'skillhub' ? source : 'all', category ? String(category) : undefined),
+  )
+  ipcMain.handle('skills:market-preview', async (_e, source: string, slug: string) => {
+    try {
+      if (source !== 'clawhub' && source !== 'skillhub') return { error: '未知的技能市场来源' }
+      return await previewSkill(source, String(slug ?? ''))
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+  ipcMain.handle('skills:market-install', async (e, payload: { source: unknown; slug: unknown; confirmRisk?: unknown }) => {
+    const result = await installFromMarket(payload ?? { source: '', slug: '' }, (p) => {
+      // 只回发给发起安装的窗口；safeSend 会在窗口已销毁时不抛错
+      const win = BrowserWindow.fromWebContents(e.sender)
+      if (win) safeSend(win, 'skills:market-progress', p)
+    })
+    // 装成功就刷新本机技能清单的缓存实例，否则账号弹窗仍显示装之前的列表
+    if (result.ok) refreshSkills()
+    return result
+  })
+
+  // —— 技能卸载（技能市场「已安装」tab，见 main/skills-mcp.ts 的 uninstallSkill）——
+  // 与安装对称的破坏性动作：主进程侧做「id 合法性 + 只能删 user 技能 + 路径夹取在
+  // ~/.shanhai/skills 之内 + realpath 复核」四道校验，任何一步不过就如实回 error 且不删任何东西；
+  // 成功后 uninstallSkill 内部已调 refreshSkills()（本处不重复调）。
+  ipcMain.handle('skills:uninstall', async (_e, id: string) => uninstallSkill(String(id ?? '')))
 
   // —— 通用设置 ——
   ipcMain.handle('settings:get', async () => runtime.getSettings())
@@ -288,7 +338,27 @@ export function registerIpc(): void {
   })
 
   // —— 窗口管理（多窗口桌面系统：打开/关闭插件应用窗口）——
-  ipcMain.handle('window:openApp', async (_e, appId: string) => openApp(appId))
+  /**
+   * 【任务223】应用窗口的「目标会话」校验（唯一入口，主进程侧唯一真相源）。
+   *
+   * 为什么必须校验：该值会被拼进窗口的 additionalArguments 交给渲染进程，并直接决定
+   * MemoryPanel/TracePanel 去查哪个会话的数据 —— 放行任意字符串等于把「查任意会话数据」
+   * 的入口开放给渲染层，且会让窗口注入了不属于会话标识的垃圾参数。
+   *
+   * 放行规则（只有两类，其余一律回落 undefined）：
+   * - 'supervisor'：内置超级会话，恒定存在；listSessions 刻意过滤掉它，故必须单独放行。
+   * - 其余必须命中 runtime.listSessions() 的真实会话 id（不存在的 id 一律拒绝）。
+   * 回落成 undefined = 不注入 argv 参数 = 窗口内读 currentSessionId，与本改动前行为一致，
+   * 既不报错也不静默显示错的数据。
+   */
+  const normalizeAppSessionId = (raw: unknown): string | undefined => {
+    if (typeof raw !== 'string') return undefined
+    const sid = raw.trim()
+    if (!sid || sid.length > 128) return undefined
+    if (sid === SUPERVISOR_ID) return sid
+    return runtime.listSessions().some((s) => s.id === sid) ? sid : undefined
+  }
+  ipcMain.handle('window:openApp', async (_e, appId: string, sessionId?: unknown) => openApp(appId, normalizeAppSessionId(sessionId)))
   ipcMain.handle('window:closeApp', async (_e, appId: string) => closeApp(appId))
   // 桌面被点击后把聊天/app 窗口带回桌面之上（fire-and-forget，减少往返延迟）
   ipcMain.on('window:restoreAboveDesktop', () => restoreAboveDesktop())

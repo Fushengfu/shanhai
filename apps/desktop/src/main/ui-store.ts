@@ -260,14 +260,23 @@ export function filterUiStateForWindow(type: WindowType | undefined, s: UiStoreS
       }
     }
     case 'chat': {
-      // 普通聊天窗口：只需当前会话(sessionMap[currentSessionId])的完整消息流。
+      // 普通聊天窗口：需要当前会话(sessionMap[currentSessionId])的完整消息流。
       // 其它会话的 items 是重字段，多窗口同开时主进程每次广播都要对整棵 sessionMap 结构化克隆、拖慢事件循环。
       // 会话列表排序依赖的 busy 由 sessions 列表(SessionListItem.busy，与 sessionMap 同步维护)承载，不需其它会话的 items。
+      //
+      // 【任务218 · 单窗口合并】额外保留**管家超级会话**一份：聊天窗口左列现在有一条「会话管家」合成条目，
+      // 点它由右列直接渲染管家界面（不再单开管家窗口），因此本窗口必须能读到 sessionMap[SUPERVISOR_ID]，
+      // 否则右列会渲染成空白消息流 —— 用户将彻底看不到管家的回复。
+      // 代价被限制在「多带一个会话」：管家会话在聊天窗口里本来就是当前可见的那一列，不是额外常驻的重字段。
       const sid = s.currentSessionId
       const self = sid ? s.sessionMap[sid] : undefined
+      const sup = s.sessionMap[SUPERVISOR_ID]
       return {
         ...s,
-        sessionMap: self ? { [sid]: self } : {},
+        sessionMap: {
+          ...(self && sid !== SUPERVISOR_ID ? { [sid]: self } : {}),
+          ...(sup ? { [SUPERVISOR_ID]: sup } : {}),
+        },
       }
     }
     case 'app': {

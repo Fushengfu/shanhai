@@ -30,8 +30,11 @@ export function SessionRow(props: {
     return (
       <div
         style={{
-          margin: '0 8px 2px',
-          padding: '6px 10px',
+          // 【任务222 · 第3条】行间距收紧：margin 2px → 1px（编辑态与展示态同口径，保持节奏一致）。
+          // 【任务237 · 第1条】同口径再收紧一档：padding 上下 6px → 4px、左右 10px 不动。
+          // 只动间距，字号/配色/圆角/选中态一律未动。
+          margin: '0 8px 1px',
+          padding: '4px 10px',
           borderRadius: 8,
           background: 'var(--tint-blue)',
         }}
@@ -71,8 +74,12 @@ export function SessionRow(props: {
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       style={{
-        margin: '0 8px 2px',
-        padding: '8px 10px',
+        // 【任务222 · 第3条】行间距收紧：padding 8px → 6px、margin-bottom 2px → 1px，实测行距 52px → 47px。
+        // 【任务237 · 第1条】再收紧一档（用户真机反馈「上下间隙再紧凑一些」）：
+        // padding 上下 6px → 4px（左右 10px 不动）、margin 保持 '0 8px 1px'，实测行高 46 → 42、行距 47 → 43px。
+        // 只动间距：字号 / 行高 / 颜色 / 图标 / 圆角 / 选中态 / hover 一律未动。
+        margin: '0 8px 1px',
+        padding: '4px 10px',
         borderRadius: 8,
         cursor: 'pointer',
         background: props.active ? 'var(--tint-blue)' : hovered ? 'var(--bg-hover)' : 'transparent',

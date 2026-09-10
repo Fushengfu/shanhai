@@ -35,9 +35,9 @@ export interface ModelProviderModule {
   /** 用会员 token 重新拉取最新模型列表并应用；token 失效时用 apiKey 兜底 */
   refreshGatewayModels(): Promise<GatewayModel[]>
   /** 账号密码登录（SHA-256），成功后拉取会员模型并切换为真实网关模型 */
-  login(u: string, p: string): Promise<{ username: string; nickname?: string }>
+  login(u: string, p: string): Promise<{ username: string; nickname?: string; avatar?: string }>
   /** 注册会员（手机号即账号，SHA-256），成功后等价于登录：拉模型 + 持久化凭证 */
-  register(username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string }>
+  register(username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string; avatar?: string }>
   /** 退出登录：清空凭证，保留自定义模型与选中模型偏好 */
   logout(): Promise<void>
   /** 网关模型列表（系统内置 + 用户自定义） */
@@ -160,7 +160,7 @@ export function createModelProviderModule(
           baseUrl?: string
           memberToken?: string
           selectedModelId?: string
-          account?: { username?: string; nickname?: string }
+          account?: { username?: string; nickname?: string; avatar?: string }
           models?: GatewayModel[]
           customModels?: GatewayModel[]
           approvalPolicy?: string
@@ -182,6 +182,8 @@ export function createModelProviderModule(
       if (g?.apiKey) {
         ctx.loggedIn = true
         ctx.username = g.account?.nickname ?? g.account?.username ?? null
+        // 【任务235】登录态下恢复「自己的」头像 URL（老 config 无该字段 → null，渲染层回落首字）。
+        ctx.avatar = g.account?.avatar ?? null
         ctx.gatewayApiKey = g.apiKey
         ctx.gatewayBaseUrl = g.baseUrl ?? ''
         // 网关内置模型列表不缓存到本地：内存 gatewayModels 保持空，登录态下由 refreshGatewayModels 实时从接口拉取
@@ -251,9 +253,12 @@ export function createModelProviderModule(
   }
 
   /** 登录/注册共用的「会话落地」逻辑：设置登录态 + 拉模型 + 持久化凭证 */
-  const applyAuthSession = async (s: AuthSession): Promise<{ username: string; nickname?: string }> => {
+  const applyAuthSession = async (s: AuthSession): Promise<{ username: string; nickname?: string; avatar?: string }> => {
     ctx.loggedIn = true
     ctx.username = s.nickname ?? s.username
+    // 【任务235】只读暴露「自己的」头像 URL（AuthSession 由 packages/auth 产出，这里仅转存到内存；
+    // 不做任何判定改动、不涉及 memberId）。
+    ctx.avatar = s.avatar ?? null
     ctx.memberToken = s.token
     const models = await ctx.authService.fetchModels(s.token)
     const first = models[0]
@@ -281,15 +286,15 @@ export function createModelProviderModule(
       baseUrl: ctx.gatewayBaseUrl,
       selectedModelId: ctx.currentModelId,
     }, expiry)
-    return { username: s.nickname ?? s.username, nickname: s.nickname }
+    return { username: s.nickname ?? s.username, nickname: s.nickname, avatar: s.avatar }
   }
 
-  const login = async (u: string, p: string): Promise<{ username: string; nickname?: string }> => {
+  const login = async (u: string, p: string): Promise<{ username: string; nickname?: string; avatar?: string }> => {
     const s = await ctx.authService.login(u, p)
     return applyAuthSession(s)
   }
 
-  const register = async (username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string }> => {
+  const register = async (username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string; avatar?: string }> => {
     const s = await ctx.authService.register(username, password, nickname, phone, email)
     return applyAuthSession(s)
   }
@@ -297,6 +302,7 @@ export function createModelProviderModule(
   const logout = async (): Promise<void> => {
     ctx.loggedIn = false
     ctx.username = null
+    ctx.avatar = null
     ctx.gatewayApiKey = ''
     ctx.gatewayBaseUrl = ''
     ctx.memberToken = ''

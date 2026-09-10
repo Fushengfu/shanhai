@@ -1,5 +1,5 @@
 import type { ComponentType } from 'react'
-import { IconActivity, IconClock } from '../components/icons'
+import { IconActivity, IconClock, IconGrid, IconWrench } from '../components/icons'
 // 【任务181】Dock 槽位改用专用图标族：原来「私信 / 聊天」同为 IconChat、「管家 / 退出到桌面」同为 IconMonitor，
 // 同排里两个槽位一个字形，用户无法区分；且通用图标被标题栏等处复用，不能就地改。
 import {
@@ -45,11 +45,19 @@ export const APP_REGISTRY: AppManifest[] = [
   // 私信（会员实时通讯底线的内置 UI）：占 Dock 图标位，便于发现与看到未读红点
   { id: 'messages', nameKey: 'app.messages.name', descKey: 'app.messages.desc', Icon: IconDockMessages },
   { id: 'chat', nameKey: 'app.chat.name', descKey: 'app.chat.desc', Icon: IconDockChat },
-  { id: 'supervisor', nameKey: 'app.supervisor.name', descKey: 'app.supervisor.desc', Icon: IconDockSupervisor },
+  // 【任务221 · 第2条】会话管家不再占 Dock 图标位（用户明确要求「dock上的管家应用按钮也不需要了」）：
+  // 单窗口化后管家界面就在主窗口右列（左列「会话管家」条目进入），Dock 再给一个图标只会让人以为还要开个窗口。
+  // 保留注册（showInDock:false）而非删条目：注册表还承担 app 展示名解析等用途，且 openApp('supervisor')
+  // 仍是一条安全的入口（window-manager 里它已转发到主窗口，不会再 new 出独立管家窗口）。
+  { id: 'supervisor', nameKey: 'app.supervisor.name', descKey: 'app.supervisor.desc', Icon: IconDockSupervisor, showInDock: false },
   { id: 'terminal', nameKey: 'app.terminal.name', descKey: 'app.terminal.desc', Icon: IconDockTerminal },
   // 轨迹 / 记忆：不直接占 Dock 图标位，入口收敛到聊天窗口顶栏（HeaderPlugin 的「记忆」「轨迹」按钮）
   { id: 'trace', nameKey: 'app.trace.name', descKey: 'app.trace.desc', Icon: IconActivity, showInDock: false },
   { id: 'memory', nameKey: 'app.memory.name', descKey: 'app.memory.desc', Icon: IconClock, showInDock: false },
+  // 技能市场：入口在账号悬停弹窗的「技能」区（点击「去技能市场」），同记忆/轨迹一样不占 Dock 图标位
+  { id: 'skills-market', nameKey: 'app.skillsMarket.name', descKey: 'app.skillsMarket.desc', Icon: IconWrench, showInDock: false },
+  // MCP 管理：入口在账号悬停弹窗的「MCP 服务」区（「MCP 管理」），编辑已有服务 / 启停，不占 Dock 图标位
+  { id: 'mcp-manager', nameKey: 'app.mcpManager.name', descKey: 'app.mcpManager.desc', Icon: IconGrid, showInDock: false },
   { id: 'settings', nameKey: 'app.settings.name', descKey: 'app.settings.desc', Icon: IconDockSettings },
   { id: 'models', nameKey: 'app.models.name', descKey: 'app.models.desc', Icon: IconDockModels },
   { id: 'wallpaper', nameKey: 'app.wallpaper.name', descKey: 'app.wallpaper.desc', Icon: IconDockWallpaper },

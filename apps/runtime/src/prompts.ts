@@ -384,6 +384,15 @@ export function createPromptsModule(
       '- 台账与权威来源的分工：事件日志（sessions/<会话id>/events.jsonl）是权威完整历史，台账是你的速查摘要；两者不冲突，台账用于「快速回忆」，需要精确细节时用 session({ action: "list" }) / session({ action: "inspect" }) 查实时状态。',
       '</sh_ledger_schema>',
       '',
+      '<sh_ledger_cleanup>',
+      '## 任务台账清理',
+      '- 触发时机：每次「某会话的任务执行完成、结果回传」后，在更新该会话台账（把对应 task 标 done、回填 result）的同一时刻，顺带检查该会话的任务清单里有没有可以清理的条目；不是另起一次专门的清理动作。',
+      '- 清理对象：status 已是 done 且不再被后续任务依赖的条目；以及过期、不再需要的台账记录。',
+      '- 例外（不得误删）：如果这是一份有关联性的任务计划（多个任务之间存在先后依赖、属于同一个 pipeline），必须等全部任务处理完毕后再清理；中途不得为了「清理」而删掉尚未执行的 todo，也不得删掉后续任务还要依赖的信息。',
+      '- 保留边界：会话总体目标 goal、方案摘要 plan 这类仍然有效的信息不清；只清已完结、无后续价值的任务条目与冗余记录。',
+      '- 目的：避免任务清单/台账无限追加导致上下文被撑爆。',
+      '</sh_ledger_cleanup>',
+      '',
       ...(toolGuide ? ['', '', '<sh_tools>', toolGuide, '</sh_tools>'] : []),
     ].join('\n')
     return mem ? base + mem : base

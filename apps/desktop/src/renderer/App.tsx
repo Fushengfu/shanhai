@@ -28,6 +28,7 @@ import { SlotView } from './slots'
 import { UIContext, type UIContextValue } from './ui-context'
 import { patchUiStore, useUiStoreSelector, getUiStoreSnapshot } from './store-client'
 import { AiOrb } from './components/AiOrb'
+import { appendErrorBubble, ERROR_RESET_STATE } from './components/errorBubble'
 import './plugins/WelcomePlugin'
 import './plugins/StatusbarPlugin'
 import './plugins/PanelsPlugin'
@@ -37,6 +38,29 @@ import './plugins/HeaderPlugin'
 import './plugins/ChatPlugin'
 import './plugins/ComposerPlugin'
 import './plugins/TerminalPlugin'
+
+/**
+ * 【任务218 · 单窗口合并】会话管家面板（懒加载）。
+ *
+ * 单窗口形态下，管家不再单开一个常驻窗口，而是渲染在聊天窗口**右列**（左列「会话管家」条目被选中时）。
+ * 用 React.lazy + 动态 import 让 Vite 把 SupervisorApp 切到独立 chunk：常规路径（只看会话、从不点管家）
+ * 不为它付出体积与首屏解析成本，点开时才按需加载。
+ *
+ * ⚠️ 传 onClosePanel：面板形态下的标题栏关闭按钮走 `hideChatWindow`（= 关闭主窗口并给出悬浮图标），
+ * 与聊天窗口顶栏的关闭按钮同一条路径 —— 用户反馈「在管家界面点关闭，界面还在、只是切回了子会话」，
+ * 那正是 218 传 `setMainView('session')` 造成的语义错位（见任务221）。
+ */
+const SupervisorPanel = React.lazy(async () => {
+  const m = await import('./supervisor/SupervisorApp')
+  return { default: m.SupervisorApp }
+})
+
+/**
+ * 【任务222 · 第1条】会话管家超级会话的固定 id（与 runtime 的 SUPERVISOR_ID、SupervisorApp 的 SUPERVISOR_SID 同值）。
+ * 与 SidebarPlugin / MemberPanel 同口径：本文件不复用别处的常量，各自声明一份字面量，避免渲染层跨模块耦合。
+ * 用途只有一个：判断主进程投来的「私信引用」载荷目标是不是管家（见下方 dm:quote-to-session 分派）。
+ */
+const SUPERVISOR_SID = 'supervisor'
 
 export function App() {
   useLocaleSync()
@@ -71,6 +95,9 @@ export function App() {
   // 共享状态 store setter（值更新，内部 patchUiStore 深合并 + 广播，跨窗口一致）
   const setLoggedIn = (v: boolean): void => patchUiStore({ loggedIn: v })
   const setUsername = (v: string | null): void => patchUiStore({ username: v })
+  // 【任务235】自己的头像 URL：与 username 同生命周期，但**不入 ui-store** ——
+  // 它只被侧栏账号区（本窗口）消费，写进跨窗口 store 只会增加广播体积，故用本地 state 承载。
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null)
   const setSessions = (list: SessionListItem[]): void => patchUiStore({ sessions: list })
   const setCurrentSessionId = (id: string): void => patchUiStore({ currentSessionId: id })
   const setModels = (list: GatewayModel[]): void => patchUiStore({ models: list })
@@ -132,6 +159,22 @@ export function App() {
   const [memoryPanelOpen, setMemoryPanelOpen] = useState(false)
   const [settingsPanelOpen, setSettingsPanelOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  /**
+   * 【任务218 · 单窗口合并】右列当前展示哪一路（'session' = 当前会话，'supervisor' = 会话管家）。
+   * 纯渲染层视图状态：不写主进程 store、不新增 IPC、不碰 runtime 的 currentSessionId。
+   * 默认 'session'，因此启动时聊天窗口的表现与从前完全一致。
+   */
+  const [mainView, setMainView] = useState<'session' | 'supervisor'>('session')
+  /**
+   * 【任务220 · 第3条】管家面板「首次打开后保持挂载」的闸门。
+   * 根因：219 把管家面板做成 `{mainView === 'supervisor' && …}` 条件渲染，切回会话时整棵卸载，
+   * 于是 SupervisorComposer 的本地输入 state（SupervisorComposer.tsx:72 的 `input`）连同附件/模型/安全模式
+   * 一起被丢弃 —— 用户体感就是「切换管家/子会话时输入框内容会丢」。
+   * 这里只在**第一次**进入管家时置 true，之后面板常驻（用 visibility 隐藏而非卸载），草稿与滚动位置全部保留；
+   * 仍保留 React.lazy 的收益：没点过管家时该 chunk 不会被加载。
+   * 属组件内局部装配状态（不是设置项 / 不是 store 字段 / 不新增 IPC），与 218 的 mainView 同性质。
+   */
+  const [supervisorMounted, setSupervisorMounted] = useState(false)
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null)
   const [editingTitle, setEditingTitle] = useState('')
   // 图片预览：点击输入框/聊天历史里的图片放大查看（遮罩层，点击或 Esc 关闭）
@@ -154,6 +197,17 @@ export function App() {
   // 不代表任何已发送内容，也不会触发发送 / 工具执行 / 审批。
   const [dmQuote, setDmQuote] = useState<DmQuotePayload | null>(null)
   const clearDmQuote = useCallback((): void => setDmQuote(null), [])
+  /**
+   * 【任务222 · 第1条】投给**会话管家**的私信引用载荷（null = 没有）。
+   * 218 单窗口化后管家面板就渲染在本窗口右列，主进程 quoteDmToSession 也随之改成把两种目标都投 chat 窗口
+   * （见 main/member-channel.ts），因此这里按 payload.sessionId 分派：
+   *   目标是管家 → 存进本 state，经 props 交给管家面板（SupervisorApp 的 dmQuote），不写会话输入框；
+   *   目标是普通会话 → 走下面既有的 switchToSession + setComposerInput 路径，行为与从前一致。
+   * 为什么不交给 SupervisorApp 自己订阅 onDmQuoteToSession：管家面板是**按需挂载**（supervisorMounted），
+   * 从未点开过管家时它的监听尚未注册，而事件是一次性投递 —— 由常驻的 App 收下再投递才不丢。
+   * 与 218 的 mainView 同性质：组件内局部装配状态，不写主进程 store、不新增 IPC。
+   */
+  const [supDmQuote, setSupDmQuote] = useState<DmQuotePayload | null>(null)
   // 外部重置 Composer 输入态（草稿恢复 / 新建清空 / 发送清空）
   const resetComposer = useCallback((input: string, attachments: AttachmentItem[]) => {
     composerRef.current = { input, attachments }
@@ -209,7 +263,16 @@ export function App() {
     })
     ro.observe(el)
     return () => ro.disconnect()
-  }, [])
+    // 【任务218】deps 加 mainView（保留）：218 时右列是二选一替换，header 会随切换卸载重挂成新节点；
+    // 219 改为会话列常驻后 header 节点不再变，本 effect 变成一次无害的重新 observe。
+    // 依赖项与 offsetHeight>0 的守卫均保持原样，不改行为。
+  }, [mainView])
+
+  // 【任务220 · 第3条】首次进入管家视图才把面板挂上；此后常驻（见下方渲染处的 visibility 说明）。
+  // 放 effect 而不是渲染期直接 setState：避免在 render 期间触发额外一次渲染。
+  useEffect(() => {
+    if (mainView === 'supervisor') setSupervisorMounted(true)
+  }, [mainView])
 
   // 健壮化：sessionMap[currentSessionId] 可能是残缺对象（patchSession 只发 patch 字段、首次写入不补全时），
   // 用 EMPTY_SESSION 兜底 items/streaming/busy 等字段，避免 cur.items.length 抛 undefined 白屏。
@@ -277,6 +340,7 @@ export function App() {
     void api.status().then((s) => {
       setLoggedIn(s.loggedIn)
       setUsername(s.username)
+      setAvatarUrl(s.avatar ?? null)
     })
     void api
       .listSessions()
@@ -388,6 +452,9 @@ export function App() {
   }
 
   async function switchToSession(id: string): Promise<void> {
+    // 【任务218】点会话 = 右列必须回到会话视图（用户可能在管家面板里点左列的会话条目）。
+    // 放在函数最前：异步切换期间画面就已切回会话列，不会出现「点了会话但还停在管家面板」的中间态。
+    setMainView('session')
     // 切换令牌：本次切换的序号，只有仍是最新时才允许写「会话级全局状态」。
     const token = ++switchSeqRef.current
     // 保存当前会话输入框草稿，切回来不丢（从 composerRef 读当前输入真值）
@@ -458,6 +525,17 @@ export function App() {
   useEffect(() => {
     const off = window.shanhai?.onDmQuoteToSession((p) => {
       if (!p?.text) return
+      // 【任务222 · 第1条】目标 = 会话管家：走管家面板那条路（存 state → 下方 SupervisorPanel 的 dmQuote prop），
+      // 绝不写会话输入框、也绝不经 switchToSession —— runtime 的 switchSessionInternal 对管家会话直接
+      // return ok:false（管家会话刻意不进 listSessions、不能成为 currentSessionId，这是山海既有硬约束）。
+      // 同时把右列切到管家视图并确保面板已挂载：用户点「引用到管家」后应当**直接看到**文字落进管家输入框，
+      // 而不是收到一句「管家窗口未打开」。不自动发送，仍由用户自己按发送（与普通会话同一条红线）。
+      if (p.sessionId === SUPERVISOR_SID) {
+        setSupervisorMounted(true)
+        setMainView('supervisor')
+        setSupDmQuote(p)
+        return
+      }
       const write = (): void => {
         // 【真机 bug 兜底·必读】附件私信的 content 是紧凑 JSON 引用（{"t":"image",…}）。主进程
         // quoteDmToSession 负责把它展开成「正文 + [图片] 名字 → URL」，但那是**主进程代码**：
@@ -485,6 +563,8 @@ export function App() {
   async function createSession(): Promise<void> {
     const id = await window.shanhai?.createSession()
     if (!id) return
+    // 【任务218】新建会话 = 右列必须回到会话视图（可能在管家面板里点的「新建」）
+    setMainView('session')
     // 新建会话是权威切换：递增令牌，让任何仍在途的 switchToSession 过期，避免其晚返回覆盖新建会话的 currentSessionId
     switchSeqRef.current++
     loadedSessions.current.add(id)
@@ -499,9 +579,10 @@ export function App() {
     await refreshSessions()
   }
 
-  async function applyLoginUi(username: string): Promise<void> {
+  async function applyLoginUi(username: string, avatar?: string): Promise<void> {
     setLoggedIn(true)
     setUsername(username)
+    setAvatarUrl(avatar ?? null)
     setLoginOpen(false)
     // 登录成功后刷新模型列表（含 apiKey/baseUrl），切换到真实网关模型
     const list = await window.shanhai!.listModels()
@@ -512,18 +593,19 @@ export function App() {
 
   async function handleLogin(u: string, p: string): Promise<void> {
     const r = await window.shanhai!.login(u, p)
-    await applyLoginUi(r.username)
+    await applyLoginUi(r.username, r.avatar)
   }
 
   async function handleRegister(u: string, p: string, nickname?: string, phone?: string, email?: string): Promise<void> {
     const r = await window.shanhai!.register(u, p, nickname, phone, email)
-    await applyLoginUi(r.username)
+    await applyLoginUi(r.username, r.avatar)
   }
 
   async function handleLogout(): Promise<void> {
     await window.shanhai?.logout()
     setLoggedIn(false)
     setUsername(null)
+    setAvatarUrl(null)
     setModels([])
     setSelectedModel('')
   }
@@ -630,7 +712,7 @@ export function App() {
         setRetryPrompt({ sessionId: sid, message: retryExhaustedMessage(err) })
         retryExhausted = true
       } else {
-        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: t('chat.shell.errorPrefix', { msg: String(err) }), turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: Date.now() - startTs }] }))
+        patchSession(sid, (s) => ({ items: appendErrorBubble(s.items, String(err), { turnSeq: s.items.filter((it) => it.kind === 'user').length, turnDuration: Date.now() - startTs }) }))
       }
     } finally {
       // 闪屏修复：正常完成/中断/普通错误时，主进程 onSessionActivity('end') 会同步重建 items + 置 busy=false
@@ -821,7 +903,7 @@ export function App() {
         setRetryPrompt({ sessionId: sid, message: retryExhaustedMessage(err) })
         patchSession(sid, { streaming: '', streamingReasoning: '', busy: false })
       } else {
-        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: t('chat.shell.errorPrefix', { msg: String(err) }) }], streaming: '', streamingReasoning: '', busy: false }))
+        patchSession(sid, (s) => ({ items: appendErrorBubble(s.items, String(err)), ...ERROR_RESET_STATE }))
       }
     })
   }
@@ -845,7 +927,7 @@ export function App() {
         setRetryPrompt({ sessionId: sid, message: retryExhaustedMessage(err) })
         patchSession(sid, { streaming: '', streamingReasoning: '', busy: false })
       } else {
-        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: t('chat.shell.errorPrefix', { msg: String(err) }) }], streaming: '', streamingReasoning: '', busy: false }))
+        patchSession(sid, (s) => ({ items: appendErrorBubble(s.items, String(err)), ...ERROR_RESET_STATE }))
       }
     })
   }
@@ -864,7 +946,7 @@ export function App() {
         setRetryPrompt({ sessionId: sid, message: retryExhaustedMessage(err) })
         patchSession(sid, { streaming: '', streamingReasoning: '', busy: false })
       } else {
-        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: t('chat.shell.errorPrefix', { msg: String(err) }) }], streaming: '', streamingReasoning: '', busy: false }))
+        patchSession(sid, (s) => ({ items: appendErrorBubble(s.items, String(err)), ...ERROR_RESET_STATE }))
       }
     })
   }
@@ -884,7 +966,7 @@ export function App() {
         setRetryPrompt({ sessionId: sid, message: retryExhaustedMessage(err) })
         patchSession(sid, { streaming: '', streamingReasoning: '', busy: false })
       } else {
-        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: t('chat.shell.errorPrefix', { msg: String(err) }) }], streaming: '', streamingReasoning: '', busy: false }))
+        patchSession(sid, (s) => ({ items: appendErrorBubble(s.items, String(err)), ...ERROR_RESET_STATE }))
       }
     })
   }
@@ -957,7 +1039,7 @@ export function App() {
         running = false
       }
       if (stopError) {
-        patchSession(sid, (s) => ({ items: [...s.items, { kind: 'assistant', content: t('chat.shell.errorPrefix', { msg: String(stopError instanceof Error ? stopError.message : stopError) }) }] }))
+        patchSession(sid, (s) => ({ items: appendErrorBubble(s.items, String(stopError instanceof Error ? stopError.message : stopError)) }))
       }
       if (running) {
         // 真值说还在跑：保持/写回 busy=true，绝不清 streaming（清了会文字闪断，更像「停了但没停」）
@@ -977,11 +1059,14 @@ export function App() {
     // 通用
     loggedIn,
     username,
+    avatar: avatarUrl,
     currentSessionId,
     cur,
     isEmpty,
     sidebarCollapsed,
     setSidebarCollapsed,
+    mainView,
+    setMainView,
     headerHeight,
     theme,
     toggleTheme,
@@ -1086,13 +1171,66 @@ export function App() {
 
       {/* 主区 */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative', minWidth: 0, minHeight: 0, overflow: 'hidden' }}>
-        <div ref={headerWrapRef} style={{ flexShrink: 0 }}>
-          <SlotView slot="shell.header" />
+        {/*
+          【任务218 · 单窗口合并】右列二选一：
+          - mainView === 'supervisor' → 渲染会话管家（懒加载面板），左列「会话管家」条目被选中时进入；
+          - 否则 → 原有的一整列（header / 聊天 / 输入区 / 状态栏 / 终端），行为与从前完全一致。
+          管家面板自带标题栏、消息区、输入区与状态栏（见 supervisor/SupervisorApp），因此这里整列替换而不是拼装。
+        */}
+        {/*
+          【任务219 · 消除切换闪烁】会话列**常驻**，不再整列卸载重挂。
+          218 用的是「mainView==='supervisor' ? 管家 : 会话列」二选一：headless 实测每次切换右列有
+          10~16 个节点被拆掉重建，会话消息列表随之重新挂载，滚动位置被吸底 effect 拉回底部
+          （实测 scrollTop 2287 → 2579），观感就是「切一下画面跳一下」。
+          现在：会话列一直挂在流内（布局与滚动位置全部保持），管家面板作为**覆盖层**渲染在它之上
+          （SupervisorApp 根节点自带不透明背景 var(--bg-app)，覆盖后看不到下层）。
+          ⚠️ 管家面板仍走 React.lazy：从不点管家时不加载它的 chunk（首屏体积不变），点开时才按需加载。
+        */}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, overflow: 'hidden' }}>
+          <div ref={headerWrapRef} style={{ flexShrink: 0 }}>
+            <SlotView slot="shell.header" />
+          </div>
+          <SlotView slot="shell.chat" />
+          <SlotView slot="shell.composer" />
+          <SlotView slot="shell.statusbar" />
+          <SlotView slot="shell.terminal" />
         </div>
-        <SlotView slot="shell.chat" />
-        <SlotView slot="shell.composer" />
-        <SlotView slot="shell.statusbar" />
-        <SlotView slot="shell.terminal" />
+        {/*
+          【任务220 · 第3条】管家面板「打开过就一直挂着」：
+          - 首次进入管家后才挂载（保持 React.lazy 的按需加载，没点过就不加载该 chunk）；
+          - 之后**不再卸载**，只把整层切成 visibility:hidden —— SupervisorComposer 的输入草稿、附件、
+            模型/安全模式选择、消息区滚动位置全部保留（改前每次切走都整棵卸载，草稿被丢弃）。
+          - 用 visibility 而不是 display:none：display:none 的元素没有布局盒，滚动位置会被清掉，
+            回来时会跳到列表顶部；visibility:hidden 保留布局盒，滚动位置与各项测量都保持有效。
+          - 隐藏时不可点击（visibility:hidden 不接收指针事件），不会挡住会话列。
+        */}
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            zIndex: 10,
+            display: 'flex',
+            flexDirection: 'column',
+            visibility: mainView === 'supervisor' ? 'visible' : 'hidden',
+          }}
+        >
+          {supervisorMounted && (
+            <React.Suspense fallback={null}>
+              {/*
+                【任务221 · 第1条】关闭按钮语义 = **关窗口**，不是「关管家面板 = 切回子会话视图」。
+                218 这里传的是 `() => setMainView('session')`：在管家界面点右上角关闭，界面还在（只是切回了
+                子会话），用户体感是「点了关闭没关掉」。现在改为与聊天窗口顶栏关闭按钮**同一条路径**
+                （HeaderPlugin 的 window.shanhai.hideChatWindow）——关掉主窗口并给出悬浮图标，
+                与 macOS 普通窗口关闭一致；要回到子会话，点左列任一会话即可。
+              */}
+              <SupervisorPanel
+                onClosePanel={() => void window.shanhai?.hideChatWindow()}
+                dmQuote={supDmQuote}
+                onDmQuoteApplied={() => setSupDmQuote(null)}
+              />
+            </React.Suspense>
+          )}
+        </div>
       </div>
 
       {/* 侧滑面板层（自定义模型 / 执行轨迹 / 长期记忆 / 设置）：通过 slot 插件渲染，可被 selfmod 替换 */}

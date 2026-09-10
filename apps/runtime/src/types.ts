@@ -214,10 +214,15 @@ export interface Runtime {
   /** 登录状态 */
   loggedIn: boolean
   username: string | null
+  /**
+   * 【任务235】当前登录用户**自己的**头像 URL（未登录 / 网关未下发 / 老配置无该字段时为 null）。
+   * 只读暴露：仅供渲染层「有头像则显示头像」用；绝不暴露 memberId，也不涉及任何他人资料。
+   */
+  avatar: string | null
   /** 账号密码登录（SHA-256），成功后拉取会员模型并切换为真实网关模型 */
-  login(username: string, password: string): Promise<{ username: string; nickname?: string }>
+  login(username: string, password: string): Promise<{ username: string; nickname?: string; avatar?: string }>
   /** 注册会员（手机号即账号，SHA-256），成功后等价于登录 */
-  register(username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string }>
+  register(username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string; avatar?: string }>
   logout(): Promise<void>
   /** 当前会员 JWT（登录后有效，供远程连接走网关 bridge 鉴权；未登录返回空串） */
   getMemberToken(): string

@@ -23,11 +23,27 @@ export interface UIContextValue {
   // —— 通用 ——
   loggedIn: boolean
   username: string | null
+  /**
+   * 【任务235】当前登录用户**自己的**头像 URL（未登录 / 网关未下发 / 老配置无该字段时 null）。
+   * 只读、只用于「有头像则显示头像」；绝不涉及 memberId，也不用于任何判定。
+   */
+  avatar: string | null
   currentSessionId: string
   cur: SessionUIState
   isEmpty: boolean
   sidebarCollapsed: boolean
   setSidebarCollapsed: React.Dispatch<React.SetStateAction<boolean>>
+  /**
+   * 【任务218 · 单窗口合并】右侧主区当前展示哪一路：
+   * - 'session'    = 当前会话的消息流（聊天窗口的原有形态，默认值）
+   * - 'supervisor' = 会话管家（左列「会话管家」合成条目被选中时）
+   *
+   * 为什么放在 UIContext 而不是某个子组件里：左列（shell.sidebar 插件）负责「点」，主区（App）负责「渲染」，
+   * 两者是同一棵树上的兄弟节点，必须由共同祖先持有这个开关。这是**纯渲染层视图状态**，
+   * 不写进主进程 ui-store、不影响 runtime 的 currentSessionId（管家永远不成为当前会话）。
+   */
+  mainView: 'session' | 'supervisor'
+  setMainView: (v: 'session' | 'supervisor') => void
   /** 顶部状态栏（header + 浏览器标签条）实际高度，侧滑面板顶部从它下方开始 */
   headerHeight: number
   // 主题：亮/暗模式切换

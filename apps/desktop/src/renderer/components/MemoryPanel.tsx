@@ -28,10 +28,22 @@ const SCOPE_COLOR: Record<string, { dot: string; tint: string }> = {
 }
 
 /** 长期记忆面板：展示当前会话记忆（按会话隔离），支持删除。侧滑铺满主区域（从侧边栏右缘到窗口右缘、状态栏下方到底部） */
-export function MemoryPanel({ left, top, onClose, variant = 'panel' }: { left?: number; top?: number; onClose?: () => void; variant?: 'panel' | 'window' }) {
+export function MemoryPanel({ left, top, sessionId, onClose, variant = 'panel' }: {
+  left?: number
+  top?: number
+  /**
+   * 【任务220 · 第4条】要展示哪个会话的记忆（可选）。
+   * 不传 = 原行为：读 ui-store 的 currentSessionId（独立应用窗口即「当前会话」）。
+   * 传 'supervisor' = 展示会话管家自己的记忆——管家面板在窗口内复用它时用这条路径，
+   * 因为管家会话不是、也不能是 currentSessionId（runtime 的 switchSessionInternal 明确拒绝）。
+   */
+  sessionId?: string
+  onClose?: () => void
+  variant?: 'panel' | 'window'
+}) {
   // 【期4C 谁取词谁订阅】本组件渲染期取词（标题/空态/scope 标签）→ 必须自订阅
   useLocaleSync()
-  const currentSessionId = useUiStore().currentSessionId
+  const currentSessionId = sessionId ?? useUiStore().currentSessionId
   const [memories, setMemories] = useState<MemoryEntry[]>([])
   const [hoverId, setHoverId] = useState<number | null>(null)
   const load = useCallback(() => {

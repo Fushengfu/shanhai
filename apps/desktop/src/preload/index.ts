@@ -1,4 +1,10 @@
 import { contextBridge, ipcRenderer, clipboard } from 'electron'
+// 本机技能 / MCP 只读清单的共用形状（主进程产出、preload 桥、渲染层消费三处同源）
+import type { McpServerListResult, McpToolCountResult, SkillListResult } from '../shared/account-services'
+// 技能市场（第三方市场搜索 / 详情审计 / 安装）的共用形状：主进程产出、本桥、渲染层消费三处同源
+import type { SkillInstallProgress, SkillInstallResult, SkillMarketSearchResult, SkillPreview, SkillUninstallResult } from '../shared/skills-market'
+// MCP 管理（编辑 / 启停）的共用形状：与主进程 main/mcp-config.ts 同源
+import type { McpManageListResult, McpManageResult, McpServerPatch } from '../shared/mcp-manage'
 
 export interface ToolTrace {
   kind: 'tool-call' | 'tool-result'
@@ -258,8 +264,13 @@ export interface ShanhaiBridge {
   platform: string
   /** app 类型窗口的应用 id（terminal/trace/memory/settings/models），非 app 窗口为 undefined */
   windowAppId?: string
-  /** 打开（或聚焦）一个插件应用窗口 */
-  openApp(appId: string): Promise<boolean>
+  /**
+   * 【任务223】本 app 窗口要展示的「目标会话」（主进程 additionalArguments 注入；非 app 窗口/未指定为 undefined）。
+   * 不指定时窗口内回落到 ui-store 的 currentSessionId（= 与本改动前完全一致）。
+   */
+  windowAppSessionId?: string
+  /** 打开（或聚焦）一个插件应用窗口。sessionId 可选：指定则该 app 窗口展示该会话的数据（任务223） */
+  openApp(appId: string, sessionId?: string): Promise<boolean>
   /** 关闭一个插件应用窗口 */
   closeApp(appId: string): Promise<void>
   /** 查询动态插件窗口应用（appId = 插件持久化 id），返回 { appId, name, icon? } 或 null */
@@ -447,9 +458,9 @@ export interface ShanhaiBridge {
   /** 插件市场：卸载已安装插件（撤销运行 + 删除 ~/.shanhai/plugins/<id>/ 目录，不可恢复） */
   uninstallMarketPlugin(pluginId: string): Promise<{ ok: boolean; message: string }>
   // 认证
-  status(): Promise<{ loggedIn: boolean; username: string | null }>
-  login(username: string, password: string): Promise<{ username: string; nickname?: string }>
-  register(username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string }>
+  status(): Promise<{ loggedIn: boolean; username: string | null; avatar: string | null }>
+  login(username: string, password: string): Promise<{ username: string; nickname?: string; avatar?: string }>
+  register(username: string, password: string, nickname?: string, phone?: string, email?: string): Promise<{ username: string; nickname?: string; avatar?: string }>
   logout(): Promise<void>
   listModels(): Promise<Array<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean; modelType?: string }>>
   refreshModels(): Promise<Array<{ id: string; name: string; tier: string; apiKey: string; baseUrl: string; model?: string; protocol?: 'openai' | 'anthropic'; custom?: boolean; modelType?: string }>>
@@ -548,6 +559,32 @@ export interface ShanhaiBridge {
   onClientRemove(cb: (pkgId: string) => void): () => void
   listMemory(sessionId: string): Promise<MemoryEntry[]>
   removeMemory(id: number): Promise<void>
+  // 本机技能 / MCP（账号悬停弹窗的只读展示；MCP 配置里的 env 等敏感字段不下发）
+  listSkills(): Promise<SkillListResult>
+  listMcpServers(): Promise<McpServerListResult>
+  listMcpToolCounts(): Promise<McpToolCountResult>
+  // 技能市场（第三方市场，公网访问 + 落盘安装）
+  /** 搜索技能市场（两源合并去重，按下载量倒序）。单源失败不整体失败，两源都失败才回 error */
+  searchSkillMarket(query: string, source?: 'all' | 'clawhub' | 'skillhub', category?: string): Promise<SkillMarketSearchResult>
+  /** 拉取某技能的 SKILL.md + 安全审计预览（返回 { error } 表示失败，不回抛异常） */
+  previewSkillMarket(source: 'clawhub' | 'skillhub', slug: string): Promise<SkillPreview | { error: string }>
+  /** 安装技能到 ~/.shanhai/skills/<id>/（高危等级须带 confirmRisk=true，否则回 needConfirm 且不下载任何内容） */
+  installSkillFromMarket(payload: { source: 'clawhub' | 'skillhub'; slug: string; confirmRisk?: boolean }): Promise<SkillInstallResult>
+  /** 订阅安装进度（仅发起安装的那个窗口能收到），返回取消订阅函数 */
+  onSkillInstallProgress(cb: (p: SkillInstallProgress) => void): () => void
+  /**
+   * 卸载一个**用户技能**（删除 ~/.shanhai/skills/<id>/ 整个目录）。
+   * 破坏性操作：主进程侧做 id 合法性 / 只能删 user 技能 / 路径夹取四道校验，
+   * 任何一步不过只回 { ok:false, error }，**不删任何东西**；内置技能一律拒绝。
+   */
+  uninstallSkill(id: string): Promise<SkillUninstallResult>
+  // MCP 管理（编辑 / 启停；会写 ~/.shanhai/mcp.json）
+  /** 列出 MCP 服务（启用 + 停用），env 只给键名 + 掩码，**原始值不下发** */
+  listMcpManaged(): Promise<McpManageListResult>
+  /** 保存某个 MCP 服务的 command / args / env（env 里 value=null 表示保持原值） */
+  saveMcpServer(patch: McpServerPatch): Promise<McpManageResult>
+  /** 启用 / 停用某个 MCP 服务（停用 = 移到 disabledServers 段，AI 侧不可见） */
+  setMcpServerEnabled(id: string, enabled: boolean): Promise<McpManageResult>
   // 通用设置
   getSettings(): Promise<AppSettings>
   setSettings(patch: AppSettingsPatch): Promise<AppSettings>
@@ -755,12 +792,15 @@ function readArg(prefix: string): string | undefined {
 }
 const windowType: 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble' | 'app-menu' = (readArg('--shanhai-window-type=') as 'desktop' | 'dock' | 'chat' | 'app' | 'supervisor' | 'supervisor-bubble' | 'app-menu') ?? 'chat'
 const windowAppId: string | undefined = readArg('--shanhai-app-id=')
+/** 【任务223】app 窗口的目标会话（主进程注入；未指定为 undefined → 窗口内回落 currentSessionId） */
+const windowAppSessionId: string | undefined = readArg('--shanhai-app-session-id=')
 
 const bridge: ShanhaiBridge = {
   windowType,
   platform: process.platform,
   windowAppId,
-  openApp: (appId) => ipcRenderer.invoke('window:openApp', appId),
+  windowAppSessionId,
+  openApp: (appId, sessionId) => ipcRenderer.invoke('window:openApp', appId, sessionId),
   closeApp: (appId) => ipcRenderer.invoke('window:closeApp', appId),
   getPluginApp: (appId) => ipcRenderer.invoke('plugin-app:get', appId),
   listPluginApps: () => ipcRenderer.invoke('plugin-app:list'),
@@ -1060,6 +1100,21 @@ const bridge: ShanhaiBridge = {
   },
   listMemory: (sessionId) => ipcRenderer.invoke('memory:list', sessionId),
   removeMemory: (id) => ipcRenderer.invoke('memory:remove', id),
+  listSkills: () => ipcRenderer.invoke('skills:list'),
+  listMcpServers: () => ipcRenderer.invoke('mcp:servers'),
+  listMcpToolCounts: () => ipcRenderer.invoke('mcp:tool-counts'),
+  searchSkillMarket: (query, source, category) => ipcRenderer.invoke('skills:market-search', query, source, category),
+  previewSkillMarket: (source, slug) => ipcRenderer.invoke('skills:market-preview', source, slug),
+  installSkillFromMarket: (payload) => ipcRenderer.invoke('skills:market-install', payload),
+  onSkillInstallProgress: (cb) => {
+    const listener = (_e: unknown, p: SkillInstallProgress) => cb(p)
+    ipcRenderer.on('skills:market-progress', listener)
+    return () => ipcRenderer.removeListener('skills:market-progress', listener)
+  },
+  uninstallSkill: (id) => ipcRenderer.invoke('skills:uninstall', id),
+  listMcpManaged: () => ipcRenderer.invoke('mcp:manage-list'),
+  saveMcpServer: (patch) => ipcRenderer.invoke('mcp:manage-save', patch),
+  setMcpServerEnabled: (id, enabled) => ipcRenderer.invoke('mcp:manage-set-enabled', id, enabled),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   setSettings: (patch) => ipcRenderer.invoke('settings:set', patch),
   getHttpTrace: (id) => ipcRenderer.invoke('trace:http-list', id),

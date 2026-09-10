@@ -8,7 +8,7 @@ import { startRemoteRelay, reconnectWithFreshCredential } from './remote-relay'
 import { startCredentialRenewal, stopCredentialRenewal, onCredentialSnapshot } from './member-credentials'
 import { startMemberChannel, reconnectMemberChannelWithFreshCredential } from './member-channel'
 import { startRemoteServer } from './remote-server'
-import { createWindow, loadWindowContent, showChatWindow, toggleChatWindow, ensureDesktopLayer, openApp, getOrCreateSupervisorWindow, ICON_PATH } from './window-manager'
+import { createWindow, loadWindowContent, showChatWindow, toggleChatWindow, ensureDesktopLayer, openApp, ICON_PATH } from './window-manager'
 import { subscribeMemberUnread } from './member-channel'
 import { scheduleStartupUpdateCheck } from './app-updater'
 import { reportDeviceStartup } from './device-report'
@@ -149,12 +149,18 @@ if (!gotSingleInstanceLock) {
     // 用户通过 Dock「聊天」图标 / 托盘 / 全局快捷键打开聊天窗口
     const chatWin = createWindow({ type: 'chat', appId: 'subSession', show: true })
     await loadWindowContent(chatWin)
-    // 会话管家窗口（独立常驻，右侧停靠，承载主 Agent 单会话聊天界面）
-    // ⚠️ 必须走 getOrCreateSupervisorWindow（全进程【唯一】创建入口）：旧写法在这里直接 createWindow，
-    // 与 showSupervisorWindow 形成两个入口，且打的 appId 'mainSession' 让按类型查找恒失配 →
-    // 点关闭关不掉（还无条件弹悬浮图标）、点悬浮图标又新建一个 → 「悬浮按钮与窗口共存 + 两个管家窗口」。
-    const { win: supervisorWin, created: supervisorCreated } = getOrCreateSupervisorWindow({ width: 500, height: 760 })
-    if (supervisorCreated) await loadWindowContent(supervisorWin)
+    // 会话管家：**默认不再随启动自建独立窗口**（单窗口化）。
+    // 管家的界面改由聊天窗口右列承载（左列「会话管家」条目 → 右列渲染），因此启动时屏幕上只有一个
+    // 内容窗口，不再出现「聊天 + 管家」两个窗口。
+    //
+    // 【任务221】独立管家窗口这条路已**取消**（用户明确要求「不再需要单独独立的管家窗口了」）：
+    //   - Dock 上的「会话管家」图标已移除（apps/registry.tsx 里该条目改为 showInDock:false）；
+    //   - window-manager 的 getOrCreateSupervisorWindow（全进程唯一创建入口）已删除，
+    //     showSupervisorWindow() 退化为转发 showChatWindow()，openApp('supervisor') 同样只会打开主窗口；
+    //   - 悬浮图标（supervisor-bubble）保留并改指主窗口：关闭主窗口 / 回到桌面时给出，
+    //     点它 → showSupervisorFromBubble() → showChatWindow()。
+    // 磁吸（SNAP_TYPES）代码保留未动：它只对 chat/supervisor 生效，而 supervisor 窗口已不再被创建，
+    // 因此实际只剩 chat 一个成员、联动自然无对象（保留集合与简化集合在本形态下等价，待管家裁决）。
     registerPush()
 
     // 启动应用版本自动检查：1 秒后查一次，之后每 10 分钟查一次。
