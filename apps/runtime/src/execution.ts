@@ -160,7 +160,7 @@ export function createExecutionModule(
           memoryIndex: prompts.buildMemoryIndexBlock(isSupervisorRun ? SUPERVISOR_ID : meta.id),
           attachments: opts?.attachments,
           modelContent,
-          // 管家历史回放轮数比普通会话多（【任务269】10 vs 5），便于跨会话编排时保留更长上下文主线
+          // 管家历史回放轮数比普通会话多（【任务280】20 vs 10），便于跨会话编排时保留更长上下文主线
           maxHistoryTurns: isSupervisorRun ? SUPERVISOR_MAX_HISTORY_TURNS : undefined,
           // 发新任务（run）时，普通会话与管家会话一致剔除「最后一个未完成轮次」：网络中断遗留的孤立 user（其后无 assistant 正文）。
           // resume 续跑走 resumeRun 不传此标志，天然不受影响。

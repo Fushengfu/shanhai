@@ -198,7 +198,7 @@ export interface AgentLoopOptions {
   attachments?: ContentPart[]
   /** 发给模型的内容（可选）。图片降级等场景下：落盘仍保留原始 message + attachments，发给模型改用降级后的文字 */
   modelContent?: string
-  /** 历史回放保留的最近对话回合数（缺省 MAX_HISTORY_TURNS=5；管家等特殊会话可传入更大值，如 10） */
+  /** 历史回放保留的最近对话回合数（缺省 MAX_HISTORY_TURNS=10；管家等特殊会话可传入更大值，如 20） */
   maxHistoryTurns?: number
   /** 裁剪历史回合时是否保留回合内的工具调用事件（tool/call + tool/result + assistant(tool_calls)）。
    * true=按事件完整回放（管家会话用，保证工具调用历史不丢失、后续决策有依据）；false/缺省=只保留 user + 最终 assistant 正文（普通会话用，压缩上下文体积）。 */
@@ -351,7 +351,7 @@ export class AgentLoop {
     // 不完整回合（中断残留、注入消息后无回复）被丢弃后仍能往前凑满（【任务269】）。
     this.replayHistory(messages, options?.preserveToolCalls === true, maxHistoryTurns * HISTORY_CANDIDATE_TURNS_FACTOR)
 
-    // 用户发起的新任务（新发消息 / 编辑重发 / 点击重发）：始终按最近 maxHistoryTurns（普通会话缺省 5、管家 10）轮对话回放（每轮只保留用户消息 + 最终 assistant 回复正文，
+    // 用户发起的新任务（新发消息 / 编辑重发 / 点击重发）：始终按最近 maxHistoryTurns（普通会话缺省 10、管家 20）轮对话回放（每轮只保留用户消息 + 最终 assistant 回复正文，
     // 丢弃更早历史与工具执行过程），不再全量回放。断点续跑 resumeRun() 走独立路径，保留全量已执行历史。
     // preserveToolCalls=true 时（管家会话），每回合按事件完整回放、保留工具调用（tool/call + tool/result + assistant(tool_calls)）。
     this.trimHistoryToRecentTurns(messages, maxHistoryTurns, options?.preserveToolCalls, options?.dropIncompleteTurn)
@@ -864,7 +864,7 @@ export class AgentLoop {
     const prefix = messages.slice(0, lastUserIdx + 1) // system + 历史回合 + 当前 user 消息
     const currentTurn = messages.slice(lastUserIdx + 1) // 本轮已执行的步骤
     // 当前轮没有实质工具步骤（空轮，或已被压成摘要只剩 assistant 文本）：说明超限来自历史本身，
-    // 压缩当前轮救不了（压完历史仍超会反复压缩），回退裁剪历史到 MAX_HISTORY_TURNS 轮（【任务269】=5）。
+    // 压缩当前轮救不了（压完历史仍超会反复压缩），回退裁剪历史到 MAX_HISTORY_TURNS 轮（【任务269】=5；【任务280】=10）。
     const hasToolSteps = currentTurn.some(
       (m) => m.role === 'tool' || (m.role === 'assistant' && isToolCallMessage(m)),
     )
@@ -1145,10 +1145,10 @@ const GATEWAY_ERROR_BACKOFF_MS = 3000
 const GATEWAY_MAX_RETRY = 3
 
 /** 用户发起新任务时（新发消息 / 编辑重发 / 点击重发）回放历史保留的最近对话回合数。
- * 【任务269】用户拍板：普通会话从 20 轮压到 **5 轮**（管家见 apps/runtime 的 SUPERVISOR_MAX_HISTORY_TURNS=10）。
+ * 【任务269】用户拍板：普通会话 5 轮（管家见 apps/runtime 的 SUPERVISOR_MAX_HISTORY_TURNS）；【任务280】用户拍板调整为普通会话 **10 轮**、管家 20 轮。
  * 「1 轮」= 1 对完整回合（一条用户原始消息 + 该回合最终 assistant 回复正文），不含工具执行过程。
  * 口径依据：真机实测历史消息占单轮请求 ~59%（管家 268,752 字符 / 455,000），而真正被用到的通常只有最近 1~2 轮。 */
-const MAX_HISTORY_TURNS = 5
+const MAX_HISTORY_TURNS = 10
 
 /** 回放候选窗口倍数（【任务269】）：真正回放给模型的回合数由 buildTrimmedMessages 保证（只取完整成对回合），
  * replayHistory 这里多取若干倍作为候选——尾部可能存在不完整回合（中断残留、注入消息后无回复），
