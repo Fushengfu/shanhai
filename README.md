@@ -1,13 +1,15 @@
 # 山海
 
+中文 ｜ [English](README.en.md)
+
 > 通用桌面端多 Agent 智能体 —— 自研插件内核。
 
 山海是一个运行在 macOS 桌面的智能体应用：多专家编排、真实工具执行、会话级隔离、可自我升级。后端内核自研（提供 `ctx`/`inject`/`effect`/`slots`/`fiber` 语义），前端用 Electron + React 渲染，另配 Flutter 移动端。
 
 ## 下载
 
-- [🪟 Windows 版下载](https://store.bjctykj.com/app-versions/Windows/1788797196_Shanhai-0.6.5-x64.exe)（x64，v0.6.5）
-- [🍎 macOS 版下载](https://store.bjctykj.com/app-versions/macOS/1788798042_Shanhai-0.6.5-arm64.dmg)（Apple Silicon / arm64，v0.6.5）
+- [🪟 Windows 版下载](https://store.bjctykj.com/app-versions/Windows/1789119725_Shanhai-0.6.9-x64.exe)（x64，v0.6.9）
+- [🍎 macOS 版下载](https://store.bjctykj.com/app-versions/macOS/1789119766_Shanhai-0.6.9-arm64.dmg)（Apple Silicon / arm64，v0.6.9）
 
 > 各版本更新内容见 [更新日志](CHANGELOG.md)。
 
