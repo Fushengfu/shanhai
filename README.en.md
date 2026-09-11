@@ -1,8 +1,8 @@
 # Shanhai
 
-> A general-purpose desktop multi-Agent assistant —— with a self-built plugin kernel.
-
 [中文](README.md) ｜ English
+
+> A general-purpose desktop multi-Agent assistant —— with a self-built plugin kernel.
 
 Shanhai is an agent application that runs on the macOS desktop: multi-expert orchestration, real tool execution, session-level isolation, and self-upgrade. The backend kernel is self-built (providing `ctx`/`inject`/`effect`/`slots`/`fiber` semantics); the frontend is rendered with Electron + React, and there is also a Flutter mobile client.
 
