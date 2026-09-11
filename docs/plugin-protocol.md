@@ -246,7 +246,7 @@ interface InstalledPackageMeta {
 | `imageGenQuery` | **图片生成查询**：透传网关 `GET /api/v1/image/generations/{taskId}`（网关尚未实现，桥已预留，见 §6.2）。**需显式声明** `permissions: ["imageGenQuery"]` |
 | `tts` | **语音合成（提交）**：透传网关 `POST /api/v1/audio/tts`（网关尚未实现，桥已预留，见 §6.2）。**需显式声明** `permissions: ["tts"]` |
 | `uploadFile` | **上传文件到七牛云**：返回 https 公网 URL（供素材/图片直传，拿到公网链接后转给 videoGen 等）。凭证由主进程持有（登录账号 memberToken），插件只传文件 base64 + 可选 mimeType/fileName，拿不到 token/key。**需显式声明** `permissions: ["uploadFile"]`；未登录返回错误 |
-| `netSubscribe` | **插件实时通讯·订阅通道**：订阅一条房间帧通道（下行帧的落点）。入参 `channelId`（形如 `chat:1v1:{较小 memberId}-{较大 memberId}`），返回 `{ ok, channelId?, error? }`。**需显式声明** `permissions: ["netSubscribe"]`（见 §6.3） |
+| `netSubscribe` | **插件实时通讯·订阅通道**：订阅一条房间帧通道（下行帧的落点）。**推荐入参 `{ peerUsername }` 或 `{ peerNickname }`**（用户看得懂的那两种；也接受 `{ peerMemberId }` 与旧的完整 `channelId` 字符串），本机那一半与「名字→会员号」全由主进程补全，返回 `{ ok, channelId?, error?, message? }`。**需显式声明** `permissions: ["netSubscribe"]`（见 §6.3） |
 | `netSend` | **插件实时通讯·上行一帧**：往已订阅的通道发一帧（对局状态、操作指令等）。入参 `{ channelId, peerMemberId, payload }`，单帧 ≤ 8KB，独立限流桶。**需显式声明** `permissions: ["netSend"]`（见 §6.3） |
 
 > 完整可声明清单即上述 23 项；`permissions` 缺省 = 空数组 = 最小权限。
@@ -352,17 +352,43 @@ const url = await window.shanhaiPlugin.uploadFile({
 
 **场景**：插件要做「真·跨网对战 / 多人实时协作」（两台不同电脑上的山海）。山海提供**一条内核代理的实时帧通道**，插件**不持有任何账号凭证**。
 
-**① 订阅通道 `netSubscribe(channelId)`**：
+**① 订阅通道 `netSubscribe(对端身份)`** —— 对端三选一，**优先级固定** `peerMemberId` > `peerUsername` > `peerNickname`：
 ```ts
-const r = await window.shanhaiPlugin.netSubscribe('chat:1v1:1001-1002')
-// r = { ok: true, channelId: 'chat:1v1:1001-1002' } 或 { ok: false, error: 'invalid_channel' }
+// ★推荐：把用户看得懂的那个名字传进来（界面上让用户填这个）
+const r = await window.shanhaiPlugin.netSubscribe({ peerUsername: 'alice' })
+// const r = await window.shanhaiPlugin.netSubscribe({ peerNickname: '小爱' })
+// const r = await window.shanhaiPlugin.netSubscribe({ peerMemberId: '1002' })  // 兼容：插件自己已拿到会员号
+// r = { ok: true, channelId: 'chat:1v1:1001-1002' }
+//   或 { ok: false, error: 'peer_not_found' | 'peer_ambiguous' | 'not_friends' | … , message: '…' }
+// 把返回的 channelId 当作**不透明句柄**原样用于 netSend 即可，不必解析它。
 ```
 
-**② 上行一帧 `netSend({ channelId, peerMemberId, payload })`**：
+> ⚠️ **插件如何取得通道（正确口径，必读）**：
+> 通道 id 是 `chat:1v1:{较小 memberId}-{较大 memberId}`，**少了本机自己的 memberId 就拼不出来**。
+> 而本机 memberId 属**凭证边界内的信息** —— 插件**拿不到**（内核也不会把 memberId / token 直接返回给插件）。
+> 所以正确做法是：插件**只提供对端身份**（用户名 / 昵称 / 会员号任一），由主进程用自己那一半补全、
+> 把名字换成会员号、算出通道 id 后返回给你当句柄。**不要**尝试自己拼 `chat:1v1:...`（你拼不出本机那一半），
+> **也绝对不要**去读配置文件取凭证。
+>
+> ★★**硬口径（写给所有做联网插件的人）**：**用户界面上看不到 memberId，因此不要要求用户输入它。**
+> 山海的显示口径是「昵称 → 用户名 → 未知会员」，任何界面都不回显那串数字；让用户填「对方的会员号」
+> 等于要一个系统刻意不给出的东西，这条路永远走不通。请让用户填**他看得懂的好友用户名或昵称**。
+> （历史教训：桌球插件 0.6.0 曾提示「请填写对方的会员号」，真机上直接卡死无法建房。）
+>
+> **昵称可以重名**：命中多人时返回 `error: 'peer_ambiguous'`，内核**绝不随机挑一个人**（挑错人等于把
+> 对战帧发给陌生人）；此时请让用户改用**用户名**（全局唯一）。昵称只在**本机好友表**里检索
+> （网关的会员检索定稿为「只按用户名精确匹配，防枚举」），查不到就是 `peer_not_found`。
+>
+> 兼容旧口径：`netSubscribe('chat:1v1:1001-1002')` 仍可用，但主进程会校验它确实是
+> 「本账号 ↔ 某人」的那条通道，否则返回 `error: 'channel_forbidden'`。
+
+**② 上行一帧 `netSend({ channelId, 对端身份, payload })`**：
 ```ts
 await window.shanhaiPlugin.netSend({
-  channelId: 'chat:1v1:1001-1002',   // 必填：必须与 netSubscribe 过的同一条
-  peerMemberId: '1002',              // 必填：对端会员标识（须互为好友）
+  channelId: r.channelId,            // 推荐：原样回传 netSubscribe 返回的句柄
+                                     // （也可省略；省略时主进程按对端身份自算，结果一致）
+  peerUsername: 'alice',             // 对端：peerMemberId / peerUsername / peerNickname 任一
+                                     // ★发帧路径只查本机好友表、不查网关（热路径不做网络往返）
   payload: { type: 'shot', x: 0.5, y: -0.3 },  // 必填：任意 JSON 可序列化值，≤ 8KB
 })
 ```
@@ -375,27 +401,47 @@ const off = window.shanhaiPlugin.onNetFrame((frame) => {
 // off()  // 可选：解除监听（插件窗口关闭时内核会自动回收订阅，无需额外处理）
 ```
 
-**通道 id 规范**：`chat:1v1:{较小 memberId}-{较大 memberId}` —— 这是「本账号 ↔ 某好友」那条 1v1 会话通道，**两台电脑上算出的值相同**，所以对战双方无需另建房间协议。插件不需要（也拿不到）本机会员标识：主进程会按发起窗口反查插件身份，并**校验该通道确实属于「本账号 ↔ peerMemberId」**，不匹配直接拒绝。
+**通道 id 规范**：`chat:1v1:{较小 memberId}-{较大 memberId}` —— 这是「本账号 ↔ 某好友」那条 1v1 会话通道，**两台电脑上算出的值相同**，所以对战双方无需另建房间协议。
+
+**身份补全（务必按此写）**：通道 id 里含**两端的 memberId**，而它属凭证边界内的信息 —— 插件拿不到，
+也不该拿。所以插件只提供「对端是谁」（**用户名 / 昵称 / 会员号任一**），主进程负责：① 把名字换成会员号
+（先查本机好友表，用户名查不到时只读查一次网关）；② 用本机那一半补全并算出通道 id 返回。插件把返回的
+`channelId` 当**不透明句柄**用即可。主进程按发起窗口反查插件身份，并**校验该通道确实属于「本账号 ↔ 该对端」**；
+`netSend` 时还会再次校验通道归属，不匹配直接拒绝。
+
+★**换名字不放宽任何一道闸**：解析出的 memberId 走的仍是原来那五道闸（① 通道已连接 ② 已知本账号身份
+③ 对端可解析且非空 ④ 对端不是自己 ⑤ 互为好友），**一道不减**；解析不出来就到此为止，不产生通道 id、
+不订阅、不发送。★**换出来的 memberId 绝不回给插件**：成功返回只有 `{ ok, channelId }`，
+重名时也只说「有多个同名好友」，**不列出候选会员号**。
 
 **返回的 `error` 取值**：
 
 | error | 含义 |
 |-------|------|
 | `missing_plugin` | 无法确定发起插件的身份（异常，通常是窗口类型不对） |
-| `invalid_channel` | 通道 id 不符合 `chat:1v1:{数字}-{数字}` |
+| `invalid_channel` | 通道 id 不符合 `chat:1v1:{数字}-{数字}`，且没有可用的 `peerMemberId` 可推导 |
+| `invalid_peer` | 没有提供有效的对端身份（`peerMemberId` / `peerUsername` / `peerNickname` 三者皆空） |
+| `peer_not_found` | 按用户名/昵称找不到对端（**查无此人**）。用户名：本机好友表与网关都查不到；昵称：本机好友表里查不到（网关不支持按昵称检索） |
+| `peer_ambiguous` | 昵称命中**多位好友**，无法确定对端 ⇒ 请改用用户名。内核**绝不随机挑一个**，也不列出候选会员号 |
+| `peer_lookup_failed` | 网关查询本身失败（网络/服务异常）。与「查无此人」**严格分开**，不把故障说成没这个人 |
+| `channel_forbidden` | 直接给了完整 channelId，但它不是「本账号 ↔ 某人」的那条通道 |
 | `too_many_channels` | 单个插件同时订阅的通道数超过上限（8 条） |
 | `not_subscribed` | `netSend` 前没有对本窗口订阅过该通道，或订阅来自别的窗口 |
 | `unserializable` | `payload` 无法 JSON 序列化 |
 | `frame_too_large` | 单帧超过 8KB |
-| `rate_limited` | 超出房间帧限流额度（每插件 900 帧 / 10 秒） |
+| `rate_limited` | 超出限流额度：房间帧每插件 900 帧 / 10 秒；**订阅请求每插件 20 次 / 10 秒**（两个桶各自独立，见安全规则 4） |
 | `not_connected` | 会员通道未连接（未登录或连接已断开） |
-| 其它（中文文案） | 好友校验、通道归属校验、发送失败等，**文案原样透传**（如「你们还不是好友…」） |
+| `no_self` | 已连接但尚未取得本账号身份（网关未下发 selfMemberId） |
+| `self_peer` | 对端解析出来就是自己（不能跟自己通信） |
+| `not_friends` | 对方不是好友（须先互加好友）。用户名在网关查得到但不在你好友表时，给的就是这个码（**与 `peer_not_found` 区分**） |
+| 其它（中文文案） | 发送失败等，**文案原样透传**（如「会员通道未连接」） |
 
 **安全规则（写死，插件不可突破）**：
 1. **凭证不出主进程**：插件**拿不到**会员 token / 任何凭证；连接、鉴权、好友校验、限流全部由内核代理完成。**没有任何「让插件读配置文件取凭证」的通道**。
 2. **按插件隔离**：订阅表是**双键** `(pluginId, channelId)`，`pluginId` 由主进程从发起窗口反查、**插件无法传入或伪造**；投递给某个插件的帧，**其它插件收不到**（`onNetFrame` 侧重按 `pluginId` 过滤，是第二道防线）。
 3. **仅互为好友可发**：复用会员通道的既有好友校验；网关侧另有 `friend_required` 兜底。
-4. **限流与尺寸独立**：房间帧有**自己的**限流额度（每插件 900 帧 / 10 秒）与尺寸上限（8KB），**与私信额度（30 条 / 10 秒）互不挤占**。
+4. **限流与尺寸独立**：房间帧有**自己的**限流额度（每插件 900 帧 / 10 秒）与尺寸上限（8KB），**与私信额度（30 条 / 10 秒）互不挤占**；订阅请求另有一枚独立额度（每插件 20 次 / 10 秒）—— 因为用户名解析可能要查网关，不限流就等于给插件开一条**会员枚举**的探测口。
+4b. **身份解析不放宽闸门**：`peerUsername` / `peerNickname` 只是「换成 memberId 的另一种写法」，换完之后走的仍是同五道闸；昵称重名一律 `peer_ambiguous` 拒绝，**禁止随机挑一个对端**。
 5. **绝不进 Agent 上下文**：帧**不落盘**、不写会话历史、不进任何 Agent 上下文、不触发任何执行；也**不会**出现在私信里（插件订阅不写进私信订阅表，插件窗口收不到同通道上的私信正文）。
 6. **需显式声明**：`netSend` / `netSubscribe` 都要显式声明（**非默认放行**），install 顶层审批时一并批准。
 7. **无取消订阅 API**：关闭插件窗口即可（内核在窗口销毁时自动回收该窗口的订阅与限流桶）。

@@ -6,7 +6,7 @@ import { safeSend } from './safe-send'
 // 插件实时通讯代理（L2）：本模块是它的**唯一传输委托**。
 // 依赖方向固定为 member-channel → plugin-net（单向），plugin-net 不反向 import 本模块 —— 避免循环依赖。
 // 插件订阅**不写进**下面的 subscribers（那张表决定 member:message 投给谁），否则插件窗口会收到用户私信正文。
-import { clearPluginNet, deliverPluginFrame, setPluginNetTransport } from './plugin-net'
+import { clearPluginNet, deliverPluginFrame, setPluginNetTransport, type PluginPeerInput } from './plugin-net'
 import { getRuntime } from './runtime'
 import { getWindowType } from './window-manager'
 import { notifyDmMessage, notifyFriendRequest } from './notifications'
@@ -2406,22 +2406,146 @@ export function quoteDmToSession(input: { sessionId: string; channelId: string; 
 // 依赖方向 member-channel → plugin-net 单向，无循环。
 
 /**
+ * 【身份补全】按「对端身份」算出「本账号 ↔ 该好友」的 1v1 通道 id。
+ *
+ * ── 为什么必须有它 ────────────────────────────────────────────────────────────
+ * 协议 §6.3 规定通道 id = `chat:1v1:{较小 memberId}-{较大 memberId}`，而**插件既拿不到本机
+ * memberId、也不该被要求去问用户要对方的 memberId**（山海的界面从不显示那串数字）。
+ * 若让插件去读配置文件取凭证、或把「本机 memberId」当成一个能力发给所有插件，都等于把账号钥匙
+ * 交给第三方代码 —— 不可接受。因此：插件只说「我要跟谁通信」，可以是
+ * **`peerMemberId` / `peerUsername` / `peerNickname` 三选一**（优先级见 resolvePluginPeerMemberId），
+ * 本机那一半与「名字→会员号」**全部由主进程补全**；返回的 channelId 对插件只是一个
+ * **不透明句柄**（原样回传给 netSend 即可，插件无需解析它）。
+ *
+ * ── 五道闸（与 sendPluginFrame 同一套判定，一道不减）─────────────────────────
+ * ① 通道已连接 ② 已知本账号身份 ③ 对端可解析且非空 ④ 对端不是自己 ⑤ 互为好友。
+ * ★「按用户名/昵称进房」不绕开任何一道：名字只是**换成 memberId 的另一种写法**，换完之后
+ *   走的还是同一条闸门；换不出来（查无此人 / 重名歧义）就在此为止，不产生通道 id。
+ * 任何一道不过就返回 `{ ok:false, error:<枚举>, message:<本地化文案> }` ——
+ * **不产生任何通道 id、不订阅、不发送**（调用方拿到 !ok 必须原样返回，不得兜底继续）。
+ *
+ * ── 不返回什么（红线）
+ * 返回值里**没有** memberId / selfMemberId / token / 凭证字段（**对方的也不行**：重名时只说
+ * 「有多个同名好友」，绝不列出候选会员号）：只有通道 id 与错误枚举。
+ * （如实告知的边界：通道 id 形如 `chat:1v1:1001-1002`，其构成本身含两端会员标识 ——
+ *  这是协议既定规范，不是本函数新增的暴露面；本轮按要求把它当**不透明句柄**交给插件，
+ *  并且**不提供**任何「直接返回 memberId」的能力。）
+ */
+type PluginPeerResolved = { ok: true; memberId: string } | { ok: false; error: string; message?: string }
+
+/** 形态归一：会员号/用户名都可能是 number（网关 memberId 是 Go uint，用户名常是手机号形态） */
+function pickPeerText(v: unknown): string {
+  if (typeof v === 'string') return v.trim()
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v)
+  return ''
+}
+
+/**
+ * 在**本机好友表**里按 username / nickname 找人。
+ * 精确匹配优先，其次大小写不敏感（用户手输时大小写经常不一致）；返回**全部命中**，
+ * 由调用方判「唯一 / 重名」—— 重名时绝不随机挑一个（挑错人 = 把对战帧发给陌生人）。
+ */
+function matchFriendIds(field: 'username' | 'nickname', want: string): string[] {
+  const exact: string[] = []
+  const loose: string[] = []
+  const lower = want.toLowerCase()
+  for (const f of friends) {
+    const v = String(f[field] ?? '').trim()
+    if (!v || !f.memberId) continue
+    if (v === want) exact.push(f.memberId)
+    else if (v.toLowerCase() === lower) loose.push(f.memberId)
+  }
+  return exact.length > 0 ? exact : loose
+}
+
+/**
+ * 【身份补全 · 名字换会员号】把插件给的「对端身份」解析成 memberId。
+ *
+ * 优先级（写进协议 §6.3，代码与文档同一口径）：**peerMemberId > peerUsername > peerNickname**。
+ * 为什么这个顺序：会员号是精确标识（无歧义），用户名全局唯一，昵称**可重名** ⇒ 放最后。
+ *
+ * 「查无此人」与「还不是好友」必须分开（两回事，混起来会误导用户去加错人）：
+ *  · 先查本机好友表（零网络、热路径友好）；命中唯一 → 直接用；
+ *  · 用户名未命中时**只读查一次网关**（既有 /members/search，按用户名精确匹配）：
+ *      查到 → 把 memberId 交回外层，由既有的好友闸门给出 `not_friends`（**沿用既有文案，不新造**）；
+ *      404 → `peer_not_found`；请求本身失败 → `peer_lookup_failed`（不能把网络故障说成没这个人）。
+ *  · 昵称不做网关探测：该接口定稿为「只按用户名精确匹配，防会员枚举」，拿昵称去查是无效请求，
+ *    所以昵称只能在本机好友表里找，找不到就如实 `peer_not_found`（协议里同口径写明）。
+ *
+ * @param allowGatewayLookup 订阅路径 true；**发帧热路径 false**（每帧都查网关既慢又会被拿去做会员枚举）。
+ */
+async function resolvePluginPeerMemberId(peer: PluginPeerInput, allowGatewayLookup: boolean): Promise<PluginPeerResolved> {
+  const byId = pickPeerText(peer.peerMemberId)
+  if (byId) return { ok: true, memberId: byId }
+  const byUsername = pickPeerText(peer.peerUsername)
+  const byNickname = pickPeerText(peer.peerNickname)
+  if (!byUsername && !byNickname) return { ok: false, error: 'invalid_peer', message: tIn(getMainLocale(), 'dm.sendNoPeer') }
+  const field: 'username' | 'nickname' = byUsername ? 'username' : 'nickname'
+  const want = byUsername || byNickname
+  const hits = matchFriendIds(field, want)
+  if (hits.length > 1) return { ok: false, error: 'peer_ambiguous', message: tIn(getMainLocale(), 'pluginNet.peerAmbiguous') }
+  if (hits.length === 1) return { ok: true, memberId: hits[0] ?? '' }
+  if (field === 'nickname' || !allowGatewayLookup) {
+    return { ok: false, error: 'peer_not_found', message: tIn(getMainLocale(), 'pluginNet.peerNotFound', { name: want }) }
+  }
+  const s = await searchMembers(want)
+  const found = s.members.find((m) => m.memberId)
+  if (found?.memberId) return { ok: true, memberId: found.memberId }
+  if (s.notFound) return { ok: false, error: 'peer_not_found', message: tIn(getMainLocale(), 'pluginNet.peerNotFound', { name: want }) }
+  return { ok: false, error: 'peer_lookup_failed', message: s.message || tIn(getMainLocale(), 'pluginNet.peerLookupFailed') }
+}
+
+export async function resolvePluginPeerChannel(peerInput: PluginPeerInput | string): Promise<{ ok: boolean; channelId?: string; error?: string; message?: string }> {
+  if (!connected) return { ok: false, error: 'not_connected', message: tIn(getMainLocale(), 'dm.sendNotConnected') }
+  const self = resolveSelfMemberId()
+  if (!self) return { ok: false, error: 'no_self', message: tIn(getMainLocale(), 'dm.sendNoSelf') }
+  // 先换 memberId（用户名/昵称 → 会员号），再走下面**一道不减**的闸门；换不出来就到此为止
+  const input: PluginPeerInput = typeof peerInput === 'string' ? { peerMemberId: peerInput } : peerInput
+  const resolved = await resolvePluginPeerMemberId(input, true)
+  if (!resolved.ok) return { ok: false, error: resolved.error, message: resolved.message }
+  const peer = resolved.memberId
+  if (!peer) return { ok: false, error: 'invalid_peer', message: tIn(getMainLocale(), 'dm.sendNoPeer') }
+  if (peer === self) return { ok: false, error: 'self_peer', message: tIn(getMainLocale(), 'dm.sendToSelf') }
+  // 【硬性前提·与私信同一道门】互为好友才允许通讯（网关侧另有 friend_required 兜底）
+  if (!friends.some((f) => f.memberId === peer)) return { ok: false, error: 'not_friends', message: tIn(getMainLocale(), 'dm.sendNotFriends') }
+  return { ok: true, channelId: computeDmChannelId(self, peer) }
+}
+
+/**
+ * 【兼容口径】直接传完整 channelId 时，校验它确实是「本账号 ↔ 某人」的那条通道。
+ *
+ * 为什么需要：`netSubscribe` 旧口径允许插件直接给一个 `chat:1v1:a-b` 字符串，那等于让插件
+ * 订阅**任意两个人**的通道（既占订阅额度，又会让本机连接去 subscribe 别人的通道）。
+ * 这里只回布尔、**不回 memberId** —— 插件无法用它试探他人身份，只能确认「这条是不是我自己的」。
+ */
+export function isPluginOwnChannel(channelId: string): boolean {
+  const self = resolveSelfMemberId()
+  if (!self) return false
+  const m = /^chat:1v1:(\d+)-(\d+)$/.exec((channelId ?? '').trim())
+  if (!m) return false
+  return m[1] === self || m[2] === self
+}
+
+/**
  * 上行一帧插件帧（由 plugin-net 经传输委托调用）。
  *
  * 与 sendDm 的差别只在「载荷形态」与「限流桶」，**安全检查一道不减**：连接态、已知本账号身份、
  * 非自己、互为好友、通道归属，逐条相同。载荷走 `payload.data`，与私信 `payload.content` 分开，
  * 网关据此区分帧类型；本模块**不落盘、不建线程、不广播**（见 handleDownstream 的 plugin_msg 分支）。
  */
-export function sendPluginFrame(input: {
+export async function sendPluginFrame(input: {
   pluginId: string
   channelId: string
-  peerMemberId: string
+  peer: PluginPeerInput
   payload: unknown
-}): MemberResult & { channelId?: string } {
+}): Promise<MemberResult & { channelId?: string }> {
   if (!connected) return { ok: false, message: tIn(getMainLocale(), 'dm.sendNotConnected') }
   const self = resolveSelfMemberId()
   if (!self) return { ok: false, message: tIn(getMainLocale(), 'dm.sendNoSelf') }
-  const peer = (input.peerMemberId ?? '').trim()
+  // 热路径：只在本机好友表里换会员号（allowGatewayLookup=false），**每帧一次网络往返绝不可接受**
+  const resolved = await resolvePluginPeerMemberId(input.peer ?? {}, false)
+  if (!resolved.ok) return { ok: false, message: resolved.message ?? tIn(getMainLocale(), 'dm.sendNoPeer') }
+  const peer = resolved.memberId
   if (!peer) return { ok: false, message: tIn(getMainLocale(), 'dm.sendNoPeer') }
   if (peer === self) return { ok: false, message: tIn(getMainLocale(), 'dm.sendToSelf') }
   // 【硬性前提·与私信同一道门】互为好友才允许通讯（网关侧另有 friend_required 兜底）
@@ -2463,9 +2587,13 @@ export function ensurePluginChannelSubscribed(channelId: string): void {
 
 // 注入传输委托（plugin-net 不反向 import 本模块，避免循环依赖）
 setPluginNetTransport({
-  send: (input) => {
-    const r = sendPluginFrame(input)
+  send: async (input) => {
+    const r = await sendPluginFrame(input)
     return { ok: r.ok, message: r.message, channelId: r.channelId }
   },
   ensureSubscribed: (channelId) => ensurePluginChannelSubscribed(channelId),
+  // 【身份补全】插件只说「跟谁通信」，本机那一半由主进程补全（插件永远不需要知道自己的 memberId）
+  resolveChannel: (peer) => resolvePluginPeerChannel(peer),
+  // 【兼容口径】插件直接给完整 channelId 时，校验它确实是「本账号 ↔ 某人」的那条
+  ownsChannel: (channelId) => isPluginOwnChannel(channelId),
 })

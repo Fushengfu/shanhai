@@ -115,25 +115,39 @@ export interface ShanhaiPluginBridge {
    * 【插件实时通讯】订阅一条通道（房间帧的下行落点）。
    * 需显式声明 permissions: ["netSubscribe"]。
    *
-   * 通道 id 形如 `chat:1v1:{较小 memberId}-{较大 memberId}`（同一对会员在两台电脑上算出的值相同），
-   * 插件用自己的方式拿到「对端会员标识」后与本机会员拼成该通道即可；主进程会**再次校验**该通道确实属于
-   * 「本账号 ↔ 该好友」，不匹配直接拒绝。插件**无需**（也拿不到）本机会员标识 —— 校验全在内核侧完成。
+   * **推荐用法：传用户看得懂的那个名字（用户名 / 昵称）** ——
+   * ```ts
+   * const r = await window.shanhaiPlugin.netSubscribe({ peerUsername: 'alice' })   // 或 { peerNickname: '小爱' }
+   * // r = { ok: true, channelId: 'chat:1v1:1001-1002' } 或 { ok: false, error: 'peer_not_found', message: '…' }
+   * ```
+   * ★**不要向用户索要「会员号」**：山海的界面从不显示 memberId（一律 昵称 → 用户名 → 未知会员），
+   *   让用户填那串数字等于要一个系统刻意不给出的东西。`{ peerMemberId }` 仍然支持（向后兼容），
+   *   但它只该用在「插件自己从别处拿到了会员号」的场合。
+   * 三种写法优先级固定：`peerMemberId` > `peerUsername` > `peerNickname`；昵称重名会返回
+   * `peer_ambiguous`（**绝不随机挑一个人**）。本机那一半与「名字 → 会员号」全由主进程补全，
+   * 插件拿不到、也不需要知道自己的 memberId。返回的 `channelId` 请当**不透明句柄**原样传给 `netSend`。
    *
-   * 返回 { ok, channelId?, error? }：error 取值 invalid_channel / too_many_channels 等（详见协议）。
-   * ⚠️ 主进程**不会**返回任何 token / 凭证 —— 连接与鉴权全部由内核代理。
+   * 兼容旧口径：也可以直接传完整 `'chat:1v1:{小}-{大}'` 字符串，
+   * 但主进程会校验它确实是「本账号 ↔ 某人」的通道，否则返回 `error: 'channel_forbidden'`。
+   *
+   * 返回 { ok, channelId?, error?, message? }：error 取值见协议 §6.3 的错误表。
+   * ⚠️ 主进程**不会**返回任何 token / 凭证，也不会返回本机 memberId —— 连接与鉴权全部由内核代理。
    */
-  netSubscribe(channelId: string): Promise<{ ok: boolean; channelId?: string; error?: string }>
+  netSubscribe(input: string | PluginPeerIdentity): Promise<{ ok: boolean; channelId?: string; error?: string; message?: string }>
   /**
    * 【插件实时通讯】上行一帧（对局状态、操作指令等）。需显式声明 permissions: ["netSend"]。
    *
-   * - 必须先 `netSubscribe` 过同一 channelId（且必须是本窗口订阅的），否则返回 error: not_subscribed；
+   * - 必须先 `netSubscribe` 过同一通道（且必须是本窗口订阅的），否则返回 error: not_subscribed；
+   * - `channelId` **可省略**：省略时主进程按对端身份自算（与 netSubscribe 结果一致）；
+   * - 对端可以是 `peerMemberId` / `peerUsername` / `peerNickname` 任一（同 netSubscribe 的优先级）；
+   *   发帧热路径**只查本机好友表、不查网关**，所以请优先在 netSubscribe 时用名字、netSend 时直接回传句柄；
    * - 单帧上限 8KB（超出返回 error: frame_too_large）；每个插件有独立的房间帧限流额度
    *   （与「私信 30 条 / 10 秒」**互不挤占**），超限返回 error: rate_limited；
    * - 只有互相加为好友才能收发（本地好友表 + 网关 friend_required 双重校验）。
    *
    * ⚠️ 帧内容**不会**落盘、**不会**进任何 Agent 会话上下文 —— 它只是一条实时数据帧。
    */
-  netSend(input: { channelId: string; peerMemberId: string; payload: unknown }): Promise<{ ok: boolean; channelId?: string; error?: string }>
+  netSend(input: { channelId?: string } & PluginPeerIdentity & { payload: unknown }): Promise<{ ok: boolean; channelId?: string; error?: string; message?: string }>
   /**
    * 【插件实时通讯】订阅下行房间帧。返回取消订阅函数。
    *
@@ -149,6 +163,17 @@ export interface ShanhaiPluginBridge {
    * 需显式声明 permissions: ["uploadFile"]；未登录返回错误。
    */
   uploadFile(input: { dataBase64: string; mimeType?: string; fileName?: string }): Promise<string>
+}
+
+/**
+ * 插件实时通讯的「对端身份」：三选一，优先级 `peerMemberId` > `peerUsername` > `peerNickname`。
+ * 推荐把**用户名/昵称**交给用户填 —— 山海的界面从不显示 memberId，插件也不该去问用户要那串数字。
+ * （主进程负责把名字换成会员号并补全本机那一半，换出来的 memberId 绝不回给插件。）
+ */
+export interface PluginPeerIdentity {
+  peerMemberId?: string | number
+  peerUsername?: string | number
+  peerNickname?: string | number
 }
 
 /** 统一入口：所有能力走主进程 plugin:invoke 双层校验 */
@@ -193,8 +218,8 @@ const pluginBridge: ShanhaiPluginBridge = {
   imageGen: (input) => invoke('imageGen', input) as Promise<{ taskId: string }>,
   imageGenQuery: (input) => invoke('imageGenQuery', input) as Promise<{ status: string; progress?: number; imageUrl?: string; resultUrl?: string; sourceUrl?: string; errorMessage?: string }>,
   tts: (input) => invoke('tts', input) as Promise<unknown>,
-  netSubscribe: (channelId) => invoke('netSubscribe', channelId) as Promise<{ ok: boolean; channelId?: string; error?: string }>,
-  netSend: (input) => invoke('netSend', input) as Promise<{ ok: boolean; channelId?: string; error?: string }>,
+  netSubscribe: (input) => invoke('netSubscribe', input) as Promise<{ ok: boolean; channelId?: string; error?: string; message?: string }>,
+  netSend: (input) => invoke('netSend', input) as Promise<{ ok: boolean; channelId?: string; error?: string; message?: string }>,
   // 与 modelCallStream 同一条「主进程推 → 窗口按标识过滤」的思路：
   // 主进程投递时只发「订阅了该通道的插件窗口」，帧上还带 pluginId；这里再比对一次本插件 id，
   // 双保险（windowAppId 由主进程注入 argv，插件改不了）。

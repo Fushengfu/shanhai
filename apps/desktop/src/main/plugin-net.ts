@@ -42,11 +42,37 @@ export const PLUGIN_FRAME_RATE_MAX = 900
 export const PLUGIN_FRAME_RATE_WINDOW_MS = 10_000
 /** 单个插件最多同时订阅的通道数（防刷爆订阅表） */
 export const PLUGIN_MAX_CHANNELS_PER_PLUGIN = 8
+/**
+ * 订阅请求限流：每插件每 10 秒最多 20 次。
+ *
+ * 为什么必须有它（本轮新增用户名/昵称解析后才需要）：用户名在本地好友表查不到时，会员通道会
+ * **只读查一次网关**，用它区分「查无此人」与「还不是好友」。没有这道闸，插件就能拿两种错误码的
+ * 差异去**枚举哪些账号在网关上存在**（会员枚举）—— 那是我们替第三方代码开的一个探测口。
+ * 帧上行另有 900/10s 的独立额度（PLUGIN_FRAME_RATE_MAX），两者互不挤占。
+ */
+export const PLUGIN_SUBSCRIBE_RATE_MAX = 20
 /** 下行帧投递给插件窗口的 IPC 事件名（与 member:message 严格分离） */
 export const PLUGIN_FRAME_EVENT = 'plugin:net-frame'
 
 /** 通道 id 结构：chat:1v1:{较小 memberId}-{较大 memberId}（与 computeDmChannelId 同规范） */
 const CHANNEL_RE = /^chat:1v1:(\d+)-(\d+)$/
+
+/**
+ * 插件给的「对端身份」——三选一，**优先级固定**：`peerMemberId` > `peerUsername` > `peerNickname`。
+ *
+ * 为什么必须支持用户名/昵称：山海的显示口径是「昵称 → 用户名 → 未知会员」，**任何界面都不向用户
+ * 回显纯数字 memberId**。若联网插件让用户填「对方的会员号」，那是在要一个系统刻意不给出的数字
+ * ⇒ 这条路永远走不通（桌球 0.6.1 的真机反馈正是卡在这里）。所以插件侧把**用户看得懂的用户名/昵称**
+ * 交进来，由主进程换成 memberId；换出来的 memberId 一路留在主进程，**绝不回给插件**。
+ *
+ * 类型写 unknown：入参来自第三方代码，形态不可信，一律在本文件里归一（trim / number→string），
+ * 语义校验全部交给会员通道（本模块不判好友、不判存在性）。
+ */
+export interface PluginPeerInput {
+  peerMemberId?: unknown
+  peerUsername?: unknown
+  peerNickname?: unknown
+}
 
 /**
  * 传输委托：由 member-channel.ts 在模块加载时注入（`setPluginNetTransport`）。
@@ -56,14 +82,32 @@ const CHANNEL_RE = /^chat:1v1:(\d+)-(\d+)$/
  * 「member-channel → plugin-net」单向，规避循环，也让本模块可被单独测试。
  */
 export interface PluginNetTransport {
-  /** 上行：把一帧交付到会员通道（内部做鉴权/好友/落库策略） */
-  send(input: { pluginId: string; channelId: string; peerMemberId: string; payload: unknown }): {
+  /** 上行：把一帧交付到会员通道（内部做鉴权/好友/落库策略；对端身份由会员通道解析成 memberId） */
+  send(input: { pluginId: string; channelId: string; peer: PluginPeerInput; payload: unknown }): Promise<{
     ok: boolean
     message?: string
     channelId?: string
-  }
+  }>
   /** 让会员通道对某 channelId 补发一次 ws subscribe（插件订阅不写进私信订阅表） */
   ensureSubscribed(channelId: string): void
+  /**
+   * 【身份补全】按「对端身份」（会员号 / 用户名 / 昵称三选一）算「本账号 ↔ 该好友」的 1v1 通道 id。
+   *
+   * 为什么必须由会员通道（而非本模块）算：本机 memberId 是**凭证边界内的信息**
+   * （只在 member-channel 内，插件拿不到），而「用户名/昵称 → memberId」的查表依据是它持有的
+   * **好友表**。本模块若自己拼通道，要么得读本机身份/好友表（越界），要么得信任插件给的字符串
+   * （可伪造）—— 都不可接受。所以把「解析 + 算」整个委托回去，本模块只消费结果，
+   * 并把失败原样透出（不兜底、不降级、绝不把 memberId 转交给插件）。
+   *
+   * 为什么是 Promise：用户名在本地好友表查不到时，会员通道会**只读查一次网关**，
+   * 用它把「查无此人」与「有此人但还不是好友」分开（否则只能给出一句误导性的「没找到」）。
+   */
+  resolveChannel(peer: PluginPeerInput): Promise<{ ok: boolean; channelId?: string; error?: string; message?: string }>
+  /**
+   * 【兼容口径】该通道是否属于「本账号 ↔ 某人」（插件直接给完整 channelId 时的归属校验）。
+   * 只回布尔：既能让本模块挡住「订阅别人的通道」，又不会把本机 memberId 反向暴露给插件。
+   */
+  ownsChannel(channelId: string): boolean
 }
 
 let transport: PluginNetTransport | null = null
@@ -82,6 +126,8 @@ const channelIndex = new Map<string, Set<string>>()
 const upstreamSubscribed = new Set<string>()
 /** 房间帧限流桶：插件 id → 发送时间戳滑动窗口（与私信桶完全独立） */
 const frameWindows = new Map<string, number[]>()
+/** 订阅请求限流桶：插件 id → 时间戳滑动窗口（与房间帧桶**再分开一枚**，互不挤占） */
+const subscribeWindows = new Map<string, number[]>()
 
 function subKey(pluginId: string, channelId: string): string {
   return `${pluginId}\u0000${channelId}`
@@ -97,6 +143,42 @@ function normalizePluginId(raw: unknown): string | null {
   if (typeof raw !== 'string') return null
   const id = raw.trim()
   return id ? id : null
+}
+
+/**
+ * 从入参里取「对端身份」三件套（会员号 / 用户名 / 昵称），做**纯形态归一**。
+ *
+ * 为什么接受 number：网关侧 memberId 是数值（Go uint），用户名也常是手机号形态，插件从自己那侧
+ * 拿到的可能是 number；若只认 string，插件就得自己转一次（漏转就变成一个看不懂的 invalid_peer）。
+ * 这里**不校验存在性、不判好友**（那些语义全在会员通道），只做「取字段 + trim + number→string」。
+ *
+ * 只认对象形态：**裸字符串/数字一律不当作对端身份** —— 旧口径里裸字符串是「完整 channelId 句柄」
+ * （`netSubscribe('chat:1v1:1001-1002')`），把它当成会员号会让兼容路径凭空失效。
+ * 返回 null = 入参里没有任何对端身份（调用方再走 channelId 兼容口径或报 invalid_peer）。
+ */
+function pickPeerInput(raw: unknown): PluginPeerInput | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const src = raw as Record<string, unknown>
+  const out: PluginPeerInput = {}
+  for (const key of ['peerMemberId', 'peerUsername', 'peerNickname'] as const) {
+    const v = src[key]
+    if (typeof v === 'string' && v.trim()) out[key] = v.trim()
+    else if (typeof v === 'number' && Number.isFinite(v)) out[key] = String(v)
+  }
+  return out.peerMemberId || out.peerUsername || out.peerNickname ? out : null
+}
+
+/**
+ * 【身份补全】把「对端身份」交给会员通道换回「本账号 ↔ 该好友」的通道 id。
+ *
+ * 本模块**不自己拼**通道 id：那需要本机 memberId（凭证边界内，插件与本模块都不该持有），
+ * 而「用户名/昵称 → memberId」要查的好友表也在会员通道里。
+ * 传输未注入 / 解析失败一律**原样透出**，绝不兜底猜一个通道出来（宁可让插件用不了，
+ * 也不能把帧发到一条来路不明的通道上）。
+ */
+async function resolveChannelByPeer(peer: PluginPeerInput): Promise<{ ok: boolean; channelId?: string; error?: string; message?: string }> {
+  if (!transport) return { ok: false, error: 'not_connected' }
+  return transport.resolveChannel(peer)
 }
 
 /** 回收已销毁窗口的订阅（窗口关闭没有可靠 app 级事件，改为投递前惰性回收） */
@@ -167,23 +249,67 @@ function takeFrameToken(pluginId: string): boolean {
   return true
 }
 
+/** 订阅请求限流（独立桶；见 PLUGIN_SUBSCRIBE_RATE_MAX 的「防会员枚举」理由） */
+function takeSubscribeToken(pluginId: string): boolean {
+  const now = Date.now()
+  const bucketKey = `plugin:${pluginId}`
+  const win = subscribeWindows.get(bucketKey) ?? []
+  while (win.length > 0 && now - (win[0] ?? 0) > PLUGIN_FRAME_RATE_WINDOW_MS) win.shift()
+  if (win.length >= PLUGIN_SUBSCRIBE_RATE_MAX) {
+    subscribeWindows.set(bucketKey, win)
+    return false
+  }
+  win.push(now)
+  subscribeWindows.set(bucketKey, win)
+  return true
+}
+
 /**
  * 订阅一条通道（插件 client 半 `netSubscribe`）。
+ *
+ * 入参两种形态，**推荐第一种**（也是唯一推荐给最终用户看的那一种）：
+ *  ① 对端身份对象 `{ peerMemberId }` / `{ peerUsername }` / `{ peerNickname }`（三者可混给，
+ *     优先级固定 memberId > username > nickname）—— 插件只说「我要跟谁通信」，**本机那一半
+ *     与「名字→会员号」全部由主进程补全**（`transport.resolveChannel`），返回的 `channelId`
+ *     只是一个**不透明句柄**，插件原样拿去做 `netSend` 即可，**无需也无法**知道自己的 memberId。
+ *     ★ 面向用户时请优先要**用户名/昵称**：山海的界面从不显示 memberId，让用户填那串数字
+ *       等于要一个系统刻意不给出的东西（协议 §6.3 已把这句写成硬口径）。
+ *  ② `'chat:1v1:{小}-{大}'`（旧口径，保留兼容）—— 主进程会校验它确实是「本账号 ↔ 某人」的通道，
+ *     否则返回 `channel_forbidden`（不能拿别人的通道当订阅目标）。
+ *
+ * 失败错误码（原样透出，不兜底）：`not_connected` / `no_self` / `invalid_peer` / `self_peer` /
+ * `not_friends` / `peer_not_found` / `peer_ambiguous` / `peer_lookup_failed` / `channel_forbidden`
+ * / `invalid_channel` / `too_many_channels` / `rate_limited` / `missing_plugin` / `invalid_window`。
  *
  * @param appId  插件 id。**必须**由调用方从发起窗口反查得到，绝不能从插件入参取
  *               （否则插件可冒充他人身份订阅他人通道）。
  * @param webContentsId 发起窗口 id（主进程从 event.sender 取，插件无法伪造）。
  */
-export function pluginSubscribeChannel(
+export async function pluginSubscribeChannel(
   appId: string,
-  rawChannelId: unknown,
+  rawInput: unknown,
   webContentsId: number,
-): { ok: boolean; channelId?: string; error?: string } {
+): Promise<{ ok: boolean; channelId?: string; error?: string; message?: string }> {
   const pluginId = normalizePluginId(appId)
   if (!pluginId) return { ok: false, error: 'missing_plugin' }
-  const channelId = parseChannelId(rawChannelId)
-  if (!channelId) return { ok: false, error: 'invalid_channel' }
   if (!Number.isFinite(webContentsId)) return { ok: false, error: 'invalid_window' }
+  // 【身份补全】优先按对端身份（会员号 / 用户名 / 昵称）解析：本机那一半与名字换号都由主进程做
+  let channelId: string | null = null
+  const peer = pickPeerInput(rawInput)
+  if (peer) {
+    // ★闸门在**解析之前**：解析失败会去查网关（区分查无此人 / 还不是好友），不限流就等于给插件
+    //   开一条会员枚举的路。放在这里意味着「连解析的资格都要限」。
+    if (!takeSubscribeToken(pluginId)) return { ok: false, error: 'rate_limited' }
+    const r = await resolveChannelByPeer(peer)
+    if (!r.ok || !r.channelId) return { ok: false, error: r.error ?? 'invalid_peer', message: r.message }
+    channelId = r.channelId
+  } else {
+    // 兼容口径：插件直接给完整通道 id —— 但**必须是自己那条**，不能订阅别人的通道
+    const raw = parseChannelId(rawInput)
+    if (raw) channelId = transport && !transport.ownsChannel(raw) ? null : raw
+    if (raw && !channelId) return { ok: false, error: 'channel_forbidden' }
+  }
+  if (!channelId) return { ok: false, error: 'invalid_channel' }
   pruneDeadWindows()
 
   const key = subKey(pluginId, channelId)
@@ -221,21 +347,34 @@ export function dropPluginWindowSubscriptions(webContentsId: number): void {
 
 /**
  * 上行：插件发一帧（插件 client 半 `netSend`）。
- * 顺序：身份（appId 反查）→ 参数 → 订阅关系 → 尺寸 → 限流 → 交 member-channel（好友校验 + 鉴权网关）。
+ * 顺序：身份（appId 反查）→ 对端 → 通道（未给则主进程自算）→ 订阅关系 → 尺寸 → 限流
+ *       → 交 member-channel（连接态 / 好友校验 / 通道归属 / 鉴权网关）。
+ *
+ * 对端可以是会员号，也可以是**用户名/昵称**（同 netSubscribe 的三选一与优先级）—— 插件不必
+ * 为了发一帧去记那串数字。
+ *
+ * `channelId` **可省略**：省略时由主进程按对端身份自算（插件不必知道本机 memberId，也就没必要
+ * 自己拼那个字符串）；给了则按给的值走，并在 member-channel 侧被再次校验是否恰为
+ * 「本账号 ↔ 该对端」那条（`channel_forbidden`）。
  */
-export function pluginSendFrame(
+export async function pluginSendFrame(
   appId: string,
   input: unknown,
   webContentsId: number,
-): { ok: boolean; channelId?: string; error?: string } {
+): Promise<{ ok: boolean; channelId?: string; error?: string; message?: string }> {
   const pluginId = normalizePluginId(appId)
   if (!pluginId) return { ok: false, error: 'missing_plugin' }
   if (!transport) return { ok: false, error: 'not_connected' }
-  const obj = (input ?? {}) as { channelId?: unknown; peerMemberId?: unknown; payload?: unknown }
-  const channelId = parseChannelId(obj.channelId)
-  if (!channelId) return { ok: false, error: 'invalid_channel' }
-  const peerMemberId = typeof obj.peerMemberId === 'string' ? obj.peerMemberId.trim() : ''
-  if (!peerMemberId) return { ok: false, error: 'invalid_peer' }
+  const obj = (input ?? {}) as { channelId?: unknown; payload?: unknown }
+  const peer = pickPeerInput(obj)
+  if (!peer) return { ok: false, error: 'invalid_peer' }
+  // 【身份补全】没给句柄就由主进程按对端身份自算（与 netSubscribe 同一条解析路径，结果必然一致）
+  let channelId = parseChannelId(obj.channelId)
+  if (!channelId) {
+    const r = await resolveChannelByPeer(peer)
+    if (!r.ok || !r.channelId) return { ok: false, error: r.error ?? 'invalid_peer', message: r.message }
+    channelId = r.channelId
+  }
   // 必须先从**本窗口**订阅过该通道：否则等于把任意好友的通道当成广播口
   const key = subKey(pluginId, channelId)
   const ids = subscriptions.get(key)
@@ -249,7 +388,8 @@ export function pluginSendFrame(
   }
   if (bytes > PLUGIN_FRAME_MAX_BYTES) return { ok: false, error: 'frame_too_large' }
   if (!takeFrameToken(pluginId)) return { ok: false, error: 'rate_limited' }
-  const r = transport.send({ pluginId, channelId, peerMemberId, payload: obj.payload ?? null })
+  // 把「对端身份」原样交给会员通道换成 memberId（本模块不查好友表、也不把 memberId 回给插件）
+  const r = await transport.send({ pluginId, channelId, peer, payload: obj.payload ?? null })
   return r.ok ? { ok: true, channelId } : { ok: false, error: r.message ?? 'send_failed' }
 }
 
@@ -286,6 +426,7 @@ export function clearPluginNet(): void {
   channelIndex.clear()
   upstreamSubscribed.clear()
   frameWindows.clear()
+  subscribeWindows.clear()
 }
 
 /** 调试/断言用快照。**只含 id 与计数，绝不返回 token 或帧内容** */

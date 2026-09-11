@@ -1148,12 +1148,43 @@ export class SelfModifyRuntime {
   }
 
   /**
-   * 插件统一入口工具 plugin：把插件「管理 / 列出 / 调用」三类能力收敛成一个普通顶层工具，内部按 action 参数分派到 10 个动作。
-   * agent 直接调 plugin({ action, args })。10 个动作：list / inspect / scaffold / build / test-load / verify / install / publish / uninstall / tool。
+   * 解析「插件窗口应用」目标（plugin 的 openApp / closeApp 用）。
+   *
+   * 为什么必须在这里校验：主进程 window-manager.openApp 对「非插件 appId」会退化成
+   * 「按内置 app 打开一个内容为空的应用窗口」（用户看到空窗、且没有任何反馈）。内核侧必须在
+   * 下发到主进程之前把它挡住，并把原因如实回给调用方（禁止静默失败、禁止开出空窗）。
+   *
+   * 校验三条：① appId 必填；② 必须是「已安装且正在运行」的插件（status='installed'，
+   * 被 stop 的插件窗口应用已在主进程注销）；③ 该插件必须真的有窗口（entryHtml 存在，即 hasWindow=true）。
+   */
+  private resolveWindowApp(action: string, rawArgs: Record<string, unknown> | undefined): DynamicPackage {
+    const nested = rawArgs?.args && typeof rawArgs.args === 'object' ? (rawArgs.args as Record<string, unknown>) : {}
+    const appId = String(rawArgs?.appId ?? nested.appId ?? '').trim()
+    const verb = action === 'openApp' ? '打开' : '关闭'
+    if (!appId) {
+      throw new Error(`plugin(${action}) 缺少 appId 参数（插件持久化 id，可用 plugin({ action: "list" }) 查看）`)
+    }
+    const pkg = this.inventory.get(appId)
+    if (!pkg) {
+      throw new Error(`插件应用不存在: ${appId}（可用 plugin({ action: "list" }) 查看已安装插件的 id）`)
+    }
+    if (pkg.status !== 'installed') {
+      throw new Error(`插件「${appId}」当前未运行（status=${pkg.status}），无法${verb}窗口；请先让该插件运行（plugin({ action: "install" }) 或重新安装）`)
+    }
+    if (!pkg.entryHtml) {
+      throw new Error(`插件「${appId}」没有窗口应用（hasWindow=false，属纯工具插件），无法${verb}窗口`)
+    }
+    return pkg
+  }
+
+  /**
+   * 插件统一入口工具 plugin：把插件「管理 / 列出 / 调用 / 窗口」四类能力收敛成一个普通顶层工具，内部按 action 参数分派到 12 个动作。
+   * agent 直接调 plugin({ action, args })。12 个动作：list / inspect / scaffold / build / test-load / verify / install / publish / uninstall / tool / openApp / closeApp。
    * - list：列出所有已安装插件及其注册的功能工具（原 plugin(list)）
    * - inspect / scaffold / build / test-load / verify / install / publish / uninstall：插件管理（原 plugin 的 8 个动作）
    * - tool：双键分派调用插件注册的功能工具（原 plugin(tool)），入参 pluginId + tool + args
-   * 审批粒度：list/inspect/verify 只读免审批；scaffold/build/test-load/publish 可逆免审批；install/uninstall 可逆但需审批；tool 委托具体插件工具的 riskLevel/approvalRequired。
+   * - openApp / closeApp：打开 / 关闭已安装插件的窗口应用（入参 appId），复用主进程既有 openApp / closeApp 通道
+   * 审批粒度：list/inspect/verify 只读免审批；scaffold/build/test-load/publish/openApp/closeApp 可逆免审批；install/uninstall 可逆但需审批；tool 委托具体插件工具的 riskLevel/approvalRequired。
    */
   createPluginTool(getSessionId: () => string): ToolContract {
     const actionTools = this.createTools(getSessionId)
@@ -1161,7 +1192,7 @@ export class SelfModifyRuntime {
     for (const t of actionTools) {
       byAction.set(t.name.replace(/^plugin_/, ''), t)
     }
-    const ACTION_ENUM = ['list', 'inspect', 'scaffold', 'build', 'test-load', 'verify', 'install', 'publish', 'uninstall', 'tool']
+    const ACTION_ENUM = ['list', 'inspect', 'scaffold', 'build', 'test-load', 'verify', 'install', 'publish', 'uninstall', 'tool', 'openApp', 'closeApp']
     return {
       name: 'plugin',
       description:
@@ -1173,21 +1204,23 @@ export class SelfModifyRuntime {
         'publish（打包共享包 zip 供提交创意空间）、uninstall（卸载已安装插件）、' +
         'tool（调用【已安装插件】注册的功能工具，日常使用入口而不只是开发流程的一环：入参 pluginId + tool + args，必须先用 list 查到可用的 (pluginId, tool) 组合再调；插件可被改名/卸载，任何具体 id 与工具名都不是固定常量，禁止凭印象猜）。' +
         '开发插件前先 skill_read plugin-protocol 读完整规范。' +
-        '开发闭环：scaffold → build → test-load → verify → install → uninstall；发布：publish。',
+        '开发闭环：scaffold → build → test-load → verify → install → uninstall；发布：publish。' +
+        'openApp / closeApp（打开 / 关闭【已安装插件】的窗口应用：入参 appId = 插件持久化 id，取 list 里 hasWindow=true 的项；appId 不存在 / 未运行 / 该插件无窗口都会被拒绝并给出原因）。',
       inputSchema: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
-            description: '要执行的动作，可选：list / inspect / scaffold / build / test-load / verify / install / publish / uninstall / tool',
+            description: '要执行的动作，可选：list / inspect / scaffold / build / test-load / verify / install / publish / uninstall / tool / openApp / closeApp',
           },
           args: {
             type: 'object',
             description:
-              '传给该动作的参数对象。inspect:{what?,name?}；scaffold:{id,name?,purpose?}；build/test-load/verify:{id,projectDir?}；install:{id,persistId?,name?,purpose?,version?,permissions?,capabilities?}；publish:{pluginDir,categories?,outDir?}；uninstall:{id}；tool:{…传给插件工具的参数对象}',
+              '传给该动作的参数对象。inspect:{what?,name?}；scaffold:{id,name?,purpose?}；build/test-load/verify:{id,projectDir?}；install:{id,persistId?,name?,purpose?,version?,permissions?,capabilities?}；publish:{pluginDir,categories?,outDir?}；uninstall:{id}；tool:{…传给插件工具的参数对象}；openApp/closeApp:{appId}',
           },
           pluginId: { type: 'string', description: '仅 action=tool 时必填：插件持久化 id（list 返回的 id 字段）' },
           tool: { type: 'string', description: '仅 action=tool 时必填：要调用的插件工具名（= 插件 host 半 tools.register 时用的 name）' },
+          appId: { type: 'string', description: '仅 action=openApp / closeApp 时必填：插件持久化 id（= plugin({ action: "list" }) 返回的 id，须 hasWindow=true）。也可放在 args.appId 里，二者等价' },
         },
         required: ['action'],
       },
@@ -1197,6 +1230,8 @@ export class SelfModifyRuntime {
       ): Promise<{ riskLevel: import('@shanhai/tools').RiskLevel; approvalRequired: boolean }> => {
         const action = String(args?.action ?? '').trim()
         if (action === 'list') return { riskLevel: 'readonly', approvalRequired: false }
+        // 打开 / 关闭插件窗口：可逆、免审批（窗口随手可关，不改变任何持久化状态；非法/无窗口目标在执行时被拒）
+        if (action === 'openApp' || action === 'closeApp') return { riskLevel: 'reversible', approvalRequired: false }
         if (action === 'tool') {
           const pluginId = String(args?.pluginId ?? '')
           const toolName = String(args?.tool ?? '')
@@ -1214,6 +1249,20 @@ export class SelfModifyRuntime {
           throw new Error(`plugin 缺少 action 参数（可选：${ACTION_ENUM.join(' / ')}）`)
         }
         if (action === 'list') return this.listPluginApps()
+        if (action === 'openApp' || action === 'closeApp') {
+          const pkg = this.resolveWindowApp(action, args)
+          if (action === 'openApp') this.hooks.openAppWindow(pkg.id)
+          else this.hooks.closeAppWindow(pkg.id)
+          return {
+            ok: true,
+            appId: pkg.id,
+            name: pkg.name,
+            message:
+              action === 'openApp'
+                ? `已打开插件应用窗口「${pkg.name}」(${pkg.id})`
+                : `已关闭插件应用窗口「${pkg.name}」(${pkg.id})（该窗口此前未打开时为无操作）`,
+          }
+        }
         if (action === 'tool') {
           const pluginId = String(args?.pluginId ?? '').trim()
           const toolName = String(args?.tool ?? '').trim()

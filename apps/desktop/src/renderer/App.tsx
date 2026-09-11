@@ -162,9 +162,21 @@ export function App() {
   /**
    * 【任务218 · 单窗口合并】右列当前展示哪一路（'session' = 当前会话，'supervisor' = 会话管家）。
    * 纯渲染层视图状态：不写主进程 store、不新增 IPC、不碰 runtime 的 currentSessionId。
-   * 默认 'session'，因此启动时聊天窗口的表现与从前完全一致。
+   * 【启动默认激活管家】默认值由 'session' 改为 'supervisor'：每次启动都落在会话管家。
+   * 为什么改默认值就够：本状态是组件内局部装配状态，**不持久化**（主进程 ui-store 只持久化 wallpaper，
+   * currentSessionId 也不落盘），每次启动都从这里的初值重新开始 ⇒ 「每次启动都回管家」天然成立，
+   * 无需新增「记住上次」/「清除记忆」之类的逻辑，也不需要任何设置项。
+   * 注意：**不**伪造会话切换、**不**让管家成为 currentSessionId（runtime 硬约束：管家会话不在 listSessions 里，
+   * 也不允许成为 ctx.currentSessionId）—— 这里只改右列渲染的是哪一路。
    */
-  const [mainView, setMainView] = useState<'session' | 'supervisor'>('session')
+  const [mainView, setMainView] = useState<'session' | 'supervisor'>('supervisor')
+  /**
+   * 【启动默认激活管家】启动时那次「自动选中最近活跃会话」不得把右列切回会话视图。
+   * 启动链路要照旧跑（它负责恢复 currentSessionId / 安全模式 / 模型 / 浏览器窗口 / 未完成轮次等），
+   * 但它开头的 `setMainView('session')` 会覆盖默认视图 ⇒ 只对这一**次**调用抑制视图切换。
+   * 用户手动点会话 / 新建会话 / 私信引用到会话等路径不受影响（标志位会被同一次同步调用立即消费）。
+   */
+  const suppressViewSwitchRef = useRef(false)
   /**
    * 【任务220 · 第3条】管家面板「首次打开后保持挂载」的闸门。
    * 根因：219 把管家面板做成 `{mainView === 'supervisor' && …}` 条件渲染，切回会话时整棵卸载，
@@ -173,8 +185,12 @@ export function App() {
    * 这里只在**第一次**进入管家时置 true，之后面板常驻（用 visibility 隐藏而非卸载），草稿与滚动位置全部保留；
    * 仍保留 React.lazy 的收益：没点过管家时该 chunk 不会被加载。
    * 属组件内局部装配状态（不是设置项 / 不是 store 字段 / 不新增 IPC），与 218 的 mainView 同性质。
+   * 【启动默认激活管家】初值由 false 改为 true：默认视图就是管家，首帧就该有面板。
+   * 若仍从 false 起步，首帧会渲染「空的覆盖层 + 下层会话列」，等下一条 effect 才挂上面板 ——
+   * 启动瞬间会出现一次「先看到会话列、再跳到管家」的闪动。改为 true 后首帧即渲染面板，
+   * 代价只是把 React.lazy 的按需加载提前到启动时（默认视图是管家，这个 chunk 本来就要立刻加载）。
    */
-  const [supervisorMounted, setSupervisorMounted] = useState(false)
+  const [supervisorMounted, setSupervisorMounted] = useState(true)
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null)
   const [editingTitle, setEditingTitle] = useState('')
   // 图片预览：点击输入框/聊天历史里的图片放大查看（遮罩层，点击或 Esc 关闭）
@@ -349,6 +365,10 @@ export function App() {
         // 重启恢复：激活「最顶第一个」会话（按最近活跃时间倒序），而非未排序的 list[0]（Map 插入顺序）
         const first = [...list].sort((a, b) => (b.lastActiveAt ?? 0) - (a.lastActiveAt ?? 0))[0]
         if (first) {
+          // 【启动默认激活管家】这次自动选会话仍照旧执行（恢复 currentSessionId / 安全模式 / 模型 /
+          // 浏览器窗口 / 未完成轮次等），但**不改右列视图** —— 启动后右列停在会话管家。
+          // 置位必须在调用前且同步完成：switchToSession 第一行就同步消费该标志，不存在竞态窗口。
+          suppressViewSwitchRef.current = true
           void switchToSession(first.id)
         }
       })
@@ -454,7 +474,10 @@ export function App() {
   async function switchToSession(id: string): Promise<void> {
     // 【任务218】点会话 = 右列必须回到会话视图（用户可能在管家面板里点左列的会话条目）。
     // 放在函数最前：异步切换期间画面就已切回会话列，不会出现「点了会话但还停在管家面板」的中间态。
-    setMainView('session')
+    // 【启动默认激活管家】唯一例外：启动时那次「自动选中最近活跃会话」不改右列视图（仍停在管家）。
+    // 该标志由启动链路在调用前同步置位，并在这一行被同一次同步调用立即消费，因此不会波及用户操作。
+    if (suppressViewSwitchRef.current) suppressViewSwitchRef.current = false
+    else setMainView('session')
     // 切换令牌：本次切换的序号，只有仍是最新时才允许写「会话级全局状态」。
     const token = ++switchSeqRef.current
     // 保存当前会话输入框草稿，切回来不丢（从 composerRef 读当前输入真值）

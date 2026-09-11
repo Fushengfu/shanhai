@@ -592,17 +592,21 @@ export function registerIpc(): void {
        * 【插件实时通讯】订阅一条通道（房间帧的下行落点）。
        * 身份：appId 来自窗口反查（上面已取），插件**无法传入**；webContentsId 取 e.sender.id，
        * 同样无法伪造 —— 这两项共同保证「A 插件订阅的通道，B 插件收不到它的帧」。
-       * 通道结构在 plugin-net 侧校验（必须匹配 chat:1v1:{数字}-{数字}）。
+       * 入参：推荐对端身份 `{ peerUsername }` / `{ peerNickname }`（**用户看得懂的那两种**），
+       *      也接受 `{ peerMemberId }`（向后兼容，桌球 0.6.1 在用）与旧的完整 channelId 字符串
+       *      （会校验它确实是「本账号 ↔ 某人」的通道）。本机那一半与「名字→会员号」全由主进程补全，
+       *      插件既拿不到也不需要知道自己的 memberId。★ 解析是异步的（可能要查一次网关）⇒ await。
        */
       case 'netSubscribe':
-        return pluginSubscribeChannel(appId, args[0], e.sender.id)
+        return await pluginSubscribeChannel(appId, args[0], e.sender.id)
       /**
        * 【插件实时通讯】上行一帧（对局状态）。
        * 顺序：尺寸 → 限流 → 交 member-channel（连接态 / 好友校验 / 通道归属 / 网关鉴权）。
-       * 全程不返回任何 token/凭证（返回值只有 {ok, channelId?, error?}）。
+       * channelId 可省略（省略时主进程按对端身份自算）；对端同样支持会员号 / 用户名 / 昵称三种写法。
+       * 全程不返回任何 token/凭证（返回值只有 {ok, channelId?, error?, message?}）。
        */
       case 'netSend':
-        return pluginSendFrame(appId, args[0], e.sender.id)
+        return await pluginSendFrame(appId, args[0], e.sender.id)
       case 'modelCall':
         // 受控单次文本生成：modelId 可选（须在 listModelsForPlugin 可用列表内），缺省用当前选中模型；maxTokens 上限由 runtime 固定。
         return runtime.invokeModelForPlugin(appId, args[0] as { prompt: string; systemPrompt?: string; modelId?: string })

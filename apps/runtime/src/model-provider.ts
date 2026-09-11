@@ -131,12 +131,54 @@ export function createModelProviderModule(
 ): ModelProviderModule {
   const { allModels, tokenStats, deepSeekBridge, currentWorkDir } = deps
 
+  /**
+   * 【任务248 · 修复模型解析缓存污染】
+   * 旧行为：按 modelId 查不到模型记录时，把「当前全局 provider」（ctx.model）当作该模型的 provider
+   * 返回，并在末尾无条件 ctx.modelProviders.set(modelId, provider) 写进缓存。
+   * 而网关模型列表是启动后 fire-and-forget 异步拉取的（bootstrap.ts:952 `void refreshGatewayModels()`
+   * 不 await；model-provider.ts 内注释亦明写「网关内置模型列表不缓存到本地」），于是重启后头几秒内
+   * 任何一次模型解析都会把该 modelId 永久绑成全局默认模型的 provider，且整个进程生命周期不自愈。
+   * 子会话与管家共用同一份 ctx.modelProviders（execution.ts:102 / :435 两条路径最终都进这里），
+   * 表现为「界面显示 deepseek-v4-flash、实际请求发出 qwen3.8-flash」两侧同时命中。
+   * 新行为：**只有命中模型记录时才写缓存**；未命中不 set（缓存永不被污染），等列表到位后
+   * 由 applyGatewayModels 的自愈逻辑重新解析（见下方【任务248】注释）。
+   * ⚠️ 未命中时「返回什么 provider」在【任务249】里又改了一次：网关列表尚未到手时改为用网关凭证
+   * 现造一次性 provider（使出口 model 恒等于会话 meta.modelId），详见函数体内【任务249】注释。
+   */
   const resolveProvider = (modelId: string): Model => {
     const cached = ctx.modelProviders.get(modelId)
     if (cached) return cached
     const target = allModels().find((m) => m.id === modelId)
+    // 未命中：不缓存、不绑定（否则一次竞态就永久错）。命中路径的下方逻辑与改前逐字一致。
+    if (!target) {
+      // 【任务249 · 闭合 248 残留的「时序①」】未命中记录时不再一律回落全局 provider。
+      // 场景：Cmd+Q 重启后网关模型列表还在异步拉取（bootstrap.ts:952 `void refreshGatewayModels()` 不 await），
+      // 用户第一件事就是发消息 → 此刻 allModels() 里没有该 modelId 的记录，248 之后虽然「不永久污染 + 到位即自愈」，
+      // 但**那第一条消息**仍会发出全局默认模型（界面显示的却是会话 meta 里的模型）——从用户视角等于没修完。
+      // 新行为：仅当「权威的网关模型列表还没拿到手」（ctx.gatewayModels 为空 = 正是那个竞态窗口）时，
+      // 用主进程已持有的网关凭证现造一个**一次性** provider，model 直接取 modelId
+      // （无记录可查，也就没有 target.model 上游别名可言），于是出口 model 恒等于 meta.modelId。
+      // 先例：models.ts:18 `createGatewayModel` 同样是纯凭 apiKey + baseUrl + modelId 构造、完全不依赖模型列表。
+      // 四条硬约束（详见任务249）：
+      //  ① 只对「网关来源」生效，判据有两层且都必须成立：
+      //     (a) 列表尚未到手（ctx.gatewayModels.length === 0）—— 列表已到手却查不到 = 该 id 根本不是网关模型
+      //         （被删的自定义模型 / 拼错的 id / 未注册的桥模型），此时**绝不**凭空造一个网关 provider，
+      //         保持 248 的回落语义，避免把未知 id 连同网关凭证发给网关；
+      //     (b) 该 id 不是当前已登记的自定义模型、也不是 DeepSeek 网页版桥模型 —— 它们各有自己的构造路径与端点，
+      //         绝不能拿网关 apiKey 去请求非网关端点（凭证错配 = 安全问题）。
+      //  ② **不写缓存**：用完即弃，保持 248 的「miss 不落缓存」语义；列表到位后由 applyGatewayModels
+      //     清表 + 按权威记录（含 protocol / maxTokens / 上游别名）重建，本兜底只是过渡态。
+      //  ③ 未登录 / 无网关凭证：如实返回改前行为（回落 ctx.model），不抛错、不把消息卡死。
+      //  ④ baseUrl 一律取 ctx.gatewayBaseUrl（网关统一入口），本兜底不存在把请求发往第三方端点的可能。
+      const listNotInHandYet = ctx.gatewayModels.length === 0
+      const hasOwnConstructionPath = ctx.customModels.some((m) => m.id === modelId) || ctx.deepseekBridgeModel?.id === modelId
+      if (listNotInHandYet && !hasOwnConstructionPath && ctx.loggedIn && ctx.gatewayApiKey && ctx.gatewayBaseUrl) {
+        return createModelProvider({ apiKey: ctx.gatewayApiKey, baseUrl: ctx.gatewayBaseUrl, model: modelId, onUsage: tokenStats.onUsage, onTrace: tokenStats.onHttpTrace })
+      }
+      return ctx.model
+    }
     let provider = ctx.model
-    if (target?.source === 'deepseek-bridge') {
+    if (target.source === 'deepseek-bridge') {
       provider = createDeepSeekModel({ chat: deepSeekBridge.deepSeekChat, getWorkspace: currentWorkDir })
     } else if (target?.baseUrl) {
       provider = createModelProvider({ apiKey: target.apiKey, baseUrl: target.baseUrl, model: target.model ?? target.id, protocol: target.protocol, maxTokens: target.maxTokens, onUsage: tokenStats.onUsage, onTrace: tokenStats.onHttpTrace, supportsReasoning: target.supportsReasoning, temperature: resolveTemperature(target), reasoningEffort: toReasoningEffort(target.reasoningEffort) })
@@ -211,6 +253,17 @@ export function createModelProviderModule(
   const applyGatewayModels = async (models: GatewayModel[]): Promise<void> => {
     if (!Array.isArray(models) || models.length === 0) return
     ctx.gatewayModels = models
+    // 【任务248 · 配套兜底：让已经发生的缓存污染能自愈，不必等用户重启】
+    // 模型列表刷新成功 = 此刻才第一次拥有「权威且完整」的模型记录，之前按 modelId 缓存下来的
+    // provider 全都不可信（可能是列表未到位时留下的污染条目，也可能是用旧 apiKey/baseUrl 建的条目），
+    // 因此整表清空，再按当前选中模型重新解析登记（resolveProvider 命中记录后会重新缓存）。
+    // 清空对自定义模型同样安全：resolveProvider 会从 ctx.customModels 原样重建同一配置的 provider。
+    // 注意这里只重建 provider 缓存，不动 ctx.currentModelId / ctx.defaultModelId / 会话 meta，
+    // 也不新增任何状态字段或开关。
+    ctx.modelProviders.clear()
+    if (ctx.currentModelId && allModels().some((m) => m.id === ctx.currentModelId)) {
+      applyModel(ctx.currentModelId)
+    }
     ctx.modelsChangedCallbacks.forEach((cb) => cb())
     tokenStats.refreshContextLength()
   }

@@ -1231,6 +1231,9 @@ export const zhCN = {
   'dm.quoteNoChatWindow': '聊天窗口未打开，无法写入输入框（请先打开聊天窗口再引用）',
   'pluginNet.channelForbidden': '该通道不属于「你与当前对端」的会话，插件通道发送被拒绝',
   'pluginNet.frameRateLimited': '插件实时帧发送过于频繁（房间帧限流与私信额度互相独立），本帧未发送',
+  'pluginNet.peerNotFound': '插件通道未找到对端「{name}」：只能填你【好友】的用户名或昵称（系统不显示会员号，也不会要求你填它）',
+  'pluginNet.peerAmbiguous': '有多位好友使用同一个昵称，无法确定对端；请改用对方的用户名（系统不会随机挑一个）',
+  'pluginNet.peerLookupFailed': '查询对端身份失败（网关未返回可用结果），本次插件通道操作未执行',
   // 凭证三态（私信面板顶部条 + 设置页「连接」分区两处显示 → 归 common.*）
   'common.cred.anonymous': '未登录会员账号',
   'common.cred.expiredHard': '登录凭证已过期且超出续签宽限期，请重新登录',
