@@ -151,6 +151,9 @@ export const Composer = React.memo(function Composer(p: ComposerProps): React.JS
             <span style={{ minWidth: 0 }}>{p.sendNotice}</span>
           </div>
         )}
+        {/* 【任务238】color 必须显式给：<textarea> 不继承父级 color，不写就落回浏览器默认（亮色
+            color-scheme 下恒为黑 rgb(0,0,0)）。暗色主题下底色是 --bg-panel(#262627)，
+            黑字对比度只有 1.39:1 —— 这正是用户报的「夜间模式输入框内容看不清」。走既有 token，不新增色值。 */}
         <textarea
           value={p.input}
           onChange={(e) => p.setInput(e.target.value)}
@@ -177,7 +180,7 @@ export const Composer = React.memo(function Composer(p: ComposerProps): React.JS
           autoFocus
           rows={3}
           placeholder={t('chat.composer.placeholder')}
-          style={{ width: '100%', border: 'none', outline: 'none', resize: 'none', fontSize: 14, lineHeight: 1.6, background: 'transparent', minHeight: 60, maxHeight: 200, fontFamily: 'inherit', display: 'block', boxSizing: 'border-box' }}
+          style={{ width: '100%', border: 'none', outline: 'none', resize: 'none', fontSize: 14, lineHeight: 1.6, background: 'transparent', color: 'var(--text)', minHeight: 60, maxHeight: 200, fontFamily: 'inherit', display: 'block', boxSizing: 'border-box' }}
         />
         {/* 追加型扩展点：输入框下方（agent 往这里挂按钮/小组件，不替换核心输入框） */}
         <AppendSlotView slot="composer.below" />

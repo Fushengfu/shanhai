@@ -112,6 +112,38 @@ export interface ShanhaiPluginBridge {
   /** 语音合成（提交）：透传网关 POST /api/v1/audio/tts（网关尚未实现，桥已预留）。需显式声明 permissions: ["tts"]。 */
   tts(input: { model?: string; text: string; [key: string]: unknown }): Promise<unknown>
   /**
+   * 【插件实时通讯】订阅一条通道（房间帧的下行落点）。
+   * 需显式声明 permissions: ["netSubscribe"]。
+   *
+   * 通道 id 形如 `chat:1v1:{较小 memberId}-{较大 memberId}`（同一对会员在两台电脑上算出的值相同），
+   * 插件用自己的方式拿到「对端会员标识」后与本机会员拼成该通道即可；主进程会**再次校验**该通道确实属于
+   * 「本账号 ↔ 该好友」，不匹配直接拒绝。插件**无需**（也拿不到）本机会员标识 —— 校验全在内核侧完成。
+   *
+   * 返回 { ok, channelId?, error? }：error 取值 invalid_channel / too_many_channels 等（详见协议）。
+   * ⚠️ 主进程**不会**返回任何 token / 凭证 —— 连接与鉴权全部由内核代理。
+   */
+  netSubscribe(channelId: string): Promise<{ ok: boolean; channelId?: string; error?: string }>
+  /**
+   * 【插件实时通讯】上行一帧（对局状态、操作指令等）。需显式声明 permissions: ["netSend"]。
+   *
+   * - 必须先 `netSubscribe` 过同一 channelId（且必须是本窗口订阅的），否则返回 error: not_subscribed；
+   * - 单帧上限 8KB（超出返回 error: frame_too_large）；每个插件有独立的房间帧限流额度
+   *   （与「私信 30 条 / 10 秒」**互不挤占**），超限返回 error: rate_limited；
+   * - 只有互相加为好友才能收发（本地好友表 + 网关 friend_required 双重校验）。
+   *
+   * ⚠️ 帧内容**不会**落盘、**不会**进任何 Agent 会话上下文 —— 它只是一条实时数据帧。
+   */
+  netSend(input: { channelId: string; peerMemberId: string; payload: unknown }): Promise<{ ok: boolean; channelId?: string; error?: string }>
+  /**
+   * 【插件实时通讯】订阅下行房间帧。返回取消订阅函数。
+   *
+   * 回调载荷：`{ pluginId, channelId, from, payload, ts }`（`from` = 对端会员标识，`payload` = 对端发出的数据）。
+   * **按 pluginId 过滤**：preload 只会把「pluginId 等于本插件自身 id」的帧交给你，
+   * 其它插件的帧即使到了本窗口也不会回调（主进程侧投递隔离是第一道，这里是第二道）。
+   * 与 `onThemeChange` 同形（返回 disposer），插件卸载/窗口关闭时无需额外处理。
+   */
+  onNetFrame(cb: (frame: { pluginId: string; channelId: string; from: string; payload: unknown; ts: number }) => void): (() => void)
+  /**
    * 上传文件到七牛云，返回 https 公网 URL（供素材/图片直传，拿到公网链接后转给 videoGen 等）。
    * 凭证由主进程持有（登录账号 memberToken），插件只传文件 base64 + 可选 mimeType/fileName，拿不到 token/key。
    * 需显式声明 permissions: ["uploadFile"]；未登录返回错误。
@@ -161,6 +193,20 @@ const pluginBridge: ShanhaiPluginBridge = {
   imageGen: (input) => invoke('imageGen', input) as Promise<{ taskId: string }>,
   imageGenQuery: (input) => invoke('imageGenQuery', input) as Promise<{ status: string; progress?: number; imageUrl?: string; resultUrl?: string; sourceUrl?: string; errorMessage?: string }>,
   tts: (input) => invoke('tts', input) as Promise<unknown>,
+  netSubscribe: (channelId) => invoke('netSubscribe', channelId) as Promise<{ ok: boolean; channelId?: string; error?: string }>,
+  netSend: (input) => invoke('netSend', input) as Promise<{ ok: boolean; channelId?: string; error?: string }>,
+  // 与 modelCallStream 同一条「主进程推 → 窗口按标识过滤」的思路：
+  // 主进程投递时只发「订阅了该通道的插件窗口」，帧上还带 pluginId；这里再比对一次本插件 id，
+  // 双保险（windowAppId 由主进程注入 argv，插件改不了）。
+  onNetFrame: (cb) => {
+    const listener = (_e: unknown, frame: { pluginId?: string; channelId?: string; from?: string; payload?: unknown; ts?: number }) => {
+      if (!frame || !frame.channelId) return
+      if (windowAppId && frame.pluginId !== windowAppId) return
+      cb({ pluginId: String(frame.pluginId ?? ''), channelId: frame.channelId, from: String(frame.from ?? ''), payload: frame.payload, ts: Number(frame.ts ?? 0) })
+    }
+    ipcRenderer.on('plugin:net-frame', listener)
+    return () => ipcRenderer.removeListener('plugin:net-frame', listener)
+  },
   uploadFile: (input) => invoke('uploadFile', input) as Promise<string>,
 }
 

@@ -3,6 +3,10 @@ import { app, BrowserWindow } from 'electron'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { safeSend } from './safe-send'
+// 插件实时通讯代理（L2）：本模块是它的**唯一传输委托**。
+// 依赖方向固定为 member-channel → plugin-net（单向），plugin-net 不反向 import 本模块 —— 避免循环依赖。
+// 插件订阅**不写进**下面的 subscribers（那张表决定 member:message 投给谁），否则插件窗口会收到用户私信正文。
+import { clearPluginNet, deliverPluginFrame, setPluginNetTransport } from './plugin-net'
 import { getRuntime } from './runtime'
 import { getWindowType } from './window-manager'
 import { notifyDmMessage, notifyFriendRequest } from './notifications'
@@ -1621,6 +1625,24 @@ function handleDownstream(env: MemberEnvelope, rawBytes: number): void {
       return
     }
 
+    /**
+     * 【插件实时通讯 · 下行房间帧】网关按通道直投的插件帧。
+     * 本分支**只做一件事**：把帧原样转交 plugin-net 做「按插件隔离」的投递。刻意**不做**下面任何一件：
+     *   · 不落盘（不写 dm-store.json）——房间帧是高频瞬态数据，落盘只会撑爆私信库
+     *   · 不进会话/线程（不进 threads，不动未读、不发系统通知）
+     *   · 不进任何 Agent 上下文（不广播 member:dm:auto-route，与文件头「外部消息绝不自动进 Agent 上下文」同一条红线）
+     *   · 不广播 member:message（否则插件窗口能读到同通道上的**私信正文** —— 那是用户隐私）
+     */
+    case 'plugin_msg': {
+      const channelId = env.channelId ?? pickStr(p, ['channelId', 'channel_id']) ?? ''
+      if (!channelId) return
+      const from = pickStr(p, ['from', 'fromMemberId']) ?? idStr(env.from)
+      // 载荷名：本轮定 `data`（与上行一致）；兼容网关若回 payload 形态
+      const data = p.data !== undefined ? p.data : p.payload
+      deliverPluginFrame(channelId, from, data, env.ts)
+      return
+    }
+
     case 'error': {
       const { payload: err, spec: errSpec } = normalizeErrorPayload(env)
       // 审计的 topic/result 一律 ASCII 枚举（code），**不写译文** → 切语言不会让审计日志换语言，
@@ -1682,6 +1704,9 @@ export function stopMemberChannel(): void {
   stopHeartbeat()
   reconnectAttempts = 0
   subscribers.clear()
+  // 插件通道态一并清空（订阅表 + 限流桶）：通道关着时不该留着「谁订阅了哪条通道」的记忆。
+  // 不清 plugin-net 的 transport（它是静态注入，重连后仍要走同一条路）。
+  clearPluginNet()
   if (ws) {
     ws.close()
     ws = null
@@ -2375,3 +2400,72 @@ export function quoteDmToSession(input: { sessionId: string; channelId: string; 
     ? { ok: true, message: tIn(getMainLocale(), 'dm.quoteAppended', { where }) }
     : { ok: false, message: tIn(getMainLocale(), isSupervisor ? 'dm.quoteNoSupWindow' : 'dm.quoteNoChatWindow') }
 }
+
+// ——————————————————————— 插件实时通讯（L2 通道代理 · 传输半）———————————————————————
+// 分工：本文件负责「连接 / 鉴权 / 好友校验 / 上行组装」，plugin-net.ts 负责「按插件隔离的订阅与投递」。
+// 依赖方向 member-channel → plugin-net 单向，无循环。
+
+/**
+ * 上行一帧插件帧（由 plugin-net 经传输委托调用）。
+ *
+ * 与 sendDm 的差别只在「载荷形态」与「限流桶」，**安全检查一道不减**：连接态、已知本账号身份、
+ * 非自己、互为好友、通道归属，逐条相同。载荷走 `payload.data`，与私信 `payload.content` 分开，
+ * 网关据此区分帧类型；本模块**不落盘、不建线程、不广播**（见 handleDownstream 的 plugin_msg 分支）。
+ */
+export function sendPluginFrame(input: {
+  pluginId: string
+  channelId: string
+  peerMemberId: string
+  payload: unknown
+}): MemberResult & { channelId?: string } {
+  if (!connected) return { ok: false, message: tIn(getMainLocale(), 'dm.sendNotConnected') }
+  const self = resolveSelfMemberId()
+  if (!self) return { ok: false, message: tIn(getMainLocale(), 'dm.sendNoSelf') }
+  const peer = (input.peerMemberId ?? '').trim()
+  if (!peer) return { ok: false, message: tIn(getMainLocale(), 'dm.sendNoPeer') }
+  if (peer === self) return { ok: false, message: tIn(getMainLocale(), 'dm.sendToSelf') }
+  // 【硬性前提·与私信同一道门】互为好友才允许通讯（网关侧另有 friend_required 兜底）
+  if (!friends.some((f) => f.memberId === peer)) {
+    audit({ dir: 'out', caller: `plugin:${input.pluginId}`, topic: 'plugin_frame:rejected', channelId: null, to: peer, bytes: 0, result: 'not_friends' })
+    return { ok: false, message: tIn(getMainLocale(), 'dm.sendNotFriends') }
+  }
+  // 【防伪造通道】通道必须恰是「本账号 ↔ 该好友」那条：插件不能拿着别人的通道号往别处发
+  const expected = computeDmChannelId(self, peer)
+  const channelId = (input.channelId ?? '').trim()
+  if (channelId !== expected) {
+    audit({ dir: 'out', caller: `plugin:${input.pluginId}`, topic: 'plugin_frame:rejected', channelId, to: peer, bytes: 0, result: 'channel_forbidden' })
+    return { ok: false, message: tIn(getMainLocale(), 'pluginNet.channelForbidden') }
+  }
+  const caller = `plugin:${input.pluginId}`
+  // 独立限流桶（每插件一枚）：房间帧额度与私信 30 条/10 秒完全分开，互不挤占
+  if (!takeSendToken(caller)) {
+    audit({ dir: 'out', caller, topic: 'plugin_frame:rejected', channelId, to: peer, bytes: 0, result: 'rate_limited' })
+    return { ok: false, message: tIn(getMainLocale(), 'pluginNet.frameRateLimited') }
+  }
+  const ok = out('plugin_msg', channelId, { data: input.payload ?? null }, peer, caller)
+  if (!ok) return { ok: false, message: tIn(getMainLocale(), 'dm.sendFailedDisconnected') }
+  return { ok: true, message: '' }
+}
+
+/**
+ * 让网关对某 channelId 补发一次 subscribe —— 供 plugin-net 的订阅路径调用。
+ *
+ * ⚠️ 刻意**不写进 `subscribers`**：那张表决定 `member:message` 投给谁（私信正文），
+ * 插件窗口绝不该收到用户私信。这里只发 ws subscribe（网关据此把该通道的**帧**投过来），
+ * 投递落点由 plugin-net 的 `(pluginId, channelId)` 表决定。
+ * 同理**不发 leave**（同一条 chat:1v1 通道可能同时被私信订阅，发 leave 会连带关掉私信实时推送）。
+ */
+export function ensurePluginChannelSubscribed(channelId: string): void {
+  const id = (channelId ?? '').trim()
+  if (!id) return
+  out('subscribe', id, { plugin: true })
+}
+
+// 注入传输委托（plugin-net 不反向 import 本模块，避免循环依赖）
+setPluginNetTransport({
+  send: (input) => {
+    const r = sendPluginFrame(input)
+    return { ok: r.ok, message: r.message, channelId: r.channelId }
+  },
+  ensureSubscribed: (channelId) => ensurePluginChannelSubscribed(channelId),
+})

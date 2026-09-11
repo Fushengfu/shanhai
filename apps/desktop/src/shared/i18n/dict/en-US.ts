@@ -1189,6 +1189,8 @@ const en = {
   'dm.quoteWhereChat': 'this conversation input box',
   'dm.quoteNoSupWindow': 'The Session Supervisor window is not open, so the input box cannot be written (open it first, then quote).',
   'dm.quoteNoChatWindow': 'The chat window is not open, so the input box cannot be written (open it first, then quote).',
+  'pluginNet.channelForbidden': 'That channel does not belong to the conversation between you and this peer; the plugin frame was rejected.',
+  'pluginNet.frameRateLimited': 'Plugin realtime frames are being sent too frequently (the room-frame quota is separate from the direct-message quota); this frame was not sent.',
   'common.cred.anonymous': 'Not signed in to a member account',
   'common.cred.expiredHard': 'The login credential expired past the renewal grace period. Please sign in again.',
   'common.cred.expiredGrace': 'The login credential expired (automatic renewal is in progress; remote control and direct messages are unavailable meanwhile).',

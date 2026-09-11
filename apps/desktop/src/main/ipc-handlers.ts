@@ -41,6 +41,9 @@ import {
   quoteDmToSession,
 } from './member-channel'
 import { checkAndPromptForUpdate, getLastUpdateCheckResult, getLastDownloadProgress, cancelUpdateDownload, fetchMobileApkInfo } from './app-updater'
+// 插件实时通讯（L2）：白名单能力 netSend / netSubscribe 的落点。
+// 只有这一个模块与 plugin-net 交互 —— appId 一律由窗口反查（见下方 case），插件无法传入/伪造。
+import { pluginSendFrame, pluginSubscribeChannel, dropPluginWindowSubscriptions } from './plugin-net'
 import { listMarketPlugins, downloadAndInstallPlugin, submitPluginToMarket, listMyPlugins, uninstallMarketPlugin } from './marketplace'
 import { listSkills, listMcpServers, listMcpToolCounts, refreshSkills, uninstallSkill } from './skills-mcp'
 import { listManagedServers, saveServer, setServerEnabled } from './mcp-config'
@@ -442,8 +445,13 @@ export function registerIpc(): void {
   ipcMain.handle('remote:relayStatus', async () => getRelayStatus())
 
   // 窗口被销毁时回收它持有的通道订阅（并向网关发 leave），避免死窗口的订阅 id 堆积、通道长期挂着
+  // 【插件实时通讯】插件窗口的通道订阅走**另一张表**（plugin-net 的 (pluginId, channelId)），
+  // 同样要在窗口销毁时回收：否则插件窗口关了、帧还会被往死窗口投（白跑一遍 getAllWindows）。
   app.on('web-contents-created', (_e, contents) => {
-    contents.on('destroyed', () => dropWindowSubscriptions(contents.id))
+    contents.on('destroyed', () => {
+      dropWindowSubscriptions(contents.id)
+      dropPluginWindowSubscriptions(contents.id)
+    })
   })
 
   // —— 会员实时通讯底座（私信 / 好友）——
@@ -521,6 +529,10 @@ export function registerIpc(): void {
     'listSessions', 'listMemory', 'getUiState', 'closeApp', 'getWallpaper', 'getTokenStats',
     'invokePluginService', 'modelCall', 'listModels', 'modelCallStream',
     'videoGen', 'videoGenQuery', 'imageGen', 'imageGenQuery', 'tts', 'uploadFile',
+    // 【插件实时通讯】房间帧收发（21 → 23 项）。
+    // ⚠️ 两项都**不进** alwaysAllowed：必须由插件在 manifest.permissions 显式声明才可用
+    //   （与 modelCall 同档：会真正对外发数据，不能默认放行）。
+    'netSend', 'netSubscribe',
   ])
   ipcMain.handle('plugin:invoke', async (e, capability: string, ...args: unknown[]) => {
     const win = BrowserWindow.fromWebContents(e.sender)
@@ -576,6 +588,21 @@ export function registerIpc(): void {
       case 'invokePluginService':
         // client → host 自定义 RPC：appId 反查窗口 → 插件 id，只调「本插件」host 半注册的服务（无法越权）
         return runtime.invokePluginService(appId, String(args[0] ?? ''), Array.isArray(args[1]) ? args[1] : [])
+      /**
+       * 【插件实时通讯】订阅一条通道（房间帧的下行落点）。
+       * 身份：appId 来自窗口反查（上面已取），插件**无法传入**；webContentsId 取 e.sender.id，
+       * 同样无法伪造 —— 这两项共同保证「A 插件订阅的通道，B 插件收不到它的帧」。
+       * 通道结构在 plugin-net 侧校验（必须匹配 chat:1v1:{数字}-{数字}）。
+       */
+      case 'netSubscribe':
+        return pluginSubscribeChannel(appId, args[0], e.sender.id)
+      /**
+       * 【插件实时通讯】上行一帧（对局状态）。
+       * 顺序：尺寸 → 限流 → 交 member-channel（连接态 / 好友校验 / 通道归属 / 网关鉴权）。
+       * 全程不返回任何 token/凭证（返回值只有 {ok, channelId?, error?}）。
+       */
+      case 'netSend':
+        return pluginSendFrame(appId, args[0], e.sender.id)
       case 'modelCall':
         // 受控单次文本生成：modelId 可选（须在 listModelsForPlugin 可用列表内），缺省用当前选中模型；maxTokens 上限由 runtime 固定。
         return runtime.invokeModelForPlugin(appId, args[0] as { prompt: string; systemPrompt?: string; modelId?: string })

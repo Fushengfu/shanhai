@@ -107,7 +107,7 @@ client 半运行在浏览器渲染进程，**唯一形态**：窗口应用（配
 
 - 窗口内容由 `dist/client.html` + `dist/assets/*`（vite 完整 React bundle）渲染，**可用完整 React + JSX + 任意依赖 + 复杂 UI**。
 - 该入口挂**插件专用 preload**（`plugin.cjs`），暴露两个桥：
-  - `window.shanhaiPlugin`（白名单桥，21 项能力，见 §6）—— 插件调山海公开接口的**唯一**通道；
+  - `window.shanhaiPlugin`（白名单桥，23 项能力，见 §6）—— 插件调山海公开接口的**唯一**通道；
   - `window.shanhai`（宿主桥，**极度缩小**：仅 `windowType`/`platform`/`windowAppId`/`getPluginApp`/`closeApp`/`minimizeWindow`/`toggleMaximizeWindow`，无任何危险接口）。
 - 构建配置要求：`base: './'`（Electron `loadFile(file://)` 下资源必须相对路径）。
 
@@ -221,7 +221,7 @@ interface InstalledPackageMeta {
 
 **危险接口（`auth:*` / `chat:run` / `supervisor:*` / `model:switch` / `model:addCustom` / `model:updateCustom` / `model:removeCustom` / `remote:disable` / `approval:setPolicy` / `session:delete` / `settings:set` / `wallpaper:set` 等）永不进白名单，物理拿不到。** 注意：`chat:run` 是「完整多轮 agent 循环」（带工具调用/审批/多轮），插件**永远拿不到**；插件若需要模型能力，只能用下方 §6 新增的 `listModels` / `modelCall` / `modelCallStream`（受控模型能力，见「模型调用」小节）。
 
-## 6. 白名单能力清单（21 项）
+## 6. 白名单能力清单（23 项）
 
 | 能力 | 说明 |
 |------|------|
@@ -239,15 +239,17 @@ interface InstalledPackageMeta {
 | `invokePluginService` | 调用本插件 host 半注册的自定义服务（client→host RPC，见 §1.2 `ctx.provide`）。入参：服务名 + 可变参数，返回值须 JSON 可序列化。**默认放行**：无需 `permissions` 声明 |
 | `modelCall` | **模型调用（非流式）**：用「当前选中的模型」或「listModels 可用列表里指定的模型」做一次单次文本生成（受控，见 §6.1）。**需显式声明** `permissions: ["modelCall"]` |
 | `listModels` | **列出可用模型**：返回山海网关可用模型列表（精简 `{ id, name }`，隔离 apiKey/baseUrl）。**需显式声明** `permissions: ["listModels"]` |
-| `modelCallStream` | **流式模型调用**：边生成边推送分片，适合长文本避免一次性返回超时（受控，见 §6.3）。**需显式声明** `permissions: ["modelCallStream"]` |
+| `modelCallStream` | **流式模型调用**：边生成边推送分片，适合长文本避免一次性返回超时（受控，见 §6.1）。**需显式声明** `permissions: ["modelCallStream"]` |
 | `videoGen` | **视频生成（提交）**：透传网关 `POST /api/v1/video/generations`，返回 `{ taskId }`（真实接口已存在，见 §6.2）。**需显式声明** `permissions: ["videoGen"]` |
 | `videoGenQuery` | **视频生成查询**：透传网关 `GET /api/v1/video/generations/{taskId}`，返回 `{ status, progress?, errorMessage? }`（只读查询，见 §6.2）。**需显式声明** `permissions: ["videoGenQuery"]` |
 | `imageGen` | **图片生成（提交）**：透传网关 `POST /api/v1/image/generations`（网关尚未实现，桥已预留，见 §6.2）。**需显式声明** `permissions: ["imageGen"]` |
 | `imageGenQuery` | **图片生成查询**：透传网关 `GET /api/v1/image/generations/{taskId}`（网关尚未实现，桥已预留，见 §6.2）。**需显式声明** `permissions: ["imageGenQuery"]` |
 | `tts` | **语音合成（提交）**：透传网关 `POST /api/v1/audio/tts`（网关尚未实现，桥已预留，见 §6.2）。**需显式声明** `permissions: ["tts"]` |
 | `uploadFile` | **上传文件到七牛云**：返回 https 公网 URL（供素材/图片直传，拿到公网链接后转给 videoGen 等）。凭证由主进程持有（登录账号 memberToken），插件只传文件 base64 + 可选 mimeType/fileName，拿不到 token/key。**需显式声明** `permissions: ["uploadFile"]`；未登录返回错误 |
+| `netSubscribe` | **插件实时通讯·订阅通道**：订阅一条房间帧通道（下行帧的落点）。入参 `channelId`（形如 `chat:1v1:{较小 memberId}-{较大 memberId}`），返回 `{ ok, channelId?, error? }`。**需显式声明** `permissions: ["netSubscribe"]`（见 §6.3） |
+| `netSend` | **插件实时通讯·上行一帧**：往已订阅的通道发一帧（对局状态、操作指令等）。入参 `{ channelId, peerMemberId, payload }`，单帧 ≤ 8KB，独立限流桶。**需显式声明** `permissions: ["netSend"]`（见 §6.3） |
 
-> 完整可声明清单即上述 21 项；`permissions` 缺省 = 空数组 = 最小权限。
+> 完整可声明清单即上述 23 项；`permissions` 缺省 = 空数组 = 最小权限。
 
 ### 6.1 模型调用（`modelCall` / `modelCallStream` / `listModels`）
 
@@ -345,6 +347,62 @@ const url = await window.shanhaiPlugin.uploadFile({
 3. **需显式声明**：六个能力都要显式声明（**非默认放行**），install 顶层审批时一并批准。
 4. **限流**：生成类（videoGen/imageGen/tts）复用 modelCall 的频率窗口（每插件每分钟 20 次）；查询类（videoGenQuery/imageGenQuery）只读、不加限流。
 5. **危险接口隔离**：六个能力与 `model:switch` / `chat:run` / `supervisor:*` 完全隔离，插件依然物理拿不到。
+
+### 6.3 插件实时通讯（`netSend` / `netSubscribe` / `onNetFrame`）
+
+**场景**：插件要做「真·跨网对战 / 多人实时协作」（两台不同电脑上的山海）。山海提供**一条内核代理的实时帧通道**，插件**不持有任何账号凭证**。
+
+**① 订阅通道 `netSubscribe(channelId)`**：
+```ts
+const r = await window.shanhaiPlugin.netSubscribe('chat:1v1:1001-1002')
+// r = { ok: true, channelId: 'chat:1v1:1001-1002' } 或 { ok: false, error: 'invalid_channel' }
+```
+
+**② 上行一帧 `netSend({ channelId, peerMemberId, payload })`**：
+```ts
+await window.shanhaiPlugin.netSend({
+  channelId: 'chat:1v1:1001-1002',   // 必填：必须与 netSubscribe 过的同一条
+  peerMemberId: '1002',              // 必填：对端会员标识（须互为好友）
+  payload: { type: 'shot', x: 0.5, y: -0.3 },  // 必填：任意 JSON 可序列化值，≤ 8KB
+})
+```
+
+**③ 收下行帧 `onNetFrame(cb)`**（返回取消订阅函数）：
+```ts
+const off = window.shanhaiPlugin.onNetFrame((frame) => {
+  // frame = { pluginId, channelId, from, payload, ts }
+})
+// off()  // 可选：解除监听（插件窗口关闭时内核会自动回收订阅，无需额外处理）
+```
+
+**通道 id 规范**：`chat:1v1:{较小 memberId}-{较大 memberId}` —— 这是「本账号 ↔ 某好友」那条 1v1 会话通道，**两台电脑上算出的值相同**，所以对战双方无需另建房间协议。插件不需要（也拿不到）本机会员标识：主进程会按发起窗口反查插件身份，并**校验该通道确实属于「本账号 ↔ peerMemberId」**，不匹配直接拒绝。
+
+**返回的 `error` 取值**：
+
+| error | 含义 |
+|-------|------|
+| `missing_plugin` | 无法确定发起插件的身份（异常，通常是窗口类型不对） |
+| `invalid_channel` | 通道 id 不符合 `chat:1v1:{数字}-{数字}` |
+| `too_many_channels` | 单个插件同时订阅的通道数超过上限（8 条） |
+| `not_subscribed` | `netSend` 前没有对本窗口订阅过该通道，或订阅来自别的窗口 |
+| `unserializable` | `payload` 无法 JSON 序列化 |
+| `frame_too_large` | 单帧超过 8KB |
+| `rate_limited` | 超出房间帧限流额度（每插件 900 帧 / 10 秒） |
+| `not_connected` | 会员通道未连接（未登录或连接已断开） |
+| 其它（中文文案） | 好友校验、通道归属校验、发送失败等，**文案原样透传**（如「你们还不是好友…」） |
+
+**安全规则（写死，插件不可突破）**：
+1. **凭证不出主进程**：插件**拿不到**会员 token / 任何凭证；连接、鉴权、好友校验、限流全部由内核代理完成。**没有任何「让插件读配置文件取凭证」的通道**。
+2. **按插件隔离**：订阅表是**双键** `(pluginId, channelId)`，`pluginId` 由主进程从发起窗口反查、**插件无法传入或伪造**；投递给某个插件的帧，**其它插件收不到**（`onNetFrame` 侧重按 `pluginId` 过滤，是第二道防线）。
+3. **仅互为好友可发**：复用会员通道的既有好友校验；网关侧另有 `friend_required` 兜底。
+4. **限流与尺寸独立**：房间帧有**自己的**限流额度（每插件 900 帧 / 10 秒）与尺寸上限（8KB），**与私信额度（30 条 / 10 秒）互不挤占**。
+5. **绝不进 Agent 上下文**：帧**不落盘**、不写会话历史、不进任何 Agent 上下文、不触发任何执行；也**不会**出现在私信里（插件订阅不写进私信订阅表，插件窗口收不到同通道上的私信正文）。
+6. **需显式声明**：`netSend` / `netSubscribe` 都要显式声明（**非默认放行**），install 顶层审批时一并批准。
+7. **无取消订阅 API**：关闭插件窗口即可（内核在窗口销毁时自动回收该窗口的订阅与限流桶）。
+
+> ⚠️ **部署前提（如实告知）**：该能力**仅单实例可用** —— 通道与订阅都是本进程内存态，网关侧帧路由是「在线连接直投」。多实例 / 多开场景需要网关侧提供房间层（如 Redis pub/sub），山海侧不承担该职责。
+
+> ⚠️ **诚实标注**：网关侧对 `plugin_msg` 帧类型与房间层的支持**由网关独立实现**（山海侧只负责代理与隔离）。两端就绪前，本能力在真机上可能返回连接类错误。
 
 ---
 

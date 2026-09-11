@@ -360,6 +360,9 @@ export function DmComposer(p: DmComposerProps): React.JSX.Element {
           </div>
         )}
         <input ref={fileRef} type="file" multiple accept={accept} style={{ display: 'none' }} onChange={(e) => void handleFileSelect(e)} />
+        {/* 【任务238】color 必须显式给：<textarea> 不继承父级 color，不写就落回浏览器默认（亮色
+            color-scheme 下恒为黑 rgb(0,0,0)）。暗色主题下底色是 --bg-panel(#262627)，
+            黑字对比度只有 1.39:1 —— 这正是用户报的「夜间模式输入框内容看不清」。走既有 token，不新增色值。 */}
         <textarea
           value={text}
           onChange={(e) => { setText(e.target.value); p.onTextChange?.(e.target.value) }}
@@ -385,7 +388,7 @@ export function DmComposer(p: DmComposerProps): React.JSX.Element {
           onPaste={(e) => void handlePaste(e)}
           rows={3}
           placeholder={placeholder}
-          style={{ width: '100%', border: 'none', outline: 'none', resize: 'none', fontSize: 14, lineHeight: 1.6, background: 'transparent', minHeight: 60, maxHeight: 200, fontFamily: 'inherit', display: 'block', boxSizing: 'border-box' }}
+          style={{ width: '100%', border: 'none', outline: 'none', resize: 'none', fontSize: 14, lineHeight: 1.6, background: 'transparent', color: 'var(--text)', minHeight: 60, maxHeight: 200, fontFamily: 'inherit', display: 'block', boxSizing: 'border-box' }}
         />
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4, gap: 8 }}>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', flex: 1, minWidth: 0 }}>

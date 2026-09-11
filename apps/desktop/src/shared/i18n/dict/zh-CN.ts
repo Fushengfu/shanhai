@@ -1229,6 +1229,8 @@ export const zhCN = {
   'dm.quoteWhereChat': '该会话的输入框',
   'dm.quoteNoSupWindow': '会话管家窗口未打开，无法写入输入框（请先打开管家再引用）',
   'dm.quoteNoChatWindow': '聊天窗口未打开，无法写入输入框（请先打开聊天窗口再引用）',
+  'pluginNet.channelForbidden': '该通道不属于「你与当前对端」的会话，插件通道发送被拒绝',
+  'pluginNet.frameRateLimited': '插件实时帧发送过于频繁（房间帧限流与私信额度互相独立），本帧未发送',
   // 凭证三态（私信面板顶部条 + 设置页「连接」分区两处显示 → 归 common.*）
   'common.cred.anonymous': '未登录会员账号',
   'common.cred.expiredHard': '登录凭证已过期且超出续签宽限期，请重新登录',
