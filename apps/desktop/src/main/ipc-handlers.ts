@@ -159,6 +159,10 @@ export function registerIpc(): void {
   // —— 长期记忆 ——
   ipcMain.handle('memory:list', async (_e, sessionId: string) => runtime.listMemory(sessionId))
   ipcMain.handle('memory:remove', async (_e, id: number) => runtime.removeMemory(id))
+  // 【任务257】编辑单条记忆正文（只改 value；id/scope/key/created 由内核拒绝变更）
+  ipcMain.handle('memory:update', async (_e, id: number, value: unknown) => runtime.updateMemory(id, value))
+  // 【任务257】记忆落盘状态（写失败可见）：面板据此显示横幅，只读不清空
+  ipcMain.handle('memory:status', async () => runtime.memoryStatus())
 
   // —— 本机技能 / MCP（账号悬停弹窗的只读展示，见 main/skills-mcp.ts）——
   // 全部只读；MCP 工具数探测带 5s 超时与逐台降级，拿不到就回 error，不编数字。

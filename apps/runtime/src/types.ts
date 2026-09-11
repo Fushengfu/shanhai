@@ -472,9 +472,13 @@ export interface Runtime {
   /** 插件语音合成（提交）：透传网关 POST /api/v1/audio/tts（网关尚未实现，桥已预留，返回透传） */
   invokeTts(appId: string, input: PluginTtsInput): Promise<unknown>
   /** 列出长期记忆（按会话隔离，仅返回当前会话的记忆） */
-  listMemory(sessionId: string): Array<{ id: number; scope: string; key: string; value: unknown; source: string; confidence: number; timestamp: number; sessionId?: string }>
+  listMemory(sessionId: string): Array<{ id: number; scope: string; key: string; value: unknown; source: string; confidence: number; timestamp: number; sessionId?: string; created?: number; updated?: number }>
   /** 删除一条长期记忆（按 id） */
   removeMemory(id: number): void
+  /** 【任务257】更新一条长期记忆的**正文**（只改 value；id/scope/key/created 不可变）。失败回 { ok:false, error }，**不静默** */
+  updateMemory(id: number, value: unknown): { ok: boolean; error?: string }
+  /** 【任务257】记忆落盘状态（写失败对渲染层可见）：ok=false ⇒ 存储处于失败态；failures 为累计失败次数 */
+  memoryStatus(): { ok: boolean; error?: string; failures: number; unknownFiles: Array<{ file: string; reason: string }> }
   /** 语音转文字（STT）：音频 base64 → 文本（优先 LLM 网关 AI 识别，失败降级 macOS Speech） */
   transcribeAudio(audioBase64: string, format?: string): Promise<string>
   /** 当前通用设置（持久化到 config.json，跨会话、重启保留） */

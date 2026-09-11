@@ -5,8 +5,9 @@ import type { DmPendingReply } from './types'
 /** 「会话管家」超级会话的固定 id（独立常驻窗口承载，作为主 Agent 监控/转发所有用户会话） */
 export const SUPERVISOR_ID = 'supervisor'
 
-/** 管家上下文历史回放保留的最近对话回合数（普通会话为 20，管家更多，便于跨会话编排时保留更长上下文主线） */
-export const SUPERVISOR_MAX_HISTORY_TURNS = 30
+/** 管家上下文历史回放保留的最近对话回合数（普通会话为 5，管家更多，便于跨会话编排时保留更长上下文主线）
+ * 【任务269】用户拍板从 30 压到 **10 轮**；「1 轮」= 1 对完整回合（用户原始消息 + 该回合最终 assistant 正文），不含工具执行过程。 */
+export const SUPERVISOR_MAX_HISTORY_TURNS = 10
 
 /**
  * 会话管家（主 Agent）工具集。

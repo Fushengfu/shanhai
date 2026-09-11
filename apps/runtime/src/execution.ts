@@ -153,12 +153,14 @@ export function createExecutionModule(
       const result = await sessionContext.run(sid, () =>
         loop.run(message, {
           ...opts,
-          systemPrompt: isSupervisorRun ? prompts.buildSupervisorSystemPrompt(message) : prompts.buildSystemPrompt(meta.workDir, prompts.buildMemoryContext(message, meta.id)),
+          systemPrompt: isSupervisorRun ? prompts.buildSupervisorSystemPrompt() : prompts.buildSystemPrompt(meta.workDir),
           // 运行环境明细的唯一真相源：注入到「发给模型的首条用户消息」之前的系统提示标签块（不落盘、不进回放）
           userContext: prompts.buildUserContextBlock(meta.workDir),
+          // 【任务263】长期记忆目录 + 使用规则：注入到「本轮这条用户消息」前的系统提示标签块（不落盘、不进回放）
+          memoryIndex: prompts.buildMemoryIndexBlock(isSupervisorRun ? SUPERVISOR_ID : meta.id),
           attachments: opts?.attachments,
           modelContent,
-          // 管家历史回放轮数比普通会话多（30 vs 20），便于跨会话编排时保留更长上下文主线
+          // 管家历史回放轮数比普通会话多（【任务269】10 vs 5），便于跨会话编排时保留更长上下文主线
           maxHistoryTurns: isSupervisorRun ? SUPERVISOR_MAX_HISTORY_TURNS : undefined,
           // 发新任务（run）时，普通会话与管家会话一致剔除「最后一个未完成轮次」：网络中断遗留的孤立 user（其后无 assistant 正文）。
           // resume 续跑走 resumeRun 不传此标志，天然不受影响。
@@ -642,7 +644,7 @@ export function createExecutionModule(
     try {
       return await sessionContext.run(sid, () =>
         loop.resumeRun(
-          isSupervisorRun ? prompts.buildSupervisorSystemPrompt(lastUserContent) : prompts.buildSystemPrompt(meta.workDir, prompts.buildMemoryContext(lastUserContent, meta.id)),
+          isSupervisorRun ? prompts.buildSupervisorSystemPrompt() : prompts.buildSystemPrompt(meta.workDir),
           (text) => {
             if (ctx.stoppedSessions.has(sid)) throw new Error('__stopped__')
             ctx.deltaCallbacks.forEach((cb) => cb(sid, text))
@@ -650,6 +652,8 @@ export function createExecutionModule(
           (text) => ctx.reasoningCallbacks.forEach((cb) => cb(sid, text)),
           // 断点续跑同样注入系统提示标签块（首条用户消息带运行环境明细、每条带自己的真实时间）
           prompts.buildUserContextBlock(meta.workDir),
+          // 【任务263】断点续跑同样带长期记忆目录（挂在本轮这条用户消息上）
+          prompts.buildMemoryIndexBlock(isSupervisorRun ? SUPERVISOR_ID : meta.id),
         ),
       )
     } catch (err) {

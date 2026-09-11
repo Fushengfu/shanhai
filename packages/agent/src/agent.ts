@@ -42,7 +42,8 @@ const REPLAY_ASSISTANT_CLOSE = '</replay-assistant>'
  *   ├ <user_info>            运行环境明细（只注入在首条用户消息）
  *   ├ <additional_data>
  *   │     └ <current_time>   该条用户消息自己的时间（每条都有；历史用落盘真实时间，本轮用当下）
- *   └ <sh_mandate>           反编造硬约束（每条都有；sh_ 前缀 → 自动进保留标签名单，无需改名）
+ *   ├ <sh_mandate>           反编造硬约束（每条都有；sh_ 前缀 → 自动进保留标签名单，无需改名）
+ *   └ <sh_memory_index>      长期记忆「目录 + 使用规则」（只注入在【本轮这条】用户消息；只有标题、无正文）
  * 铁律：整块只在「发给模型那一刻」构造——不落盘、不进事件日志、不进回放；
  *       且一律放在 <user_query> 之外（块在前、用户原话标签在后）。
  */
@@ -56,6 +57,11 @@ const CURRENT_TIME_OPEN = '<current_time>'
 const CURRENT_TIME_CLOSE = '</current_time>'
 const MANDATE_OPEN = '<sh_mandate>'
 const MANDATE_CLOSE = '</sh_mandate>'
+/** 长期记忆「目录 + 使用规则」标签（sh_ 前缀族 → 自动进保留标签名单，无需改名单/正则）。
+ * 【任务263】记忆不再进系统提示词，改为注入「本轮这条用户消息」前的系统提示标签块：
+ * 只有目录标题与使用规则、**没有任何正文**，正文由模型按需调 recall_memory 取回。 */
+const MEMORY_INDEX_OPEN = '<sh_memory_index>'
+const MEMORY_INDEX_CLOSE = '</sh_memory_index>'
 
 /** 系统保留标签名清单（单一真相源之一：逐个登记的「具名标签」，转义 / 检测 / 剥离三处都由它派生） */
 const SYSTEM_RESERVED_TAG_NAMES = ['user_query', 'system-reminder', 'additional_data', 'current_time', 'user_info'] as const
@@ -105,17 +111,29 @@ function wrapReplayAssistant(content: string): string {
 
 /** 系统提示标签块（包在 <user_query> 之前；块内内容不是用户指令）。
  * 结构：外层 <system-reminder>，块内依次 <user_info>（只首条）→ <additional_data>/<current_time>（每条）
- *      → <sh_mandate>（每条，反编造硬约束，放在最靠近用户原话的一侧，弱模型对尾部内容更敏感）。 */
-function wrapUserContext(envLines: string[], atMs: number): string {
+ *      → <sh_memory_index>（只本轮这条；【任务263】记忆从系统提示词搬到这里）→ <sh_mandate>（每条，
+ *      反编造硬约束，放在最靠近用户原话的一侧，弱模型对尾部内容更敏感）。 */
+function wrapUserContext(envLines: string[], atMs: number, memoryLines: string[] = []): string {
   const envPart = envLines.length > 0 ? `${USER_INFO_OPEN}\n${envLines.join('\n')}\n${USER_INFO_CLOSE}\n` : ''
   const timePart = `${ADDITIONAL_DATA_OPEN}\n${CURRENT_TIME_OPEN}${formatContextTime(atMs)}${CURRENT_TIME_CLOSE}\n${ADDITIONAL_DATA_CLOSE}`
-  return `${SYSTEM_REMINDER_OPEN}\n${envPart}${timePart}\n${SYSTEM_REMINDER_CLOSE}`
+  const memPart = memoryLines.length > 0 ? `${MEMORY_INDEX_OPEN}\n${escapeReservedTags(memoryLines.join('\n'))}\n${MEMORY_INDEX_CLOSE}\n` : ''
+  return `${SYSTEM_REMINDER_OPEN}\n${envPart}${timePart}\n${memPart}${SYSTEM_REMINDER_CLOSE}`
 }
 
 /** 把环境明细补进某条用户消息已有的上下文块里（幂等：已带 <user_info> 则原样返回）。 */
 function injectEnvIntoContextText(text: string, envLines: string[]): string {
   if (!text.startsWith(SYSTEM_REMINDER_OPEN) || text.includes(USER_INFO_OPEN)) return text
   return `${SYSTEM_REMINDER_OPEN}\n${USER_INFO_OPEN}\n${envLines.join('\n')}\n${USER_INFO_CLOSE}\n${text.slice(SYSTEM_REMINDER_OPEN.length + 1)}`
+}
+
+/** 把「记忆目录 + 使用规则」补进某条用户消息已有的上下文块里（幂等：已带 <sh_memory_index> 则原样返回）。
+ * 插在外层块收尾标签之前——即块内最靠近用户原话的位置，与 mandate 同一思路（尾部内容对弱模型更醒目）。
+ * 用函数式 replace 避免记忆正文里的 `$&` 之类被当成替换模式；正文先过 escapeReservedTags 防提前闭合穿模。 */
+function injectMemoryIntoContextText(text: string, memoryLines: string[]): string {
+  if (memoryLines.length === 0 || text.includes(MEMORY_INDEX_OPEN)) return text
+  const body = `${MEMORY_INDEX_OPEN}\n${escapeReservedTags(memoryLines.join('\n'))}\n${MEMORY_INDEX_CLOSE}\n`
+  if (!text.includes(SYSTEM_REMINDER_CLOSE)) return text
+  return text.replace(SYSTEM_REMINDER_CLOSE, () => `${body}${SYSTEM_REMINDER_CLOSE}`)
 }
 
 /** 剥掉历史回放包裹（供挂起快照落盘用）：只去外层标签，正文原样返回；不是包裹形态则不动。
@@ -180,7 +198,7 @@ export interface AgentLoopOptions {
   attachments?: ContentPart[]
   /** 发给模型的内容（可选）。图片降级等场景下：落盘仍保留原始 message + attachments，发给模型改用降级后的文字 */
   modelContent?: string
-  /** 历史回放保留的最近对话回合数（缺省 MAX_HISTORY_TURNS=20；管家等特殊会话可传入更大值） */
+  /** 历史回放保留的最近对话回合数（缺省 MAX_HISTORY_TURNS=5；管家等特殊会话可传入更大值，如 10） */
   maxHistoryTurns?: number
   /** 裁剪历史回合时是否保留回合内的工具调用事件（tool/call + tool/result + assistant(tool_calls)）。
    * true=按事件完整回放（管家会话用，保证工具调用历史不丢失、后续决策有依据）；false/缺省=只保留 user + 最终 assistant 正文（普通会话用，压缩上下文体积）。 */
@@ -194,6 +212,11 @@ export interface AgentLoopOptions {
    * 只在「发给模型那一刻」拼进首条用户消息前的系统提示标签块，绝不落盘、不进事件日志、不进回放。
    * 未传时本轮不注入环境块（行为与改造前一致）。 */
   userContext?: string[]
+  /** 长期记忆「目录 + 使用规则」行（单一真相源：由宿主 apps/runtime 的 buildMemoryIndexBlock 渲染）。
+   * 【任务263】记忆不再进系统提示词：只在「发给模型那一刻」拼进**本轮这条**用户消息前的系统提示标签块，
+   * 且只有目录标题与使用规则、**不含任何记忆正文**（正文由模型按需调 recall_memory 取回）。
+   * 同样绝不落盘、不进事件日志、不进回放；未传时本轮不注入记忆块。 */
+  memoryIndex?: string[]
 }
 
 /**
@@ -251,6 +274,8 @@ export class AgentLoop {
   private readonly userMessageTimes = new WeakMap<ChatMessage, number>()
   /** 本轮的运行环境快照行（宿主传入，未传 = 不注入环境块），供 retry() 重新注入用 */
   private lastUserContext: string[] | undefined
+  /** 本轮的长期记忆「目录 + 使用规则」行（宿主传入，未传 = 不注入记忆块），供 retry() 重新注入用 */
+  private lastMemoryIndex: string[] | undefined
 
   constructor(
     private readonly model: Model,
@@ -321,9 +346,12 @@ export class AgentLoop {
     // 从 session 事件日志回放历史（多轮对话 + 断点续跑：中断后历史仍在 session）
     // includeReasoning=false：上下文回放（近轮数裁剪、供模型使用）剔除 reasoning_content，避免思维链撑爆上下文、触发超时；
     // 仅 preserveToolCalls=true（按事件完整回放，保留工具调用）时才视为完整事件回放，保留 reasoning_content。
-    this.replayHistory(messages, options?.preserveToolCalls === true, maxHistoryTurns)
+    // 候选窗口放宽到 maxHistoryTurns 的 HISTORY_CANDIDATE_TURNS_FACTOR 倍：真正回放给模型的回合数在下一步
+    // trimHistoryToRecentTurns 里按「完整成对回合」取最近 maxHistoryTurns 个；此处多取候选，是为了让尾部
+    // 不完整回合（中断残留、注入消息后无回复）被丢弃后仍能往前凑满（【任务269】）。
+    this.replayHistory(messages, options?.preserveToolCalls === true, maxHistoryTurns * HISTORY_CANDIDATE_TURNS_FACTOR)
 
-    // 用户发起的新任务（新发消息 / 编辑重发 / 点击重发）：始终按最近 maxHistoryTurns（缺省 20）轮对话回放（每轮只保留用户消息 + 最终 assistant 回复正文，
+    // 用户发起的新任务（新发消息 / 编辑重发 / 点击重发）：始终按最近 maxHistoryTurns（普通会话缺省 5、管家 10）轮对话回放（每轮只保留用户消息 + 最终 assistant 回复正文，
     // 丢弃更早历史与工具执行过程），不再全量回放。断点续跑 resumeRun() 走独立路径，保留全量已执行历史。
     // preserveToolCalls=true 时（管家会话），每回合按事件完整回放、保留工具调用（tool/call + tool/result + assistant(tool_calls)）。
     this.trimHistoryToRecentTurns(messages, maxHistoryTurns, options?.preserveToolCalls, options?.dropIncompleteTurn)
@@ -357,6 +385,7 @@ export class AgentLoop {
     // 在「发给模型那一刻」给每条用户消息前置系统提示标签块（环境快照 + 各条自己的时间）。
     // 必须在裁剪之后做：保证环境块落在最终上下文里的第一条用户消息上，不会因早期历史被裁掉而丢失。
     this.lastUserContext = options?.userContext
+    this.lastMemoryIndex = options?.memoryIndex
     this.applyUserContext(messages)
 
     this.session.append('turn/start', { turn: 1 })
@@ -451,12 +480,16 @@ export class AgentLoop {
     messages.push(...trimmed)
   }
 
-  /** 裁剪 messages 到最近 maxTurns（缺省 MAX_HISTORY_TURNS）个对话回合，返回新数组：
+  /** 裁剪 messages 到最近 maxTurns（缺省 MAX_HISTORY_TURNS）个**完整**对话回合，返回新数组：
+   * - 回合边界 = 一条 user 消息；「完整」= 该回合内存在最终 assistant 正文（非工具调用消息）。
+   * - 不完整回合（孤立 user：中断残留、注入消息后无回复、只调了工具没出正文）**整体丢弃**，
+   *   绝不回放出「连续两条 user」或「只有 user 没 assistant」的残缺半对（【任务269】）。
+   * - 只从尾部取最近 limit 个完整回合；尾部若干回合不完整时自动继续往前取，凑满 limit 个或取尽为止。
    * - preserveToolCalls=true：每回合按事件完整保留（user → assistant(tool_calls) → tool → ... → 最终 assistant 正文），不丢弃工具调用；
    * - preserveToolCalls=false/缺省：每回合只保留「用户原始消息 + 最终 assistant 回复正文」，丢弃中间的 tool/call、tool/result、assistant(tool_calls) 工具执行过程。
-   * - dropIncompleteTurn=true（发新任务 run():由普通会话传入）：若最后一个 user 回合无最终 assistant 正文（网络中断残留的孤立 user），
-   *   连同其后的 tool 消息一起丢弃，只回放完整问答轮，避免与新任务的 user 叠成连续两条 user。resumeRun / 管家不传该标志，保持原回放。
-   * 调用方已确认需要裁剪，此处不再判断回合数是否超上限，始终只保留最近 limit 个回合。 */
+   * - dropIncompleteTurn 参数保留以兼容调用方签名：成对规则已覆盖其原语义（原先只剔除「最后一个未完成回合」，
+   *   现在不完整回合一律剔除，故该标志不再改变结果）。
+   * 调用方已确认需要裁剪，此处不再判断回合数是否超上限，始终只保留最近 limit 个完整回合。 */
   private buildTrimmedMessages(
     messages: ChatMessage[],
     maxTurns?: number,
@@ -470,72 +503,79 @@ export class AgentLoop {
     rest.forEach((m, i) => {
       if (m.role === 'user') userIndices.push(i)
     })
-    const kept: ChatMessage[] = []
-    const keptUserIndices = userIndices.slice(-limit) // 最近 limit 个 user 消息在 rest 中的索引
-    keptUserIndices.forEach((userIdx, t) => {
-      const nextUserIdx = keptUserIndices[t + 1] ?? rest.length // 下一个 user 消息的位置（最后一个回合取 rest 末尾）
-      const isLastTurn = t === keptUserIndices.length - 1
-      if (preserveToolCalls) {
-        // 按事件完整保留该回合：user → assistant(tool_calls) → tool/result → ... → 最终 assistant 正文
-        for (let i = userIdx; i < nextUserIdx; i++) {
-          const m = rest[i]
-          if (m) kept.push(m)
-        }
-        return
-      }
-      // 发新任务时剔除「最后一个未完成轮次」：网络中断遗留的孤立 user（其后没有最终 assistant 正文）。
-      // 只在最后一个 user 回合且 dropIncompleteTurn=true 时判定，避免误删中间的正常轮次。
-      if (dropIncompleteTurn && isLastTurn) {
-        let hasFinalText = false
-        for (let i = userIdx + 1; i < nextUserIdx; i++) {
-          const m = rest[i]
-          if (m && m.role === 'assistant' && !isToolCallMessage(m)) {
-            hasFinalText = true
-            break
-          }
-        }
-        // 无最终 assistant 正文 → 该回合是未完成轮次，连同其后未走完的 tool 消息一起跳过
-        if (!hasFinalText) return
-      }
-      const userMsg = rest[userIdx]
-      if (!userMsg) return
-      kept.push(userMsg) // 用户发的原始消息
-      // 在该回合内倒序找最后一条 assistant 正文（最终回复，无工具调用）；任务中止无正文时该回合只留 user 消息
+    // 逐回合定位「最终 assistant 正文」的位置；finalIdx = -1 表示该回合不完整（孤立 user）
+    const turns = userIndices.map((userIdx, t) => {
+      const nextUserIdx = userIndices[t + 1] ?? rest.length // 下一个 user 的位置（最后一个回合取 rest 末尾）
+      let finalIdx = -1
       for (let i = nextUserIdx - 1; i > userIdx; i--) {
         const m = rest[i]
         if (m && m.role === 'assistant' && !isToolCallMessage(m)) {
-          kept.push(m)
+          finalIdx = i
           break
         }
       }
+      return { userIdx, nextUserIdx, finalIdx }
     })
+    const kept: ChatMessage[] = []
+    turns
+      .filter((t) => t.finalIdx >= 0) // 成对规则：不完整回合整体丢弃（isolated user 不进上下文）
+      .slice(-limit) // 最近 limit 个完整回合
+      .forEach((t) => {
+        if (preserveToolCalls) {
+          // 按事件完整保留该回合：user → assistant(tool_calls) → tool/result → ... → 最终 assistant 正文
+          for (let i = t.userIdx; i < t.nextUserIdx; i++) {
+            const m = rest[i]
+            if (m) kept.push(m)
+          }
+          return
+        }
+        const userMsg = rest[t.userIdx]
+        if (userMsg) kept.push(userMsg) // 用户发的原始消息
+        const finalMsg = rest[t.finalIdx]
+        if (finalMsg) kept.push(finalMsg) // 该回合最终 assistant 正文（无工具调用）
+      })
+    void dropIncompleteTurn
     return [...systemMsgs, ...kept]
   }
 
   /** 在「发给模型那一刻」给每条用户消息前置系统提示标签块（块在前、<user_query> 在后，块内内容不进用户原话标签）：
    * - 每条用户消息：带该条消息自己的时间（历史用它落盘时的真实时间戳，当前消息用当下；
    *   时间未知的消息一律不注入，绝不拿 now 冒充历史时间）；
-   * - 上下文里的第一条用户消息：额外带运行环境快照（宿主传入，本包不计算）。
+   * - 上下文里的第一条用户消息：额外带运行环境快照（宿主传入，本包不计算）；
+   * - **本轮这条**（上下文里最后一条）用户消息：额外带长期记忆目录块（【任务263】）。
+   *   为什么只挂最后一条：记忆目录是「当前这轮要用的背景」，挂到全部历史消息上会让同一份目录在上下文里
+   *   重复 N 份（与环境块只挂首条同理，都是按「块只出现一次」去重）；历史轮次不需要重复携带目录。
    * 只在内存里构造：落盘的用户消息永远是原文，故注入内容不进 events.jsonl、不进回放、不显示给用户。
    * 幂等：已带块的文本不会被二次注入（retry 复用同一批 messages 对象时安全）。 */
   private applyUserContext(messages: ChatMessage[]): void {
     const envLines = (this.lastUserContext ?? []).filter((l) => l.trim().length > 0)
+    const memoryLines = (this.lastMemoryIndex ?? []).filter((l) => l.trim().length > 0)
+    // 先定位「本轮这条」用户消息（上下文里最后一条 user）：只有它带记忆目录块
+    let lastUserIdx = -1
+    messages.forEach((m, i) => {
+      if (m.role === 'user') lastUserIdx = i
+    })
     let envPlaced = false
-    for (const m of messages) {
-      if (m.role !== 'user') continue
+    messages.forEach((m, i) => {
+      if (m.role !== 'user') return
+      const isCurrentTurn = i === lastUserIdx
       const atMs = this.userMessageTimes.get(m)
       const decorate = (text: string): string => {
-        // 已带块（retry 复用同一批 messages 对象 / 中途追加后再走一遍）：不重复注入，只可能补一次环境明细
+        // 已带块（retry 复用同一批 messages 对象 / 中途追加后再走一遍）：不重复注入，只可能补一次环境明细 / 记忆目录
         if (text.startsWith(SYSTEM_REMINDER_OPEN)) {
-          if (envPlaced || envLines.length === 0) return text
-          envPlaced = true
-          return injectEnvIntoContextText(text, envLines)
+          let out = text
+          if (!envPlaced && envLines.length > 0) {
+            envPlaced = true
+            out = injectEnvIntoContextText(out, envLines)
+          }
+          if (isCurrentTurn) out = injectMemoryIntoContextText(out, memoryLines)
+          return out
         }
         // 时间未知（非本层构造的消息，如运行护栏提示、压缩摘要）一律不注入，绝不拿 now 冒充历史时间
         if (atMs === undefined) return text
         const withEnv = !envPlaced && envLines.length > 0
         if (withEnv) envPlaced = true
-        return `${wrapUserContext(withEnv ? envLines : [], atMs)}\n${text}`
+        return `${wrapUserContext(withEnv ? envLines : [], atMs, isCurrentTurn ? memoryLines : [])}\n${text}`
       }
       if (typeof m.content === 'string') {
         m.content = decorate(m.content)
@@ -544,7 +584,7 @@ export class AgentLoop {
         const firstText = m.content.find((p): p is { type: 'text'; text: string } => p.type === 'text')
         if (firstText) firstText.text = decorate(firstText.text)
       }
-    }
+    })
   }
 
   /** 深拷贝一份 messages 并剥掉所有「只在发给模型那一刻构造」的注入标签：专给 retry/snapshot 落盘用（注入内容不进事件日志）。
@@ -584,6 +624,7 @@ export class AgentLoop {
     onDelta?: (text: string) => void,
     onReasoning?: (text: string) => void,
     userContext?: string[],
+    memoryIndex?: string[],
   ): Promise<string> {
     // 清理上次中断残留的流式增量（半截 assistant/delta）：回放时虽忽略，但残留会污染持久化文件与后续重建
     const events = this.session.list()
@@ -595,8 +636,9 @@ export class AgentLoop {
     const messages: ChatMessage[] = []
     if (systemPrompt) messages.push({ role: 'system', content: systemPrompt })
     this.replayHistory(messages)
-    // 断点续跑同样注入上下文块（历史用它落盘时的真实时间，第一条带环境快照）
+    // 断点续跑同样注入上下文块（历史用它落盘时的真实时间，第一条带环境快照，最后一条带记忆目录）
     this.lastUserContext = userContext
+    this.lastMemoryIndex = memoryIndex
     this.applyUserContext(messages)
     // 断点续跑不裁剪：保留全量已执行历史，确保从断点继续时上下文完整（按长度裁剪只对用户发起新任务生效，见 run()）
     return this.runLoop(messages, 0, maxSteps, onDelta, onReasoning)
@@ -801,7 +843,7 @@ export class AgentLoop {
 
   /** 循环中压缩：最近一次真实 usage.total_tokens 达到窗口 70% 临界值（COMPACTION_THRESHOLD）时，仅针对「当前轮」（最后一条 user 消息之后已执行的工具调用与结果）
    * 做 LLM 摘要，生成一段本轮进度摘要，保证本轮任务连贯性后继续执行。历史回合保持原文不动——超过上下文窗口临界值的
-   * 历史也保留、不裁剪、不丢弃（用户发起新任务时已按最近 20 轮裁剪，见 trimHistoryToRecentTurns）。
+   * 历史也保留、不裁剪、不丢弃（用户发起新任务时已按最近 maxHistoryTurns 轮裁剪，见 trimHistoryToRecentTurns）。
    * 判断依据：lastUsageTotalTokens（最后一次 LLM 返回的真实 usage.total_tokens），不是本地估算。
    * @param force true 时跳过判断直接压缩（网关已返回 400 超限时的兜底强制压缩）；若当前轮尚无可压缩步骤且非 force，则保留原样返回（不裁剪历史）。 */
   private async maybeCompact(messages: ChatMessage[], force = false): Promise<ChatMessage[]> {
@@ -822,17 +864,17 @@ export class AgentLoop {
     const prefix = messages.slice(0, lastUserIdx + 1) // system + 历史回合 + 当前 user 消息
     const currentTurn = messages.slice(lastUserIdx + 1) // 本轮已执行的步骤
     // 当前轮没有实质工具步骤（空轮，或已被压成摘要只剩 assistant 文本）：说明超限来自历史本身，
-    // 压缩当前轮救不了（压完历史仍超会反复压缩），回退裁剪历史到 20 轮。
+    // 压缩当前轮救不了（压完历史仍超会反复压缩），回退裁剪历史到 MAX_HISTORY_TURNS 轮（【任务269】=5）。
     const hasToolSteps = currentTurn.some(
       (m) => m.role === 'tool' || (m.role === 'assistant' && isToolCallMessage(m)),
     )
     if (!hasToolSteps) {
       // 当前轮无实质工具步骤（空轮，或已被压成摘要只剩 assistant 文本）：说明超限来自历史本身，压缩当前轮救不了。
       // 非 force（预防性压缩）：按需求「超窗口临界值的历史也保留」，不裁剪历史，直接原样返回（宁可超限报错也不偷偷丢弃历史）。
-      // force（网关已明确返回 400「发起即超」）：压缩当前轮救不了，此时必须裁剪历史 20 轮自救——否则注定 400 死循环。
+      // force（网关已明确返回 400「发起即超」）：压缩当前轮救不了，此时必须裁剪历史自救——否则注定 400 死循环。
       if (force) {
         const trimmed = this.buildTrimmedMessages(messages)
-        // 裁剪后消息数未减少（历史本身不超过 20 轮，无内容可裁）→ 返回原样，让外层抛错（裁剪也救不了）
+        // 裁剪后消息数未减少（历史本身不超过上限轮数，无内容可裁）→ 返回原样，让外层抛错（裁剪也救不了）
         if (trimmed.length >= messages.length) return messages
         return trimmed
       }
@@ -1102,8 +1144,16 @@ const GATEWAY_ERROR_BACKOFF_MS = 3000
  */
 const GATEWAY_MAX_RETRY = 3
 
-/** 用户发起新任务时（新发消息 / 编辑重发 / 点击重发）回放历史保留的最近对话回合数（20 轮：用户原始消息 + 最终 assistant 回复正文） */
-const MAX_HISTORY_TURNS = 20
+/** 用户发起新任务时（新发消息 / 编辑重发 / 点击重发）回放历史保留的最近对话回合数。
+ * 【任务269】用户拍板：普通会话从 20 轮压到 **5 轮**（管家见 apps/runtime 的 SUPERVISOR_MAX_HISTORY_TURNS=10）。
+ * 「1 轮」= 1 对完整回合（一条用户原始消息 + 该回合最终 assistant 回复正文），不含工具执行过程。
+ * 口径依据：真机实测历史消息占单轮请求 ~59%（管家 268,752 字符 / 455,000），而真正被用到的通常只有最近 1~2 轮。 */
+const MAX_HISTORY_TURNS = 5
+
+/** 回放候选窗口倍数（【任务269】）：真正回放给模型的回合数由 buildTrimmedMessages 保证（只取完整成对回合），
+ * replayHistory 这里多取若干倍作为候选——尾部可能存在不完整回合（中断残留、注入消息后无回复），
+ * 成对规则会把它们整体丢弃，多取的候选用于「继续往前取，凑满 maxHistoryTurns 个完整回合」。 */
+const HISTORY_CANDIDATE_TURNS_FACTOR = 3
 
 /** 循环中上下文压缩触发临界值：最近一次真实 usage.total_tokens 达到窗口 70% 即触发（预留 30% 余量，用户设定） */
 const COMPACTION_THRESHOLD = 0.7

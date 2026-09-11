@@ -406,6 +406,19 @@ export interface MemoryEntry {
   confidence: number
   timestamp: number
   sessionId?: string
+  /** 【任务257】首次创建时间（ms） */
+  created?: number
+  /** 【任务257】最近一次写入时间（ms）；与 created 不同才在界面区分显示 */
+  updated?: number
+}
+
+/** 【任务257】记忆落盘状态（写失败可见）：ok=false ⇒ 存储处于失败态；failures 为累计失败次数 */
+export interface MemoryStatus {
+  ok: boolean
+  error?: string
+  failures: number
+  /** 未被认定为山海记忆的 .md（只登记、永不删除） */
+  unknownFiles: Array<{ file: string; reason: string }>
 }
 
 /** 通用设置（与 preload / runtime 的 AppSettings 对应） */
@@ -749,6 +762,10 @@ declare global {
       onClientRemove(cb: (pkgId: string) => void): () => void
       listMemory(sessionId: string): Promise<MemoryEntry[]>
       removeMemory(id: number): Promise<void>
+      /** 【任务257】编辑单条记忆正文（只改 value；id/scope/key/session/created 不可变）。失败回 { ok:false, error }，不静默 */
+      updateMemory(id: number, value: unknown): Promise<{ ok: boolean; error?: string }>
+      /** 【任务257】记忆落盘状态（写失败可见）：ok=false / failures>0 时面板显示横幅 */
+      memoryStatus(): Promise<MemoryStatus>
       /** 本机技能清单（只读：内置说明书技能 + ~/.shanhai/skills 用户技能） */
       listSkills(): Promise<SkillListResult>
       /** 本机已配置的 MCP 服务器（只读：id/command/args，不含 env 等敏感字段） */

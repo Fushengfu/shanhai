@@ -29,7 +29,7 @@ import { createAtomicTools, createUtilityTools, toolReasoningContext, type ToolC
 import { createAskTools, AskService, ASK_CANCELLED, type AskRequest } from '@shanhai/ask'
 import { createSkillTools, SkillService } from '@shanhai/skills'
 import { createMcpTools, McpService } from '@shanhai/mcp'
-import { MemoryStore } from '@shanhai/memory'
+import { MemoryStore, migrateMemoryJsonToVault, type MemoryEntry } from '@shanhai/memory'
 import { FileCredentialStore, AuthService } from '@shanhai/auth'
 import type { GatewayModel, ModelTier } from '@shanhai/auth'
 import type { VoiceService } from '@shanhai/voice'
@@ -50,7 +50,7 @@ import {
   deleteSessionDir,
   migrateLegacySessionFile,
 } from './session-store'
-import { promises as fs } from 'node:fs'
+import { promises as fs, existsSync } from 'node:fs'
 import { homedir, hostname as osHostname } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { join, basename, isAbsolute } from 'node:path'
@@ -234,7 +234,16 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
   ctx.userTerminalSessionMap = new Map<string, string>()
   ctx.userTerminalOutputCallbacks = new Set<(sessionId: string, terminalId: string, data: string) => void>()
   ctx.voice = createSystemVoiceService()
-  ctx.memory = new MemoryStore()
+  // 【任务256 · 形态B】长期记忆后端切到 vault（`~/.shanhai/memory/` 下的 Markdown + frontmatter 文件树）。
+  // 对外仍是同一个 `ctx.memory`（MemoryStore），五个方法签名未变 ⇒ 调用方零改动。
+  // 写盘改为「save() 时就地原子写单文件」，**不再有全量覆盖**；旧 `memory.json` 仅作为迁移来源与只读兜底。
+  const memoryVaultRoot = join(homedir(), '.shanhai', 'memory')
+  ctx.memory = new MemoryStore({
+    vaultRoot: memoryVaultRoot,
+    // 【任务259】目录口径：sessions/<sessionId 原文>/<scope 英文原名>/ —— 不再按标题建目录（无需读 meta.json）
+    // 写失败/未知文件一律走这里（原实现的 `catch {}` 静默吞掉已删除）
+    onError: (msg: string) => console.warn('[memory]', msg),
+  })
   ctx.currentSettings = {
     browser: { showOnCreate: DEFAULT_SETTINGS.browser.showOnCreate, enableWebBridge: DEFAULT_SETTINGS.browser.enableWebBridge },
     messageSubmit: { mode: DEFAULT_SETTINGS.messageSubmit.mode },
@@ -471,27 +480,62 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
 
   // 向用户提问服务（ask_user 工具阻塞等待用户回答；UI 订阅 onRequest 弹卡片，respond 提交答案）
 
-  // 长期记忆持久化：启动时从 ~/.shanhai/memory.json 恢复（跨会话不丢），remember 后落盘
+  // 长期记忆持久化【任务256 · 形态B】：后端已是 `~/.shanhai/memory/` 下的 Markdown vault。
+  // 启动三步：① 扫 vault 建索引；② vault 为空而旧 memory.json 还在 ⇒ 自动迁移（**先备份，绝不改原文件**）；
+  // ③ vault 不可用 ⇒ 只读旧 JSON 兜底灌注内存（不落盘），保证读路径不空窗。
   try {
-    const raw = await fs.readFile(ctx.memoryFile, 'utf8')
-    const entries = JSON.parse(raw) as Array<{ scope: never; key: string; value: unknown; source?: never; confidence?: number; sessionId?: string }>
-    for (const e of entries) {
-      if (e && typeof e.key === 'string') ctx.memory.save(e.scope, e.key, e.value, { source: e.source, confidence: e.confidence, sessionId: e.sessionId })
+    const loaded = ctx.memory.load()
+    if (loaded.loaded === 0 && existsSync(ctx.memoryFile)) {
+      const migrated = migrateMemoryJsonToVault({
+        memoryJsonPath: ctx.memoryFile,
+        vaultRoot: memoryVaultRoot,
+      })
+      const reloaded = ctx.memory.load()
+      console.log(
+        `[memory] 已迁移 memory.json → vault：${migrated.written}/${migrated.total} 条（备份 ${migrated.backupPath ?? '无'}），重载 ${reloaded.loaded} 条`,
+      )
+    } else {
+      console.log(`[memory] vault 载入 ${loaded.loaded} 条（未知文件 ${loaded.unknown} 个，只登记不删除）`)
     }
-  } catch {
-    // 无记忆文件或损坏，忽略
-  }
-  const persistMemory = async (): Promise<void> => {
+  } catch (err) {
+    console.warn('[memory] vault 载入/迁移失败，退回旧 memory.json 只读兜底：', err instanceof Error ? err.message : err)
     try {
-      await fs.writeFile(ctx.memoryFile, JSON.stringify(ctx.memory.list(), null, 2), { mode: 0o600 })
+      const raw = await fs.readFile(ctx.memoryFile, 'utf8')
+      const entries = JSON.parse(raw) as Array<Partial<MemoryEntry> & { key: string }>
+      const hydrated: MemoryEntry[] = entries
+        .filter((e) => e && typeof e.key === 'string')
+        .map((e, i) => ({
+          id: typeof e.id === 'number' ? e.id : i + 1,
+          scope: e.scope ?? 'project_knowledge',
+          key: e.key,
+          value: e.value,
+          source: e.source ?? 'explicit',
+          confidence: typeof e.confidence === 'number' ? e.confidence : 1,
+          timestamp: typeof e.timestamp === 'number' ? e.timestamp : Date.now(),
+          sessionId: e.sessionId,
+          created: typeof e.created === 'number' ? e.created : typeof e.timestamp === 'number' ? e.timestamp : Date.now(),
+          updated: typeof e.updated === 'number' ? e.updated : typeof e.timestamp === 'number' ? e.timestamp : Date.now(),
+        }))
+      ctx.memory.hydrate(hydrated)
+      console.warn(`[memory] 兜底灌注 ${hydrated.length} 条（本次运行不落盘，vault 修好后重启即可落盘）`)
     } catch {
-      // 忽略持久化失败
+      // 无记忆文件或损坏，忽略
     }
+  }
+  /**
+   * 【任务256】落盘已改为「save() 内就地原子写单文件」，此处**不再做全量覆盖**（那正是会冲掉用户手改的那条路径）。
+   * 该函数保留为「写失败可见」的汇合点：把最近一次写失败取出并打进主进程日志（原实现是 `catch {}` 静默吞掉）。
+   * 渲染层可见提示（面板角标）属 P3 范围，本轮不做——这里至少不再是"悄悄失败"。
+   */
+  const persistMemory = async (): Promise<{ ok: boolean; error?: string }> => {
+    const status = ctx.memory.flushStatus()
+    if (!status.ok) console.warn(`[memory] 记忆落盘失败（累计 ${status.failures} 次）：${status.error ?? ''}`)
+    return { ok: status.ok, error: status.error }
   }
 
   // —— computer-use / browser-use 能力缝（实例提前创建；工具不再直接暴露，改为在下方注册为可执行技能）——
 
-  // —— token 统计模块 + prompts 模块（sessionStats/snapshot/onUsage/onHttpTrace/refreshContextLength/currentContextBudget/currentApiKey + promptsModule.buildSystemPrompt/promptsModule.buildMemoryContext/promptsModule.analyzeImageWithVision/promptsModule.getSessionCwd）——
+  // —— token 统计模块 + prompts 模块（sessionStats/snapshot/onUsage/onHttpTrace/refreshContextLength/currentContextBudget/currentApiKey + promptsModule.buildSystemPrompt/promptsModule.buildMemoryIndexBlock/promptsModule.analyzeImageWithVision/promptsModule.getSessionCwd）——
   const tokenStatsModule = createTokenStatsModule(ctx, allModels, () => sessionContext.getStore() ?? ctx.currentSessionId ?? '')
   const promptsModule = createPromptsModule(ctx, {
     getCurrentSid: () => sessionContext.getStore() ?? ctx.currentSessionId ?? '',
@@ -1631,7 +1675,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
       try {
         return await sessionContext.run(sid, () =>
           loop.resumeRun(
-            isSupervisorRun ? promptsModule.buildSupervisorSystemPrompt(lastUserContent) : promptsModule.buildSystemPrompt(meta.workDir, promptsModule.buildMemoryContext(lastUserContent, meta.id)),
+            isSupervisorRun ? promptsModule.buildSupervisorSystemPrompt() : promptsModule.buildSystemPrompt(meta.workDir),
             (text) => {
               if (ctx.stoppedSessions.has(sid)) throw new Error('__stopped__')
               ctx.deltaCallbacks.forEach((cb) => cb(sid, text))
@@ -1639,6 +1683,8 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
             (text) => ctx.reasoningCallbacks.forEach((cb) => cb(sid, text)),
           // 断点续跑同样注入系统提示标签块（首条用户消息带运行环境明细、每条带自己的真实时间）
             promptsModule.buildUserContextBlock(meta.workDir),
+            // 【任务263】断点续跑同样带长期记忆目录（挂在本轮这条用户消息上）
+            promptsModule.buildMemoryIndexBlock(isSupervisorRun ? SUPERVISOR_ID : meta.id),
           ),
         )
       } catch (err) {
@@ -2050,6 +2096,28 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Runtime
     removeMemory(id) {
       ctx.memory.remove(id)
       void persistMemory()
+    },
+
+    /**
+     * 【任务257】编辑单条记忆正文（只改 value）。写盘复用 MemoryStore.update →
+     * writeEntry（原子写 + 写前 stat + 外部手改优先归档），失败**不再静默**：
+     * 记日志 + 把 { ok:false, error } 如实回给渲染层（面板就地显示失败原因）。
+     */
+    updateMemory(id, value) {
+      const r = ctx.memory.update(id, value)
+      if (!r.ok) console.warn(`[memory] 更新失败（id=${id}）：${r.error ?? ''}`)
+      return { ok: r.ok, error: r.error }
+    },
+
+    /** 【任务257】记忆落盘状态（只读、不清空）—— 渲染层面板据此显示「写失败」横幅 */
+    memoryStatus() {
+      const s = ctx.memory.persistStatus()
+      return {
+        ok: s.ok,
+        error: s.error,
+        failures: s.failures,
+        unknownFiles: s.unknownFiles.map((u) => ({ file: u.file, reason: u.reason })),
+      }
     },
 
     async transcribeAudio(audioBase64, _format) {

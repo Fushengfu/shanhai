@@ -130,32 +130,115 @@ function rememberTool(memory: NonNullable<UtilityDeps['memory']>): ToolContract 
   }
 }
 
-/** recall_memory：召回长期记忆（按作用域 + 关键词） */
+/** recall_memory 的默认返回条数上限（不传 `limit` 时生效） */
+const DEFAULT_RECALL_LIMIT = 10
+
+/** 子串出现次数（**不做大小写处理**，大小写不敏感由调用方先 toLowerCase） */
+function countHits(haystack: string, needle: string): number {
+  if (!needle) return 0
+  let n = 0
+  let from = 0
+  for (;;) {
+    const at = haystack.indexOf(needle, from)
+    if (at < 0) return n
+    n += 1
+    from = at + needle.length
+  }
+}
+
+/** 记忆正文文本（value 可能是对象） */
+function memoryText(value: unknown): string {
+  if (typeof value === 'string') return value
+  try {
+    return JSON.stringify(value) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 召回打分：**key 命中权重 3、value 命中权重 1**，按出现次数累加（大小写不敏感）。
+ * 目的：让「搜索词出现在标题里」的条目排在「正文里偶然提到」的前面。
+ */
+export function scoreMemoryHit(key: string, value: unknown, needle: string): number {
+  if (!needle) return 0
+  const n = needle.toLowerCase()
+  return countHits(key.toLowerCase(), n) * 3 + countHits(memoryText(value).toLowerCase(), n)
+}
+
+/** 召回结果的对外投影：只带 AI 真正用得上的字段（正文 + 身份 + 时间 + 来源） */
+function projectMemoryEntry(raw: unknown): Record<string, unknown> {
+  const e = (raw ?? {}) as Record<string, unknown>
+  return { id: e.id, scope: e.scope, key: e.key, value: e.value, timestamp: e.timestamp, source: e.source }
+}
+
+/** 排序：命中分降序 → 时间降序兜底（**不再是无条件 reverse 的时间倒序**） */
+function rankMemories(list: unknown[], keyword?: string): unknown[] {
+  return list
+    .map((raw) => {
+      const e = (raw ?? {}) as { key?: unknown; value?: unknown; timestamp?: unknown }
+      return {
+        raw,
+        score: scoreMemoryHit(String(e.key ?? ''), e.value, keyword ?? ''),
+        ts: Number(e.timestamp ?? 0),
+      }
+    })
+    .sort((a, b) => b.score - a.score || b.ts - a.ts)
+    .map((x) => x.raw)
+}
+
+/**
+ * recall_memory：召回长期记忆（按作用域 + 关键词）。
+ *
+ * 【任务259·P2】修掉「**不带 scope 时 keyword 被直接丢弃**」：
+ * 旧实现是 `scope ? recall(scope, keyword) : list().reverse()`，
+ * 于是「搜记忆」在无 scope 时退化成「把当前会话的全部记忆倒出来」——
+ * 用户看到的「十几条不相关、纯时间倒序」就是它。
+ * 现在：无 scope 时在**当前会话的全部 scope** 内按 key/value 子串过滤（**大小写不敏感**），
+ * 再按命中分排序；`scope` 存在时**仍走 `memory.recall(scope, keyword)`**（既有子串语义逐字不动，不得退化）。
+ */
 function recallMemoryTool(memory: NonNullable<UtilityDeps['memory']>): ToolContract {
   return {
     name: 'recall_memory',
-    description: '召回长期记忆。按 scope 过滤、keyword 关键词匹配，返回最新的在前。',
+    description:
+      '召回长期记忆。按 scope 过滤、keyword 关键词匹配（key 与正文都匹配，大小写不敏感），' +
+      '按相关度排序返回、默认最多 10 条（可用 limit 调整）。' +
+      '不传 scope 时在当前会话的全部作用域里搜；不传 keyword 时按时间倒序返回最近的记忆。',
     inputSchema: {
       type: 'object',
       properties: {
-        scope: { type: 'string', description: '记忆作用域（可选）' },
-        keyword: { type: 'string', description: '关键词（可选）' },
+        scope: { type: 'string', description: '记忆作用域（可选；不传则搜全部作用域）' },
+        keyword: { type: 'string', description: '关键词（可选；匹配 key 与正文，大小写不敏感）' },
+        limit: { type: 'number', description: '返回条数上限（可选，默认 10）' },
       },
     },
     riskLevel: 'readonly',
     guide: {
       usage: [
         '需要回忆之前是否处理过类似问题、查找历史约定/偏好时，按 scope + 关键词召回长期记忆。',
+        '记忆的存放位置与使用规则写在**本轮用户消息前的记忆块**里（该块只给位置与用法，**不列条目索引**）；' +
+          '需要正文时用本工具按关键词（或 scope）取回。',
+        '一次先用一个精准 keyword 试；结果按相关度排序（标题命中优先），默认只给前 10 条，需要更多再调大 limit。',
       ],
       cautions: [
-        '纯关键词匹配，一次先用一个精准 keyword 试，不要连续多次调用。',
+        '纯关键词子串匹配，没有语义理解：换同义词搜不到时，换一个更短的词再试，不要连续多次调用。',
       ],
     },
     execute: async (args) => {
       const scope = args.scope ? String(args.scope) : undefined
       const keyword = args.keyword ? String(args.keyword) : undefined
-      const list = scope ? memory.recall(scope, keyword) : memory.list().reverse()
-      return { items: list }
+      const rawLimit = Number(args.limit)
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : DEFAULT_RECALL_LIMIT
+      const matched = scope
+        ? memory.recall(scope, keyword)
+        : keyword
+          ? memory.list().filter((raw) => {
+              const e = (raw ?? {}) as { key?: unknown; value?: unknown }
+              return scoreMemoryHit(String(e.key ?? ''), e.value, keyword) > 0
+            })
+          : memory.list()
+      const ranked = rankMemories(matched, keyword)
+      return { total: ranked.length, items: ranked.slice(0, limit).map(projectMemoryEntry) }
     },
   }
 }

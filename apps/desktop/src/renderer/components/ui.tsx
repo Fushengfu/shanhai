@@ -101,6 +101,16 @@ export function formatRelativeTime(ts: number): string {
     : t('chat.time.yearMonthDay', { y: d.getFullYear(), m: d.getMonth() + 1, d: d.getDate() })
 }
 
+/** 【任务257】把时间戳格式化成绝对可读时间 `YYYY-MM-DD HH:mm`（记忆面板显示创建/更新时间用）。
+ *  为什么不用 toLocaleString：那个随宿主 locale 漂（月份/顺序都变），而记忆的「什么时候记的」要能跟日期直觉对上。
+ *  与 DmIm 的 HH:mm、ui.tsx 的月日口径同属「数字型时间」，不引入新的本地化依赖。 */
+export function formatDateTime(ts: number): string {
+  if (!ts || !Number.isFinite(ts)) return ''
+  const d = new Date(ts)
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
 /** 把 token 数格式化成可读文本（k/M） */
 export function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`

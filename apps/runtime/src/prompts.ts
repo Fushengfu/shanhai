@@ -6,11 +6,12 @@
  * createPromptsModule(ctx, deps)。
  */
 import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { TokenUsage, HttpTrace } from '@shanhai/llm'
 import { createModelProvider } from '@shanhai/llm'
 import { buildToolGuidePrompt } from '@shanhai/tools'
+import { ARCHIVE_DIR, GLOBAL_DIR, SCOPE_DIRS, SESSIONS_DIR, USER_DIR, sessionDirName } from '@shanhai/memory'
 import { modelSupportsVision, fetchGatewayModels } from './models'
-import { SUPERVISOR_ID } from './supervisor'
 import { DEFAULT_WORK_DIR, type RuntimeContext, type RuntimeEnvironment } from './context'
 
 /**
@@ -36,14 +37,17 @@ export interface PromptsModule {
   getSessionCwd(): string
   /** 自动采集当前运行环境快照（时间 / 操作系统 / Shell / 主目录 / 工作目录 / 语言） */
   collectEnvironment(cwd: string): RuntimeEnvironment
-  /** 系统提示词：工具调用约束 + 合规安全 + 自我升级 + 任务完成规范（环境明细不在此，见 buildUserContextBlock） */
-  buildSystemPrompt(cwd: string, memoryContext?: string): string
+  /** 系统提示词：工具调用约束 + 合规安全 + 自我升级 + 任务完成规范。
+   * 【任务263】环境明细不在此（见 buildUserContextBlock）；**长期记忆也不在此**（见 buildMemoryIndexBlock）——
+   * 用户口径：记忆（含偏好/环境正文）一律不再直接注入系统提示词，改为注入用户消息前的系统提示标签块。 */
+  buildSystemPrompt(cwd: string): string
   /** 运行环境明细（注入首条用户消息前的系统提示标签块）——环境信息的唯一渲染处，系统提示词不再自带这些值 */
   buildUserContextBlock(cwd: string): string[]
-  /** 长期记忆上下文：配置型全量注入 + 经验型按当前消息关键词召回（全隔离：仅召回当前会话） */
-  buildMemoryContext(message: string, sessionId: string): string | undefined
+  /** 长期记忆「存放位置 + 使用规则」行（【任务263】注入到本轮用户消息前的系统提示标签块，不进系统提示词；
+   * 【任务264】**不再逐条列目录索引**，只给位置与取用方式，**不含任何正文/标题**；正文由模型按需用 recall_memory 取回 */
+  buildMemoryIndexBlock(sessionId: string): string[]
   /** 管家系统提示词：调度流程 + 任务编排（项目经理模式）+ 台账约定 + 求助用户形式 */
-  buildSupervisorSystemPrompt(message: string): string
+  buildSupervisorSystemPrompt(): string
 }
 
 export function createPromptsModule(
@@ -116,7 +120,7 @@ export function createPromptsModule(
     }
   }
 
-  const buildSystemPrompt = (cwd: string, memoryContext?: string): string => {
+  const buildSystemPrompt = (cwd: string): string => {
     const env = collectEnvironment(cwd)
     const toolGuide = buildToolGuidePrompt(ctx.tools)
     return [
@@ -217,7 +221,6 @@ export function createPromptsModule(
       '调用【已安装插件】注册的功能工具走同一个 plugin 入口：plugin({ action: \'list\' }) 查有哪些插件及各自的 tools 清单 → plugin({ action: \'tool\', pluginId, tool, args }) 调用。pluginId 与 tool 一律以 list 返回的实际值为准，禁止凭印象猜 —— 插件可被作者改名或卸载，任何具体插件的 id/工具名都不是固定常量。需要向用户开口念结论时，从 list 里找语音播报类插件的发声工具调用即可。顶层工具表里只有 plugin 这一个入口，不存在 plugin_tool / plugin_apps 这类名字；插件工具各自的 riskLevel / approvalRequired 仍照常过审批门。',
       '</sh_selfmod>',
       ...(ctx.builtinSkillCatalog ? ['', '<sh_skills>', '## 内置能力', ctx.builtinSkillCatalog, '</sh_skills>'] : []),
-      '<sh_memory>', memoryContext, '</sh_memory>',
       '',
       '<sh_honesty>',
       '## 不要耍嘴炮（最高优先级，务必遵守）',
@@ -264,8 +267,7 @@ export function createPromptsModule(
     ]
   }
 
-  const buildSupervisorSystemPrompt = (message: string): string => {
-    const mem = buildMemoryContext(message, SUPERVISOR_ID)
+  const buildSupervisorSystemPrompt = (): string => {
     const toolGuide = buildToolGuidePrompt(ctx.supervisorLoopTools)
     const base = [
       '你是「会话管家」，山海多会话系统的主 Agent。你的主要任务是在每条消息中遵循用户的指令，这些指令由 <user_query> 标签标明。你负责准确理解用户意图、把任务精准调度给合适的会话，并监控各会话状态，而不是替某个会话执行具体的编码/文件任务。',
@@ -396,17 +398,33 @@ export function createPromptsModule(
       '',
       ...(toolGuide ? ['', '', '<sh_tools>', toolGuide, '</sh_tools>'] : []),
     ].join('\n')
-    return mem ? base + mem : base
+    return base
   }
 
-  const buildMemoryContext = (message: string, sessionId: string): string | undefined => {
-    const config = ctx.memory.listBySession(sessionId).filter((e) => e.scope !== 'task_experience' && e.scope !== 'session')
-    const experience = ctx.memory.recall('task_experience', message, sessionId).slice(0, 5)
-    const all = [...config, ...experience]
-    if (all.length === 0) return undefined
-    const lines = all.map((e) => `- [${e.scope}] ${e.key}: ${typeof e.value === 'string' ? e.value : JSON.stringify(e.value)}`)
-    return `\n\n【长期记忆】\n${lines.join('\n')}`
+  /**
+   * 长期记忆「存放位置 + 使用规则」（【任务263】注入位置：用户消息前的系统提示标签块，不进系统提示词；
+   * 【任务264】**不再逐条列目录索引**——用户口径：「不要直接记录目录索引呀…直接注入记忆存放位置就行了」）。
+   *
+   * 为什么连目录也不列：
+   * - 目录索引随会话增长（管家侧曾到 127 行 / 约 3.9k 字符），仍是「每轮固定开销」；
+   * - 模型只需要知道「记忆在哪儿、怎么取」；需要正文时用 recall_memory 按 keyword / scope 取回即可；
+   * - 位置口径直接复用记忆包（@shanhai/memory）的单点真相源 —— vaultRoot / SESSIONS_DIR / sessionDirName /
+   *   SCOPE_DIRS / GLOBAL_DIR / USER_DIR / ARCHIVE_DIR，避免这里另抄一份路径规则、日后与 vault 实现漂移。
+   * 普通会话与管家**共用本函数**，改一处两侧同时生效。
+   */
+  const buildMemoryIndexBlock = (sessionId: string): string[] => {
+    const root = ctx.memory.vaultPath() ?? join(homedir(), '.shanhai', 'memory')
+    const sessionDir = join(root, SESSIONS_DIR, sessionDirName(sessionId))
+    return [
+      '## 长期记忆（正文不在本块，需要时用 recall_memory 取回）',
+      `- 存放位置：${root}（本机 Markdown 文件；每个会话一个目录，目录内按 scope 分子目录，正文是 Markdown + YAML frontmatter）`,
+      `- 本会话目录：${sessionDir}`,
+      `- 目录结构：${SESSIONS_DIR}/<会话ID>/<scope>/<标题>.md；scope 为 ${Object.keys(SCOPE_DIRS).join(' / ')} 之一，目录名与条目的 scope 字段逐字符一致`,
+      `- 其它位置：${GLOBAL_DIR}/（无会话归属的记忆）、${USER_DIR}/（用户手记，山海只读）、${ARCHIVE_DIR}/（被覆盖或移除的旧正文归档）`,
+      '- 取正文：调用 recall_memory —— 可传 scope 只搜某类；可传 keyword 在标题与正文里搜（不传 scope 时搜全部）；可传 limit 限制条数。',
+      '- 使用规则：问到历史决策、项目背景、用户偏好、环境约定、既定口径时，**先 recall_memory 查一遍再作答**；不确定就查，不要凭印象编造。',
+    ]
   }
 
-  return { analyzeImageWithVision, getSessionCwd, collectEnvironment, buildSystemPrompt, buildUserContextBlock, buildMemoryContext, buildSupervisorSystemPrompt }
+  return { analyzeImageWithVision, getSessionCwd, collectEnvironment, buildSystemPrompt, buildUserContextBlock, buildMemoryIndexBlock, buildSupervisorSystemPrompt }
 }

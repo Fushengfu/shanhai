@@ -559,6 +559,10 @@ export interface ShanhaiBridge {
   onClientRemove(cb: (pkgId: string) => void): () => void
   listMemory(sessionId: string): Promise<MemoryEntry[]>
   removeMemory(id: number): Promise<void>
+  /** 【任务257】编辑单条记忆的正文（只改 value；id/scope/key/session/created 不可变）。失败回 { ok:false, error }，不静默 */
+  updateMemory(id: number, value: unknown): Promise<{ ok: boolean; error?: string }>
+  /** 【任务257】记忆落盘状态（写失败可见）：ok=false / failures>0 时面板显示横幅 */
+  memoryStatus(): Promise<MemoryStatus>
   // 本机技能 / MCP（账号悬停弹窗的只读展示；MCP 配置里的 env 等敏感字段不下发）
   listSkills(): Promise<SkillListResult>
   listMcpServers(): Promise<McpServerListResult>
@@ -608,6 +612,20 @@ export interface MemoryEntry {
   source: string
   confidence: number
   timestamp: number
+  sessionId?: string
+  /** 【任务257】首次创建时间（ms） */
+  created?: number
+  /** 【任务257】最近一次写入时间（ms）；与 created 不同才在界面区分显示 */
+  updated?: number
+}
+
+/** 【任务257】记忆落盘状态（写失败可见）：ok=false ⇒ 存储处于失败态；failures 为累计失败次数（只增不减） */
+export interface MemoryStatus {
+  ok: boolean
+  error?: string
+  failures: number
+  /** 未被认定为山海记忆的 .md（只登记、永不删除） */
+  unknownFiles: Array<{ file: string; reason: string }>
 }
 
 /** 用户手动终端简要信息（会话级隔离） */
@@ -1100,6 +1118,8 @@ const bridge: ShanhaiBridge = {
   },
   listMemory: (sessionId) => ipcRenderer.invoke('memory:list', sessionId),
   removeMemory: (id) => ipcRenderer.invoke('memory:remove', id),
+  updateMemory: (id, value) => ipcRenderer.invoke('memory:update', id, value),
+  memoryStatus: () => ipcRenderer.invoke('memory:status'),
   listSkills: () => ipcRenderer.invoke('skills:list'),
   listMcpServers: () => ipcRenderer.invoke('mcp:servers'),
   listMcpToolCounts: () => ipcRenderer.invoke('mcp:tool-counts'),
